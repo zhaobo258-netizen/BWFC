@@ -62,6 +62,12 @@ final class AnalysisMockURLProtocol: MockURLProtocolBase {
     override class var sharedStorage: MockURLProtocolStorage { storage }
 }
 
+/// Kimi 网关分析接口测试专用
+final class KimiMockURLProtocol: MockURLProtocolBase {
+    static let storage = MockURLProtocolStorage()
+    override class var sharedStorage: MockURLProtocolStorage { storage }
+}
+
 /// 从请求中提取请求体（兼容 httpBody / httpBodyStream 两种形态）
 func mockRequestBodyData(of request: URLRequest) -> Data? {
     if let body = request.httpBody { return body }

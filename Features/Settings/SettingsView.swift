@@ -9,16 +9,18 @@ struct SettingsView: View {
     @State private var apiKeyInput: String = ""
     @State private var saveMessage: String?
     @State private var showError: String?
+    @State private var isTestingConnection = false
+    @State private var connectionTestResult: (ok: Bool, text: String)?
 
     var body: some View {
         Form {
             Section {
                 HStack {
-                    Text("云端 API Key")
+                    Text("API Key（\(CloudModelConfig.analysisProviderName)）")
                     Spacer()
                     configurationBadge
                 }
-                SecureField("粘贴你的 API Key（不会明文保存）", text: $apiKeyInput)
+                SecureField("粘贴你的 \(CloudModelConfig.analysisProviderName) API Key（不会明文保存）", text: $apiKeyInput)
                     .textFieldStyle(.roundedBorder)
                 HStack {
                     Button("保存到 Keychain") {
@@ -49,16 +51,25 @@ struct SettingsView: View {
             }
 
             Section {
-                Button("连接测试") {}
-                    .disabled(true)
-                Text("连接测试将在阶段 3 提供：只返回「可用 / 不可用」与脱敏错误。")
+                HStack {
+                    Button(isTestingConnection ? "测试中…" : "连接测试") {
+                        runConnectionTest()
+                    }
+                    .disabled(isTestingConnection || !environment.isCloudConfigured)
+                    if let connectionTestResult {
+                        Text(connectionTestResult.text)
+                            .font(.footnote)
+                            .foregroundStyle(connectionTestResult.ok ? .green : .orange)
+                    }
+                }
+                Text("对 \(CloudModelConfig.analysisProviderName) 网关发起一次最小请求，只返回「可用 / 不可用」与脱敏错误。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
 
             Section {
-                LabeledContent("说话人识别模型", value: CloudModelConfig.diarizationModelID)
-                LabeledContent("谈判分析模型", value: CloudModelConfig.analysisModelID)
+                LabeledContent("谈判分析", value: "\(CloudModelConfig.analysisProviderName) · \(CloudModelConfig.analysisModelID)")
+                LabeledContent("说话人识别", value: "OpenAI 兼容 · \(CloudModelConfig.diarizationModelID)")
                 Text("模型版本由应用统一固定，发布前会锁定为评测通过的具体版本。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -111,6 +122,25 @@ struct SettingsView: View {
             // 只展示错误类型，不展示 Key 内容
             showError = "保存失败：\(error.localizedDescription)"
             saveMessage = nil
+        }
+    }
+
+    /// 连接测试：最小真实请求，只显示可用/不可用与脱敏错误
+    private func runConnectionTest() {
+        guard !isTestingConnection else { return }
+        isTestingConnection = true
+        connectionTestResult = nil
+        Task { @MainActor in
+            defer { isTestingConnection = false }
+            do {
+                let ok = try await environment.negotiationAnalysis.testConnection()
+                connectionTestResult = ok
+                    ? (true, "连接正常（\(CloudModelConfig.analysisProviderName) 网关可用）")
+                    : (false, "连接失败")
+            } catch {
+                // 错误描述已脱敏（不含 Key 与正文）
+                connectionTestResult = (false, "不可用：\(error.localizedDescription)")
+            }
         }
     }
 

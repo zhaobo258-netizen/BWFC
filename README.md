@@ -128,3 +128,16 @@ swift test                  # 可完成构建；本机执行阶段静默失效�
 - 删除整场会议：二次确认并明确列明删除内容（录音、样本、分片与队列、数据库记录）；
   删除后验证会议专属目录与数据库记录均不存在；导出文件存于用户自选位置，
   应用目录内无导出缓存需清理。
+
+## 云端分析 provider 切换（Kimi）
+
+- 谈判文字分析改用本机 Kimi 网关（Anthropic 风格 messages 接口）：
+  `POST https://agent-gw.kimi.com/coding/v1/messages`，`x-api-key` + `anthropic-version` 头，
+  模型 `kimi-for-coding`（集中配置于 CloudModelConfig）。
+- 无 Structured Outputs 强制能力：系统提示词约束「只输出 JSON」+ 本地
+  AnalysisSchema 严格解码与证据过滤兜底；不合规按 invalidResponse 处理并保留上一版。
+- 响应 content 可能含 thinking/text 块：只拼接 text 块；```json 围栏解析前剥离。
+- 说话人识别模块保持 OpenAI 兼容形态不变。
+- 设置页：「API Key（Kimi）」+ 真实连接测试（最小 messages 请求，可用/不可用与脱敏错误）。
+- 真实联调已通过（探针在 /tmp，不进仓库）：最小分析输入 → HTTP 200 →
+  合法分析 JSON（5 insights + 3 topics，枚举与证据引用全部有效）。

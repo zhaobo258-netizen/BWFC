@@ -41,6 +41,8 @@ protocol NegotiationAnalysisServicing: Sendable {
     ///   - inputJSON: 增量输入（AnalysisInputAssembler 组装，含不可信包裹）
     /// - Returns: 通过严格 schema 的输出 DTO（尚未做证据校验）
     func analyze(instructions: String, inputJSON: String) async throws -> AnalysisOutputDTO
+    /// 连接测试（设置页使用）：只返回可用/不可用，错误按统一分类抛出（脱敏）
+    func testConnection() async throws -> Bool
 }
 
 /// 基于 URLSession 的 OpenAI Responses API 实现（阶段 4）。
@@ -105,6 +107,22 @@ struct OpenAIAnalysisService: NegotiationAnalysisServicing {
 
     // MARK: - 内部
 
+    /// 连接测试（OpenAI 兼容形态：GET /models）
+    func testConnection() async throws -> Bool {
+        guard let apiKey = try apiKeyStore.readKey(), !apiKey.isEmpty else {
+            throw AnalysisAPIError.missingAPIKey
+        }
+        var request = URLRequest(url: baseURL.appending(path: "/models"))
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 15
+        let (_, response) = try await perform(request)
+        guard let http = response as? HTTPURLResponse else {
+            throw AnalysisAPIError.invalidResponse
+        }
+        return (200..<300).contains(http.statusCode)
+    }
+
     private func perform(_ request: URLRequest) async throws -> (Data, URLResponse) {
         do {
             return try await session.data(for: request)
@@ -164,5 +182,8 @@ struct OpenAIAnalysisService: NegotiationAnalysisServicing {
 struct UnimplementedNegotiationAnalysisService: NegotiationAnalysisServicing {
     func analyze(instructions: String, inputJSON: String) async throws -> AnalysisOutputDTO {
         throw ServiceNotReadyError.notImplemented("谈判分析")
+    }
+    func testConnection() async throws -> Bool {
+        throw ServiceNotReadyError.notImplemented("连接测试")
     }
 }

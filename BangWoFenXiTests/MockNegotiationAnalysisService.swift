@@ -26,4 +26,6 @@ final class MockNegotiationAnalysisService: NegotiationAnalysisServicing, @unche
             keyFacts: [], insights: []
         )
     }
+
+    func testConnection() async throws -> Bool { true }
 }
