@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- App Sandbox（实施计划 12.1 首版硬要求） -->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<!-- 麦克风：会议录音与本地转写 -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+	<!-- 出站网络：云端说话人识别与谈判分析 -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+</dict>
+</plist>

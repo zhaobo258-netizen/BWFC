@@ -1,0 +1,10 @@
+# SwiftPM 构建产物
+.build/
+# 自制 .app 输出目录
+build/
+# macOS 杂项
+.DS_Store
+# 敏感数据一律不进仓库（实施计划第 0 节）：API Key、录音、声音样本
+*.key
+*.pem
+secrets/
