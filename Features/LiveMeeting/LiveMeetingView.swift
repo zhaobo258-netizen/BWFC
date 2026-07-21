@@ -33,6 +33,10 @@ struct LiveMeetingView: View {
                 if recorder?.deviceInterrupted == true {
                     deviceInterruptedBanner(meeting: meeting)
                 }
+                if transcription?.availability?.assetState == .supportedNotInstalled
+                    || transcription?.assetDownloadProgress != nil {
+                    assetDownloadBanner
+                }
                 if case .suspended(let reason) = diarization?.cloudState {
                     cloudSuspendedBanner(reason: reason)
                 }
@@ -287,6 +291,44 @@ struct LiveMeetingView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .background(.orange.opacity(0.12))
+    }
+
+    // MARK: - 中文语言资源下载横幅（supported 但未安装：一键下载）
+
+    private var assetDownloadBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.down.circle")
+            if let progress = transcription?.assetDownloadProgress {
+                Text("正在下载中文语言资源…")
+                    .font(.callout)
+                ProgressView(value: progress)
+                    .frame(maxWidth: 220)
+                Text("\(Int(progress * 100))%")
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("本地中文转写需要下载语言资源。下载后即可开始录音转写。")
+                    .font(.callout)
+                Button("下载中文语言资源") {
+                    Task { await transcription?.installChineseAssets() }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(transcription?.canInstallChineseAssets != true)
+            }
+            if let error = transcription?.assetInstallError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                Button("重试") {
+                    Task { await transcription?.installChineseAssets() }
+                }
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.blue.opacity(0.08))
     }
 
     // MARK: - 云端暂停提示（401 / 未配置 Key：本地录音继续，修复后可重试）

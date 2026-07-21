@@ -54,6 +54,8 @@ enum LocalTranscriptionError: Error, Equatable {
     case sessionAlreadyRunning
     /// 无法确定分析所需音频格式
     case noCompatibleAudioFormat
+    /// 本设备不支持中文语言资源（无法下载）
+    case assetInstallUnsupported
 }
 
 extension LocalTranscriptionError: LocalizedError {
@@ -63,6 +65,7 @@ extension LocalTranscriptionError: LocalizedError {
         case .sessionNotStarted: return "转写会话未启动"
         case .sessionAlreadyRunning: return "转写会话已在运行"
         case .noCompatibleAudioFormat: return "找不到与语音识别兼容的音频格式"
+        case .assetInstallUnsupported: return "本设备不支持下载中文语言资源"
         }
     }
 }
@@ -74,6 +77,10 @@ protocol LocalTranscriptionServicing: AnyObject, Sendable {
     var results: AsyncStream<LocalTranscriptResult> { get }
     /// 检查普通话转写可用性（不静默降级；返回真实原因）
     func checkMandarinAvailability() async -> TranscriptionAvailability
+    /// 触发中文语言资源下载安装（AssetInventory.assetInstallationRequest +
+    /// downloadAndInstall）。进度经回调报告（0…1，1 即完成）；
+    /// 不支持下载或安装失败时抛出真实错误。
+    func installMandarinAssets(onProgress: @escaping @Sendable (Double) -> Void) async throws
     /// 启动转写会话
     /// - Parameter contextualStrings: 上下文词汇（专业词汇、参会人姓名等；
     ///   仅用于改善识别，不改写原意）
@@ -140,7 +147,7 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
                 issues.append("中文语言资源正在下载，请稍后重试")
             case .supported:
                 assetState = .supportedNotInstalled
-                issues.append("中文语言资源尚未安装（可在系统设置中下载，或联网后重试）")
+                issues.append("中文语言资源尚未安装（可点击「下载中文语言资源」获取）")
             case .unsupported:
                 assetState = .unsupported
                 issues.append("本设备缺少可用的中文语言资源")
@@ -157,20 +164,40 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
         )
     }
 
-    /// 尝试触发中文语言资源下载（用户主动点击「下载资源」时调用）。
-    /// 返回是否成功发起/完成安装；失败时抛出真实错误。
-    @discardableResult
-    func requestMandarinAssetInstallation() async throws -> Bool {
+    /// 触发中文语言资源下载（实施计划：AssetInventory.assetInstallationRequest +
+    /// downloadAndInstall）。进度经 onProgress 报告（0…1，1 即完成）；
+    /// 本设备不支持时抛 assetInstallUnsupported，下载失败抛底层真实错误（可重试）。
+    func installMandarinAssets(onProgress: @escaping @Sendable (Double) -> Void) async throws {
         guard let matched = await SpeechTranscriber.supportedLocale(equivalentTo: Self.mandarinLocale) else {
-            return false
+            throw LocalTranscriptionError.assetInstallUnsupported
         }
         _ = try await AssetInventory.reserve(locale: matched)
         let probe = SpeechTranscriber(locale: matched, preset: .timeIndexedProgressiveTranscription)
         guard let request = try await AssetInventory.assetInstallationRequest(supporting: [probe]) else {
-            return true // 无需安装（可能已就绪）
+            // 无需安装（可能已就绪）
+            onProgress(1)
+            return
         }
-        try await request.downloadAndInstall()
-        return true
+
+        // 轮询 Progress 并上报（下载完成或取消后停止）
+        let progress = request.progress
+        let poller = Task {
+            while !Task.isCancelled {
+                onProgress(progress.fractionCompleted)
+                if progress.isFinished || progress.isCancelled { break }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+        do {
+            try await request.downloadAndInstall()
+            poller.cancel()
+            onProgress(1)
+        } catch {
+            poller.cancel()
+            // 失败透出真实错误（由界面展示，可重试）
+            AppLog.transcription.error("\(LogSanitizer.formatEvent("asset_install_failed", error: String(describing: type(of: error))))")
+            throw error
+        }
     }
 
     // MARK: - 会话

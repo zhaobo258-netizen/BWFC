@@ -19,7 +19,15 @@ final class MockLocalTranscriptionService: LocalTranscriptionServicing, @uncheck
     private(set) var finishCount = 0
     private(set) var cancelCount = 0
     private(set) var fedBufferCount = 0
+    private(set) var installCallCount = 0
     var startError: (any Error)?
+
+    /// 安装脚本：设置后 installMandarinAssets 抛出该错误
+    var installError: (any Error)?
+    /// 安装时上报的进度序列
+    var installProgressSteps: [Double] = [0.3, 0.7, 1.0]
+    /// 安装成功后的可用性（模拟「下载完成 → installed」）
+    var availabilityAfterInstall: TranscriptionAvailability?
 
     init() {
         var captured: AsyncStream<LocalTranscriptResult>.Continuation!
@@ -34,6 +42,17 @@ final class MockLocalTranscriptionService: LocalTranscriptionServicing, @uncheck
     func startSession(contextualStrings: [String]) async throws {
         if let startError { throw startError }
         startSessionCalls.append(contextualStrings)
+    }
+
+    func installMandarinAssets(onProgress: @escaping @Sendable (Double) -> Void) async throws {
+        installCallCount += 1
+        if let installError { throw installError }
+        for step in installProgressSteps {
+            onProgress(step)
+        }
+        if let availabilityAfterInstall {
+            availability = availabilityAfterInstall
+        }
     }
 
     func feed(_ buffer: AVAudioPCMBuffer) async {

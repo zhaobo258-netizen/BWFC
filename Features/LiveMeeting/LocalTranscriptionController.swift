@@ -34,6 +34,42 @@ final class LocalTranscriptionController {
     /// 新最终片段到达回调（阶段 4：驱动分析调度器）
     var onNewFinalSegment: (() -> Void)?
 
+    /// 语言资源下载进度（nil = 未在下载；0…1）
+    private(set) var assetDownloadProgress: Double?
+    /// 下载失败的脱敏提示（展示并可重试）
+    private(set) var assetInstallError: String?
+
+    /// 当前是否可一键下载中文语言资源（supported 但未安装）
+    var canInstallChineseAssets: Bool {
+        availability?.assetState == .supportedNotInstalled && assetDownloadProgress == nil
+    }
+
+    /// 一键下载中文语言资源（实施计划：AssetInventory 下载路径）。
+    /// 完成后自动重新检查可用性并清除不可用状态；失败显示真实错误可重试。
+    func installChineseAssets() async {
+        guard availability?.assetState == .supportedNotInstalled else { return }
+        assetDownloadProgress = 0
+        assetInstallError = nil
+        do {
+            try await service.installMandarinAssets { [weak self] value in
+                Task { @MainActor in
+                    self?.assetDownloadProgress = value
+                }
+            }
+            assetDownloadProgress = nil
+            // 完成后自动重查：恢复 ready 则清除不可用状态
+            let updated = await checkAvailability()
+            if updated.isReady {
+                runState = .idle
+                lastErrorDescription = nil
+            }
+        } catch {
+            assetDownloadProgress = nil
+            assetInstallError = "下载失败：\(error.localizedDescription)"
+            AppLog.transcription.error("\(LogSanitizer.formatEvent("asset_install_failed", error: String(describing: type(of: error))))")
+        }
+    }
+
     init(service: any LocalTranscriptionServicing) {
         self.service = service
     }
