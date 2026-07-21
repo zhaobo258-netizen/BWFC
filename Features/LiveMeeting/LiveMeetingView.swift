@@ -46,6 +46,9 @@ struct LiveMeetingView: View {
                 if let operationError {
                     errorBanner(text: operationError)
                 }
+                if PerfCounters.isDebugOverlayEnabled {
+                    debugCountersBar
+                }
                 workingArea(meeting: meeting)
                 Divider()
                 TranscriptPanelView(
@@ -128,6 +131,7 @@ struct LiveMeetingView: View {
 
             // 录音时长（墙钟，含暂停）
             TimelineView(.periodic(from: .now, by: 1)) { context in
+                let _ = PerfCounters.increment(.timerTick) // 计时器存证（渲染风暴排查）
                 Text(Self.formatDuration(ms: recorder?.elapsedWallMs(at: context.date) ?? 0))
                     .monospacedDigit()
             }
@@ -291,6 +295,26 @@ struct LiveMeetingView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .background(.orange.opacity(0.12))
+    }
+
+    // MARK: - 调试计数条（渲染风暴排查；UserDefaults bwfxDebugCounters=YES 开启）
+
+    private var debugCountersBar: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { _ in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ForEach(PerfCounters.snapshot(), id: \.counter) { item in
+                        Text("\(item.counter.rawValue) \(item.count)")
+                            .font(.caption2)
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
+            .padding(.vertical, 4)
+            .background(.black.opacity(0.05))
+        }
     }
 
     // MARK: - 中文语言资源下载横幅（supported 但未安装：一键下载）

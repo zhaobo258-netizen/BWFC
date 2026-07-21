@@ -1,10 +1,62 @@
 import SwiftUI
 
+/// 转写行数据（值类型，Equatable）。
+/// SwiftUI 以行级 Equatable 做差分：未变化的行不重建 body（渲染风暴根治点）。
+struct TranscriptRowData: Equatable, Identifiable {
+    let id: UUID
+    var startMs: Int64
+    var text: String
+    var state: SegmentState
+    var source: SegmentSource
+    var isStarred: Bool
+    var speakerName: String
+    var speakerColorToken: String?
+    var isHighlighted: Bool
+
+    /// 由片段映射（纯函数，可单测）
+    static func make(
+        from segment: TranscriptSegment,
+        participants: [Participant],
+        unknownDisplay: String?,
+        highlightedID: UUID?
+    ) -> TranscriptRowData {
+        let participant = segment.participantId.flatMap { id in
+            participants.first(where: { $0.id == id })
+        }
+        return TranscriptRowData(
+            id: segment.id,
+            startMs: segment.startMs,
+            text: segment.text,
+            state: segment.state,
+            source: segment.source,
+            isStarred: segment.isStarred,
+            speakerName: participant?.displayName ?? (unknownDisplay ?? "识别中"),
+            speakerColorToken: participant?.colorToken,
+            isHighlighted: segment.id == highlightedID
+        )
+    }
+}
+
+/// 说话人菜单项（值类型）。
+/// 由参会人列表**预先构建一次**（替代每行每次重建时对参会人 class 数组做
+/// ForEach 泛型 keypath 解析——采样中该路径占单行成本大头）。
+struct SpeakerMenuItem: Equatable, Identifiable {
+    let id: UUID
+    let title: String
+
+    static func makeItems(from participants: [Participant]) -> [SpeakerMenuItem] {
+        participants.map {
+            SpeakerMenuItem(id: $0.id, title: "\($0.displayName)（\($0.side.displayName)）")
+        }
+    }
+}
+
 /// 底部同声转写面板（实施计划 6.5）：
 /// - 默认自动滚动到最新；用户向上浏览后暂停滚动并显示「回到最新」；
 /// - 临时文字使用较浅颜色；最终替换就地更新（片段 ID 稳定，不整页跳动）；
 /// - 说话人未识别时显示「识别中 / 待识别 A…」；
 /// - 右键可修改说话人（含待识别映射）、修改文字、加星标（阶段 3）。
+/// 性能：行视图为 Equatable，未变化行零重建；菜单内容预计算为值类型数组。
 struct TranscriptPanelView: View {
     let segments: [TranscriptSegment]
     let participants: [Participant]
@@ -35,30 +87,11 @@ struct TranscriptPanelView: View {
                                 .frame(maxWidth: .infinity, alignment: .center)
                                 .padding(.top, 12)
                         }
-                        ForEach(segments) { segment in
-                            TranscriptRowView(
-                                segment: segment,
-                                participant: participants.first(where: { $0.id == segment.participantId }),
-                                unknownDisplay: unknownSpeakerDisplay?(segment)
-                            )
-                            .id(segment.id)
-                            .background(
-                                segment.id == highlightedSegmentID
-                                    ? Color.yellow.opacity(0.25)
-                                    : Color.clear,
-                                in: RoundedRectangle(cornerRadius: 4)
-                            )
-                            .contextMenu {
-                                speakerMenu(for: segment)
-                                Button("修改文字…") {
-                                    editingText = segment.text
-                                    editingTextSegment = segment
+                        ForEach(rows) { row in
+                            TranscriptRowView(row: row)
+                                .contextMenu {
+                                    rowContextMenu(for: row)
                                 }
-                                Divider()
-                                Button(segment.isStarred ? "取消星标" : "加星标") {
-                                    onToggleStar?(segment)
-                                }
-                            }
                         }
                     }
                     .padding(.horizontal, 16)
@@ -128,29 +161,68 @@ struct TranscriptPanelView: View {
         }
     }
 
-    /// 说话人修改菜单（含待识别映射与清除）。
-    /// 性能说明：菜单内容扁平化（Section + ForEach 直排，无嵌套 Menu），
-    /// 避免每行每次重建都构造子菜单与泛型解析（渲染风暴回归修复）。
+    /// 片段 → 行数据（纯映射；行 Equatable 保证未变化行零重建）
+    private var rows: [TranscriptRowData] {
+        segments.map { segment in
+            TranscriptRowData.make(
+                from: segment,
+                participants: participants,
+                unknownDisplay: unknownSpeakerDisplay?(segment),
+                highlightedID: highlightedSegmentID
+            )
+        }
+    }
+
+    /// 说话人菜单项（预计算为值类型数组；参会人不变时内容稳定）
+    private var speakerItems: [SpeakerMenuItem] {
+        SpeakerMenuItem.makeItems(from: participants)
+    }
+
+    /// 行右键菜单（扁平、值类型驱动）
     @ViewBuilder
-    private func speakerMenu(for segment: TranscriptSegment) -> some View {
+    private func rowContextMenu(for row: TranscriptRowData) -> some View {
         Section("修改说话人") {
-            ForEach(participants) { participant in
+            ForEach(speakerItems) { item in
                 Button {
+                    guard let segment = segment(for: row),
+                          let participant = participants.first(where: { $0.id == item.id }) else {
+                        return
+                    }
                     onAssignSpeaker?(segment, participant)
                 } label: {
-                    if segment.participantId == participant.id {
-                        Label("\(participant.displayName)（\(participant.side.displayName)）", systemImage: "checkmark")
+                    if row.speakerName == item.title.components(separatedBy: "（").first {
+                        Label(item.title, systemImage: "checkmark")
                     } else {
-                        Text("\(participant.displayName)（\(participant.side.displayName)）")
+                        Text(item.title)
                     }
                 }
             }
-            if segment.participantId != nil {
+            if hasSpeaker(row) {
                 Button("清除说话人映射") {
+                    guard let segment = segment(for: row) else { return }
                     onAssignSpeaker?(segment, nil)
                 }
             }
         }
+        Button("修改文字…") {
+            guard let segment = segment(for: row) else { return }
+            editingText = segment.text
+            editingTextSegment = segment
+        }
+        Divider()
+        Button(row.isStarred ? "取消星标" : "加星标") {
+            guard let segment = segment(for: row) else { return }
+            onToggleStar?(segment)
+        }
+    }
+
+    /// 行 → 原始片段（编辑操作需要模型引用）
+    private func segment(for row: TranscriptRowData) -> TranscriptSegment? {
+        segments.first(where: { $0.id == row.id })
+    }
+
+    private func hasSpeaker(_ row: TranscriptRowData) -> Bool {
+        segment(for: row)?.participantId != nil
     }
 
     private func scrollToLatest(proxy: ScrollViewProxy) {
@@ -159,31 +231,32 @@ struct TranscriptPanelView: View {
     }
 }
 
-/// 单个转写片段行
-struct TranscriptRowView: View {
-    let segment: TranscriptSegment
-    let participant: Participant?
-    /// 未知说话人的展示名（「待识别 A」）
-    var unknownDisplay: String?
+/// 单个转写片段行（Equatable：row 未变则 body 零重建）
+struct TranscriptRowView: View, Equatable {
+    let row: TranscriptRowData
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.row == rhs.row
+    }
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             // 开始时间
-            Text(Self.formatMs(segment.startMs))
+            Text(Self.formatMs(row.startMs))
                 .font(.caption)
                 .monospacedDigit()
                 .foregroundStyle(.tertiary)
                 .frame(width: 48, alignment: .leading)
 
             // 星标
-            if segment.isStarred {
+            if row.isStarred {
                 Image(systemName: "star.fill")
                     .font(.caption2)
                     .foregroundStyle(.yellow)
             }
 
             // 说话人（未识别 → 识别中 / 待识别 A）
-            Text(speakerName)
+            Text(row.speakerName)
                 .font(.caption)
                 .fontWeight(.medium)
                 .foregroundStyle(speakerColor)
@@ -191,9 +264,9 @@ struct TranscriptRowView: View {
                 .lineLimit(1)
 
             // 正文：临时文字浅色
-            Text(segment.text)
+            Text(row.text)
                 .font(.callout)
-                .foregroundStyle(segment.state == .provisional ? .secondary : .primary)
+                .foregroundStyle(row.state == .provisional ? .secondary : .primary)
 
             Spacer(minLength: 8)
 
@@ -206,27 +279,26 @@ struct TranscriptRowView: View {
                 .foregroundStyle(.secondary)
         }
         .padding(.vertical, 2)
-    }
-
-    private var speakerName: String {
-        if let participant { return participant.displayName }
-        return unknownDisplay ?? "识别中"
+        .background(
+            row.isHighlighted ? Color.yellow.opacity(0.25) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 4)
+        )
     }
 
     private var speakerColor: Color {
-        if let participant {
-            return colorForToken(participant.colorToken)
+        if let token = row.speakerColorToken {
+            return colorForToken(token)
         }
         return .secondary
     }
 
     /// 状态标签：按来源与状态区分（实施计划 6.5）
     private var stateLabel: String {
-        switch segment.state {
+        switch row.state {
         case .provisional:
             return "识别中"
         case .final:
-            return segment.source == .cloud ? "云端已确认" : "已确认"
+            return row.source == .cloud ? "云端已确认" : "已确认"
         case .edited:
             return "人工已修订"
         case .failed:
@@ -235,7 +307,7 @@ struct TranscriptRowView: View {
     }
 
     private var stateBackground: Color {
-        switch segment.state {
+        switch row.state {
         case .provisional: return .gray.opacity(0.15)
         case .final: return .green.opacity(0.15)
         case .edited: return .blue.opacity(0.15)

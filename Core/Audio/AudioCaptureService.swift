@@ -317,6 +317,7 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
         }
         // 阶段 2：录音中把缓冲同时分发给语音分析（暂停期间不分发）
         if shouldWrite {
+            PerfCounters.increment(.bufferFed)
             onBuffer?(buffer)
         }
         // 电平：约每 8 个缓冲上报一次（4096 帧 @44.1kHz ≈ 93ms）
@@ -324,6 +325,7 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
         guard bufferCountSinceLevel >= 8 else { return }
         bufferCountSinceLevel = 0
         let rms = Self.rmsLevel(of: buffer)
+        PerfCounters.increment(.levelCallback)
         onLevel?(rms)
     }
 

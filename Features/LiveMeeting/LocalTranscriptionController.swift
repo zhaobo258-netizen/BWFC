@@ -192,11 +192,33 @@ final class LocalTranscriptionController {
     private var lastProvisionalPublishAt: Date = .distantPast
     private var pendingFlushTask: Task<Void, Never>?
 
-    /// 发布当前片段序列（唯一出口，计数可观测）
+    /// 发布当前片段序列（唯一出口，计数可观测）。
+    /// 差分保护：内容签名无变化时跳过，不触发任何界面更新（渲染风暴根治点）。
     private func publishSegments() {
-        segments = reconciler.allSegments
+        let all = reconciler.allSegments
+        var hasher = Hasher()
+        for segment in all {
+            hasher.combine(segment.id)
+            hasher.combine(segment.startMs)
+            hasher.combine(segment.endMs)
+            hasher.combine(segment.text)
+            hasher.combine(segment.state)
+            hasher.combine(segment.source)
+            hasher.combine(segment.isStarred)
+            hasher.combine(segment.participantId)
+        }
+        let signature = hasher.finalize()
+        guard signature != lastPublishedSignature else {
+            PerfCounters.increment(.segmentsNoChangeSkip)
+            return
+        }
+        lastPublishedSignature = signature
+        segments = all
         segmentsPublishCount += 1
+        PerfCounters.incrementWithSignpost(.segmentsPublish)
     }
+
+    private var lastPublishedSignature: Int?
 
     /// 临时结果：立即发布或登记一次尾随刷新（节流）
     private func publishProvisionalThrottled() {
@@ -207,6 +229,7 @@ final class LocalTranscriptionController {
             return
         }
         // 间隔内：只登记一次尾随刷新，保证最终文字一致
+        PerfCounters.increment(.provisionalSuppressed)
         guard pendingFlushTask == nil else { return }
         pendingFlushTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(Int(Self.provisionalPublishInterval * 1000)))
@@ -245,6 +268,7 @@ final class LocalTranscriptionController {
         case .skippedManual, .duplicate, .discardedEmpty:
             break
         }
+        PerfCounters.increment(.cloudSegmentApplied)
         publishSegments()
     }
 
@@ -260,6 +284,7 @@ final class LocalTranscriptionController {
         let endWallMs = timeline?.wallMs(forEffectiveAudioMs: result.endAudioMs) ?? result.endAudioMs
 
         if result.isFinal {
+            PerfCounters.increment(.finalResult)
             let outcome = reconciler.applyFinal(
                 startMs: startWallMs,
                 endMs: endWallMs,
@@ -275,6 +300,7 @@ final class LocalTranscriptionController {
             pendingFlushTask = nil
             publishSegments()
         } else {
+            PerfCounters.increment(.provisionalResult)
             _ = reconciler.upsertProvisional(
                 startMs: startWallMs,
                 endMs: endWallMs,
