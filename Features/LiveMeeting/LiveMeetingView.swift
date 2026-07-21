@@ -20,6 +20,8 @@ struct LiveMeetingView: View {
     @State private var newDeviceID: String?
     /// 证据定位高亮（点击左右两栏证据 → 底部片段滚动 + 高亮）
     @State private var highlightedSegmentID: UUID?
+    /// 结束时分片未处理完毕的选择弹窗（实施计划 11.2：允许稍后继续处理）
+    @State private var showPendingChunksChoice = false
     /// 分片轮询定时器（录音中每 2 秒检查一次分片产出）
     private let chunkPollTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
@@ -94,6 +96,16 @@ struct LiveMeetingView: View {
             Button("取消", role: .cancel) {}
         } message: {
             Text("结束后将停止录音与转写并进入会后页面，不能重新开始。")
+        }
+        .alert("还有分片未能上传处理", isPresented: $showPendingChunksChoice) {
+            Button("重试并继续等待") {
+                retryAndContinueFinish()
+            }
+            Button("稍后继续处理") {
+                completeFinishAnyway()
+            }
+        } message: {
+            Text("录音已安全保存在本机。失败分片已保留在本机队列中：选择「稍后继续处理」将先结束会议，下次打开时可继续补传；选择「重试并继续等待」将立即重试。")
         }
     }
 
@@ -451,13 +463,16 @@ struct LiveMeetingView: View {
         guard let meeting else { return }
         Task {
             do {
-                // 阶段 3：先进入 finalizing，等待分片队列处理完毕再 completed
                 try recorder?.beginFinish()
                 persist(meeting)
                 environment.audioCapture.onBuffer = nil
                 await transcription?.finish()
                 await diarization?.finishAndDrain()
-                // 阶段 4：会议结束后用完整最终转写再生成一次「最终分析」（实施计划 10.4）
+                // 仍有待处理分片：由用户选择稍后处理或重试等待（实施计划 11.2）
+                if (diarization?.awaitingUserRetryCount ?? 0) > 0 {
+                    showPendingChunksChoice = true
+                    return
+                }
                 await analysis?.generateFinalAnalysis()
                 try recorder?.completeFinalizing()
                 persist(meeting)
@@ -466,6 +481,36 @@ struct LiveMeetingView: View {
                 operationError = error.localizedDescription
                 return
             }
+            persist(meeting)
+            router.showMeetingReview(meeting.id)
+        }
+    }
+
+    /// 重试失败分片并继续收尾（用户选择「重试并继续等待」）
+    private func retryAndContinueFinish() {
+        guard let meeting else { return }
+        Task {
+            diarization?.retryAwaitingUserChunks()
+            diarization?.resumeAfterKeyFix()
+            await diarization?.finishAndDrain()
+            if (diarization?.awaitingUserRetryCount ?? 0) > 0 {
+                // 仍未成功：再次交给用户选择
+                showPendingChunksChoice = true
+                return
+            }
+            await analysis?.generateFinalAnalysis()
+            try? recorder?.completeFinalizing()
+            persist(meeting)
+            router.showMeetingReview(meeting.id)
+        }
+    }
+
+    /// 稍后继续处理：先结束会议，分片队列保留在本机（实施计划 11.2）
+    private func completeFinishAnyway() {
+        guard let meeting else { return }
+        Task {
+            await analysis?.generateFinalAnalysis()
+            try? recorder?.completeFinalizing()
             persist(meeting)
             router.showMeetingReview(meeting.id)
         }

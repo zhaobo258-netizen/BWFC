@@ -21,7 +21,7 @@ final class AppEnvironment {
     let diarization: any DiarizationServicing
     /// 云端谈判分析（阶段 4 实现）
     let negotiationAnalysis: any NegotiationAnalysisServicing
-    /// 导出（阶段 5 实现）
+    /// 导出（阶段 5 实现：生成 Markdown/JSON 内容，保存位置由用户选择）
     let exporter: any MeetingExportServicing
 
     /// 云端功能是否已配置（API Key 存在）
@@ -38,7 +38,7 @@ final class AppEnvironment {
         localTranscription: any LocalTranscriptionServicing = AppleSpeechTranscriptionService(),
         diarization: any DiarizationServicing = OpenAIDiarizationService(),
         negotiationAnalysis: any NegotiationAnalysisServicing = OpenAIAnalysisService(),
-        exporter: any MeetingExportServicing = UnimplementedMeetingExportService(),
+        exporter: (any MeetingExportServicing)? = nil,
         isPersistentStorageUnavailable: Bool = false
     ) {
         self.meetingStore = meetingStore
@@ -48,7 +48,7 @@ final class AppEnvironment {
         self.localTranscription = localTranscription
         self.diarization = diarization
         self.negotiationAnalysis = negotiationAnalysis
-        self.exporter = exporter
+        self.exporter = exporter ?? LocalMeetingExportService(meetingStore: meetingStore)
         self.isPersistentStorageUnavailable = isPersistentStorageUnavailable
         self.isCloudConfigured = apiKeyStore.hasConfiguredKey
     }
@@ -74,6 +74,17 @@ final class AppEnvironment {
             meetings.append(meeting)
         }
         try meetingStore.saveMeetings(meetings)
+    }
+
+    /// 删除整场会议（实施计划 12.1）：
+    /// 同步删除数据库记录与会议专属目录（本地完整录音、声音样本、
+    /// 临时分片与队列状态）。导出文件由用户自行选择保存位置，不在应用目录内，
+    /// 不产生需要清理的导出缓存。
+    func deleteMeeting(_ meeting: Meeting) throws {
+        var meetings = try meetingStore.loadMeetings()
+        meetings.removeAll { $0.id == meeting.id }
+        try meetingStore.saveMeetings(meetings)
+        try fileStore.deleteMeetingFiles(for: meeting.id)
     }
 
     /// 生产环境：默认 JSON 持久化 + 文件存储

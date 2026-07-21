@@ -1,8 +1,10 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 
-/// 会后页面（阶段 1）：
-/// 会议信息查看 + 录音本地回放与时间跳转。
-/// 完整转写（阶段 2/3）、结构总结与分析（阶段 4）、导出与删除（阶段 5）暂为占位说明。
+/// 会后页面（阶段 5，实施计划 5.4）：
+/// 完整按人转写（可修订）、最终结构总结与证据化分析、证据回放联动、
+/// 重新生成最终分析、Markdown/JSON 导出、整场会议删除（二次确认）。
 struct MeetingReviewView: View {
     @Environment(AppEnvironment.self) private var environment
     @Environment(AppRouter.self) private var router
@@ -12,185 +14,192 @@ struct MeetingReviewView: View {
     @State private var meeting: Meeting?
     @State private var playback = AudioPlaybackController()
     @State private var audioUnavailableNote: String?
+    @State private var highlightedSegmentID: UUID?
+    @State private var reanalysis: NegotiationAnalysisController?
+    @State private var showDeleteConfirmation = false
+    @State private var operationError: String?
+    /// 待识别说话人展示名缓存（片段 ID → 「待识别 A」）
+    @State private var unknownSpeakerNames: [UUID: String] = [:]
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                if let meeting {
-                    headerSection(meeting: meeting)
-                    playbackSection(meeting: meeting)
-                    infoSection(meeting: meeting)
-                    participantsSection(meeting: meeting)
-                    placeholderSection
-                } else {
-                    Text("会议不存在或已被删除")
-                        .foregroundStyle(.secondary)
-                }
+        VStack(spacing: 0) {
+            if let meeting {
+                headerBar(meeting: meeting)
+                Divider()
+                playbackBar(meeting: meeting)
+                Divider()
+                workingArea(meeting: meeting)
+                Divider()
+                TranscriptPanelView(
+                    segments: meeting.segments
+                        .filter { $0.state != .provisional }
+                        .sorted { $0.startMs < $1.startMs },
+                    participants: meeting.participants,
+                    unknownSpeakerDisplay: { segment in
+                        guard segment.participantId == nil else { return nil }
+                        return unknownSpeakerNames[segment.id] ?? "识别中"
+                    },
+                    highlightedSegmentID: highlightedSegmentID,
+                    onAssignSpeaker: { segment, participant in
+                        if let participant {
+                            MeetingTranscriptEditor.assignSpeaker(segment, to: participant)
+                        } else {
+                            MeetingTranscriptEditor.clearSpeaker(segment)
+                        }
+                        persistAndRebuild(meeting)
+                    },
+                    onEditText: { segment, newText in
+                        MeetingTranscriptEditor.editText(segment, to: newText)
+                        persistAndRebuild(meeting)
+                    },
+                    onToggleStar: { segment in
+                        MeetingTranscriptEditor.toggleStar(segment)
+                        persist(meeting)
+                    }
+                )
+                .frame(height: 240)
+            } else {
+                Text("会议不存在或已被删除")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .padding(32)
-            .frame(maxWidth: 860)
-            .frame(maxWidth: .infinity)
         }
         .navigationTitle(meeting?.title ?? "会后")
-        .toolbar {
-            ToolbarItem(placement: .cancellationAction) {
-                Button("返回列表") {
-                    router.showMeetingList()
-                }
+        .onAppear { loadMeeting() }
+        .onDisappear { playback.stopTicker() }
+        .confirmationDialog(
+            "删除本场会议？",
+            isPresented: $showDeleteConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("永久删除", role: .destructive) {
+                deleteMeeting()
             }
-        }
-        .onAppear {
-            loadMeeting()
-        }
-        .onDisappear {
-            playback.stopTicker()
+            Button("取消", role: .cancel) {}
+        } message: {
+            if let meeting {
+                Text(deletionSummary(for: meeting))
+            }
         }
     }
 
-    // MARK: - 头部
+    // MARK: - 头部操作区
 
-    private func headerSection(meeting: Meeting) -> some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(meeting.title)
-                    .font(.title)
-                    .fontWeight(.bold)
-                Text("状态：\(meeting.status.displayName)")
-                    .font(.callout)
+    private func headerBar(meeting: Meeting) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(meeting.title)
+                        .font(.title2)
+                        .fontWeight(.bold)
+                    HStack(spacing: 12) {
+                        Text("状态：\(meeting.status.displayName)")
+                        if let startedAt = meeting.startedAt {
+                            Text("开始于 \(startedAt.formatted(date: .abbreviated, time: .shortened))")
+                        }
+                        if let snapshot = meeting.latestSnapshot {
+                            Text("分析版本 v\(snapshot.version)")
+                        }
+                    }
+                    .font(.caption)
                     .foregroundStyle(.secondary)
-                if let startedAt = meeting.startedAt {
-                    Text("开始于 \(startedAt.formatted(date: .abbreviated, time: .shortened))")
+                }
+                Spacer()
+                Button("导出 Markdown") { exportMarkdown(meeting: meeting) }
+                Button("导出 JSON") { exportJSON(meeting: meeting) }
+                Button {
+                    regenerateFinalAnalysis(meeting: meeting)
+                } label: {
+                    if reanalysis?.state == .analyzing {
+                        Text("重新生成中…")
+                    } else {
+                        Text("重新生成最终分析")
+                    }
+                }
+                .disabled(reanalysis?.state == .analyzing || !environment.isCloudConfigured)
+                Button("删除会议", role: .destructive) {
+                    showDeleteConfirmation = true
+                }
+            }
+            if !environment.isCloudConfigured {
+                Text("云端未配置：「重新生成最终分析」不可用。")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            if let lastError = reanalysis?.lastErrorDescription {
+                Text(lastError)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            if let operationError {
+                Text(operationError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    // MARK: - 回放条
+
+    private func playbackBar(meeting: Meeting) -> some View {
+        HStack(spacing: 12) {
+            if playback.isLoaded {
+                Button {
+                    playback.togglePlay()
+                } label: {
+                    Image(systemName: playback.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                        .font(.system(size: 24))
+                }
+                .buttonStyle(.plain)
+                Text(formatSeconds(playback.currentTime)).monospacedDigit().font(.caption)
+                Slider(
+                    value: Binding(
+                        get: { playback.currentTime },
+                        set: { playback.seek(to: $0) }
+                    ),
+                    in: 0...max(playback.duration, 0.01)
+                )
+                Text(formatSeconds(playback.duration)).monospacedDigit().font(.caption)
+                if !meeting.pauseIntervals.isEmpty {
+                    Text("含 \(meeting.pauseIntervals.count) 段暂停")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+            } else {
+                Image(systemName: "waveform.slash")
+                Text(audioUnavailableNote ?? "正在加载录音…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Spacer()
         }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
     }
 
-    // MARK: - 回放
+    // MARK: - 工作区（复用会中组件）
 
-    private func playbackSection(meeting: Meeting) -> some View {
-        GroupBox("会议录音回放") {
-            VStack(alignment: .leading, spacing: 8) {
-                if playback.isLoaded {
-                    HStack(spacing: 12) {
-                        Button {
-                            playback.togglePlay()
-                        } label: {
-                            Image(systemName: playback.isPlaying ? "pause.circle.fill" : "play.circle.fill")
-                                .font(.system(size: 28))
-                        }
-                        .buttonStyle(.plain)
+    private func workingArea(meeting: Meeting) -> some View {
+        HSplitView {
+            StructureSummaryView(
+                snapshot: meeting.latestSnapshot,
+                participants: meeting.participants,
+                segments: meeting.segments,
+                onEvidenceTap: { locateAndPlay(segmentID: $0, in: meeting) }
+            )
+            .frame(minWidth: 280, idealWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
 
-                        Text(formatSeconds(playback.currentTime))
-                            .monospacedDigit()
-                        Slider(
-                            value: Binding(
-                                get: { playback.currentTime },
-                                set: { playback.seek(to: $0) }
-                            ),
-                            in: 0...max(playback.duration, 0.01)
-                        )
-                        Text(formatSeconds(playback.duration))
-                            .monospacedDigit()
-                    }
-
-                    if !meeting.pauseIntervals.isEmpty {
-                        Text("录音中有 \(meeting.pauseIntervals.count) 段暂停区间（暂停期间无音频）：")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                        ForEach(Array(meeting.pauseIntervals.enumerated()), id: \.offset) { index, interval in
-                            Text("第 \(index + 1) 段：\(Self.formatMs(interval.startMs)) — \(Self.formatMs(interval.endMs))")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                } else if let audioUnavailableNote {
-                    Label(audioUnavailableNote, systemImage: "exclamationmark.triangle")
-                        .font(.callout)
-                        .foregroundStyle(.orange)
-                } else {
-                    ProgressView("正在加载录音…")
-                }
-            }
-            .padding(8)
+            InsightCardListView(
+                snapshot: meeting.latestSnapshot,
+                participants: meeting.participants,
+                segments: meeting.segments,
+                onEvidenceTap: { locateAndPlay(segmentID: $0, in: meeting) }
+            )
+            .frame(minWidth: 480, maxWidth: .infinity, maxHeight: .infinity)
         }
-    }
-
-    // MARK: - 会议信息
-
-    private func infoSection(meeting: Meeting) -> some View {
-        GroupBox("会议信息") {
-            VStack(alignment: .leading, spacing: 8) {
-                infoRow("谈判背景", value: meeting.background)
-                infoRow("我方目标", value: meeting.ourGoal)
-                infoRow("我方底线", value: meeting.ourBottomLine)
-                infoRow("对方背景", value: meeting.counterpartContext)
-                if !meeting.glossary.isEmpty {
-                    infoRow("专业词汇", value: meeting.glossary.joined(separator: "、"))
-                }
-            }
-            .padding(8)
-        }
-    }
-
-    private func infoRow(_ label: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label).font(.caption).foregroundStyle(.secondary)
-            Text(value.isEmpty ? "（未填写）" : value)
-                .font(.callout)
-                .foregroundStyle(value.isEmpty ? .tertiary : .primary)
-        }
-    }
-
-    // MARK: - 参会人
-
-    private func participantsSection(meeting: Meeting) -> some View {
-        GroupBox("参会人") {
-            VStack(alignment: .leading, spacing: 6) {
-                if meeting.participants.isEmpty {
-                    Text("未录入参会人")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(meeting.participants) { participant in
-                        HStack(spacing: 8) {
-                            Circle()
-                                .fill(colorForToken(participant.colorToken))
-                                .frame(width: 10, height: 10)
-                            Text(participant.displayName).font(.headline)
-                            Text(participant.side.displayName)
-                                .font(.caption)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(.quaternary, in: Capsule())
-                            if !participant.role.isEmpty {
-                                Text(participant.role)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                }
-            }
-            .padding(8)
-        }
-    }
-
-    // MARK: - 后续阶段占位
-
-    private var placeholderSection: some View {
-        GroupBox("后续功能") {
-            VStack(alignment: .leading, spacing: 6) {
-                Label("完整按人转写：阶段 2–3 实现", systemImage: "text.alignleft")
-                Label("结构总结与证据化分析：阶段 4 实现", systemImage: "brain")
-                Label("Markdown / JSON 导出与会议删除：阶段 5 实现", systemImage: "square.and.arrow.up")
-            }
-            .font(.callout)
-            .foregroundStyle(.secondary)
-            .padding(8)
-        }
+        .frame(maxHeight: .infinity)
     }
 
     // MARK: - 行为
@@ -201,7 +210,8 @@ struct MeetingReviewView: View {
             return
         }
         meeting = loaded
-        // 加载录音文件用于回放
+        rebuildUnknownSpeakerNames(for: loaded)
+        // 加载录音用于回放
         do {
             if let url = try environment.fileStore.audioFileURL(for: loaded),
                FileManager.default.fileExists(atPath: url.path) {
@@ -213,17 +223,112 @@ struct MeetingReviewView: View {
         } catch {
             audioUnavailableNote = "录音文件加载失败：\(error.localizedDescription)"
         }
+        // 准备「重新生成最终分析」控制器
+        let controller = NegotiationAnalysisController(service: environment.negotiationAnalysis)
+        controller.attach(to: loaded)
+        reanalysis = controller
+    }
+
+    /// 点击证据：定位到转写片段并从对应时间播放录音（实施计划 5.4）
+    private func locateAndPlay(segmentID: UUID, in meeting: Meeting) {
+        highlightedSegmentID = segmentID
+        guard playback.isLoaded,
+              let segment = meeting.segments.first(where: { $0.id == segmentID }) else {
+            return
+        }
+        playback.seek(to: TimeInterval(segment.startMs) / 1000)
+        if !playback.isPlaying {
+            playback.togglePlay()
+        }
+    }
+
+    /// 人工修订后重新生成最终分析（完整最终转写，替换快照，实施计划 5.4）
+    private func regenerateFinalAnalysis(meeting: Meeting) {
+        guard let reanalysis else { return }
+        Task {
+            await reanalysis.generateFinalAnalysis()
+            persist(meeting)
+        }
+    }
+
+    /// 导出 Markdown（NSSavePanel 由用户选择位置；导出内容不含 API Key）
+    private func exportMarkdown(meeting: Meeting) {
+        do {
+            let markdown = try environment.exporter.makeMarkdown(for: meeting.id)
+            let panel = NSSavePanel()
+            panel.title = "导出 Markdown 纪要"
+            panel.nameFieldStringValue = "\(meeting.title)-纪要.md"
+            panel.allowedContentTypes = [UTType(filenameExtension: "md")].compactMap { $0 }
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            try markdown.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            operationError = "导出失败：\(error.localizedDescription)"
+        }
+    }
+
+    /// 导出 JSON（NSSavePanel 由用户选择位置）
+    private func exportJSON(meeting: Meeting) {
+        do {
+            let data = try environment.exporter.makeJSONData(for: meeting.id)
+            let panel = NSSavePanel()
+            panel.title = "导出 JSON 原始结构"
+            panel.nameFieldStringValue = "\(meeting.title)-原始结构.json"
+            panel.allowedContentTypes = [UTType.json]
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            try data.write(to: url, options: .atomic)
+        } catch {
+            operationError = "导出失败：\(error.localizedDescription)"
+        }
+    }
+
+    /// 删除确认文案：明确列明将删除的内容（实施计划 12.1）
+    private func deletionSummary(for meeting: Meeting) -> String {
+        let sampleCount = meeting.participants.filter { $0.voiceReferencePath != nil }.count
+        return """
+        将永久删除「\(meeting.title)」的以下全部内容，且不可恢复：
+        · 本地完整录音文件
+        · \(sampleCount) 份声音样本
+        · 全部临时分片与上传队列状态
+        · 数据库中的会议、参会人、\(meeting.segments.count) 条转写与 \(meeting.snapshots.count) 版分析记录
+        """
+    }
+
+    private func deleteMeeting() {
+        guard let meeting else { return }
+        do {
+            playback.stopTicker()
+            try environment.deleteMeeting(meeting)
+            router.showMeetingList()
+        } catch {
+            operationError = "删除失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func persist(_ meeting: Meeting) {
+        try? environment.persist(meeting)
+    }
+
+    /// 修订后持久化并重建待识别展示名缓存
+    private func persistAndRebuild(_ meeting: Meeting) {
+        persist(meeting)
+        rebuildUnknownSpeakerNames(for: meeting)
+    }
+
+    /// 按时间序解析未知说话人标签，稳定分配「待识别 A/B」
+    private func rebuildUnknownSpeakerNames(for meeting: Meeting) {
+        var mapper = SpeakerMapper(participants: meeting.participants)
+        var names: [UUID: String] = [:]
+        for segment in meeting.segments.sorted(by: { $0.startMs < $1.startMs })
+        where segment.participantId == nil {
+            if case .unknown(let displayName) = mapper.resolve(remoteLabel: segment.remoteSpeakerLabel) {
+                names[segment.id] = displayName
+            }
+        }
+        unknownSpeakerNames = names
     }
 
     private func formatSeconds(_ seconds: TimeInterval) -> String {
-        Self.formatMs(Int64(seconds * 1000))
-    }
-
-    /// 毫秒 → mm:ss
-    static func formatMs(_ ms: Int64) -> String {
-        let totalSeconds = max(0, ms / 1000)
-        let minutes = totalSeconds / 60
-        let seconds = totalSeconds % 60
-        return String(format: "%02d:%02d", minutes, seconds)
+        let totalSeconds = max(0, Int(seconds))
+        return String(format: "%02d:%02d", totalSeconds / 60, totalSeconds % 60)
     }
 }

@@ -130,6 +130,11 @@ final class Meeting: Identifiable, Codable {
     /// 分析快照
     var snapshots: [AnalysisSnapshot] = []
 
+    /// 最新一版分析快照（UI 与会后页面使用；无快照时为 nil）
+    var latestSnapshot: AnalysisSnapshot? {
+        snapshots.max { $0.version < $1.version }
+    }
+
     init(
         id: UUID = UUID(),
         title: String,
