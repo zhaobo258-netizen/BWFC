@@ -34,8 +34,15 @@ final class MeetingSetupFormModel {
 
     /// 正在编辑的会议 ID（nil = 新建）
     private(set) var editingMeetingID: UUID?
+    /// 新建会议的草稿 ID（创建时确定，声音样本文件需要稳定的会议目录）
+    let draftMeetingID = UUID()
     /// 已记录的云端处理告知确认时间
     private var existingConsentAt: Date?
+
+    /// 表单对应的会议 ID（编辑既有会议或新建草稿）
+    var meetingID: UUID {
+        editingMeetingID ?? draftMeetingID
+    }
 
     // MARK: - 载入 / 应用到模型
 
@@ -75,9 +82,10 @@ final class MeetingSetupFormModel {
         }
     }
 
-    /// 基于表单创建新会议
+    /// 基于表单创建新会议（使用稳定的草稿 ID，与声音样本目录一致）
     func makeMeeting() -> Meeting {
-        let meeting = Meeting(title: title.trimmingCharacters(in: .whitespacesAndNewlines))
+        let meeting = Meeting(id: editingMeetingID ?? draftMeetingID,
+                              title: title.trimmingCharacters(in: .whitespacesAndNewlines))
         apply(to: meeting)
         return meeting
     }

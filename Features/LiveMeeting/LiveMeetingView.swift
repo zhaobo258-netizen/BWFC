@@ -13,9 +13,12 @@ struct LiveMeetingView: View {
     @State private var meeting: Meeting?
     @State private var recorder: MeetingRecordingService?
     @State private var transcription: LocalTranscriptionController?
+    @State private var diarization: DiarizationController?
     @State private var showEndConfirmation = false
     @State private var operationError: String?
     @State private var newDeviceID: String?
+    /// 分片轮询定时器（录音中每 2 秒检查一次分片产出）
+    private let chunkPollTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -25,6 +28,9 @@ struct LiveMeetingView: View {
                 if recorder?.deviceInterrupted == true {
                     deviceInterruptedBanner(meeting: meeting)
                 }
+                if case .suspended(let reason) = diarization?.cloudState {
+                    cloudSuspendedBanner(reason: reason)
+                }
                 if let operationError {
                     errorBanner(text: operationError)
                 }
@@ -32,7 +38,27 @@ struct LiveMeetingView: View {
                 Divider()
                 TranscriptPanelView(
                     segments: transcription?.segments ?? [],
-                    participants: meeting.participants
+                    participants: meeting.participants,
+                    unknownSpeakerDisplay: { segment in
+                        guard segment.participantId == nil else { return nil }
+                        return diarization?.displayName(forRemoteLabel: segment.remoteSpeakerLabel)
+                    },
+                    onAssignSpeaker: { segment, participant in
+                        if let participant {
+                            MeetingTranscriptEditor.assignSpeaker(segment, to: participant)
+                        } else {
+                            MeetingTranscriptEditor.clearSpeaker(segment)
+                        }
+                        persistAndRefresh(meeting)
+                    },
+                    onEditText: { segment, newText in
+                        MeetingTranscriptEditor.editText(segment, to: newText)
+                        persistAndRefresh(meeting)
+                    },
+                    onToggleStar: { segment in
+                        MeetingTranscriptEditor.toggleStar(segment)
+                        persistAndRefresh(meeting)
+                    }
                 )
                 .frame(height: 220)
             } else {
@@ -44,6 +70,9 @@ struct LiveMeetingView: View {
         .navigationTitle(meeting?.title ?? "会中")
         .onAppear {
             loadMeetingAndRecorder()
+        }
+        .onReceive(chunkPollTimer) { _ in
+            diarization?.pollProgress()
         }
         .confirmationDialog(
             "结束本场会议？",
@@ -90,9 +119,22 @@ struct LiveMeetingView: View {
                 .font(.callout)
                 .foregroundStyle(transcriptionStatusColor)
 
+            // 云端说话人识别状态（实施计划 6.2）
+            Label(diarizationStatusText, systemImage: "person.2.waveform")
+                .font(.callout)
+                .foregroundStyle(diarizationStatusColor)
+
             Spacer()
 
-            // 云端状态（未配置时明确标记）
+            // 待用户重试的分片（超过自动重试上限）
+            if let diarization, diarization.awaitingUserRetryCount > 0 {
+                Button("重试 \(diarization.awaitingUserRetryCount) 个失败分片") {
+                    diarization.retryAwaitingUserChunks()
+                }
+                .font(.caption)
+            }
+
+            // 云端 Key 配置状态（未配置时明确标记）
             Text(environment.isCloudConfigured ? "云端已配置" : "云端未配置")
                 .font(.caption)
                 .foregroundStyle(environment.isCloudConfigured ? .green : .orange)
@@ -145,6 +187,27 @@ struct LiveMeetingView: View {
         }
     }
 
+    /// 云端说话人识别状态文案（实施计划 6.2：云端说话人识别状态）
+    private var diarizationStatusText: String {
+        guard let diarization else { return "云端识别待启动" }
+        switch diarization.cloudState {
+        case .idle:
+            return "云端识别正常"
+        case .working(let pending):
+            return pending > 0 ? "云端识别中（待处理 \(pending)）" : "云端识别正常"
+        case .suspended:
+            return "云端识别暂停"
+        }
+    }
+
+    private var diarizationStatusColor: Color {
+        guard let diarization else { return .secondary }
+        switch diarization.cloudState {
+        case .idle, .working: return .green
+        case .suspended: return .orange
+        }
+    }
+
     // MARK: - 设备中断提示（实施计划 11.2：麦克风拔出）
 
     private func deviceInterruptedBanner(meeting: Meeting) -> some View {
@@ -169,6 +232,26 @@ struct LiveMeetingView: View {
             }
             .disabled(newDeviceID == nil)
             Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.orange.opacity(0.12))
+    }
+
+    // MARK: - 云端暂停提示（401 / 未配置 Key：本地录音继续，修复后可重试）
+
+    private func cloudSuspendedBanner(reason: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "icloud.slash")
+            Text("云端分析暂停，本地录音与转写正常。\(reason)")
+                .font(.callout)
+            Spacer()
+            Button("已修复，重试") {
+                Task { @MainActor in
+                    environment.refreshCloudConfiguration()
+                    diarization?.resumeAfterKeyFix()
+                }
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -234,6 +317,11 @@ struct LiveMeetingView: View {
             try? environment.persist(loaded)
         }
         transcription = controller
+        diarization = DiarizationController(
+            diarization: environment.diarization,
+            fileStore: environment.fileStore,
+            transcriptController: controller
+        )
         // 进入界面即检查本地转写可用性（不可用时在状态栏显示真实原因）
         Task { await controller.checkAvailability() }
     }
@@ -278,6 +366,12 @@ struct LiveMeetingView: View {
                         let boxed = SendableAudioBuffer(buffer)
                         Task { await transcriptionService.feed(boxed.buffer) }
                     }
+                    // 启动云端说话人识别编排（恢复既有队列；未配置 Key 时进入暂停态）
+                    if environment.isCloudConfigured {
+                        diarization?.start(for: meeting) { [weak recorder] in
+                            recorder?.timeline
+                        }
+                    }
                 }
             } catch {
                 operationError = error.localizedDescription
@@ -289,15 +383,19 @@ struct LiveMeetingView: View {
         guard let meeting else { return }
         Task {
             do {
-                try recorder?.finishRecording()
+                // 阶段 3：先进入 finalizing，等待分片队列处理完毕再 completed
+                try recorder?.beginFinish()
+                persist(meeting)
+                environment.audioCapture.onBuffer = nil
+                await transcription?.finish()
+                await diarization?.finishAndDrain()
+                try recorder?.completeFinalizing()
                 persist(meeting)
                 operationError = nil
             } catch {
                 operationError = error.localizedDescription
                 return
             }
-            environment.audioCapture.onBuffer = nil
-            await transcription?.finish()
             persist(meeting)
             router.showMeetingReview(meeting.id)
         }
@@ -315,6 +413,12 @@ struct LiveMeetingView: View {
 
     private func persist(_ meeting: Meeting) {
         try? environment.persist(meeting)
+    }
+
+    /// 人工编辑后持久化并刷新转写视图
+    private func persistAndRefresh(_ meeting: Meeting) {
+        try? environment.persist(meeting)
+        transcription?.refreshSegments()
     }
 
     /// 毫秒 → hh:mm:ss

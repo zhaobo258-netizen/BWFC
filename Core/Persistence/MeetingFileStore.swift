@@ -11,6 +11,12 @@ struct MeetingFileStore: Sendable {
     static let recordingFileName = "recording.caf"
     /// 会议文件根目录名
     static let meetingsDirectoryName = "Meetings"
+    /// 上传分片目录名（会议专属目录内）
+    static let chunksDirectoryName = "chunks"
+    /// 声音样本目录名（会议专属目录内）
+    static let samplesDirectoryName = "samples"
+    /// 分片队列状态文件名
+    static let chunkQueueFileName = "queue.json"
 
     /// 应用数据根目录（通常为 ~/Library/Application Support/BangWoFenXi）
     let baseDirectory: URL
@@ -58,6 +64,38 @@ struct MeetingFileStore: Sendable {
             throw MeetingFileStoreError.invalidRelativePath
         }
         return baseDirectory.appending(path: relativePath, directoryHint: .notDirectory)
+    }
+
+    // MARK: - 阶段 3：声音样本与上传分片
+
+    /// 参会人声音样本的相对路径：Meetings/<会议>/samples/<参会人>.wav
+    func relativeVoiceSamplePath(meetingID: UUID, participantID: UUID) -> String {
+        "\(Self.meetingsDirectoryName)/\(meetingID.uuidString)/\(Self.samplesDirectoryName)/\(participantID.uuidString).wav"
+    }
+
+    /// 分片目录（绝对 URL）
+    func chunksDirectory(for meetingID: UUID) -> URL {
+        meetingDirectory(for: meetingID)
+            .appending(path: Self.chunksDirectoryName, directoryHint: .isDirectory)
+    }
+
+    /// 创建分片目录
+    @discardableResult
+    func ensureChunksDirectory(for meetingID: UUID) throws -> URL {
+        let directory = chunksDirectory(for: meetingID)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
+
+    /// 分片文件名（按序号）
+    static func chunkFileName(index: Int) -> String {
+        String(format: "chunk_%04d.wav", index)
+    }
+
+    /// 分片队列状态文件（绝对 URL）
+    func chunkQueueFileURL(for meetingID: UUID) -> URL {
+        chunksDirectory(for: meetingID)
+            .appending(path: Self.chunkQueueFileName, directoryHint: .notDirectory)
     }
 
     /// 会议录音文件的绝对 URL（若已设置相对路径）

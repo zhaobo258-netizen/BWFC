@@ -122,6 +122,40 @@ final class LocalTranscriptionController {
 
     // MARK: - 结果消费
 
+    /// 应用云端确认片段（阶段 3：由 DiarizationController 调用，作为唯一合并点）。
+    /// 人工已修订片段不被覆盖（TranscriptReconciler 保证）。
+    func applyCloudSegment(
+        wallStartMs: Int64,
+        wallEndMs: Int64,
+        text: String,
+        participantId: UUID?,
+        remoteSpeakerLabel: String?
+    ) {
+        let outcome = reconciler.applyCloudFinal(
+            startMs: wallStartMs,
+            endMs: wallEndMs,
+            text: text,
+            participantId: participantId,
+            remoteSpeakerLabel: remoteSpeakerLabel
+        )
+        switch outcome {
+        case .inserted(let segment):
+            meeting?.segments.append(segment)
+            onFinalSegment?()
+        case .updated:
+            // 就地更新的片段已在会议片段数组中（同一实例）
+            onFinalSegment?()
+        case .skippedManual, .duplicate, .discardedEmpty:
+            break
+        }
+        segments = reconciler.allSegments
+    }
+
+    /// 会话结束时把 reconciler 的最终片段与会议片段对齐（不新增，仅刷新视图）
+    func refreshSegments() {
+        segments = reconciler.allSegments
+    }
+
     private func consume(_ result: LocalTranscriptResult) {
         // 音频流时间 → 会议时间轴（含暂停区间的还原）
         let timeline = timelineProvider?()

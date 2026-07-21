@@ -112,25 +112,12 @@ struct TranscriptReconciler {
         guard !trimmed.isEmpty else { return .discardedEmpty }
 
         // 1) 与既有最终片段判重
-        for existing in finalized {
-            if isDuplicate(newStart: startMs, newEnd: endMs, newText: trimmed, of: existing) {
-                return .duplicate(existing: existing)
-            }
+        if let existing = findDuplicate(newStart: startMs, newEnd: endMs, newText: trimmed) {
+            return .duplicate(existing: existing)
         }
 
         // 2) 清除被该最终结果覆盖的临时片段
-        if let current = provisional {
-            let overlap = overlapMs(
-                startA: startMs, endA: endMs,
-                startB: current.startMs, endB: current.endMs
-            )
-            let provisionalDuration = max(1, current.endMs - current.startMs)
-            let coveredByTime = Double(overlap) / Double(provisionalDuration) >= Self.duplicateOverlapRatio
-            let coveredByOrder = current.startMs >= startMs
-            if coveredByTime || coveredByOrder {
-                provisional = nil
-            }
-        }
+        clearProvisionalCoveredBy(startMs: startMs, endMs: endMs)
 
         // 3) 按时间序插入
         let segment = TranscriptSegment(
@@ -144,6 +131,13 @@ struct TranscriptReconciler {
         let insertIndex = finalized.firstIndex { $0.startMs > startMs } ?? finalized.count
         finalized.insert(segment, at: insertIndex)
         return .inserted(segment)
+    }
+
+    /// 找出与新结果重复的既有片段；无重复返回 nil
+    private func findDuplicate(
+        newStart: Int64, newEnd: Int64, newText: String
+    ) -> TranscriptSegment? {
+        finalized.first { isDuplicate(newStart: newStart, newEnd: newEnd, newText: newText, of: $0) }
     }
 
     /// 判定新结果与既有片段是否重复
@@ -185,8 +179,97 @@ struct TranscriptReconciler {
         provisional = nil
     }
 
+    // MARK: - 阶段 3：云端确认片段合并
+
+    /// 应用云端确认片段（实施计划 7.4 合并规则）：
+    /// - 与「人工已修订」片段重叠 → 跳过（人工结果优先，不被后续云端结果覆盖）；
+    /// - 与本地最终片段重复 → 用云端内容就地更新（ID 稳定），来源转为 cloud；
+    /// - 与云端片段重复 → 判重跳过；
+    /// - 覆盖临时片段 → 清除临时，插入新片段（source: cloud, state: final）。
+    @discardableResult
+    mutating func applyCloudFinal(
+        startMs: Int64,
+        endMs: Int64,
+        text: String,
+        participantId: UUID?,
+        remoteSpeakerLabel: String?
+    ) -> CloudApplyOutcome {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .discardedEmpty }
+
+        // 1) 人工保护：与人工已修订片段重叠则跳过
+        for existing in finalized where existing.state == .edited || existing.source == .manual {
+            let overlap = Self.overlapMs(startA: startMs, endA: endMs,
+                                         startB: existing.startMs, endB: existing.endMs)
+            guard overlap > 0 else { continue }
+            let shorter = max(1, min(endMs - startMs, existing.endMs - existing.startMs))
+            if Double(overlap) / Double(shorter) >= Self.duplicateOverlapRatio {
+                return .skippedManual(existing)
+            }
+        }
+
+        // 2) 判重
+        if let existing = findDuplicate(newStart: startMs, newEnd: endMs, newText: trimmed) {
+            switch (existing.source, existing.state) {
+            case (.manual, _), (_, .edited):
+                return .skippedManual(existing)
+            case (.cloud, _):
+                return .duplicate(existing: existing)
+            default:
+                // 本地片段被云端确认：就地更新，ID 稳定
+                existing.text = trimmed
+                existing.participantId = participantId ?? existing.participantId
+                existing.remoteSpeakerLabel = remoteSpeakerLabel ?? existing.remoteSpeakerLabel
+                existing.source = .cloud
+                existing.state = .final
+                existing.updatedAt = Date()
+                return .updated(existing)
+            }
+        }
+
+        // 3) 清除被覆盖的临时片段
+        clearProvisionalCoveredBy(startMs: startMs, endMs: endMs)
+
+        // 4) 按时间序插入
+        let segment = TranscriptSegment(
+            startMs: startMs,
+            endMs: endMs,
+            text: trimmed,
+            participantId: participantId,
+            remoteSpeakerLabel: remoteSpeakerLabel,
+            source: .cloud,
+            state: .final
+        )
+        let insertIndex = finalized.firstIndex { $0.startMs > startMs } ?? finalized.count
+        finalized.insert(segment, at: insertIndex)
+        return .inserted(segment)
+    }
+
+    /// 清除被指定时间范围覆盖的临时片段
+    private mutating func clearProvisionalCoveredBy(startMs: Int64, endMs: Int64) {
+        guard let current = provisional else { return }
+        let overlap = Self.overlapMs(
+            startA: startMs, endA: endMs,
+            startB: current.startMs, endB: current.endMs
+        )
+        let provisionalDuration = max(1, current.endMs - current.startMs)
+        let coveredByTime = Double(overlap) / Double(provisionalDuration) >= Self.duplicateOverlapRatio
+        let coveredByOrder = current.startMs >= startMs
+        if coveredByTime || coveredByOrder {
+            provisional = nil
+        }
+    }
+
     enum ApplyOutcome {
         case inserted(TranscriptSegment)
+        case duplicate(existing: TranscriptSegment)
+        case discardedEmpty
+    }
+
+    enum CloudApplyOutcome {
+        case inserted(TranscriptSegment)
+        case updated(TranscriptSegment)
+        case skippedManual(TranscriptSegment)
         case duplicate(existing: TranscriptSegment)
         case discardedEmpty
     }

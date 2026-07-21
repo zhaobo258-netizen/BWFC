@@ -11,6 +11,8 @@ struct MeetingSetupView: View {
 
     @State private var form = MeetingSetupFormModel()
     @State private var levelTest = MicLevelTestController()
+    @State private var sampleRecorder: VoiceSampleController?
+    @State private var samplePlayer = AudioPlaybackController()
     @State private var inputDevices: [AudioInputDevice] = []
     @State private var newGlossaryTerm = ""
     @State private var editingParticipant: Participant?
@@ -36,10 +38,15 @@ struct MeetingSetupView: View {
         .navigationTitle(meetingID == nil ? "新建谈判" : "编辑会议")
         .onAppear {
             inputDevices = environment.audioCapture.inputDevices()
+            sampleRecorder = VoiceSampleController(
+                capture: environment.audioCapture,
+                fileStore: environment.fileStore
+            )
             loadExistingMeeting()
         }
         .onDisappear {
             levelTest.cancel()
+            sampleRecorder?.cancelRecording()
         }
         .sheet(isPresented: $showParticipantEditor) {
             ParticipantEditorView(
@@ -132,33 +139,37 @@ struct MeetingSetupView: View {
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(form.participants) { participant in
-                        HStack(spacing: 8) {
-                            Circle()
-                                .fill(colorForToken(participant.colorToken))
-                                .frame(width: 10, height: 10)
-                            Text(participant.displayName).font(.headline)
-                            Text(participant.side.displayName)
-                                .font(.caption)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(.quaternary, in: Capsule())
-                            if !participant.role.isEmpty {
-                                Text(participant.role)
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 8) {
+                                Circle()
+                                    .fill(colorForToken(participant.colorToken))
+                                    .frame(width: 10, height: 10)
+                                Text(participant.displayName).font(.headline)
+                                Text(participant.side.displayName)
                                     .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(.quaternary, in: Capsule())
+                                if !participant.role.isEmpty {
+                                    Text(participant.role)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Button("编辑") {
+                                    editingParticipant = participant
+                                    showParticipantEditor = true
+                                }
+                                Button {
+                                    form.removeParticipant(id: participant.id)
+                                } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(.red)
                             }
-                            Spacer()
-                            Button("编辑") {
-                                editingParticipant = participant
-                                showParticipantEditor = true
-                            }
-                            Button {
-                                form.removeParticipant(id: participant.id)
-                            } label: {
-                                Image(systemName: "trash")
-                            }
-                            .buttonStyle(.plain)
-                            .foregroundStyle(.red)
+                            // 声音样本（实施计划 7.5：2–10 秒单人清晰样本）
+                            voiceSampleRow(for: participant)
                         }
                         .padding(.vertical, 2)
                     }
@@ -272,6 +283,81 @@ struct MeetingSetupView: View {
     }
 
     // MARK: - 行为
+
+    /// 声音样本行：录制 / 停止、试听、状态与校验结果
+    @ViewBuilder
+    private func voiceSampleRow(for participant: Participant) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "waveform")
+                .foregroundStyle(.secondary)
+            if sampleRecorder?.isRecording(participantID: participant.id) == true {
+                ProgressView(value: Double(sampleRecorder?.liveLevel ?? 0))
+                    .frame(maxWidth: 120)
+                Button("停止") {
+                    stopSampleRecording(for: participant)
+                }
+                .buttonStyle(.borderedProminent)
+            } else {
+                // 样本状态
+                if let durationMs = participant.voiceReferenceDurationMs {
+                    Text("已录入 \(String(format: "%.1f", Double(durationMs) / 1000))s")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("未录入声音样本")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+                if let verdict = sampleRecorder?.verdicts[participant.id] {
+                    Text(verdict.displayName)
+                        .font(.caption)
+                        .foregroundStyle(verdict.isOK ? .green : .orange)
+                }
+                Button(participant.voiceReferenceDurationMs == nil ? "录制样本" : "重录") {
+                    startSampleRecording(for: participant)
+                }
+                .disabled(sampleRecorder?.phase != .idle && sampleRecorder?.phase != nil)
+                if participant.voiceReferencePath != nil {
+                    Button("试听") {
+                        playSample(for: participant)
+                    }
+                }
+            }
+        }
+        .padding(.leading, 18)
+    }
+
+    private func startSampleRecording(for participant: Participant) {
+        do {
+            try sampleRecorder?.startRecording(
+                meetingID: form.meetingID,
+                participantID: participant.id,
+                deviceID: form.selectedInputDeviceID
+            )
+        } catch {
+            saveError = "样本录制失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func stopSampleRecording(for participant: Participant) {
+        guard let result = sampleRecorder?.stopRecording() else { return }
+        participant.voiceReferencePath = result.relativePath
+        participant.voiceReferenceDurationMs = result.durationMs
+        form.updateParticipant(participant)
+    }
+
+    private func playSample(for participant: Participant) {
+        guard let relativePath = participant.voiceReferencePath,
+              let url = try? environment.fileStore.absoluteURL(forRelativePath: relativePath) else {
+            return
+        }
+        do {
+            try samplePlayer.load(url: url)
+            samplePlayer.togglePlay()
+        } catch {
+            saveError = "样本试听失败：\(error.localizedDescription)"
+        }
+    }
 
     private func addTerm() {
         if form.addGlossaryTerm(newGlossaryTerm) {

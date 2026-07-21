@@ -36,7 +36,7 @@ final class AppEnvironment {
         apiKeyStore: CloudAPIKeyStore = CloudAPIKeyStore(),
         audioCapture: any AudioCaptureServicing = AVAudioCaptureService(),
         localTranscription: any LocalTranscriptionServicing = AppleSpeechTranscriptionService(),
-        diarization: any DiarizationServicing = UnimplementedDiarizationService(),
+        diarization: any DiarizationServicing = OpenAIDiarizationService(),
         negotiationAnalysis: any NegotiationAnalysisServicing = UnimplementedNegotiationAnalysisService(),
         exporter: any MeetingExportServicing = UnimplementedMeetingExportService(),
         isPersistentStorageUnavailable: Bool = false

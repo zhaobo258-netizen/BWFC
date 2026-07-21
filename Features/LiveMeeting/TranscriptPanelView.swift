@@ -3,13 +3,23 @@ import SwiftUI
 /// 底部同声转写面板（实施计划 6.5）：
 /// - 默认自动滚动到最新；用户向上浏览后暂停滚动并显示「回到最新」；
 /// - 临时文字使用较浅颜色；最终替换就地更新（片段 ID 稳定，不整页跳动）；
-/// - 说话人未识别时显示「识别中」。
+/// - 说话人未识别时显示「识别中 / 待识别 A…」；
+/// - 右键可修改说话人（含待识别映射）、修改文字、加星标（阶段 3）。
 struct TranscriptPanelView: View {
     let segments: [TranscriptSegment]
     let participants: [Participant]
+    /// 未知说话人标签展示名（「待识别 A/B」，由 DiarizationController 提供）
+    var unknownSpeakerDisplay: ((TranscriptSegment) -> String?)?
+    /// 编辑回调（由父视图持久化）
+    var onAssignSpeaker: ((TranscriptSegment, Participant?) -> Void)?
+    var onEditText: ((TranscriptSegment, String) -> Void)?
+    var onToggleStar: ((TranscriptSegment) -> Void)?
 
     /// 是否贴底自动滚动
     @State private var pinnedToBottom = true
+    /// 正在编辑文字的片段
+    @State private var editingTextSegment: TranscriptSegment?
+    @State private var editingText: String = ""
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -26,9 +36,21 @@ struct TranscriptPanelView: View {
                         ForEach(segments) { segment in
                             TranscriptRowView(
                                 segment: segment,
-                                participant: participants.first(where: { $0.id == segment.participantId })
+                                participant: participants.first(where: { $0.id == segment.participantId }),
+                                unknownDisplay: unknownSpeakerDisplay?(segment)
                             )
                             .id(segment.id)
+                            .contextMenu {
+                                speakerMenu(for: segment)
+                                Button("修改文字…") {
+                                    editingText = segment.text
+                                    editingTextSegment = segment
+                                }
+                                Divider()
+                                Button(segment.isStarred ? "取消星标" : "加星标") {
+                                    onToggleStar?(segment)
+                                }
+                            }
                         }
                     }
                     .padding(.horizontal, 16)
@@ -64,6 +86,54 @@ struct TranscriptPanelView: View {
                 }
             }
         }
+        .sheet(item: $editingTextSegment) { segment in
+            VStack(alignment: .leading, spacing: 12) {
+                Text("修改转写文字")
+                    .font(.headline)
+                Text("修改后该片段标记为「人工已修订」，不再被云端结果覆盖。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                TextEditor(text: $editingText)
+                    .frame(minHeight: 100)
+                    .border(.quaternary)
+                HStack {
+                    Spacer()
+                    Button("取消") { editingTextSegment = nil }
+                    Button("保存") {
+                        onEditText?(segment, editingText)
+                        editingTextSegment = nil
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(editingText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .padding(20)
+            .frame(width: 480, height: 260)
+        }
+    }
+
+    /// 说话人修改菜单（含待识别映射与清除）
+    @ViewBuilder
+    private func speakerMenu(for segment: TranscriptSegment) -> some View {
+        Menu("修改说话人") {
+            ForEach(participants) { participant in
+                Button {
+                    onAssignSpeaker?(segment, participant)
+                } label: {
+                    if segment.participantId == participant.id {
+                        Label("\(participant.displayName)（\(participant.side.displayName)）", systemImage: "checkmark")
+                    } else {
+                        Text("\(participant.displayName)（\(participant.side.displayName)）")
+                    }
+                }
+            }
+            if segment.participantId != nil {
+                Divider()
+                Button("清除说话人映射") {
+                    onAssignSpeaker?(segment, nil)
+                }
+            }
+        }
     }
 
     private func scrollToLatest(proxy: ScrollViewProxy) {
@@ -76,6 +146,8 @@ struct TranscriptPanelView: View {
 struct TranscriptRowView: View {
     let segment: TranscriptSegment
     let participant: Participant?
+    /// 未知说话人的展示名（「待识别 A」）
+    var unknownDisplay: String?
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -86,7 +158,14 @@ struct TranscriptRowView: View {
                 .foregroundStyle(.tertiary)
                 .frame(width: 48, alignment: .leading)
 
-            // 说话人（未识别 → 识别中）
+            // 星标
+            if segment.isStarred {
+                Image(systemName: "star.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.yellow)
+            }
+
+            // 说话人（未识别 → 识别中 / 待识别 A）
             Text(speakerName)
                 .font(.caption)
                 .fontWeight(.medium)
@@ -102,7 +181,7 @@ struct TranscriptRowView: View {
             Spacer(minLength: 8)
 
             // 状态
-            Text(segment.state.displayName)
+            Text(stateLabel)
                 .font(.caption2)
                 .padding(.horizontal, 6)
                 .padding(.vertical, 2)
@@ -113,7 +192,8 @@ struct TranscriptRowView: View {
     }
 
     private var speakerName: String {
-        participant?.displayName ?? "识别中"
+        if let participant { return participant.displayName }
+        return unknownDisplay ?? "识别中"
     }
 
     private var speakerColor: Color {
@@ -121,6 +201,20 @@ struct TranscriptRowView: View {
             return colorForToken(participant.colorToken)
         }
         return .secondary
+    }
+
+    /// 状态标签：按来源与状态区分（实施计划 6.5）
+    private var stateLabel: String {
+        switch segment.state {
+        case .provisional:
+            return "识别中"
+        case .final:
+            return segment.source == .cloud ? "云端已确认" : "已确认"
+        case .edited:
+            return "人工已修订"
+        case .failed:
+            return "待重试"
+        }
     }
 
     private var stateBackground: Color {

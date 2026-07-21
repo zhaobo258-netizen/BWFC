@@ -99,8 +99,15 @@ final class MeetingRecordingService {
     }
 
     /// 结束录音：recording/paused → finalizing → completed。
-    /// 阶段 1 没有待处理分片，直接完成收尾；关闭文件并记录结束时间。
+    /// 阶段 1 没有待处理分片时直接完成收尾；阶段 3 起视图层应改用
+    /// beginFinish() + 等待队列清空 + completeFinalizing()。
     func finishRecording() throws {
+        try beginFinish()
+        try completeFinalizing()
+    }
+
+    /// 开始收尾：停止采集并进入 finalizing（阶段 3：随后等待分片队列清空）
+    func beginFinish() throws {
         guard let meeting = activeMeeting else {
             throw MeetingRecordingError.noActiveMeeting
         }
@@ -115,6 +122,16 @@ final class MeetingRecordingService {
         }
         capture.stopCapture()
         try meeting.transition(to: .finalizing)
+    }
+
+    /// 完成收尾：finalizing → completed（分片队列清空后调用）
+    func completeFinalizing() throws {
+        guard let meeting = activeMeeting else {
+            throw MeetingRecordingError.noActiveMeeting
+        }
+        guard meeting.status == .finalizing else {
+            throw MeetingRecordingError.wrongStatus("完成收尾", current: meeting.status)
+        }
         try meeting.transition(to: .completed)
         activeMeeting = nil
     }
