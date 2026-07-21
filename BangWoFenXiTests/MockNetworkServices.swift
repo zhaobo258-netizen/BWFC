@@ -1,23 +1,28 @@
 import Foundation
 @testable import BangWoFenXi
 
-/// URLProtocol Mock：拦截 URLSession 请求，按脚本返回响应；不依赖真实网络。
-final class MockURLProtocol: URLProtocol, @unchecked Sendable {
-    /// 请求处理器（线程安全访问）
-    nonisolated(unsafe) static var requestHandler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
-
-    /// 记录捕获的请求
-    nonisolated(unsafe) static var capturedRequests: [URLRequest] = []
-
-    static func reset() {
+/// URLProtocol Mock 存储（每个套件独立实例，避免并行测试互相污染）
+final class MockURLProtocolStorage: @unchecked Sendable {
+    var requestHandler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+    var capturedRequests: [URLRequest] = []
+    func reset() {
         requestHandler = nil
         capturedRequests = []
     }
+}
 
-    /// 配置使用该 Mock 的 URLSession
+/// URLProtocol Mock 基类：拦截 URLSession 请求，按脚本返回响应；不依赖真实网络。
+/// 每个测试套件使用独立的子类（独立静态存储），从根本上避免并行干扰。
+class MockURLProtocolBase: URLProtocol, @unchecked Sendable {
+    /// 子类必须覆盖：本类的独立存储
+    class var sharedStorage: MockURLProtocolStorage {
+        fatalError("子类必须覆盖 sharedStorage")
+    }
+
+    /// 配置使用本 Mock 的 URLSession
     static func makeSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [MockURLProtocol.self]
+        configuration.protocolClasses = [self]
         return URLSession(configuration: configuration)
     }
 
@@ -26,8 +31,9 @@ final class MockURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        MockURLProtocol.capturedRequests.append(request)
-        guard let handler = MockURLProtocol.requestHandler else {
+        let storage = type(of: self).sharedStorage
+        storage.capturedRequests.append(request)
+        guard let handler = storage.requestHandler else {
             client?.urlProtocol(self, didFailWithError: URLError(.unknown))
             return
         }
@@ -42,6 +48,35 @@ final class MockURLProtocol: URLProtocol, @unchecked Sendable {
     }
 
     override func stopLoading() {}
+}
+
+/// 阶段 3 云端识别接口测试专用
+final class DiarizationMockURLProtocol: MockURLProtocolBase {
+    static let storage = MockURLProtocolStorage()
+    override class var sharedStorage: MockURLProtocolStorage { storage }
+}
+
+/// 阶段 4 谈判分析接口测试专用
+final class AnalysisMockURLProtocol: MockURLProtocolBase {
+    static let storage = MockURLProtocolStorage()
+    override class var sharedStorage: MockURLProtocolStorage { storage }
+}
+
+/// 从请求中提取请求体（兼容 httpBody / httpBodyStream 两种形态）
+func mockRequestBodyData(of request: URLRequest) -> Data? {
+    if let body = request.httpBody { return body }
+    guard let stream = request.httpBodyStream else { return nil }
+    stream.open()
+    defer { stream.close() }
+    var data = Data()
+    let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 8192)
+    defer { buffer.deallocate() }
+    while stream.hasBytesAvailable {
+        let read = stream.read(buffer, maxLength: 8192)
+        if read <= 0 { break }
+        data.append(buffer, count: read)
+    }
+    return data
 }
 
 /// Mock 云端识别服务：按脚本返回结果或错误序列。

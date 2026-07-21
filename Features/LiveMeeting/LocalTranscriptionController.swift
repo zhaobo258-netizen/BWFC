@@ -31,6 +31,8 @@ final class LocalTranscriptionController {
     private weak var meeting: Meeting?
     /// 最终片段入库回调（由视图层注入持久化）
     var onFinalSegment: (() -> Void)?
+    /// 新最终片段到达回调（阶段 4：驱动分析调度器）
+    var onNewFinalSegment: (() -> Void)?
 
     init(service: any LocalTranscriptionServicing) {
         self.service = service
@@ -142,9 +144,11 @@ final class LocalTranscriptionController {
         case .inserted(let segment):
             meeting?.segments.append(segment)
             onFinalSegment?()
+            onNewFinalSegment?()
         case .updated:
             // 就地更新的片段已在会议片段数组中（同一实例）
             onFinalSegment?()
+            onNewFinalSegment?()
         case .skippedManual, .duplicate, .discardedEmpty:
             break
         }
@@ -171,6 +175,7 @@ final class LocalTranscriptionController {
             if case .inserted(let segment) = outcome {
                 meeting?.segments.append(segment)
                 onFinalSegment?()
+                onNewFinalSegment?()
             }
         } else {
             _ = reconciler.upsertProvisional(

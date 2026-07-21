@@ -14,9 +14,12 @@ struct LiveMeetingView: View {
     @State private var recorder: MeetingRecordingService?
     @State private var transcription: LocalTranscriptionController?
     @State private var diarization: DiarizationController?
+    @State private var analysis: NegotiationAnalysisController?
     @State private var showEndConfirmation = false
     @State private var operationError: String?
     @State private var newDeviceID: String?
+    /// 证据定位高亮（点击左右两栏证据 → 底部片段滚动 + 高亮）
+    @State private var highlightedSegmentID: UUID?
     /// 分片轮询定时器（录音中每 2 秒检查一次分片产出）
     private let chunkPollTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
@@ -31,18 +34,22 @@ struct LiveMeetingView: View {
                 if case .suspended(let reason) = diarization?.cloudState {
                     cloudSuspendedBanner(reason: reason)
                 }
+                if case .suspended(let reason) = analysis?.state {
+                    analysisSuspendedBanner(reason: reason)
+                }
                 if let operationError {
                     errorBanner(text: operationError)
                 }
                 workingArea(meeting: meeting)
                 Divider()
                 TranscriptPanelView(
-                    segments: transcription?.segments ?? [],
+                    segments: transcription?.segments ?? meeting.segments,
                     participants: meeting.participants,
                     unknownSpeakerDisplay: { segment in
                         guard segment.participantId == nil else { return nil }
                         return diarization?.displayName(forRemoteLabel: segment.remoteSpeakerLabel)
                     },
+                    highlightedSegmentID: highlightedSegmentID,
                     onAssignSpeaker: { segment, participant in
                         if let participant {
                             MeetingTranscriptEditor.assignSpeaker(segment, to: participant)
@@ -73,6 +80,8 @@ struct LiveMeetingView: View {
         }
         .onReceive(chunkPollTimer) { _ in
             diarization?.pollProgress()
+            // 分析调度器周期驱动（触发条件与防抖由 AnalysisTrigger 判定）
+            Task { await analysis?.tick() }
         }
         .confirmationDialog(
             "结束本场会议？",
@@ -123,6 +132,11 @@ struct LiveMeetingView: View {
             Label(diarizationStatusText, systemImage: "person.2.waveform")
                 .font(.callout)
                 .foregroundStyle(diarizationStatusColor)
+
+            // 云端分析状态（实施计划 6.2：含上次更新时间）
+            Label(analysisStatusText, systemImage: "brain")
+                .font(.callout)
+                .foregroundStyle(analysisStatusColor)
 
             Spacer()
 
@@ -208,6 +222,31 @@ struct LiveMeetingView: View {
         }
     }
 
+    /// 云端分析状态文案（实施计划 6.2：云端分析状态及上次更新时间）
+    private var analysisStatusText: String {
+        guard let analysis else { return "分析待启动" }
+        switch analysis.state {
+        case .idle:
+            if let lastSuccessAt = analysis.lastSuccessAt {
+                return "分析正常（更新于 \(lastSuccessAt.formatted(date: .omitted, time: .shortened))）"
+            }
+            return "分析待内容积累"
+        case .analyzing:
+            return "分析中…"
+        case .suspended:
+            return "云端分析暂停"
+        }
+    }
+
+    private var analysisStatusColor: Color {
+        guard let analysis else { return .secondary }
+        switch analysis.state {
+        case .idle: return .secondary
+        case .analyzing: return .green
+        case .suspended: return .orange
+        }
+    }
+
     // MARK: - 设备中断提示（实施计划 11.2：麦克风拔出）
 
     private func deviceInterruptedBanner(meeting: Meeting) -> some View {
@@ -258,33 +297,52 @@ struct LiveMeetingView: View {
         .background(.orange.opacity(0.12))
     }
 
-    // MARK: - 工作区占位（阶段 4 实现左侧结构与右侧分析）
+    // MARK: - 云端分析暂停提示（401：本地继续，修复后可重试）
+
+    private func analysisSuspendedBanner(reason: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "brain")
+            Text("云端分析暂停，本地录音与转写正常。\(reason)")
+                .font(.callout)
+            Spacer()
+            Button("已修复，重试") {
+                Task { @MainActor in
+                    environment.refreshCloudConfiguration()
+                    analysis?.resumeAfterKeyFix()
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.orange.opacity(0.12))
+    }
+
+    // MARK: - 工作区（实施计划 6.1：左结构总结 32% / 右谈判分析 68%）
 
     private func workingArea(meeting: Meeting) -> some View {
         HSplitView {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("结构总结")
-                    .font(.headline)
-                Text("议题、双方立场、已确认与未决事项将在阶段 4 由分析快照驱动。")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                Spacer()
-            }
-            .padding(16)
-            .frame(minWidth: 280, idealWidth: 380, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            StructureSummaryView(
+                snapshot: analysis?.currentSnapshot,
+                participants: meeting.participants,
+                segments: transcription?.segments ?? meeting.segments,
+                onEvidenceTap: locateEvidence
+            )
+            .frame(minWidth: 280, idealWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
 
-            VStack(alignment: .leading, spacing: 8) {
-                Text("谈判分析")
-                    .font(.headline)
-                Text("诉求、顾虑、动机、态度、让步与矛盾的证据化分析将在阶段 4 实现。")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                Spacer()
-            }
-            .padding(16)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            InsightCardListView(
+                snapshot: analysis?.currentSnapshot,
+                participants: meeting.participants,
+                segments: transcription?.segments ?? meeting.segments,
+                onEvidenceTap: locateEvidence
+            )
+            .frame(minWidth: 480, maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxHeight: .infinity)
+    }
+
+    /// 点击证据：定位到底部对应片段（滚动 + 高亮，实施计划 6.4）
+    private func locateEvidence(segmentID: UUID) {
+        highlightedSegmentID = segmentID
     }
 
     // MARK: - 行为
@@ -322,6 +380,16 @@ struct LiveMeetingView: View {
             fileStore: environment.fileStore,
             transcriptController: controller
         )
+        let analysisController = NegotiationAnalysisController(service: environment.negotiationAnalysis)
+        analysisController.attach(to: loaded)
+        analysisController.onSnapshotUpdated = { [environment, loaded] in
+            try? environment.persist(loaded)
+        }
+        // 新最终片段驱动分析调度（本地与云端确认都会触发）
+        controller.onNewFinalSegment = { [weak analysisController] in
+            analysisController?.noteNewFinalSegment()
+        }
+        analysis = analysisController
         // 进入界面即检查本地转写可用性（不可用时在状态栏显示真实原因）
         Task { await controller.checkAvailability() }
     }
@@ -389,6 +457,8 @@ struct LiveMeetingView: View {
                 environment.audioCapture.onBuffer = nil
                 await transcription?.finish()
                 await diarization?.finishAndDrain()
+                // 阶段 4：会议结束后用完整最终转写再生成一次「最终分析」（实施计划 10.4）
+                await analysis?.generateFinalAnalysis()
                 try recorder?.completeFinalizing()
                 persist(meeting)
                 operationError = nil

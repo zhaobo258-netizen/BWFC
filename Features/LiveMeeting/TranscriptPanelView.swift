@@ -10,6 +10,8 @@ struct TranscriptPanelView: View {
     let participants: [Participant]
     /// 未知说话人标签展示名（「待识别 A/B」，由 DiarizationController 提供）
     var unknownSpeakerDisplay: ((TranscriptSegment) -> String?)?
+    /// 证据定位高亮的片段 ID（点击左右两栏证据时设置）
+    var highlightedSegmentID: UUID?
     /// 编辑回调（由父视图持久化）
     var onAssignSpeaker: ((TranscriptSegment, Participant?) -> Void)?
     var onEditText: ((TranscriptSegment, String) -> Void)?
@@ -40,6 +42,12 @@ struct TranscriptPanelView: View {
                                 unknownDisplay: unknownSpeakerDisplay?(segment)
                             )
                             .id(segment.id)
+                            .background(
+                                segment.id == highlightedSegmentID
+                                    ? Color.yellow.opacity(0.25)
+                                    : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 4)
+                            )
                             .contextMenu {
                                 speakerMenu(for: segment)
                                 Button("修改文字…") {
@@ -69,6 +77,14 @@ struct TranscriptPanelView: View {
                 .onChange(of: segments.last?.text) { _, _ in
                     // 临时片段文字就地更新时保持贴底
                     scrollToLatest(proxy: proxy)
+                }
+                .onChange(of: highlightedSegmentID) { _, newValue in
+                    // 点击证据：定位到对应片段（滚动 + 高亮）
+                    if let id = newValue, segments.contains(where: { $0.id == id }) {
+                        withAnimation {
+                            proxy.scrollTo(id, anchor: .center)
+                        }
+                    }
                 }
 
                 if !pinnedToBottom {

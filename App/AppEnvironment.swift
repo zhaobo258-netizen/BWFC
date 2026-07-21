@@ -37,7 +37,7 @@ final class AppEnvironment {
         audioCapture: any AudioCaptureServicing = AVAudioCaptureService(),
         localTranscription: any LocalTranscriptionServicing = AppleSpeechTranscriptionService(),
         diarization: any DiarizationServicing = OpenAIDiarizationService(),
-        negotiationAnalysis: any NegotiationAnalysisServicing = UnimplementedNegotiationAnalysisService(),
+        negotiationAnalysis: any NegotiationAnalysisServicing = OpenAIAnalysisService(),
         exporter: any MeetingExportServicing = UnimplementedMeetingExportService(),
         isPersistentStorageUnavailable: Bool = false
     ) {
