@@ -1,7 +1,7 @@
 # 帮我分析（BangWoFenXi）
 
 面向线下中文商务谈判的 Mac App：实时录音、同声转写、结构总结与证据化谈判分析。
-本仓库已完成 **阶段 0–5**：工程骨架、会前准备与本地录音、Apple Speech 本地同声转写、声音样本与云端多人识别、结构总结与证据化分析、会后整理/回放/导出/删除。
+本仓库已完成 **阶段 0–6**（MVP 全部阶段）。交付状态与人工验收清单见 `交付说明.md`。
 
 - 实施计划：`../01_帮我分析_Mac_MVP开发实施计划.md`
 - 平台：Apple Silicon Mac，macOS 26+，Swift 6（严格并发）
@@ -41,10 +41,13 @@
 ## 构建与运行
 
 ```bash
-swift build                 # 编译（debug）
-Scripts/make_app.sh         # 产出 build/BangWoFenXi.app（ad-hoc 签名 + Sandbox/麦克风/网络 entitlements）
-open build/BangWoFenXi.app  # 启动
-Scripts/make_app.sh release # release 构建
+swift build                    # 编译（0 警告基线）
+Scripts/make_app.sh            # Debug .app（ad-hoc 签名 + Sandbox/麦克风/网络 entitlements）
+Scripts/make_app.sh release    # Release .app
+open build/BangWoFenXi.app     # 启动
+Scripts/run_tests.sh           # 全部 187 个自动化用例
+Scripts/soak_test.sh           # 稳定性缩短版（180s/4x）
+Scripts/soak_test.sh 3600 1    # 60 分钟完整稳定性（人工验收）
 ```
 
 ## 测试
