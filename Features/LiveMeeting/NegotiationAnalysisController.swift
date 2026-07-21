@@ -24,6 +24,8 @@ final class NegotiationAnalysisController {
     private(set) var lastSuccessAt: Date?
     /// 最近一次失败的脱敏描述
     private(set) var lastErrorDescription: String?
+    /// 最近一次失败的类别（界面友好文案；成功时清空）
+    private(set) var lastFailureKind: String?
 
     private var trigger: AnalysisTrigger
     private var analyzing = false
@@ -72,6 +74,52 @@ final class NegotiationAnalysisController {
         await fire(forceFullTranscript: true)
     }
 
+    /// 状态栏文案（诚实化：失败后不得继续只显示「正常 + 旧时间」，
+    /// 上一版结果仍保持可见）。
+    var statusDescription: String {
+        switch state {
+        case .analyzing:
+            return "分析中…"
+        case .suspended:
+            return "云端分析暂停"
+        case .idle:
+            if let kind = lastFailureKind {
+                if let lastSuccessAt {
+                    return "上次更新 \(Self.timeString(lastSuccessAt)) · 最近重试失败（\(kind)），将自动重试"
+                }
+                return "分析暂不可用（\(kind)），将自动重试"
+            }
+            if let lastSuccessAt {
+                return "分析正常（更新于 \(Self.timeString(lastSuccessAt))）"
+            }
+            return "分析待内容积累"
+        }
+    }
+
+    /// 是否有未恢复的分析失败（状态栏橙色显示）
+    var hasRecentFailure: Bool {
+        lastFailureKind != nil
+    }
+
+    private static func timeString(_ date: Date) -> String {
+        date.formatted(date: .omitted, time: .shortened)
+    }
+
+    /// 错误 → 界面友好类别文案（脱敏）
+    private static func failureKind(of error: AnalysisAPIError) -> String {
+        switch error {
+        case .timeout: return "超时"
+        case .network: return "网络中断"
+        case .rateLimited: return "限流"
+        case .serverError: return "服务繁忙"
+        case .truncated: return "输出截断"
+        case .invalidResponse: return "结果不合规"
+        case .unauthorized: return "Key 无效"
+        case .missingAPIKey: return "未配置 Key"
+        case .clientError: return "请求被拒"
+        }
+    }
+
     /// API Key 修复后恢复
     func resumeAfterKeyFix() {
         if case .suspended = state { state = .idle }
@@ -89,6 +137,7 @@ final class NegotiationAnalysisController {
         }
         analyzing = true
         state = .analyzing
+        let startedAt = Date()
         defer {
             analyzing = false
             if case .analyzing = state { state = .idle }
@@ -144,21 +193,37 @@ final class NegotiationAnalysisController {
             trigger.noteSuccess(atMs: now)
             lastSuccessAt = Date(timeIntervalSince1970: TimeInterval(now) / 1000)
             lastErrorDescription = nil
+            lastFailureKind = nil
+            AppLog.logInfo(AppLog.analysis, LogSanitizer.formatEvent(
+                "analysis_ok",
+                durationMs: Int(Date().timeIntervalSince(startedAt) * 1000),
+                error: "segments=\(newSegments.count) insights=\(snapshot.insights.count) topics=\(snapshot.topics.count)"
+            ))
             onSnapshotUpdated?()
         } catch let error as AnalysisAPIError {
             trigger.noteFailure(atMs: nowMs())
             lastErrorDescription = error.localizedDescription
+            lastFailureKind = Self.failureKind(of: error)
             if error == .unauthorized {
                 // 401 语义收窄：仅暂停分析（Kimi）自身，分人与本地不受影响
                 state = .suspended(reason: "分析 Key 无效（401）。请在设置中检查「分析（Kimi）Key」，说话人识别不受影响。")
             } else if error == .missingAPIKey {
                 state = .suspended(reason: "未配置分析（Kimi）Key。本地录音与转写正常。")
             }
-            AppLog.logError(AppLog.analysis, LogSanitizer.formatEvent("analysis_failed", error: String(describing: error)))
+            AppLog.logError(AppLog.analysis, LogSanitizer.formatEvent(
+                "analysis_failed",
+                durationMs: Int(Date().timeIntervalSince(startedAt) * 1000),
+                error: String(describing: error)
+            ))
         } catch {
             trigger.noteFailure(atMs: nowMs())
             lastErrorDescription = "分析失败，已保留上一版结果"
-            AppLog.logError(AppLog.analysis, LogSanitizer.formatEvent("analysis_failed", error: String(describing: type(of: error))))
+            lastFailureKind = "未知错误"
+            AppLog.logError(AppLog.analysis, LogSanitizer.formatEvent(
+                "analysis_failed",
+                durationMs: Int(Date().timeIntervalSince(startedAt) * 1000),
+                error: String(describing: type(of: error))
+            ))
         }
 
         // 分析期间有新内容到达：立即合并到下一次请求

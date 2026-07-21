@@ -26,8 +26,10 @@ enum CloudModelConfig {
     static let analysisBaseURL = URL(string: "https://agent-gw.kimi.com/coding/")!
     /// messages 接口路径（相对基础地址）
     static let analysisMessagesPath = "v1/messages"
-    /// 单次分析最大输出 token 数（结构化输出需要足够空间）
-    static let analysisMaxTokens = 4096
+    /// 单次分析最大输出 token 数（含思考预算；调大防止长上下文下 JSON 被截断）
+    static let analysisMaxTokens = 16384
+    /// 分析请求超时（秒；thinking 模型在长上下文下响应较慢）
+    static let analysisRequestTimeout: TimeInterval = 240
     /// Anthropic messages 协议版本头
     static let anthropicVersion = "2023-06-01"
 }

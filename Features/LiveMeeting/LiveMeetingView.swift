@@ -251,28 +251,19 @@ struct LiveMeetingView: View {
         }
     }
 
-    /// 云端分析状态文案（实施计划 6.2：云端分析状态及上次更新时间）
+    /// 云端分析状态文案（诚实化：失败经历如实显示，上一版结果保持可见）
     private var analysisStatusText: String {
-        guard let analysis else { return "分析待启动" }
-        switch analysis.state {
-        case .idle:
-            if let lastSuccessAt = analysis.lastSuccessAt {
-                return "分析正常（更新于 \(lastSuccessAt.formatted(date: .omitted, time: .shortened))）"
-            }
-            return "分析待内容积累"
-        case .analyzing:
-            return "分析中…"
-        case .suspended:
-            return "云端分析暂停"
-        }
+        analysis?.statusDescription ?? "分析待启动"
     }
 
     private var analysisStatusColor: Color {
         guard let analysis else { return .secondary }
         switch analysis.state {
-        case .idle: return .secondary
         case .analyzing: return .green
         case .suspended: return .orange
+        case .idle:
+            if analysis.hasRecentFailure { return .orange }
+            return analysis.lastSuccessAt != nil ? .green : .secondary
         }
     }
 

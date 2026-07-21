@@ -24,6 +24,11 @@ enum AppLog {
     static func logWarning(_ logger: Logger, _ sanitizedMessage: String) {
         logger.warning("\(sanitizedMessage, privacy: .public)")
     }
+
+    /// 信息日志（成功事件的状态码/耗时/计数等安全字段，public 记录）
+    static func logInfo(_ logger: Logger, _ sanitizedMessage: String) {
+        logger.info("\(sanitizedMessage, privacy: .public)")
+    }
 }
 
 /// 日志脱敏与格式化工具。

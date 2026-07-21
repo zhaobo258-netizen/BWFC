@@ -155,6 +155,10 @@ final class NegotiationAnalysisControllerTests {
         #expect(controller.currentSnapshot?.version == firstSnapshot.version, "失败必须保留上一版")
         #expect(meeting.lastAnalyzedSegmentEndMs == 6_000, "失败不推进游标")
         #expect(controller.lastErrorDescription != nil)
+        // 状态诚实化：不得继续显示「正常」，应如实显示失败类别与重试承诺
+        #expect(controller.hasRecentFailure)
+        #expect(controller.statusDescription.contains("重试失败（服务繁忙）"))
+        #expect(controller.statusDescription.contains("自动重试"))
     }
 
     @Test("401：云端分析暂停；修复后恢复")

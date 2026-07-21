@@ -39,6 +39,9 @@ struct KimiAnalysisService: NegotiationAnalysisServicing {
         let body: [String: Any] = [
             "model": modelID,
             "max_tokens": maxTokens,
+            // 关闭思考：实测网关支持，消除 thinking 预算挤占 text 导致的 JSON 截断，
+            // 且响应更快（探针验证 1.25s vs 2.47s）
+            "thinking": ["type": "disabled"],
             // 系统指令 = 8 条分析约束 + 纯文本 JSON 输出约束
             "system": instructions + "\n\n" + AnalysisSystemPrompt.jsonOutputSuffix,
             "messages": [
@@ -52,11 +55,19 @@ struct KimiAnalysisService: NegotiationAnalysisServicing {
         request.setValue(CloudModelConfig.anthropicVersion, forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        request.timeoutInterval = 120
+        request.timeoutInterval = CloudModelConfig.analysisRequestTimeout
 
-        let (data, response) = try await perform(request)
-        let text = try parse(data: data, response: response)
-        return try decodeOutput(text)
+        let startedAt = Date()
+        do {
+            let (data, response) = try await perform(request)
+            let text = try parse(data: data, response: response,
+                                 durationMs: Self.ms(since: startedAt))
+            return try decodeOutput(text)
+        } catch let error as AnalysisAPIError {
+            throw error
+        } catch {
+            throw AnalysisAPIError.network
+        }
     }
 
     /// 连接测试（实施计划 5.1：只返回可用/不可用与脱敏错误）。
@@ -99,35 +110,51 @@ struct KimiAnalysisService: NegotiationAnalysisServicing {
         baseURL.appending(path: CloudModelConfig.analysisMessagesPath)
     }
 
+    private static func ms(since date: Date) -> Int {
+        Int(Date().timeIntervalSince(date) * 1000)
+    }
+
     private func perform(_ request: URLRequest) async throws -> (Data, URLResponse) {
         do {
             return try await session.data(for: request)
+        } catch let urlError as URLError where urlError.code == .timedOut {
+            // 超时与断网区分（实施计划：超时单独归类便于诊断）
+            throw AnalysisAPIError.timeout
         } catch {
             throw AnalysisAPIError.network
         }
     }
 
-    /// 状态码分类 + 提取 text 块文本
-    private func parse(data: Data, response: URLResponse) throws -> String {
+    /// 状态码分类 + 提取 text 块文本（HTTP 层公开日志：状态码与耗时）
+    private func parse(data: Data, response: URLResponse, durationMs: Int) throws -> String {
         guard let http = response as? HTTPURLResponse else {
             throw AnalysisAPIError.invalidResponse
         }
-        switch http.statusCode {
-        case 200..<300:
-            break
-        case 401:
-            throw AnalysisAPIError.unauthorized
-        case 429:
-            throw AnalysisAPIError.rateLimited
-        case 500...599:
-            throw AnalysisAPIError.serverError(statusCode: http.statusCode)
-        default:
-            throw AnalysisAPIError.clientError(statusCode: http.statusCode)
+        guard (200..<300).contains(http.statusCode) else {
+            AppLog.logError(AppLog.analysis, LogSanitizer.formatEvent(
+                "analysis_http_error", durationMs: durationMs, statusCode: http.statusCode
+            ))
+            switch http.statusCode {
+            case 401: throw AnalysisAPIError.unauthorized
+            case 429: throw AnalysisAPIError.rateLimited
+            case 500...599: throw AnalysisAPIError.serverError(statusCode: http.statusCode)
+            default: throw AnalysisAPIError.clientError(statusCode: http.statusCode)
+            }
         }
 
         guard let dto = try? JSONDecoder().decode(MessagesResponseDTO.self, from: data) else {
             throw AnalysisAPIError.invalidResponse
         }
+        // stop_reason = max_tokens：输出被截断，单独归类便于诊断
+        if dto.stopReason == "max_tokens" {
+            AppLog.logError(AppLog.analysis, LogSanitizer.formatEvent(
+                "analysis_truncated", durationMs: durationMs, statusCode: http.statusCode
+            ))
+            throw AnalysisAPIError.truncated
+        }
+        AppLog.logInfo(AppLog.analysis, LogSanitizer.formatEvent(
+            "analysis_http_ok", durationMs: durationMs, statusCode: http.statusCode
+        ))
         // 只拼接 type == "text" 的块（忽略 thinking 等块）
         let text = (dto.content ?? [])
             .filter { $0.type == "text" }
@@ -154,14 +181,26 @@ struct KimiAnalysisService: NegotiationAnalysisServicing {
         }
         guard let data = trimmed.data(using: .utf8),
               let dto = try? JSONDecoder().decode(AnalysisOutputDTO.self, from: data) else {
+            // 截断迹象公开记录：输出长度与结尾是否闭合（不记内容）
+            let closed = trimmed.hasSuffix("}") || trimmed.hasSuffix("]")
+            AppLog.logError(AppLog.analysis, LogSanitizer.formatEvent(
+                "analysis_output_invalid",
+                error: "len=\(trimmed.count) closed=\(closed)"
+            ))
             throw AnalysisAPIError.invalidResponse
         }
         return dto
     }
 
-    /// Anthropic messages 响应（只读取 content 块的 type 与 text）
+    /// Anthropic messages 响应（只读取 content 块的 type/text 与 stop_reason）
     private struct MessagesResponseDTO: Decodable {
         let content: [ContentBlock]?
+        let stopReason: String?
+
+        enum CodingKeys: String, CodingKey {
+            case content
+            case stopReason = "stop_reason"
+        }
 
         struct ContentBlock: Decodable {
             let type: String?

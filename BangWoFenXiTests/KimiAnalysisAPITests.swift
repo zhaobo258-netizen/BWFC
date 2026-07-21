@@ -77,8 +77,11 @@ final class KimiAnalysisAPITests {
         let body = try #require(mockRequestBodyData(of: request))
         let object = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
         #expect(object["model"] as? String == "kimi-for-coding")
-        #expect(object["max_tokens"] as? Int == CloudModelConfig.analysisMaxTokens)
+        #expect(object["max_tokens"] as? Int == 16_384, "max_tokens 必须含思考预算防截断")
+        let thinking = try #require(object["thinking"] as? [String: Any])
+        #expect(thinking["type"] as? String == "disabled", "必须关闭思考（实测可防 JSON 截断且更快）")
         #expect(object["store"] == nil, "Kimi 接口不得发送 store 字段")
+        #expect(request.timeoutInterval == 240, "超时必须为 240s（长上下文响应慢）")
         let system = try #require(object["system"] as? String)
         #expect(system.contains("不输出回应建议"), "系统指令必须包含 10.3 约束")
         #expect(system.contains("只输出一个 JSON 对象"), "系统指令必须包含纯文本 JSON 输出约束")
@@ -150,7 +153,7 @@ final class KimiAnalysisAPITests {
 
     // MARK: - 错误分类
 
-    @Test("401 → unauthorized；429 → rateLimited；500 → serverError；超时 → network")
+    @Test("401 → unauthorized；429 → rateLimited；500 → serverError；超时与断网分类")
     func errorClassification() async throws {
         try saveTestKey()
         for (statusCode, expected) in [
@@ -166,8 +169,30 @@ final class KimiAnalysisAPITests {
                 _ = try await service.analyze(instructions: "", inputJSON: "{}")
             }
         }
+        // 超时单独归类（与断网区分）
         storage.requestHandler = { _ in throw URLError(.timedOut) }
+        await #expect(throws: AnalysisAPIError.timeout) {
+            _ = try await service.analyze(instructions: "", inputJSON: "{}")
+        }
+        // 断网归类为 network
+        storage.requestHandler = { _ in throw URLError(.notConnectedToInternet) }
         await #expect(throws: AnalysisAPIError.network) {
+            _ = try await service.analyze(instructions: "", inputJSON: "{}")
+        }
+    }
+
+    @Test("stop_reason = max_tokens → truncated（截断单独归类）")
+    func truncatedClassification() async throws {
+        try saveTestKey()
+        storage.requestHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            let body: [String: Any] = [
+                "content": [["type": "text", "text": "{\"current_topic\":\"被截断的输出"]],
+                "stop_reason": "max_tokens"
+            ]
+            return (response, try! JSONSerialization.data(withJSONObject: body))
+        }
+        await #expect(throws: AnalysisAPIError.truncated) {
             _ = try await service.analyze(instructions: "", inputJSON: "{}")
         }
     }

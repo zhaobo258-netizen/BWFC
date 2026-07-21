@@ -10,8 +10,12 @@ enum AnalysisAPIError: Error, Equatable {
     case serverError(statusCode: Int)
     /// 其他 4xx
     case clientError(statusCode: Int)
-    /// 网络层失败（超时、断网）
+    /// 请求超时（thinking 模型长上下文响应慢；与断网区分）
+    case timeout
+    /// 网络层失败（断网、连接失败等非超时类）
     case network
+    /// stop_reason = max_tokens：输出被长度截断（thinking 预算挤占 text）
+    case truncated
     /// 响应或结构化输出无法解析 → 丢弃该快照并保留上一版（实施计划 11.2）
     case invalidResponse
     /// 未配置 API Key
@@ -25,7 +29,9 @@ extension AnalysisAPIError: LocalizedError {
         case .rateLimited: return "云端限流（429），稍后自动重试"
         case .serverError(let code): return "云端服务失败（\(code)），稍后自动重试"
         case .clientError(let code): return "请求被拒绝（\(code)）"
+        case .timeout: return "请求超时（模型响应过慢），将自动重试"
         case .network: return "网络连接失败，稍后自动重试"
+        case .truncated: return "分析输出被长度限制截断，已丢弃并保留上一版"
         case .invalidResponse: return "分析结果不合规，已丢弃并保留上一版"
         case .missingAPIKey: return "未配置 API Key"
         }
