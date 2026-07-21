@@ -10,8 +10,6 @@ final class AppEnvironment {
     let meetingStore: any MeetingStoring
     /// 会议文件存储（录音文件布局与相对路径）
     let fileStore: MeetingFileStore
-    /// 云端 API Key 存储（Keychain）
-    let apiKeyStore: CloudAPIKeyStore
 
     /// 音频采集（阶段 1：AVAudioEngine 实现）
     let audioCapture: any AudioCaptureServicing
@@ -24,8 +22,17 @@ final class AppEnvironment {
     /// 导出（阶段 5 实现：生成 Markdown/JSON 内容，保存位置由用户选择）
     let exporter: any MeetingExportServicing
 
-    /// 云端功能是否已配置（API Key 存在）
-    private(set) var isCloudConfigured: Bool
+    /// 各 provider 的 Keychain 存储（Key 分家，互不外借）
+    private let keyStores: [CloudProvider: CloudAPIKeyStore]
+    /// 分析（Kimi）Key 是否已配置
+    private(set) var isAnalysisConfigured: Bool
+    /// 分人（OpenAI 兼容）Key 是否已配置
+    private(set) var isDiarizationConfigured: Bool
+
+    /// 兼容旧调用：任一云端能力已配置
+    var isCloudConfigured: Bool {
+        isAnalysisConfigured || isDiarizationConfigured
+    }
 
     /// 持久化是否不可用（初始化失败时降级为内存库并提示）
     let isPersistentStorageUnavailable: Bool
@@ -33,29 +40,49 @@ final class AppEnvironment {
     init(
         meetingStore: any MeetingStoring,
         fileStore: MeetingFileStore,
-        apiKeyStore: CloudAPIKeyStore = CloudAPIKeyStore(),
         audioCapture: any AudioCaptureServicing = AVAudioCaptureService(),
         localTranscription: any LocalTranscriptionServicing = AppleSpeechTranscriptionService(),
         diarization: any DiarizationServicing = OpenAIDiarizationService(),
         negotiationAnalysis: any NegotiationAnalysisServicing = KimiAnalysisService(),
         exporter: (any MeetingExportServicing)? = nil,
+        keychainServiceName: String = CloudAPIKeyStore.defaultService,
         isPersistentStorageUnavailable: Bool = false
     ) {
         self.meetingStore = meetingStore
         self.fileStore = fileStore
-        self.apiKeyStore = apiKeyStore
         self.audioCapture = audioCapture
         self.localTranscription = localTranscription
         self.diarization = diarization
         self.negotiationAnalysis = negotiationAnalysis
         self.exporter = exporter ?? LocalMeetingExportService(meetingStore: meetingStore)
         self.isPersistentStorageUnavailable = isPersistentStorageUnavailable
-        self.isCloudConfigured = apiKeyStore.hasConfiguredKey
+
+        var stores: [CloudProvider: CloudAPIKeyStore] = [:]
+        for provider in CloudProvider.allCases {
+            stores[provider] = CloudAPIKeyStore.store(for: provider, service: keychainServiceName)
+        }
+        self.keyStores = stores
+        self.isAnalysisConfigured = stores[.analysis]?.hasConfiguredKey ?? false
+        self.isDiarizationConfigured = stores[.diarization]?.hasConfiguredKey ?? false
     }
 
-    /// API Key 变更后刷新云端配置状态
+    /// 指定 provider 的 Keychain 存储（视图层读写 Key 的唯一入口）
+    func keyStore(for provider: CloudProvider) -> CloudAPIKeyStore {
+        guard let store = keyStores[provider] else {
+            return CloudAPIKeyStore.store(for: provider)
+        }
+        return store
+    }
+
+    /// 指定 provider 是否已配置 Key
+    func isConfigured(_ provider: CloudProvider) -> Bool {
+        keyStore(for: provider).hasConfiguredKey
+    }
+
+    /// API Key 变更后刷新各 provider 配置状态
     func refreshCloudConfiguration() {
-        isCloudConfigured = apiKeyStore.hasConfiguredKey
+        isAnalysisConfigured = isConfigured(.analysis)
+        isDiarizationConfigured = isConfigured(.diarization)
     }
 
     // MARK: - 会议持久化便捷入口（集中 store 读写，避免散落各视图）
@@ -89,6 +116,8 @@ final class AppEnvironment {
 
     /// 生产环境：默认 JSON 持久化 + 文件存储
     static func live() -> AppEnvironment {
+        // 旧版统一 Keychain 条目迁移（account=openai → 分析 kimi 条目）
+        CloudAPIKeyStore.migrateLegacyKeyIfNeeded()
         do {
             let store = try JSONMeetingStore.makeDefault()
             let fileStore = try MeetingFileStore.makeDefault()
@@ -96,7 +125,7 @@ final class AppEnvironment {
         } catch {
             // 持久化初始化失败：降级为内存库，保证界面可用；
             // 仅记录脱敏错误，不含路径与正文
-            AppLog.persistence.error("\(LogSanitizer.formatEvent("storage_init_failed", error: String(describing: type(of: error))))")
+            AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent("storage_init_failed", error: String(describing: type(of: error))))
             return AppEnvironment(
                 meetingStore: InMemoryMeetingStore(),
                 fileStore: MeetingFileStore(baseDirectory: FileManager.default.temporaryDirectory),

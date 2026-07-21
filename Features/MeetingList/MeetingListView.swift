@@ -13,8 +13,15 @@ struct MeetingListView: View {
             if environment.isPersistentStorageUnavailable {
                 warningBanner(text: "本地数据库初始化失败，当前数据仅保存在内存中，退出后将丢失。")
             }
-            if !environment.isCloudConfigured {
-                cloudUnconfiguredBanner
+            if !environment.isAnalysisConfigured {
+                cloudUnconfiguredBanner(
+                    text: "分析（Kimi）未配置：谈判分析暂不可用（本地录音与转写不受影响）。"
+                )
+            }
+            if !environment.isDiarizationConfigured {
+                cloudUnconfiguredBanner(
+                    text: "分人未配置：说话人将显示为待识别，可手动标注；本地录音与转写不受影响。"
+                )
             }
             if meetings.isEmpty {
                 emptyState
@@ -53,7 +60,7 @@ struct MeetingListView: View {
         } catch {
             meetings = []
             loadFailed = true
-            AppLog.persistence.error("\(LogSanitizer.formatEvent("meeting_load_failed", error: String(describing: type(of: error))))")
+            AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent("meeting_load_failed", error: String(describing: type(of: error))))
         }
     }
 
@@ -118,12 +125,12 @@ struct MeetingListView: View {
         }
     }
 
-    /// 云端未配置提示条（实施计划阶段 0 验收：无 API Key 时可进入本地界面，
-    /// 但云端功能区明确标记「未配置」）
-    private var cloudUnconfiguredBanner: some View {
+    /// 云端未配置提示条（无 Key 时可进入本地界面，
+    /// 但对应云端功能区明确标记「未配置」）
+    private func cloudUnconfiguredBanner(text: String) -> some View {
         HStack(spacing: 8) {
             Image(systemName: "icloud.slash")
-            Text("云端功能未配置：说话人识别与谈判分析暂不可用（本地录音与转写不受影响）。")
+            Text(text)
                 .font(.callout)
             Spacer()
             Button("前往设置") {

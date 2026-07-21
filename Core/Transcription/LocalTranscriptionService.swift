@@ -216,7 +216,7 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
         } catch {
             poller.cancel()
             // 失败透出真实错误（由界面展示，可重试）
-            AppLog.transcription.error("\(LogSanitizer.formatEvent("asset_install_failed", error: String(describing: type(of: error))))")
+            AppLog.logError(AppLog.transcription, LogSanitizer.formatEvent("asset_install_failed", error: String(describing: type(of: error))))
             throw error
         }
     }
@@ -286,7 +286,7 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
                 }
             } catch {
                 // 结果流异常：只记录脱敏错误类型
-                AppLog.transcription.error("\(LogSanitizer.formatEvent("transcriber_results_failed", error: String(describing: type(of: error))))")
+                AppLog.logError(AppLog.transcription, LogSanitizer.formatEvent("transcriber_results_failed", error: String(describing: type(of: error))))
             }
         }
     }

@@ -17,7 +17,7 @@ struct KimiAnalysisService: NegotiationAnalysisServicing {
 
     init(
         session: URLSession = .shared,
-        apiKeyStore: CloudAPIKeyStore = CloudAPIKeyStore(),
+        apiKeyStore: CloudAPIKeyStore = CloudAPIKeyStore.store(for: .analysis),
         baseURL: URL = CloudModelConfig.analysisBaseURL,
         modelID: String = CloudModelConfig.analysisModelID,
         maxTokens: Int = CloudModelConfig.analysisMaxTokens

@@ -116,13 +116,13 @@ struct MeetingReviewView: View {
                         Text("重新生成最终分析")
                     }
                 }
-                .disabled(reanalysis?.state == .analyzing || !environment.isCloudConfigured)
+                .disabled(reanalysis?.state == .analyzing || !environment.isAnalysisConfigured)
                 Button("删除会议", role: .destructive) {
                     showDeleteConfirmation = true
                 }
             }
-            if !environment.isCloudConfigured {
-                Text("云端未配置：「重新生成最终分析」不可用。")
+            if !environment.isAnalysisConfigured {
+                Text("分析（Kimi）未配置：「重新生成最终分析」不可用。")
                     .font(.caption)
                     .foregroundStyle(.orange)
             }

@@ -41,7 +41,7 @@ final class MicLevelTestController {
             try capture.startLevelMonitoring()
         } catch {
             // 只保留脱敏错误类型
-            AppLog.audio.error("\(LogSanitizer.formatEvent("level_test_start_failed", error: String(describing: type(of: error))))")
+            AppLog.logError(AppLog.audio, LogSanitizer.formatEvent("level_test_start_failed", error: String(describing: type(of: error))))
             capture.onLevel = nil
             return
         }

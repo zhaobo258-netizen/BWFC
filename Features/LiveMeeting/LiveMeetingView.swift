@@ -171,10 +171,13 @@ struct LiveMeetingView: View {
                 .font(.caption)
             }
 
-            // 云端 Key 配置状态（未配置时明确标记）
-            Text(environment.isCloudConfigured ? "云端已配置" : "云端未配置")
+            // 各 provider 的 Key 配置状态（分家显示，互不外借）
+            Text(environment.isAnalysisConfigured ? "分析已配置" : "分析未配置")
                 .font(.caption)
-                .foregroundStyle(environment.isCloudConfigured ? .green : .orange)
+                .foregroundStyle(environment.isAnalysisConfigured ? .green : .gray)
+            Text(environment.isDiarizationConfigured ? "分人已配置" : "分人未配置")
+                .font(.caption)
+                .foregroundStyle(environment.isDiarizationConfigured ? .green : .gray)
 
             // 控制按钮
             switch meeting.status {
@@ -226,14 +229,16 @@ struct LiveMeetingView: View {
 
     /// 云端说话人识别状态文案（实施计划 6.2：云端说话人识别状态）
     private var diarizationStatusText: String {
-        guard let diarization else { return "云端识别待启动" }
+        guard let diarization else { return "分人待启动" }
         switch diarization.cloudState {
         case .idle:
-            return "云端识别正常"
+            return "分人识别正常"
         case .working(let pending):
-            return pending > 0 ? "云端识别中（待处理 \(pending)）" : "云端识别正常"
+            return pending > 0 ? "分人识别中（待处理 \(pending)）" : "分人识别正常"
         case .suspended:
-            return "云端识别暂停"
+            return "分人识别暂停"
+        case .unconfigured:
+            return "分人未配置"
         }
     }
 
@@ -242,6 +247,7 @@ struct LiveMeetingView: View {
         switch diarization.cloudState {
         case .idle, .working: return .green
         case .suspended: return .orange
+        case .unconfigured: return .gray
         }
     }
 
@@ -358,12 +364,12 @@ struct LiveMeetingView: View {
         .background(.blue.opacity(0.08))
     }
 
-    // MARK: - 云端暂停提示（401 / 未配置 Key：本地录音继续，修复后可重试）
+    // MARK: - 分人暂停提示（401：仅分人 provider 暂停，分析与本地不受影响）
 
     private func cloudSuspendedBanner(reason: String) -> some View {
         HStack(spacing: 8) {
-            Image(systemName: "icloud.slash")
-            Text("云端分析暂停，本地录音与转写正常。\(reason)")
+            Image(systemName: "person.2.waveform")
+            Text("说话人识别暂停，本地录音与转写正常。\(reason)")
                 .font(.callout)
             Spacer()
             Button("已修复，重试") {
@@ -459,7 +465,8 @@ struct LiveMeetingView: View {
         diarization = DiarizationController(
             diarization: environment.diarization,
             fileStore: environment.fileStore,
-            transcriptController: controller
+            transcriptController: controller,
+            keyStore: environment.keyStore(for: .diarization)
         )
         let analysisController = NegotiationAnalysisController(service: environment.negotiationAnalysis)
         analysisController.attach(to: loaded)
@@ -515,8 +522,9 @@ struct LiveMeetingView: View {
                         let boxed = SendableAudioBuffer(buffer)
                         Task { await transcriptionService.feed(boxed.buffer) }
                     }
-                    // 启动云端说话人识别编排（恢复既有队列；未配置 Key 时进入暂停态）
-                    if environment.isCloudConfigured {
+                    // 启动云端说话人识别编排（仅分人 Key 已配置时发请求；
+                    // 未配置时进入 unconfigured 灰态，说话人显示待识别，可手动标注）
+                    if environment.isConfigured(.diarization) {
                         diarization?.start(for: meeting) { [weak recorder] in
                             recorder?.timeline
                         }

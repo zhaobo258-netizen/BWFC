@@ -148,15 +148,17 @@ final class NegotiationAnalysisController {
         } catch let error as AnalysisAPIError {
             trigger.noteFailure(atMs: nowMs())
             lastErrorDescription = error.localizedDescription
-            if error == .unauthorized || error == .missingAPIKey {
-                // Key 无效：云端分析暂停，本地继续；修复后可重试（实施计划 11.2）
-                state = .suspended(reason: error.localizedDescription)
+            if error == .unauthorized {
+                // 401 语义收窄：仅暂停分析（Kimi）自身，分人与本地不受影响
+                state = .suspended(reason: "分析 Key 无效（401）。请在设置中检查「分析（Kimi）Key」，说话人识别不受影响。")
+            } else if error == .missingAPIKey {
+                state = .suspended(reason: "未配置分析（Kimi）Key。本地录音与转写正常。")
             }
-            AppLog.analysis.error("\(LogSanitizer.formatEvent("analysis_failed", error: String(describing: error)))")
+            AppLog.logError(AppLog.analysis, LogSanitizer.formatEvent("analysis_failed", error: String(describing: error)))
         } catch {
             trigger.noteFailure(atMs: nowMs())
             lastErrorDescription = "分析失败，已保留上一版结果"
-            AppLog.analysis.error("\(LogSanitizer.formatEvent("analysis_failed", error: String(describing: type(of: error))))")
+            AppLog.logError(AppLog.analysis, LogSanitizer.formatEvent("analysis_failed", error: String(describing: type(of: error))))
         }
 
         // 分析期间有新内容到达：立即合并到下一次请求

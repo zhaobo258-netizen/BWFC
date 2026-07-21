@@ -66,7 +66,7 @@ final class LocalTranscriptionController {
         } catch {
             assetDownloadProgress = nil
             assetInstallError = "下载失败：\(error.localizedDescription)"
-            AppLog.transcription.error("\(LogSanitizer.formatEvent("asset_install_failed", error: String(describing: type(of: error))))")
+            AppLog.logError(AppLog.transcription, LogSanitizer.formatEvent("asset_install_failed", error: String(describing: type(of: error))))
         }
     }
 
@@ -133,7 +133,7 @@ final class LocalTranscriptionController {
         } catch {
             lastErrorDescription = error.localizedDescription
             runState = .unavailable(error.localizedDescription)
-            AppLog.transcription.error("\(LogSanitizer.formatEvent("transcription_start_failed", error: String(describing: type(of: error))))")
+            AppLog.logError(AppLog.transcription, LogSanitizer.formatEvent("transcription_start_failed", error: String(describing: type(of: error))))
             throw error
         }
 

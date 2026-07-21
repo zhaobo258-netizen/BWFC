@@ -12,8 +12,10 @@ final class DiarizationController {
         case idle
         /// 处理中（含队列等待数）
         case working(pending: Int)
-        /// 云端暂停：401 或未配置 Key（本地录音与转写继续，修复后可重试）
+        /// 云端暂停：401（本地录音与转写继续，修复后可重试）
         case suspended(reason: String)
+        /// 分人 Key 未配置（灰色显示；绝不借用分析 Key 发请求）
+        case unconfigured
     }
 
     private let diarization: any DiarizationServicing
@@ -21,6 +23,8 @@ final class DiarizationController {
     private let transcriptController: LocalTranscriptionController
     private let retryPolicy: RetryPolicy
     private let planner: ChunkPlanner
+    /// 分人 provider 的 Key 存储（判断是否可发请求）
+    private let keyStore: CloudAPIKeyStore
     /// 可注入的延迟函数（测试用，避免真实等待）
     private let sleep: (Int64) async -> Void
 
@@ -47,6 +51,7 @@ final class DiarizationController {
         transcriptController: LocalTranscriptionController,
         retryPolicy: RetryPolicy = RetryPolicy(),
         planner: ChunkPlanner = ChunkPlanner(),
+        keyStore: CloudAPIKeyStore = CloudAPIKeyStore.store(for: .diarization),
         sleep: @escaping (Int64) async -> Void = { ms in
             try? await Task.sleep(for: .milliseconds(ms))
         }
@@ -56,13 +61,15 @@ final class DiarizationController {
         self.transcriptController = transcriptController
         self.retryPolicy = retryPolicy
         self.planner = planner
+        self.keyStore = keyStore
         self.sleep = sleep
     }
 
     // MARK: - 会话
 
     /// 启动云端识别编排（录音已开始）。
-    /// 恢复既有队列（App 重启后补传）；云端未配置时进入 suspended 并仅保留本地能力。
+    /// 恢复既有队列（App 重启后补传）；分人 Key 未配置时进入 unconfigured
+    /// （灰色显示，绝不借用分析 Key 发请求；说话人显示为待识别，可手动标注）。
     func start(for meeting: Meeting, timelineProvider: @escaping () -> RecordingTimeline?) {
         self.meeting = meeting
         self.timelineProvider = timelineProvider
@@ -89,6 +96,11 @@ final class DiarizationController {
             try? store.save(queue)
         }
 
+        // 未配置分人 Key：零请求，仅保留本地能力
+        guard keyStore.hasConfiguredKey else {
+            cloudState = .unconfigured
+            return
+        }
         cloudState = .idle
         kickProcessing()
     }
@@ -137,6 +149,7 @@ final class DiarizationController {
         // 等待直到没有可处理条目（或暂停）；轮询间隔用真实延迟，退避才走注入
         while draining {
             if case .suspended = cloudState { break }
+            if case .unconfigured = cloudState { break }
             let hasWork = queue.contains { $0.needsProcessing }
             if !hasWork { break }
             try? await Task.sleep(for: .milliseconds(100))
@@ -172,7 +185,7 @@ final class DiarizationController {
             persistQueue()
         } catch {
             // 提取失败：只记录脱敏错误，不阻断录音
-            AppLog.diarization.error("\(LogSanitizer.formatEvent("chunk_extract_failed", error: String(describing: type(of: error))))")
+            AppLog.logError(AppLog.diarization, LogSanitizer.formatEvent("chunk_extract_failed", error: String(describing: type(of: error))))
         }
     }
 
@@ -182,6 +195,7 @@ final class DiarizationController {
     private func kickProcessing() {
         guard processingTask == nil else { return }
         if case .suspended = cloudState { return }
+        if case .unconfigured = cloudState { return }
         processingTask = Task { [weak self] in
             await self?.processQueue()
         }
@@ -267,23 +281,27 @@ final class DiarizationController {
         }
     }
 
-    /// 上传失败分类处理（实施计划 11.2）
+    /// 上传失败分类处理（实施计划 11.2；401 语义收窄到分人 provider 自身）
     private func handleUploadError(_ error: DiarizationAPIError, entryIndex: Int) {
         switch error {
-        case .unauthorized, .missingAPIKey:
-            // Key 无效：云端模块暂停，本地录音继续；不消耗重试次数
+        case .unauthorized:
+            // 分人 Key 无效：仅暂停分人 provider，本地录音与分析继续
             queue[entryIndex].status = .pending
-            cloudState = .suspended(reason: error.localizedDescription)
-            AppLog.diarization.error("\(LogSanitizer.formatEvent("cloud_suspended", statusCode: 401))")
+            cloudState = .suspended(reason: "分人 Key 无效（401）。请在设置中检查「分人 Key」，分析（Kimi）不受影响。")
+            AppLog.logError(AppLog.diarization, LogSanitizer.formatEvent("cloud_suspended", statusCode: 401))
+        case .missingAPIKey:
+            // 运行中 Key 被删除：视为未配置，零请求
+            queue[entryIndex].status = .pending
+            cloudState = .unconfigured
         case .rateLimited, .serverError, .network:
             queue[entryIndex].attemptCount += 1
             if retryPolicy.shouldRetry(afterFailures: queue[entryIndex].attemptCount) {
                 queue[entryIndex].status = .failed
-                AppLog.diarization.warning("\(LogSanitizer.formatEvent("chunk_retry_scheduled", statusCode: nil, error: String(describing: error)))")
+                AppLog.logWarning(AppLog.diarization, LogSanitizer.formatEvent("chunk_retry_scheduled", statusCode: nil, error: String(describing: error)))
             } else {
                 // 超过上限：待用户重试，不得无限循环
                 queue[entryIndex].status = .awaitingUserRetry
-                AppLog.diarization.error("\(LogSanitizer.formatEvent("chunk_awaiting_user_retry"))")
+                AppLog.logError(AppLog.diarization, LogSanitizer.formatEvent("chunk_awaiting_user_retry"))
             }
         case .clientError, .invalidResponse:
             // 请求/响应问题：不重试，直接待用户处理
@@ -295,18 +313,28 @@ final class DiarizationController {
 
     /// 用户手动重试「待重试」分片（重置失败计数）
     func retryAwaitingUserChunks() {
+        guard keyStore.hasConfiguredKey else {
+            cloudState = .unconfigured
+            return
+        }
         for index in queue.indices where queue[index].status == .awaitingUserRetry {
             queue[index].status = .pending
             queue[index].attemptCount = 0
         }
         if case .suspended = cloudState { cloudState = .idle }
+        if case .unconfigured = cloudState { cloudState = .idle }
         persistQueue()
         kickProcessing()
     }
 
     /// API Key 修复后恢复云端处理
     func resumeAfterKeyFix() {
+        guard keyStore.hasConfiguredKey else {
+            cloudState = .unconfigured
+            return
+        }
         if case .suspended = cloudState { cloudState = .idle }
+        if case .unconfigured = cloudState { cloudState = .idle }
         kickProcessing()
     }
 
@@ -335,6 +363,7 @@ final class DiarizationController {
 
     private func updateCloudState() {
         if case .suspended = cloudState { return }
+        if case .unconfigured = cloudState { return }
         let pending = queue.filter { $0.needsProcessing }.count
         cloudState = pending > 0 ? .working(pending: pending) : .idle
         onQueueChanged?()

@@ -80,7 +80,7 @@ struct OpenAIDiarizationService: DiarizationServicing {
 
     init(
         session: URLSession = .shared,
-        apiKeyStore: CloudAPIKeyStore = CloudAPIKeyStore(),
+        apiKeyStore: CloudAPIKeyStore = CloudAPIKeyStore.store(for: .diarization),
         baseURL: URL = CloudModelConfig.apiBaseURL,
         modelID: String = CloudModelConfig.diarizationModelID
     ) {

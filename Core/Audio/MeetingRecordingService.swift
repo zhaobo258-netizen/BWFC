@@ -64,7 +64,7 @@ final class MeetingRecordingService {
             // 失败回滚：不留下半开状态；只保留脱敏错误类型
             capture.stopCapture()
             lastErrorDescription = error.localizedDescription
-            AppLog.audio.error("\(LogSanitizer.formatEvent("recording_start_failed", error: String(describing: type(of: error))))")
+            AppLog.logError(AppLog.audio, LogSanitizer.formatEvent("recording_start_failed", error: String(describing: type(of: error))))
             throw error
         }
     }
@@ -144,7 +144,7 @@ final class MeetingRecordingService {
         }
         if meeting.status == .paused || meeting.status == .recording {
             deviceInterrupted = true
-            AppLog.audio.warning("\(LogSanitizer.formatEvent("capture_device_disconnected"))")
+            AppLog.logWarning(AppLog.audio, LogSanitizer.formatEvent("capture_device_disconnected"))
         }
     }
 

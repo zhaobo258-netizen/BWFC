@@ -68,6 +68,18 @@ final class KimiMockURLProtocol: MockURLProtocolBase {
     override class var sharedStorage: MockURLProtocolStorage { storage }
 }
 
+/// Key 分家隔离测试专用（分人侧）
+final class IsolationDiarizationMockURLProtocol: MockURLProtocolBase {
+    static let storage = MockURLProtocolStorage()
+    override class var sharedStorage: MockURLProtocolStorage { storage }
+}
+
+/// Key 分家隔离测试专用（分析侧）
+final class IsolationKimiMockURLProtocol: MockURLProtocolBase {
+    static let storage = MockURLProtocolStorage()
+    override class var sharedStorage: MockURLProtocolStorage { storage }
+}
+
 /// 从请求中提取请求体（兼容 httpBody / httpBodyStream 两种形态）
 func mockRequestBodyData(of request: URLRequest) -> Data? {
     if let body = request.httpBody { return body }

@@ -13,6 +13,17 @@ enum AppLog {
     static let analysis = Logger(subsystem: subsystem, category: "analysis")
     static let persistence = Logger(subsystem: subsystem, category: "persistence")
     static let ui = Logger(subsystem: subsystem, category: "ui")
+
+    /// 错误日志（脱敏后的错误类别/状态码/耗时等安全字段以 public 记录，
+    /// 便于实机诊断；正文/姓名/Key 仍由 LogSanitizer 拦截，严禁传入）。
+    static func logError(_ logger: Logger, _ sanitizedMessage: String) {
+        logger.error("\(sanitizedMessage, privacy: .public)")
+    }
+
+    /// 警告日志（同上的 public 安全字段约定）
+    static func logWarning(_ logger: Logger, _ sanitizedMessage: String) {
+        logger.warning("\(sanitizedMessage, privacy: .public)")
+    }
 }
 
 /// 日志脱敏与格式化工具。

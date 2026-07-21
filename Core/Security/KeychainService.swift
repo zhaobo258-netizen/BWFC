@@ -96,20 +96,54 @@ struct KeychainService: Sendable {
     }
 }
 
+/// 云端服务 provider（Key 分家：各自独立 Keychain 条目，互不外借）
+enum CloudProvider: String, Sendable, CaseIterable {
+    /// 谈判文字分析（Kimi 网关）
+    case analysis
+    /// 说话人识别（OpenAI 兼容 diarize 接口）
+    case diarization
+
+    /// Keychain account 名
+    var account: String {
+        switch self {
+        case .analysis: return "kimi"
+        case .diarization: return "diarization"
+        }
+    }
+
+    /// 界面显示名
+    var displayName: String {
+        switch self {
+        case .analysis: return "分析（Kimi）"
+        case .diarization: return "分人（OpenAI 兼容）"
+        }
+    }
+
+    /// 历史遗留的统一 account（迁移来源）
+    static let legacyAccount = "openai"
+}
+
 /// 云端 API Key 的专用封装（实施计划 12.1：API Key 只进 Keychain）。
-/// service/account 可注入，便于测试隔离。
+/// service/account 可注入，便于测试隔离；按 provider 分条目存取，互不外借。
 struct CloudAPIKeyStore: Sendable {
     /// 生产环境使用的 Keychain service 名
     static let defaultService = "com.zhaobo.BangWoFenXi.cloud-api-key"
-    static let defaultAccount = "openai"
 
     private let keychain: KeychainService
     private let account: String
 
     init(service: String = CloudAPIKeyStore.defaultService,
-         account: String = CloudAPIKeyStore.defaultAccount) {
+         account: String = CloudProvider.legacyAccount) {
         self.keychain = KeychainService(service: service)
         self.account = account
+    }
+
+    /// 按 provider 取对应条目的存储
+    static func store(
+        for provider: CloudProvider,
+        service: String = CloudAPIKeyStore.defaultService
+    ) -> CloudAPIKeyStore {
+        CloudAPIKeyStore(service: service, account: provider.account)
     }
 
     /// 是否已配置 API Key
@@ -130,5 +164,31 @@ struct CloudAPIKeyStore: Sendable {
     /// 删除 API Key
     func deleteKey() throws {
         try keychain.delete(account: account)
+    }
+
+    /// 旧版统一条目迁移：早期版本只有一个 account=openai 条目。
+    /// 若旧条目有值且「分析（kimi）」条目为空：用户当年存的就是分析 Key，
+    /// 自动迁移到 kimi 条目并清空旧条目，避免用户重输。
+    /// 分人条目不做猜测性迁移（无法判断旧值属于哪个服务，只能按分析处理）。
+    static func migrateLegacyKeyIfNeeded(
+        service: String = CloudAPIKeyStore.defaultService
+    ) {
+        let legacy = CloudAPIKeyStore(service: service, account: CloudProvider.legacyAccount)
+        let analysis = CloudAPIKeyStore.store(for: .analysis, service: service)
+        guard !analysis.hasConfiguredKey,
+              let legacyValue = try? legacy.readKey(),
+              !legacyValue.isEmpty else {
+            return
+        }
+        do {
+            try analysis.saveKey(legacyValue)
+            try legacy.deleteKey()
+            AppLog.persistence.info("API Key 已从旧版统一条目迁移到分析条目")
+        } catch {
+            // 迁移失败不清空旧条目，下次启动重试；只记录脱敏错误类型
+            AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent(
+                "key_migration_failed", error: String(describing: type(of: error))
+            ))
+        }
     }
 }

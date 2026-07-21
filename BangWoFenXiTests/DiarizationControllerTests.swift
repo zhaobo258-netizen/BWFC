@@ -16,6 +16,7 @@ final class DiarizationControllerTests {
     let controller: DiarizationController
     let meeting: Meeting
     let timeline: RecordingTimeline
+    let keychainServiceName = "com.zhaobo.BangWoFenXi.tests.\(UUID().uuidString)"
 
     init() throws {
         tempDirectory = FileManager.default.temporaryDirectory
@@ -26,10 +27,14 @@ final class DiarizationControllerTests {
         transcriptController = LocalTranscriptionController(service: mockTranscription)
         sleepCalls = LockedBox([])
         let sleeps = sleepCalls
+        // 注入已配置的分人 Key（Key 分家后 start 需要检查配置）
+        try CloudAPIKeyStore.store(for: .diarization, service: keychainServiceName)
+            .saveKey("test-diarization-key")
         controller = DiarizationController(
             diarization: mockDiarization,
             fileStore: fileStore,
             transcriptController: transcriptController,
+            keyStore: CloudAPIKeyStore.store(for: .diarization, service: keychainServiceName),
             sleep: { ms in sleeps.withLock { $0.append(ms) } }
         )
 
@@ -59,6 +64,7 @@ final class DiarizationControllerTests {
 
     deinit {
         try? FileManager.default.removeItem(at: tempDirectory)
+        try? CloudAPIKeyStore.store(for: .diarization, service: keychainServiceName).deleteKey()
     }
 
     /// 启动转写控制器与编排（建立会议关联）

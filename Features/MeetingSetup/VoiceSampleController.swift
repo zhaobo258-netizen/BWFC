@@ -83,7 +83,7 @@ final class VoiceSampleController {
             currentParticipantID = nil
             currentFileURL = nil
             lastErrorDescription = error.localizedDescription
-            AppLog.audio.error("\(LogSanitizer.formatEvent("voice_sample_start_failed", error: String(describing: type(of: error))))")
+            AppLog.logError(AppLog.audio, LogSanitizer.formatEvent("voice_sample_start_failed", error: String(describing: type(of: error))))
             throw error
         }
     }
