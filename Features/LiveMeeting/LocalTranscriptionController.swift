@@ -57,8 +57,8 @@ final class LocalTranscriptionController {
                 }
             }
             assetDownloadProgress = nil
-            // 完成后自动重查：恢复 ready 则清除不可用状态
-            let updated = await checkAvailability()
+            // 完成后自动重查（强制刷新，绕过 TTL 缓存）：恢复 ready 则清除不可用状态
+            let updated = await checkAvailability(forceRefresh: true)
             if updated.isReady {
                 runState = .idle
                 lastErrorDescription = nil
@@ -70,15 +70,32 @@ final class LocalTranscriptionController {
         }
     }
 
-    init(service: any LocalTranscriptionServicing) {
+    init(service: any LocalTranscriptionServicing,
+         availabilityCacheTTL: TimeInterval = 30) {
         self.service = service
+        self.availabilityCachePolicy = AvailabilityCachePolicy(ttl: availabilityCacheTTL)
     }
 
-    /// 检查普通话可用性（会中界面 onAppear 与开始录音前调用）
+    // MARK: - 可用性检查（TTL 缓存，杜绝热路径反复探测）
+
+    /// 控制器侧可用性缓存有效期（秒；init 可注入，测试用小值）
+    static let defaultAvailabilityCacheTTL: TimeInterval = 30
+    private let availabilityCachePolicy: AvailabilityCachePolicy
+    private var availabilityCheckedAt: Date?
+
+    /// 检查普通话可用性（会中界面 onAppear 与开始录音前调用）。
+    /// TTL 内直接复用缓存；forceRefresh 用于下载完成后强制重查。
     @discardableResult
-    func checkAvailability() async -> TranscriptionAvailability {
+    func checkAvailability(forceRefresh: Bool = false) async -> TranscriptionAvailability {
+        if !forceRefresh,
+           let checkedAt = availabilityCheckedAt,
+           availabilityCachePolicy.shouldReuse(checkedAt: checkedAt, now: Date()),
+           let availability {
+            return availability
+        }
         let result = await service.checkMandarinAvailability()
         availability = result
+        availabilityCheckedAt = Date()
         if !result.isReady, runState == .idle {
             runState = .unavailable(result.issueSummary ?? "本地转写不可用")
         }
@@ -142,9 +159,11 @@ final class LocalTranscriptionController {
     func finish() async {
         collectTask?.cancel()
         collectTask = nil
+        pendingFlushTask?.cancel()
+        pendingFlushTask = nil
         await service.finishSession()
         reconciler.dropProvisional()
-        segments = reconciler.allSegments
+        publishSegments()
         runState = .idle
     }
 
@@ -152,13 +171,51 @@ final class LocalTranscriptionController {
     func cancel() async {
         collectTask?.cancel()
         collectTask = nil
+        pendingFlushTask?.cancel()
+        pendingFlushTask = nil
         await service.cancelSession()
         reconciler.reset()
         segments = []
         runState = .idle
     }
 
-    // MARK: - 结果消费
+    // MARK: - 结果消费与发布节流
+
+    /// 临时结果发布最小间隔（秒）：volatile 结果高频到达，
+    /// 每次到达都全量发布会驱动整个转写面板重建（渲染风暴回归的根因），
+    /// 因此节流为最多每秒数次；最终结果永远立即发布。
+    static let provisionalPublishInterval: TimeInterval = 0.25
+
+    /// 片段序列发布次数（回归测试观测口：验证单位时间发布上限）
+    private(set) var segmentsPublishCount = 0
+
+    private var lastProvisionalPublishAt: Date = .distantPast
+    private var pendingFlushTask: Task<Void, Never>?
+
+    /// 发布当前片段序列（唯一出口，计数可观测）
+    private func publishSegments() {
+        segments = reconciler.allSegments
+        segmentsPublishCount += 1
+    }
+
+    /// 临时结果：立即发布或登记一次尾随刷新（节流）
+    private func publishProvisionalThrottled() {
+        let now = Date()
+        if now.timeIntervalSince(lastProvisionalPublishAt) >= Self.provisionalPublishInterval {
+            lastProvisionalPublishAt = now
+            publishSegments()
+            return
+        }
+        // 间隔内：只登记一次尾随刷新，保证最终文字一致
+        guard pendingFlushTask == nil else { return }
+        pendingFlushTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(Int(Self.provisionalPublishInterval * 1000)))
+            guard let self, !Task.isCancelled else { return }
+            self.lastProvisionalPublishAt = Date()
+            self.pendingFlushTask = nil
+            self.publishSegments()
+        }
+    }
 
     /// 应用云端确认片段（阶段 3：由 DiarizationController 调用，作为唯一合并点）。
     /// 人工已修订片段不被覆盖（TranscriptReconciler 保证）。
@@ -188,12 +245,12 @@ final class LocalTranscriptionController {
         case .skippedManual, .duplicate, .discardedEmpty:
             break
         }
-        segments = reconciler.allSegments
+        publishSegments()
     }
 
     /// 会话结束时把 reconciler 的最终片段与会议片段对齐（不新增，仅刷新视图）
     func refreshSegments() {
-        segments = reconciler.allSegments
+        publishSegments()
     }
 
     private func consume(_ result: LocalTranscriptResult) {
@@ -213,13 +270,18 @@ final class LocalTranscriptionController {
                 onFinalSegment?()
                 onNewFinalSegment?()
             }
+            // 最终结果：立即发布（并取消未执行的尾随刷新）
+            pendingFlushTask?.cancel()
+            pendingFlushTask = nil
+            publishSegments()
         } else {
             _ = reconciler.upsertProvisional(
                 startMs: startWallMs,
                 endMs: endWallMs,
                 text: result.text
             )
+            // 临时结果：节流发布（渲染风暴防护）
+            publishProvisionalThrottled()
         }
-        segments = reconciler.allSegments
     }
 }

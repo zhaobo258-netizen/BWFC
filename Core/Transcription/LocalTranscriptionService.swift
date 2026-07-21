@@ -118,9 +118,29 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
         self.resultsContinuation = continuation
     }
 
-    // MARK: - 可用性检查（不静默降级）
+    // MARK: - 可用性检查（不静默降级；结果按 TTL 缓存，杜绝热路径反复 XPC 探测）
+
+    /// 可用性缓存（服务侧，TTL 60 秒）
+    private var cachedAvailability: (value: TranscriptionAvailability, checkedAt: Date)?
+    private let availabilityCachePolicy = AvailabilityCachePolicy(ttl: 60)
 
     func checkMandarinAvailability() async -> TranscriptionAvailability {
+        if let cached = cachedAvailability,
+           availabilityCachePolicy.shouldReuse(checkedAt: cached.checkedAt, now: Date()) {
+            return cached.value
+        }
+        let result = await probeMandarinAvailability()
+        cachedAvailability = (result, Date())
+        return result
+    }
+
+    /// 使缓存失效（语言资源下载完成后调用）
+    private func invalidateAvailabilityCache() {
+        cachedAvailability = nil
+    }
+
+    /// 实际探测（每次调用都可能触发 XPC，禁止在热路径直接调用）
+    private func probeMandarinAvailability() async -> TranscriptionAvailability {
         var issues: [String] = []
 
         let transcriberAvailable = SpeechTranscriber.isAvailable
@@ -192,6 +212,7 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
             try await request.downloadAndInstall()
             poller.cancel()
             onProgress(1)
+            invalidateAvailabilityCache()
         } catch {
             poller.cancel()
             // 失败透出真实错误（由界面展示，可重试）
@@ -273,17 +294,17 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
     func feed(_ buffer: AVAudioPCMBuffer) async {
         guard let input = lock.withLock({ inputContinuation }) else { return }
 
-        // 首个缓冲到达时确定目标格式并按需建立转换器
+        // 首个缓冲到达时确定目标格式并按需建立转换器。
+        // 单飞（single-flight）：并发 feed 共享同一个解析任务，
+        // 杜绝启动瞬间几十个 Task 同时发起 bestAvailableAudioFormat 的 XPC 风暴。
         if lock.withLock({ targetFormat == nil }),
-           let transcriber = lock.withLock({ self.transcriber }),
-           let best = await SpeechAnalyzer.bestAvailableAudioFormat(
-               compatibleWith: [transcriber],
-               considering: buffer.format
-           ) {
+           let resolved = await resolveTargetFormat(for: buffer.format) {
             lock.withLock {
-                self.targetFormat = best
-                if best != buffer.format {
-                    self.converter = AVAudioConverter(from: buffer.format, to: best)
+                if self.targetFormat == nil {
+                    self.targetFormat = resolved
+                    if resolved != buffer.format {
+                        self.converter = AVAudioConverter(from: buffer.format, to: resolved)
+                    }
                 }
             }
         }
@@ -298,6 +319,43 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
             outputBuffer = converted
         }
         input.yield(AnalyzerInput(buffer: outputBuffer))
+    }
+
+    /// 目标格式解析任务（单飞；同一时间最多一个在途）
+    private var formatResolutionTask: Task<AVAudioFormat?, Never>?
+    /// 解析任务代际（防止过期的 awaiter 清掉新会话的任务）
+    private var formatResolutionGeneration = 0
+
+    /// 解析分析所需目标格式（并发调用共享同一任务，只发起一次 XPC）
+    private func resolveTargetFormat(for inputFormat: AVAudioFormat) async -> AVAudioFormat? {
+        if let existing = lock.withLock({ targetFormat }) {
+            return existing
+        }
+        let (task, generation): (Task<AVAudioFormat?, Never>, Int) = lock.withLock {
+            if let inFlight = formatResolutionTask {
+                return (inFlight, formatResolutionGeneration)
+            }
+            guard let transcriber = self.transcriber else {
+                return (Task { nil }, formatResolutionGeneration)
+            }
+            formatResolutionGeneration += 1
+            let newTask = Task<AVAudioFormat?, Never> {
+                await SpeechAnalyzer.bestAvailableAudioFormat(
+                    compatibleWith: [transcriber],
+                    considering: inputFormat
+                )
+            }
+            formatResolutionTask = newTask
+            return (newTask, formatResolutionGeneration)
+        }
+        let resolved = await task.value
+        lock.withLock {
+            // 代际未变才清空（会话重启后不得清掉新任务）
+            if generation == formatResolutionGeneration {
+                formatResolutionTask = nil
+            }
+        }
+        return resolved
     }
 
     /// 格式转换（采集硬件格式 → 分析所需格式）
@@ -364,6 +422,7 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
             transcriber = nil
             converter = nil
             targetFormat = nil
+            formatResolutionTask = nil
             collectorTask = nil
             running = false
         }

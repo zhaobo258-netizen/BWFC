@@ -128,10 +128,12 @@ struct TranscriptPanelView: View {
         }
     }
 
-    /// 说话人修改菜单（含待识别映射与清除）
+    /// 说话人修改菜单（含待识别映射与清除）。
+    /// 性能说明：菜单内容扁平化（Section + ForEach 直排，无嵌套 Menu），
+    /// 避免每行每次重建都构造子菜单与泛型解析（渲染风暴回归修复）。
     @ViewBuilder
     private func speakerMenu(for segment: TranscriptSegment) -> some View {
-        Menu("修改说话人") {
+        Section("修改说话人") {
             ForEach(participants) { participant in
                 Button {
                     onAssignSpeaker?(segment, participant)
@@ -144,7 +146,6 @@ struct TranscriptPanelView: View {
                 }
             }
             if segment.participantId != nil {
-                Divider()
                 Button("清除说话人映射") {
                     onAssignSpeaker?(segment, nil)
                 }

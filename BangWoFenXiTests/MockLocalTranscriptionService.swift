@@ -20,6 +20,7 @@ final class MockLocalTranscriptionService: LocalTranscriptionServicing, @uncheck
     private(set) var cancelCount = 0
     private(set) var fedBufferCount = 0
     private(set) var installCallCount = 0
+    private(set) var availabilityProbeCount = 0
     var startError: (any Error)?
 
     /// 安装脚本：设置后 installMandarinAssets 抛出该错误
@@ -36,7 +37,8 @@ final class MockLocalTranscriptionService: LocalTranscriptionServicing, @uncheck
     }
 
     func checkMandarinAvailability() async -> TranscriptionAvailability {
-        availability
+        availabilityProbeCount += 1
+        return availability
     }
 
     func startSession(contextualStrings: [String]) async throws {

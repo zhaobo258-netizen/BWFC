@@ -41,8 +41,9 @@ final class AssetInstallationTests {
         _ = await controller.checkAvailability()
         #expect(!controller.canInstallChineseAssets, "已安装时不得显示下载入口")
 
+        // 场景切换（资源被卸载/换机器）：强制刷新绕过 TTL 缓存
         mock.availability = supportedNotInstalled()
-        _ = await controller.checkAvailability()
+        _ = await controller.checkAvailability(forceRefresh: true)
         #expect(controller.canInstallChineseAssets)
     }
 
