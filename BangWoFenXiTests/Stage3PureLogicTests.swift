@@ -88,29 +88,51 @@ struct RetryPolicyTests {
     }
 }
 
-/// 说话人映射：已知代号、未知标签稳定分配字母（实施计划 7.5）
+/// 说话人映射：已知代号、未知标签稳定分配字母（实施计划 7.5）。
+/// 含渲染路径纯度保证：resolve 为非 mutating 纯函数（自激死循环根因修复）。
 @Suite("说话人映射")
 struct SpeakerMapperTests {
     @Test("已知代号映射到参会人")
     func knownAlias() {
         let participant = Participant(cloudAlias: "p_01", displayName: "测试", side: .counterpart)
-        var mapper = SpeakerMapper(participants: [participant])
+        let mapper = SpeakerMapper(participants: [participant])
         #expect(mapper.resolve(remoteLabel: "p_01") == .known(participantId: participant.id))
     }
 
-    @Test("未知标签按出现顺序分配「待识别 A/B」，同一标签稳定")
-    func unknownLabels() {
+    @Test("resolve 为非 mutating 纯函数：可在不可变绑定上调用（渲染路径安全证明）")
+    func resolveIsPure() {
+        let participant = Participant(cloudAlias: "p_01", displayName: "测试", side: .counterpart)
+        var mutableMapper = SpeakerMapper(participants: [participant])
+        mutableMapper.register(remoteLabel: "spk_x")
+        // 关键证明：let 绑定上可调用 resolve（若 resolve 是 mutating，此行无法编译）
+        let frozenMapper = mutableMapper
+        #expect(frozenMapper.resolve(remoteLabel: "spk_x") == .unknown(displayName: "待识别 A"))
+        #expect(frozenMapper.resolve(remoteLabel: nil) == .unknown(displayName: "识别中"))
+        // 纯解析绝不分配字母：未登记标签返回通用「待识别」，且不改变内部状态
+        #expect(frozenMapper.resolve(remoteLabel: "spk_new") == .unknown(displayName: "待识别"))
+        #expect(frozenMapper.unknownCount == 1, "纯解析不得登记新标签（视图求期零写入）")
+    }
+
+    @Test("未知标签：显式登记后按出现顺序分配字母，同一标签稳定")
+    func registerThenResolve() {
         var mapper = SpeakerMapper(participants: [])
+        // 未登记：通用「待识别」，不分配
+        #expect(mapper.resolve(remoteLabel: "spk_x") == .unknown(displayName: "待识别"))
+        #expect(mapper.unknownCount == 0)
+        // 登记：按顺序分配
+        mapper.register(remoteLabel: "spk_x")
+        mapper.register(remoteLabel: "spk_y")
         #expect(mapper.resolve(remoteLabel: "spk_x") == .unknown(displayName: "待识别 A"))
         #expect(mapper.resolve(remoteLabel: "spk_y") == .unknown(displayName: "待识别 B"))
-        // 同一标签再次解析：仍是 A
-        #expect(mapper.resolve(remoteLabel: "spk_x") == .unknown(displayName: "待识别 A"))
+        // 重复登记幂等
+        mapper.register(remoteLabel: "spk_x")
         #expect(mapper.unknownCount == 2)
+        #expect(mapper.resolve(remoteLabel: "spk_x") == .unknown(displayName: "待识别 A"))
     }
 
     @Test("空标签显示「识别中」")
     func nilLabel() {
-        var mapper = SpeakerMapper(participants: [])
+        let mapper = SpeakerMapper(participants: [])
         #expect(mapper.resolve(remoteLabel: nil) == .unknown(displayName: "识别中"))
         #expect(mapper.resolve(remoteLabel: "") == .unknown(displayName: "识别中"))
     }

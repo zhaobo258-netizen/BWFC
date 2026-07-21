@@ -3,6 +3,12 @@ import Foundation
 /// 说话人映射（纯逻辑，实施计划 7.5）：
 /// 云端返回的说话人标签 → 本地参会人 或「待识别 A/B」。
 /// 已知参会人通过云端代号（p_01…p_04）匹配；未知标签按出现顺序稳定分配字母。
+///
+/// 并发与渲染安全（血泪教训）：
+/// resolve 必须是**非 mutating 纯函数**——此前 mutating 版本在 @Observable
+/// 控制器的存储属性上被视图求值路径调用时，每次调用都经修改访问器触发
+/// 变更通知 → 视图失效 → 再次求值 → 再次调用，形成自激更新死循环。
+/// 未知标签的字母分配改由 register 在模型层显式完成。
 struct SpeakerMapper: Sendable {
     /// 云端代号 → 参会人 ID
     private let participantByAlias: [String: UUID]
@@ -21,25 +27,34 @@ struct SpeakerMapper: Sendable {
     enum Resolution: Equatable, Sendable {
         /// 已映射到参会人
         case known(participantId: UUID)
-        /// 未识别：展示标签（如「待识别 A」）
+        /// 未识别：展示标签（如「待识别 A」；未登记标签显示「待识别」）
         case unknown(displayName: String)
     }
 
-    /// 解析一个云端说话人标签（可重复调用，同一未知标签得到同一展示名）
-    mutating func resolve(remoteLabel: String?) -> Resolution {
+    /// 纯解析（不修改内部状态，可在视图求值期间安全调用）。
+    /// 未登记的未知标签返回通用「待识别」；登记后返回稳定字母。
+    func resolve(remoteLabel: String?) -> Resolution {
         guard let remoteLabel, !remoteLabel.isEmpty else {
             return .unknown(displayName: "识别中")
         }
         if let participantId = participantByAlias[remoteLabel] {
             return .known(participantId: participantId)
         }
-        // 云端可能会直接返回已知代号之外的标签（如 speaker_1 或云端自定义名）
         if let letter = unknownLabelLetters[remoteLabel] {
             return .unknown(displayName: "待识别 \(letter)")
         }
-        let letter = Self.letter(forIndex: unknownLabelLetters.count)
-        unknownLabelLetters[remoteLabel] = letter
-        return .unknown(displayName: "待识别 \(letter)")
+        return .unknown(displayName: "待识别")
+    }
+
+    /// 显式登记未知标签并分配字母（仅允许在模型层处理云端结果时调用，
+    /// 不得在视图求值/布局期间调用）。
+    mutating func register(remoteLabel: String?) {
+        guard let remoteLabel, !remoteLabel.isEmpty,
+              participantByAlias[remoteLabel] == nil,
+              unknownLabelLetters[remoteLabel] == nil else {
+            return
+        }
+        unknownLabelLetters[remoteLabel] = Self.letter(forIndex: unknownLabelLetters.count)
     }
 
     /// 当前已分配的未知标签数量

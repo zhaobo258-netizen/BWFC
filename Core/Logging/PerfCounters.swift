@@ -17,6 +17,7 @@ enum PerfCounters {
         case segmentsNoChangeSkip   = "无变化跳过"
         case cloudSegmentApplied    = "云端片段"
         case timerTick              = "计时器"
+        case panelBodyEval          = "面板求值"
     }
 
     /// signpost 日志（Points of Interest 类别，可用 Instruments 观测）
@@ -43,6 +44,11 @@ enum PerfCounters {
             return counts[counter] ?? 0
         }
         signposter.emitEvent("perf", "\(counter.rawValue)=\(value)")
+    }
+
+    /// 面板 body 求值计数（视图自激排查：零模型发布时该计数必须近乎静止）
+    static func incrementPanelBodyEval() {
+        increment(.panelBodyEval)
     }
 
     /// 当前快照（调试界面读取）

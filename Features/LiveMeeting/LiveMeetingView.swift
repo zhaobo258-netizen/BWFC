@@ -22,6 +22,9 @@ struct LiveMeetingView: View {
     @State private var highlightedSegmentID: UUID?
     /// 结束时分片未处理完毕的选择弹窗（实施计划 11.2：允许稍后继续处理）
     @State private var showPendingChunksChoice = false
+    /// 计时器锚点（固定在视图创建时；避免 TimelineView(from: .now)
+    /// 因每次父级重建重新锚定而引发的额外调度）
+    @State private var timerAnchor = Date()
     /// 分片轮询定时器（录音中每 2 秒检查一次分片产出）
     private let chunkPollTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
@@ -130,7 +133,7 @@ struct LiveMeetingView: View {
             }
 
             // 录音时长（墙钟，含暂停）
-            TimelineView(.periodic(from: .now, by: 1)) { context in
+            TimelineView(.periodic(from: timerAnchor, by: 1)) { context in
                 let _ = PerfCounters.increment(.timerTick) // 计时器存证（渲染风暴排查）
                 Text(Self.formatDuration(ms: recorder?.elapsedWallMs(at: context.date) ?? 0))
                     .monospacedDigit()
@@ -300,7 +303,7 @@ struct LiveMeetingView: View {
     // MARK: - 调试计数条（渲染风暴排查；UserDefaults bwfxDebugCounters=YES 开启）
 
     private var debugCountersBar: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { _ in
+        TimelineView(.periodic(from: timerAnchor, by: 1)) { _ in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 10) {
                     ForEach(PerfCounters.snapshot(), id: \.counter) { item in

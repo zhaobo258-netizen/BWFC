@@ -317,9 +317,13 @@ struct MeetingReviewView: View {
     /// 按时间序解析未知说话人标签，稳定分配「待识别 A/B」
     private func rebuildUnknownSpeakerNames(for meeting: Meeting) {
         var mapper = SpeakerMapper(participants: meeting.participants)
-        var names: [UUID: String] = [:]
+        // 先按时间序登记全部未知标签（模型层显式分配字母），再纯解析
         for segment in meeting.segments.sorted(by: { $0.startMs < $1.startMs })
         where segment.participantId == nil {
+            mapper.register(remoteLabel: segment.remoteSpeakerLabel)
+        }
+        var names: [UUID: String] = [:]
+        for segment in meeting.segments where segment.participantId == nil {
             if case .unknown(let displayName) = mapper.resolve(remoteLabel: segment.remoteSpeakerLabel) {
                 names[segment.id] = displayName
             }

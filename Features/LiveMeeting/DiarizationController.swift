@@ -248,6 +248,8 @@ final class DiarizationController {
     /// 云端相对时间 → 会议时间轴 → 交给合并点
     private func applyResult(_ result: DiarizationChunkResult, for entry: ChunkQueueEntry) throws {
         for segment in result.segments {
+            // 未知标签登记（模型层显式分配字母；渲染路径只做纯解析）
+            mapper.register(remoteLabel: segment.speakerLabel)
             let resolution = mapper.resolve(remoteLabel: segment.speakerLabel)
             let participantId: UUID?
             if case .known(let id) = resolution {

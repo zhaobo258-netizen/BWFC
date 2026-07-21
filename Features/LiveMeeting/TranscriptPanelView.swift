@@ -76,7 +76,8 @@ struct TranscriptPanelView: View {
     @State private var editingText: String = ""
 
     var body: some View {
-        ScrollViewReader { proxy in
+        let _ = PerfCounters.incrementPanelBodyEval() // 求值计数（自激排查；写非观测全局，安全）
+        return ScrollViewReader { proxy in
             ZStack(alignment: .bottomTrailing) {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 6) {
