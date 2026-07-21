@@ -18,6 +18,7 @@ let package = Package(
                 "Scripts",
                 "Resources",
                 "Entitlements.plist",
+                "README.md",
                 // 打包与测试执行器的临时产物
                 "build"
             ],

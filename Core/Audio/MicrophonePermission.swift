@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import AppKit
 
 /// 麦克风权限（实施计划 5.1：首次使用请求麦克风权限）
 enum MicrophonePermission {
@@ -20,5 +21,14 @@ enum MicrophonePermission {
         @unknown default:
             return false
         }
+    }
+
+    /// 打开系统设置的麦克风隐私页（权限被拒绝后的明确入口，实施计划 11.2）
+    @MainActor
+    static func openSystemSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") else {
+            return
+        }
+        NSWorkspace.shared.open(url)
     }
 }

@@ -94,7 +94,7 @@ struct MeetingListView: View {
                 case .recording, .paused, .finalizing:
                     router.showLiveMeeting(meeting.id)
                 case .draft, .ready:
-                    router.showMeetingSetup()
+                    router.showMeetingSetup(editing: meeting.id)
                 }
             } label: {
                 HStack {

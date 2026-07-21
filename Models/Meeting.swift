@@ -1,8 +1,20 @@
 import Foundation
 
 // 注意：本机 Command Line Tools 工具链缺少 SwiftDataMacros 编译器插件（仅随 Xcode 分发），
-// @Model 宏无法展开。阶段 0 的模型先以纯 Swift 类实现，字段与实施计划第 9 节完全一致；
+// @Model 宏无法展开。模型先以纯 Swift 类实现，字段与实施计划第 9 节一致；
 // 安装 Xcode 后这些类将恢复为 SwiftData @Model（字段不变，仅加回宏标注与关系声明）。
+
+/// 录音暂停区间（会议时间轴，毫秒）。
+/// 阶段 1：用于回放时标注暂停区间、校验「暂停区间无异常音频」。
+struct PauseInterval: Codable, Hashable, Sendable {
+    /// 暂停开始的会议时间轴毫秒
+    var startMs: Int64
+    /// 恢复录音的会议时间轴毫秒
+    var endMs: Int64
+
+    /// 区间时长（毫秒）
+    var durationMs: Int64 { endMs - startMs }
+}
 
 /// 会议状态（实施计划 9.1 / 11.1）
 enum MeetingStatus: String, Codable, Sendable, CaseIterable {
@@ -104,6 +116,13 @@ final class Meeting: Identifiable, Codable {
     /// 增量分析游标：已分析到的片段结束毫秒
     var lastAnalyzedSegmentEndMs: Int64
 
+    // MARK: - 阶段 1 新增字段（录音与会前准备）
+
+    /// 会前选择的音频输入设备 ID（AVCaptureDevice.uniqueID；nil 表示系统默认）
+    var preferredInputDeviceID: String?
+    /// 录音暂停区间（会议时间轴），回放与审计使用
+    var pauseIntervals: [PauseInterval]
+
     /// 参会人
     var participants: [Participant] = []
     /// 转写片段
@@ -124,7 +143,9 @@ final class Meeting: Identifiable, Codable {
         endedAt: Date? = nil,
         audioRelativePath: String? = nil,
         audioUploadConsentAt: Date? = nil,
-        lastAnalyzedSegmentEndMs: Int64 = 0
+        lastAnalyzedSegmentEndMs: Int64 = 0,
+        preferredInputDeviceID: String? = nil,
+        pauseIntervals: [PauseInterval] = []
     ) {
         self.id = id
         self.title = title
@@ -139,6 +160,31 @@ final class Meeting: Identifiable, Codable {
         self.audioRelativePath = audioRelativePath
         self.audioUploadConsentAt = audioUploadConsentAt
         self.lastAnalyzedSegmentEndMs = lastAnalyzedSegmentEndMs
+        self.preferredInputDeviceID = preferredInputDeviceID
+        self.pauseIntervals = pauseIntervals
+    }
+
+    // 自定义解码：新增字段允许缺失并回退默认值，保证旧版本 JSON 可读
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        background = try container.decodeIfPresent(String.self, forKey: .background) ?? ""
+        ourGoal = try container.decodeIfPresent(String.self, forKey: .ourGoal) ?? ""
+        ourBottomLine = try container.decodeIfPresent(String.self, forKey: .ourBottomLine) ?? ""
+        counterpartContext = try container.decodeIfPresent(String.self, forKey: .counterpartContext) ?? ""
+        glossary = try container.decodeIfPresent([String].self, forKey: .glossary) ?? []
+        status = try container.decode(MeetingStatus.self, forKey: .status)
+        startedAt = try container.decodeIfPresent(Date.self, forKey: .startedAt)
+        endedAt = try container.decodeIfPresent(Date.self, forKey: .endedAt)
+        audioRelativePath = try container.decodeIfPresent(String.self, forKey: .audioRelativePath)
+        audioUploadConsentAt = try container.decodeIfPresent(Date.self, forKey: .audioUploadConsentAt)
+        lastAnalyzedSegmentEndMs = try container.decodeIfPresent(Int64.self, forKey: .lastAnalyzedSegmentEndMs) ?? 0
+        preferredInputDeviceID = try container.decodeIfPresent(String.self, forKey: .preferredInputDeviceID)
+        pauseIntervals = try container.decodeIfPresent([PauseInterval].self, forKey: .pauseIntervals) ?? []
+        participants = try container.decodeIfPresent([Participant].self, forKey: .participants) ?? []
+        segments = try container.decodeIfPresent([TranscriptSegment].self, forKey: .segments) ?? []
+        snapshots = try container.decodeIfPresent([AnalysisSnapshot].self, forKey: .snapshots) ?? []
     }
 
     /// 经状态机校验的状态转换；非法转换抛出错误并保持原状态
