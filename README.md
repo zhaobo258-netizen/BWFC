@@ -1,7 +1,7 @@
 # 帮我分析（BangWoFenXi）
 
 面向线下中文商务谈判的 Mac App：实时录音、同声转写、结构总结与证据化谈判分析。
-本仓库已完成 **阶段 0（工程骨架）** 与 **阶段 1（会前准备与本地录音）**。
+本仓库已完成 **阶段 0（工程骨架）**、**阶段 1（会前准备与本地录音）** 与 **阶段 2（Apple Speech 本地同声转写）**。
 
 - 实施计划：`../01_帮我分析_Mac_MVP开发实施计划.md`
 - 平台：Apple Silicon Mac，macOS 26+，Swift 6（严格并发）
@@ -20,6 +20,23 @@
 - 会后回放：AVAudioPlayer 播放/暂停/进度拖动与暂停区间标注。
 - 录音核心逻辑（时间线换算、路径约定、编排服务、电平评估）均为可单测纯逻辑，
   AVAudioEngine 只做薄壳，硬件经 `AudioCaptureServicing` 协议隔离。
+
+## 阶段 2 已实现
+
+- 本地同声转写：`SpeechTranscriber`（timeIndexedProgressiveTranscription preset，
+  临时/最终结果均带 CMTimeRange）；`isAvailable` + zh-Hans 支持 + `AssetInventory`
+  资源状态三道检查，不可用则阻止开始并显示真实原因（不静默降级）。
+- 采集 tap 缓冲同时写录音文件与 SpeechAnalyzer（`onBuffer` 分发，
+  `bestAvailableAudioFormat` + AVAudioConverter 按需转换）。
+- 上下文词汇：glossary + 参会人姓名/角色经 `AnalysisContext.contextualStrings`
+  送入（仅改善识别，不改写原意）。
+- 片段合并：`TranscriptReconciler` 纯逻辑——临时片段同 ID 就地更新；最终结果按
+  「时间范围为主、规范化文本相似度为辅」去重（同文 ±2s 抖动、重叠 ≥50% 且
+  相似 ≥0.8 判重，重叠但文本不同保留），20 分钟模拟验证无重复片段。
+- 时间换算：分析器音频流时间经 `RecordingTimeline.wallMs(forEffectiveAudioMs:)`
+  逆映射回会议时间轴（正确还原暂停区间）。
+- 底部转写 UI：时间/说话人（未识别显示「识别中」）/正文/状态；自动滚动 +
+  上翻暂停 + 「回到最新」；临时文字浅色；最终替换就地更新不跳动。
 
 ## 构建与运行
 

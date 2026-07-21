@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 @testable import BangWoFenXi
 
 /// Mock 音频采集服务：不触碰硬件，记录调用序列，可模拟电平与设备断开。
@@ -26,6 +27,7 @@ final class MockAudioCaptureService: AudioCaptureServicing, @unchecked Sendable 
 
     var onLevel: (@Sendable (Float) -> Void)?
     var onDeviceDisconnected: (@Sendable () -> Void)?
+    var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
 
     private(set) var activeDeviceID: String?
     var activeDeviceName: String? {

@@ -23,6 +23,9 @@ protocol AudioCaptureServicing: AnyObject, Sendable {
     var onLevel: (@Sendable (Float) -> Void)? { get set }
     /// 当前使用中的设备被拔出 / 失效回调（在后台线程触发）
     var onDeviceDisconnected: (@Sendable () -> Void)? { get set }
+    /// 原始缓冲回调（阶段 2：同时送入录音文件与 SpeechAnalyzer；
+    /// 仅在「录音中」状态时触发，暂停期间不触发；在实时线程触发，不得阻塞）
+    var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)? { get set }
 
     /// 列出可用输入设备
     func inputDevices() -> [AudioInputDevice]
@@ -55,6 +58,15 @@ enum AudioCaptureError: Error, Equatable {
     case incompatibleDeviceFormat
     /// 引擎启动失败
     case engineStartFailed(String)
+}
+
+/// 实时音频通路专用：把非 Sendable 的 PCM 缓冲送入并发域的盒子。
+/// 安全性说明：tap 回调交付后缓冲由接收方独占使用，采集侧不再读写。
+struct SendableAudioBuffer: @unchecked Sendable {
+    let buffer: AVAudioPCMBuffer
+    init(_ buffer: AVAudioPCMBuffer) {
+        self.buffer = buffer
+    }
 }
 
 extension AudioCaptureError: LocalizedError {
@@ -97,6 +109,7 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
 
     var onLevel: (@Sendable (Float) -> Void)?
     var onDeviceDisconnected: (@Sendable () -> Void)?
+    var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
 
     private var disconnectObserver: NSObjectProtocol?
     private var configChangeObserver: NSObjectProtocol?
@@ -296,19 +309,22 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
         }
     }
 
-    /// tap 实时回调：写文件 + 计算 RMS 电平（节流约 10Hz）
+    /// tap 实时回调：写文件 + 分发缓冲 + 计算 RMS 电平（节流约 10Hz）
     private func processTapBuffer(_ buffer: AVAudioPCMBuffer) {
         let (file, shouldWrite) = lock.withLock { (audioFile, writingEnabled) }
         if shouldWrite, let file {
             try? file.write(from: buffer)
+        }
+        // 阶段 2：录音中把缓冲同时分发给语音分析（暂停期间不分发）
+        if shouldWrite {
+            onBuffer?(buffer)
         }
         // 电平：约每 8 个缓冲上报一次（4096 帧 @44.1kHz ≈ 93ms）
         bufferCountSinceLevel += 1
         guard bufferCountSinceLevel >= 8 else { return }
         bufferCountSinceLevel = 0
         let rms = Self.rmsLevel(of: buffer)
-        let report = shouldWrite ? rms : rms // 电平监听与录音都上报
-        onLevel?(report)
+        onLevel?(rms)
     }
 
     /// 计算缓冲 RMS（0…1），支持 float32 / int16 常见格式

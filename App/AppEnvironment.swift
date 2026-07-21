@@ -35,7 +35,7 @@ final class AppEnvironment {
         fileStore: MeetingFileStore,
         apiKeyStore: CloudAPIKeyStore = CloudAPIKeyStore(),
         audioCapture: any AudioCaptureServicing = AVAudioCaptureService(),
-        localTranscription: any LocalTranscriptionServicing = UnimplementedLocalTranscriptionService(),
+        localTranscription: any LocalTranscriptionServicing = AppleSpeechTranscriptionService(),
         diarization: any DiarizationServicing = UnimplementedDiarizationService(),
         negotiationAnalysis: any NegotiationAnalysisServicing = UnimplementedNegotiationAnalysisService(),
         exporter: any MeetingExportServicing = UnimplementedMeetingExportService(),

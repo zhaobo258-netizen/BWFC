@@ -58,6 +58,23 @@ struct RecordingTimeline: Sendable {
     func effectiveAudioMs(at date: Date) -> Int64 {
         wallMs(at: date) - totalPausedMs(at: date)
     }
+
+    /// 逆映射：音频流时间（不含暂停）→ 会议时间轴毫秒。
+    /// 阶段 2：SpeechAnalyzer 结果时间基于「送入的音频流」，需经此映射回到会议时间轴。
+    /// 边界说明：音频时间恰好等于某暂停起点锚点时，对应的是恢复后的第一帧，
+    /// 因此使用严格小于比较（该帧应映射到暂停结束之后）。
+    func wallMs(forEffectiveAudioMs audioMs: Int64) -> Int64 {
+        var pausedBefore: Int64 = 0
+        for interval in intervals.sorted(by: { $0.startMs < $1.startMs }) {
+            // 该暂停起点在音频流时间中的位置 = 墙钟起点 - 此前的累计暂停
+            let audioAnchor = interval.startMs - pausedBefore
+            if audioMs < audioAnchor {
+                return audioMs + pausedBefore
+            }
+            pausedBefore += interval.durationMs
+        }
+        return audioMs + pausedBefore
+    }
 }
 
 /// 时间线错误

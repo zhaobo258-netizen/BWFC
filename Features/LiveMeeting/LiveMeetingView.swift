@@ -1,8 +1,9 @@
 import SwiftUI
 
-/// 会中界面（阶段 1）：
-/// 顶部状态栏（会议名称、录音状态、时长、麦克风）、录音控制（开始/暂停/继续/结束）。
-/// 底部同声转写（阶段 2）与左右两栏分析（阶段 4）暂为占位说明。
+/// 会中界面（阶段 2）：
+/// 顶部状态栏（录音状态、时长、麦克风、本地转写状态）、录音控制、
+/// 底部同声转写（本地即时文字 + 临时/最终状态）。
+/// 左右两栏分析为阶段 4 占位。
 struct LiveMeetingView: View {
     @Environment(AppEnvironment.self) private var environment
     @Environment(AppRouter.self) private var router
@@ -11,6 +12,7 @@ struct LiveMeetingView: View {
 
     @State private var meeting: Meeting?
     @State private var recorder: MeetingRecordingService?
+    @State private var transcription: LocalTranscriptionController?
     @State private var showEndConfirmation = false
     @State private var operationError: String?
     @State private var newDeviceID: String?
@@ -28,7 +30,11 @@ struct LiveMeetingView: View {
                 }
                 workingArea(meeting: meeting)
                 Divider()
-                transcriptPlaceholder
+                TranscriptPanelView(
+                    segments: transcription?.segments ?? [],
+                    participants: meeting.participants
+                )
+                .frame(height: 220)
             } else {
                 Text("会议不存在或已被删除")
                     .foregroundStyle(.secondary)
@@ -49,11 +55,11 @@ struct LiveMeetingView: View {
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("结束后将停止录音并进入会后页面，不能重新开始。")
+            Text("结束后将停止录音与转写并进入会后页面，不能重新开始。")
         }
     }
 
-    // MARK: - 顶部状态栏（实施计划 6.2 的录音相关部分）
+    // MARK: - 顶部状态栏（实施计划 6.2）
 
     private func statusBar(meeting: Meeting) -> some View {
         HStack(spacing: 16) {
@@ -79,9 +85,14 @@ struct LiveMeetingView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
+            // 本地转写状态
+            Label(transcriptionStatusText, systemImage: "text.bubble")
+                .font(.callout)
+                .foregroundStyle(transcriptionStatusColor)
+
             Spacer()
 
-            // 云端状态（阶段 0 起：未配置时明确标记）
+            // 云端状态（未配置时明确标记）
             Text(environment.isCloudConfigured ? "云端已配置" : "云端未配置")
                 .font(.caption)
                 .foregroundStyle(environment.isCloudConfigured ? .green : .orange)
@@ -113,6 +124,25 @@ struct LiveMeetingView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+    }
+
+    /// 本地转写状态文案（实施计划 6.2：本地转写状态必须始终显示）
+    private var transcriptionStatusText: String {
+        guard let transcription else { return "本地转写待启动" }
+        switch transcription.runState {
+        case .idle: return "本地转写就绪"
+        case .running: return "本地转写中"
+        case .unavailable(let reason): return "本地转写不可用：\(reason)"
+        }
+    }
+
+    private var transcriptionStatusColor: Color {
+        guard let transcription else { return .secondary }
+        switch transcription.runState {
+        case .idle: return .secondary
+        case .running: return .green
+        case .unavailable: return .orange
+        }
     }
 
     // MARK: - 设备中断提示（实施计划 11.2：麦克风拔出）
@@ -174,22 +204,6 @@ struct LiveMeetingView: View {
         .frame(maxHeight: .infinity)
     }
 
-    // MARK: - 底部转写占位（阶段 2 实现）
-
-    private var transcriptPlaceholder: some View {
-        HStack {
-            Text("同声转写")
-                .font(.headline)
-            Text("本地即时转写将在阶段 2 实现；录音文件正在持续写入本机。")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-            Spacer()
-        }
-        .padding(16)
-        .frame(height: 120)
-        .background(.quaternary.opacity(0.3))
-    }
-
     // MARK: - 行为
 
     private func errorBanner(text: String) -> some View {
@@ -210,13 +224,18 @@ struct LiveMeetingView: View {
             return
         }
         meeting = loaded
-        let service = MeetingRecordingService(
+        let recordingService = MeetingRecordingService(
             capture: environment.audioCapture,
             fileStore: environment.fileStore
         )
-        recorder = service
-        // 异常路径兜底：如果会议仍处于 recording/paused（例如上次未恢复），
-        // 会话由启动时的恢复流程处理，这里只读展示，不自动重启采集。
+        recorder = recordingService
+        let controller = LocalTranscriptionController(service: environment.localTranscription)
+        controller.onFinalSegment = { [environment, loaded] in
+            try? environment.persist(loaded)
+        }
+        transcription = controller
+        // 进入界面即检查本地转写可用性（不可用时在状态栏显示真实原因）
+        Task { await controller.checkAvailability() }
     }
 
     private func startRecording(meeting: Meeting) {
@@ -226,19 +245,60 @@ struct LiveMeetingView: View {
             MicrophonePermission.openSystemSettings()
             return
         }
-        run {
-            try recorder?.startRecording(for: meeting, deviceID: meeting.preferredInputDeviceID)
-            persist(meeting)
+
+        // Apple 中文模型不可用：阻止开始并显示真实原因，不静默切换（实施计划 11.2）
+        if let availability = transcription?.availability, !availability.isReady {
+            operationError = "无法开始：本地中文转写不可用。\n\(availability.issueSummary ?? "")"
+            return
+        }
+
+        Task {
+            // 可用性尚未返回时先等待一次检查结果
+            if transcription?.availability == nil {
+                let result = await transcription?.checkAvailability()
+                if result?.isReady == false {
+                    operationError = "无法开始：本地中文转写不可用。\n\(result?.issueSummary ?? "")"
+                    return
+                }
+            }
+
+            do {
+                try recorder?.startRecording(for: meeting, deviceID: meeting.preferredInputDeviceID)
+                persist(meeting)
+                operationError = nil
+
+                // 录音成功后启动本地转写，并把缓冲分发给 SpeechAnalyzer
+                if let recorder, let transcription {
+                    try await transcription.start(for: meeting) { [weak recorder] in
+                        recorder?.timeline
+                    }
+                    // 采集线程直接喂给转写服务（服务内部按会话状态丢弃空转输入）
+                    let transcriptionService = environment.localTranscription
+                    environment.audioCapture.onBuffer = { buffer in
+                        let boxed = SendableAudioBuffer(buffer)
+                        Task { await transcriptionService.feed(boxed.buffer) }
+                    }
+                }
+            } catch {
+                operationError = error.localizedDescription
+            }
         }
     }
 
     private func finishRecording() {
         guard let meeting else { return }
-        run {
-            try recorder?.finishRecording()
+        Task {
+            do {
+                try recorder?.finishRecording()
+                persist(meeting)
+                operationError = nil
+            } catch {
+                operationError = error.localizedDescription
+                return
+            }
+            environment.audioCapture.onBuffer = nil
+            await transcription?.finish()
             persist(meeting)
-        }
-        if operationError == nil {
             router.showMeetingReview(meeting.id)
         }
     }
