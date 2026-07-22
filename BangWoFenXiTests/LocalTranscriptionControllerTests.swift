@@ -29,6 +29,15 @@ final class LocalTranscriptionControllerTests {
         try await Task.sleep(for: .milliseconds(100))
     }
 
+    /// 轮询等待片段数达到预期（并行高负载下消费任务调度可能超过固定睡眠窗口；
+    /// 超时后退出循环，由后续断言如实判定——同步方式加固，不降低断言强度）
+    private func waitForSegmentCount(_ expected: Int, timeout: Duration = .seconds(2)) async {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline, controller.segments.count != expected {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
     @Test("不可用则拒绝启动并给出真实原因")
     func startRefusedWhenUnavailable() async throws {
         mock.availability = TranscriptionAvailability(
@@ -128,7 +137,7 @@ final class LocalTranscriptionControllerTests {
                                         text: "已确认的一句。", isFinal: true))
         mock.emit(LocalTranscriptResult(startAudioMs: 1000, endAudioMs: 2000,
                                         text: "尚未确认的半句", isFinal: false))
-        try await settle()
+        await waitForSegmentCount(2)
         #expect(controller.segments.count == 2)
 
         await controller.finish()

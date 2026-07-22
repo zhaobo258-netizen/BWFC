@@ -20,6 +20,16 @@ final class RenderingStormRegressionTests {
         try await Task.sleep(for: .milliseconds(ms))
     }
 
+    /// 轮询等待会议片段数达到预期（并行高负载下消费任务调度可能超过固定睡眠窗口；
+    /// 超时后退出循环，由后续断言如实判定——同步方式加固，不降低断言强度）
+    private func waitForMeetingSegmentCount(_ expected: Int, in meeting: Meeting,
+                                            timeout: Duration = .seconds(2)) async {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline, meeting.segments.count != expected {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
     // MARK: - 临时结果发布节流
 
     @Test("连续 50 个临时结果：发布次数受限，尾随刷新保证文字最终一致")
@@ -89,7 +99,7 @@ final class RenderingStormRegressionTests {
                 text: "第\(index)句不同内容的话。", isFinal: true
             ))
         }
-        try await settle(120)
+        await waitForMeetingSegmentCount(5, in: meeting)
         #expect(controller.segmentsPublishCount - baseline == 5,
                 "每个最终结果都必须立即发布")
         #expect(meeting.segments.count == 5)
