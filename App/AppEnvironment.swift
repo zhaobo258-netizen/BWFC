@@ -8,6 +8,8 @@ import Foundation
 final class AppEnvironment {
     /// 会议持久化存储（当前为 JSON 实现；Xcode 可用后替换为 SwiftData 实现）
     let meetingStore: any MeetingStoring
+    /// V2 项目持久化存储（产品文档 03 号 §9.1；本阶段仅注入，UI 暂不切换）
+    let projectStore: any ProjectStoring
     /// 会议文件存储（录音文件布局与相对路径）
     let fileStore: MeetingFileStore
 
@@ -40,6 +42,7 @@ final class AppEnvironment {
     init(
         meetingStore: any MeetingStoring,
         fileStore: MeetingFileStore,
+        projectStore: (any ProjectStoring)? = nil,
         audioCapture: any AudioCaptureServicing = AVAudioCaptureService(),
         localTranscription: any LocalTranscriptionServicing = AppleSpeechTranscriptionService(),
         diarization: any DiarizationServicing = OpenAIDiarizationService(),
@@ -50,6 +53,7 @@ final class AppEnvironment {
     ) {
         self.meetingStore = meetingStore
         self.fileStore = fileStore
+        self.projectStore = projectStore ?? InMemoryProjectStore()
         self.audioCapture = audioCapture
         self.localTranscription = localTranscription
         self.diarization = diarization
@@ -114,14 +118,42 @@ final class AppEnvironment {
         try fileStore.deleteMeetingFiles(for: meeting.id)
     }
 
+    // MARK: - V2 项目持久化便捷入口（镜像会议的按 id 覆盖语义）
+
+    /// 读取全部项目
+    func allProjects() throws -> [Project] {
+        try projectStore.loadProjects()
+    }
+
+    /// 保存单个项目（按 id 覆盖；不存在则追加）
+    func persist(_ project: Project) throws {
+        var projects = try projectStore.loadProjects()
+        if let index = projects.firstIndex(where: { $0.id == project.id }) {
+            projects[index] = project
+        } else {
+            projects.append(project)
+        }
+        try projectStore.saveProjects(projects)
+    }
+
     /// 生产环境：默认 JSON 持久化 + 文件存储
     static func live() -> AppEnvironment {
         // 旧版统一 Keychain 条目迁移（account=openai → 分析 kimi 条目）
         CloudAPIKeyStore.migrateLegacyKeyIfNeeded()
         do {
             let store = try JSONMeetingStore.makeDefault()
+            let projectStore = try JSONProjectStore.makeDefault()
             let fileStore = try MeetingFileStore.makeDefault()
-            return AppEnvironment(meetingStore: store, fileStore: fileStore)
+            // V1 → V2 一次性迁移：失败只脱敏记录，绝不抛出、绝不影响启动与旧数据
+            if let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+                let directory = base.appending(path: "BangWoFenXi", directoryHint: .isDirectory)
+                do {
+                    _ = try ProjectMigrationCoordinator(directory: directory).migrateIfNeeded()
+                } catch {
+                    AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent("project_migration_failed", error: String(describing: type(of: error))))
+                }
+            }
+            return AppEnvironment(meetingStore: store, fileStore: fileStore, projectStore: projectStore)
         } catch {
             // 持久化初始化失败：降级为内存库，保证界面可用；
             // 仅记录脱敏错误，不含路径与正文
@@ -129,6 +161,7 @@ final class AppEnvironment {
             return AppEnvironment(
                 meetingStore: InMemoryMeetingStore(),
                 fileStore: MeetingFileStore(baseDirectory: FileManager.default.temporaryDirectory),
+                projectStore: InMemoryProjectStore(),
                 isPersistentStorageUnavailable: true
             )
         }

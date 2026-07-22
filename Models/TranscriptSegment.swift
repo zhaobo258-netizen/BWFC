@@ -49,6 +49,15 @@ final class TranscriptSegment: Identifiable, Codable {
     /// 审计时间：最近更新
     var updatedAt: Date
 
+    // MARK: - V2 新增可选字段（产品文档 03 号 §8.3；合成 Codable 自动容忍缺失）
+
+    /// 说话人识别置信度（低/中/高；未识别时为 nil）
+    var speakerConfidence: Confidence?
+    /// 片段语言代码（如 zh-CN；未识别时为 nil）
+    var languageCode: String?
+    /// 来源资产 ID（多资产项目中标注片段出自哪份素材）
+    var sourceAssetId: UUID?
+
     init(
         id: UUID = UUID(),
         startMs: Int64,
@@ -60,7 +69,10 @@ final class TranscriptSegment: Identifiable, Codable {
         state: SegmentState,
         isStarred: Bool = false,
         createdAt: Date = Date(),
-        updatedAt: Date = Date()
+        updatedAt: Date = Date(),
+        speakerConfidence: Confidence? = nil,
+        languageCode: String? = nil,
+        sourceAssetId: UUID? = nil
     ) {
         self.id = id
         self.startMs = startMs
@@ -73,5 +85,8 @@ final class TranscriptSegment: Identifiable, Codable {
         self.isStarred = isStarred
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.speakerConfidence = speakerConfidence
+        self.languageCode = languageCode
+        self.sourceAssetId = sourceAssetId
     }
 }
