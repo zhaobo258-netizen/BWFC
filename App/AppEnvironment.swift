@@ -153,6 +153,12 @@ final class AppEnvironment {
                     AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent("project_migration_failed", error: String(describing: type(of: error))))
                 }
             }
+            // 录音资产缺失安全恢复（幂等；仅补写空路径且文件真实存在的项目，不动录音文件）
+            do {
+                _ = try ProjectAssetRepair.repairIfNeeded(store: projectStore, fileStore: fileStore)
+            } catch {
+                AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent("project_asset_repair_failed", error: String(describing: type(of: error))))
+            }
             return AppEnvironment(meetingStore: store, fileStore: fileStore, projectStore: projectStore)
         } catch {
             // 持久化初始化失败：降级为内存库，保证界面可用；
