@@ -15,7 +15,7 @@ final class ImportProcessingController {
     private let importService: any AudioImportServicing
     /// 转写服务工厂：每次导入用独立实例，不与实时录音会话争抢
     private let makeTranscriptionService: () -> any LocalTranscriptionServicing
-    private let analysisService: any NegotiationAnalysisServicing
+    private let analysisService: any ConversationAnalysisServicing
     private let fileStore: MeetingFileStore
     private let loadProject: (UUID) throws -> Project?
     private let persistProject: (Project) throws -> Void
@@ -39,7 +39,7 @@ final class ImportProcessingController {
     init(
         importService: any AudioImportServicing,
         makeTranscriptionService: @escaping () -> any LocalTranscriptionServicing,
-        analysisService: any NegotiationAnalysisServicing,
+        analysisService: any ConversationAnalysisServicing,
         fileStore: MeetingFileStore,
         isAnalysisConfigured: @escaping () -> Bool,
         loadProject: @escaping (UUID) throws -> Project?,
@@ -240,31 +240,22 @@ final class ImportProcessingController {
         }
     }
 
-    /// 分析：桥接运行时 Meeting，复用「最终分析」一次性整篇生成
+    /// 分析（阶段 D：V2 通用分析，语义分析师）：整篇一次性生成，快照直接写在 Project 上
     private func runAnalysis(for project: Project) async -> JobOutcome {
         guard !project.segments.isEmpty else {
             // 空转写没有可分析内容：如实完成（分析结果为空），不伪造洞察
             return .completed
         }
-        do {
-            let meeting = try ProjectRuntimeSession.makeRuntimeMeeting(from: project)
-            let controller = NegotiationAnalysisController(service: analysisService)
-            controller.attach(to: meeting)
-            await controller.generateFinalAnalysis()
-            if Task.isCancelled { return .cancelled }
-            if let failure = controller.lastFailureKind {
-                return .failed(category: "analysis_failed", retryable: true,
-                               message: "分析失败（\(failure)），可重试")
-            }
-            try ProjectRuntimeSession.applyRuntime(meeting, to: project)
-            // applyRuntime 按运行时状态覆盖 status；导入流水线以 Job 判定为准，恢复 processing
-            project.status = .processing
-            persistQuietly(project)
-            return .completed
-        } catch {
-            return .failed(category: String(describing: type(of: error)), retryable: true,
-                           message: "分析失败，可重试")
+        let controller = ConversationAnalysisController(service: analysisService)
+        controller.attach(to: project)
+        await controller.generateFinalAnalysis()
+        if Task.isCancelled { return .cancelled }
+        if let failure = controller.lastFailureKind {
+            return .failed(category: "analysis_failed", retryable: true,
+                           message: "分析失败（\(failure)），可重试")
         }
+        persistQuietly(project)
+        return .completed
     }
 
     // MARK: - Job 状态与持久化
@@ -303,6 +294,12 @@ final class ImportProcessingController {
                 stored.processingJobs = project.processingJobs
                 stored.segments = project.segments
                 stored.legacySnapshots = project.legacySnapshots
+                stored.analysisSnapshots = project.analysisSnapshots
+                // 场景自动建议由分析产生，属流水线拥有字段；用户手选（工作台写入
+                // scenarioWasUserSelected=true 并落库）优先，不被建议覆盖
+                if !stored.scenarioWasUserSelected {
+                    stored.scenario = project.scenario
+                }
                 stored.runtimeAssetRelativePath = project.runtimeAssetRelativePath
                 stored.startedAt = project.startedAt
                 stored.endedAt = project.endedAt

@@ -1,0 +1,296 @@
+import Foundation
+import Testing
+@testable import BangWoFenXi
+
+/// V2 通用分析调度（阶段 D，03 §9.2 / §10.3）：
+/// 触发 / 防抖 / 串行 / 游标 / 非法结果保留上一版 / 场景建议与用户修正。
+@Suite("通用分析调度")
+@MainActor
+final class ConversationAnalysisControllerTests {
+    let mock: MockConversationAnalysisService
+    let controller: ConversationAnalysisController
+    let project: Project
+    private let nowBox: LockedBox<Int64>
+
+    init() {
+        mock = MockConversationAnalysisService()
+        let nowBox = LockedBox<Int64>(1_000_000)
+        self.nowBox = nowBox
+        controller = ConversationAnalysisController(
+            service: mock,
+            nowMs: { nowBox.withLock { $0 } }
+        )
+        project = Project(title: "调度测试", sourceType: .liveRecording)
+        project.speakers.append(
+            Speaker(cloudAlias: "p_01", displayName: "王经理", role: "客户采购")
+        )
+        controller.attach(to: project)
+    }
+
+    /// 推进假时钟（毫秒）
+    private func advance(_ ms: Int64) {
+        nowBox.withLock { $0 += ms }
+    }
+
+    /// 向项目添加一个最终片段并通知调度器
+    @discardableResult
+    private func addFinalSegment(startMs: Int64, text: String) -> TranscriptSegment {
+        let segment = TranscriptSegment(
+            startMs: startMs, endMs: startMs + 2_000, text: text,
+            participantId: project.speakers[0].id,
+            source: .local, state: .final
+        )
+        project.segments.append(segment)
+        controller.noteNewFinalSegment()
+        return segment
+    }
+
+    /// 满足触发条件的三个片段
+    private func addThreeSegments() {
+        addFinalSegment(startMs: 0, text: "第一句。")
+        addFinalSegment(startMs: 2_000, text: "第二句。")
+        addFinalSegment(startMs: 4_000, text: "第三句。")
+    }
+
+    /// 造一个引用真实片段的合法条目
+    private func makeItem(text: String, category: String = "fact",
+                          evidence: TranscriptSegment) -> ConversationAnalysisOutputDTO.ItemDTO {
+        ConversationAnalysisOutputDTO.ItemDTO(
+            category: category, text: text, subjectSpeakerId: "p_01",
+            epistemicStatus: "explicit", confidence: "high",
+            evidenceSegmentIds: [evidence.id.uuidString]
+        )
+    }
+
+    @Test("不足 3 个新片段不发起分析")
+    func belowThresholdNoCall() async {
+        addFinalSegment(startMs: 0, text: "第一句。")
+        addFinalSegment(startMs: 2_000, text: "第二句。")
+        advance(20_000)
+        await controller.tick()
+        #expect(mock.calls.isEmpty)
+    }
+
+    @Test("满 3 个片段且过防抖：发起分析、快照落到 Project、游标推进、持久化回调触发")
+    func firesAfterDebounce() async {
+        addThreeSegments()
+        var persisted = false
+        controller.onSnapshotUpdated = { persisted = true }
+
+        await controller.tick()
+        #expect(mock.calls.isEmpty, "防抖未过不触发")
+
+        advance(10_100)
+        await controller.tick()
+        #expect(mock.calls.count == 1)
+        #expect(controller.currentSnapshot?.version == 1)
+        #expect(controller.currentSnapshot?.analyzedThroughMs == 6_000, "游标推进到已分析片段末尾")
+        #expect(project.analysisSnapshots.count == 1, "快照写入 Project 权威容器")
+        #expect(persisted, "快照更新必须触发持久化回调")
+        #expect(controller.lastSuccessAt != nil)
+        #expect(mock.calls[0].instructions == ConversationAnalysisPrompt.text(scenario: nil),
+                "未选场景时使用 auto 指令")
+    }
+
+    @Test("增量：第二次分析只发送游标之后的新片段，并携带上一版压缩状态")
+    func incrementalUsesCursor() async throws {
+        addThreeSegments()
+        let evidence = try #require(project.segments.first)
+        mock.resultQueue = [ConversationAnalysisOutputDTO(
+            headline: "第一版总览", detectedScenario: nil, scenarioConfidence: nil,
+            items: [makeItem(text: "第一版条目", evidence: evidence)]
+        )]
+        advance(10_100)
+        await controller.tick()
+        #expect(controller.currentSnapshot?.version == 1)
+
+        addFinalSegment(startMs: 6_000, text: "第四句。")
+        addFinalSegment(startMs: 8_000, text: "第五句。")
+        addFinalSegment(startMs: 10_000, text: "第六句。")
+        advance(10_100)
+        await controller.tick()
+
+        #expect(mock.calls.count == 2)
+        let secondInput = mock.calls[1].inputJSON
+        #expect(!secondInput.contains("第一句。"), "已分析片段不重复发送")
+        #expect(secondInput.contains("第四句。"))
+        #expect(secondInput.contains("第一版总览"), "上一版压缩状态随请求携带")
+        #expect(secondInput.contains("第一版条目"))
+        #expect(controller.currentSnapshot?.version == 2)
+        #expect(project.analysisSnapshots.count == 2)
+    }
+
+    @Test("证据校验端到端：云端返回引用不存在片段的项不进快照")
+    func evidenceFilteringEndToEnd() async throws {
+        addThreeSegments()
+        let real = try #require(project.segments.first)
+        mock.resultQueue = [ConversationAnalysisOutputDTO(
+            headline: nil, detectedScenario: nil, scenarioConfidence: nil,
+            items: [
+                ConversationAnalysisOutputDTO.ItemDTO(
+                    category: "fact", text: "引用不存在片段", subjectSpeakerId: nil,
+                    epistemicStatus: "explicit", confidence: "high",
+                    evidenceSegmentIds: [UUID().uuidString]
+                ),
+                makeItem(text: "引用真实片段", evidence: real)
+            ]
+        )]
+        advance(10_100)
+        await controller.tick()
+        let snapshot = try #require(controller.currentSnapshot)
+        #expect(snapshot.items.count == 1)
+        #expect(snapshot.items.first?.text == "引用真实片段")
+        #expect(snapshot.items.first?.subjectSpeakerId == project.speakers[0].id,
+                "代号回映射为本地说话人 ID")
+    }
+
+    @Test("串行：分析期间的 tick 不并发第二个请求（长会议不堆积）")
+    func serialSingleRequest() async {
+        mock.delayMs = 300
+        addThreeSegments()
+        advance(10_100)
+
+        async let first: Void = controller.tick()
+        try? await Task.sleep(for: .milliseconds(50))
+        addFinalSegment(startMs: 6_000, text: "第四句。")
+        await controller.tick()
+        await first
+        try? await Task.sleep(for: .milliseconds(500))
+
+        let callCount = mock.calls.count
+        #expect(callCount <= 2, "同一时间最多一个请求；新内容合并到下一次，实际 \(callCount) 次")
+    }
+
+    @Test("非法 JSON：保留上一版快照，不推进游标，状态如实提示")
+    func invalidResponseKeepsPreviousSnapshot() async throws {
+        addThreeSegments()
+        let evidence = try #require(project.segments.first)
+        mock.resultQueue = [ConversationAnalysisOutputDTO(
+            headline: "第一版", detectedScenario: nil, scenarioConfidence: nil,
+            items: [makeItem(text: "第一版条目", evidence: evidence)]
+        )]
+        advance(10_100)
+        await controller.tick()
+        let firstSnapshot = try #require(controller.currentSnapshot)
+
+        addFinalSegment(startMs: 6_000, text: "第四句。")
+        addFinalSegment(startMs: 8_000, text: "第五句。")
+        addFinalSegment(startMs: 10_000, text: "第六句。")
+        mock.errorQueue = [AnalysisAPIError.invalidResponse]
+        advance(10_100)
+        await controller.tick()
+
+        #expect(controller.currentSnapshot?.id == firstSnapshot.id, "非法结果必须保留上一版")
+        #expect(controller.currentSnapshot?.analyzedThroughMs == 6_000, "失败不推进游标")
+        #expect(project.analysisSnapshots.count == 1, "非法结果不落库")
+        #expect(controller.hasRecentFailure)
+        #expect(controller.statusDescription.contains("重试失败（结果不合规）"))
+        #expect(controller.statusDescription.contains("自动重试"))
+    }
+
+    @Test("401：云端分析暂停；修复后恢复")
+    func unauthorizedSuspends() async {
+        addThreeSegments()
+        mock.errorQueue = [AnalysisAPIError.unauthorized]
+        advance(10_100)
+        await controller.tick()
+
+        guard case .suspended = controller.state else {
+            Issue.record("401 必须使云端分析暂停")
+            return
+        }
+        await controller.tick()
+        #expect(mock.calls.count == 1, "暂停期间不发请求")
+
+        controller.resumeAfterKeyFix()
+        advance(30_100) // 过失败退避
+        await controller.tick()
+        #expect(mock.calls.count == 2)
+    }
+
+    @Test("结束后最终分析：消费完整最终转写（含已分析过的片段）")
+    func finalAnalysisUsesFullTranscript() async {
+        addThreeSegments()
+        advance(10_100)
+        await controller.tick()
+        #expect(controller.currentSnapshot?.version == 1)
+
+        await controller.generateFinalAnalysis()
+        #expect(mock.calls.count == 2)
+        let input = mock.calls[1].inputJSON
+        #expect(input.contains("第一句。"))
+        #expect(input.contains("第二句。"))
+        #expect(input.contains("第三句。"))
+        #expect(controller.currentSnapshot?.version == 2)
+    }
+
+    @Test("人工已修订片段参与分析；临时片段不参与")
+    func editedSegmentsEligible() async {
+        let edited = TranscriptSegment(startMs: 0, endMs: 2_000, text: "人工修订的句子。",
+                                       source: .manual, state: .edited)
+        project.segments.append(edited)
+        let provisional = TranscriptSegment(startMs: 2_000, endMs: 4_000, text: "临时半句",
+                                            source: .local, state: .provisional)
+        project.segments.append(provisional)
+        controller.noteNewFinalSegment()
+        controller.noteNewFinalSegment()
+        controller.noteNewFinalSegment()
+        advance(10_100)
+        await controller.tick()
+
+        #expect(mock.calls.count == 1)
+        #expect(mock.calls[0].inputJSON.contains("人工修订的句子。"))
+        #expect(!mock.calls[0].inputJSON.contains("临时半句"), "临时片段不参与分析")
+    }
+
+    @Test("场景自动建议：用户未手选时采纳模型建议并触发回调")
+    func scenarioSuggestionAdopted() async throws {
+        addThreeSegments()
+        let evidence = try #require(project.segments.first)
+        mock.resultQueue = [ConversationAnalysisOutputDTO(
+            headline: nil, detectedScenario: "client_visit", scenarioConfidence: "high",
+            items: [makeItem(text: "条目", evidence: evidence)]
+        )]
+        var suggested = false
+        controller.onScenarioSuggested = { suggested = true }
+        advance(10_100)
+        await controller.tick()
+
+        #expect(project.scenario == .clientVisit, "未手选时采纳模型建议")
+        #expect(!project.scenarioWasUserSelected, "自动建议不冒充用户手选")
+        #expect(suggested)
+    }
+
+    @Test("用户手选场景优先：模型建议不得覆盖，指令按手选场景组装")
+    func userScenarioNotOverridden() async throws {
+        project.scenario = .classLearning
+        project.scenarioWasUserSelected = true
+        addThreeSegments()
+        let evidence = try #require(project.segments.first)
+        mock.resultQueue = [ConversationAnalysisOutputDTO(
+            headline: nil, detectedScenario: "journalist_interview", scenarioConfidence: "high",
+            items: [makeItem(text: "条目", evidence: evidence)]
+        )]
+        var suggested = false
+        controller.onScenarioSuggested = { suggested = true }
+        advance(10_100)
+        await controller.tick()
+
+        #expect(project.scenario == .classLearning, "手选场景不被模型建议覆盖")
+        #expect(project.scenarioWasUserSelected)
+        #expect(!suggested)
+        #expect(mock.calls[0].instructions == ConversationAnalysisPrompt.text(scenario: .classLearning),
+                "指令按手选场景组装")
+        #expect(mock.calls[0].inputJSON.contains(#""scenario":"class_learning""#))
+    }
+
+    @Test("attach 恢复：重新进入项目时以最高版本快照为当前版")
+    func attachRestoresLatestSnapshot() {
+        let old = ConversationAnalysisSnapshot(version: 1, analyzedThroughMs: 10_000, items: [])
+        let latest = ConversationAnalysisSnapshot(version: 4, analyzedThroughMs: 88_000, items: [])
+        project.analysisSnapshots = [latest, old]
+        controller.attach(to: project)
+        #expect(controller.currentSnapshot?.version == 4)
+        #expect(controller.currentSnapshot?.analyzedThroughMs == 88_000)
+    }
+}

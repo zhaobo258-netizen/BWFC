@@ -19,8 +19,10 @@ final class AppEnvironment {
     let localTranscription: any LocalTranscriptionServicing
     /// 云端说话人识别（阶段 3 实现）
     let diarization: any DiarizationServicing
-    /// 云端谈判分析（阶段 4 实现）
+    /// 云端谈判分析（阶段 4 实现；V1 遗留，旧会议页面使用）
     let negotiationAnalysis: any NegotiationAnalysisServicing
+    /// V2 通用对话分析（阶段 D，语义分析师；工作台与导入流水线使用）
+    let conversationAnalysis: any ConversationAnalysisServicing
     /// 导出（阶段 5 实现：生成 Markdown/JSON 内容，保存位置由用户选择）
     let exporter: any MeetingExportServicing
     /// 音视频导入（阶段 C 实现：检查 + 音轨提取）
@@ -35,7 +37,7 @@ final class AppEnvironment {
         let controller = ImportProcessingController(
             importService: audioImport,
             makeTranscriptionService: makeImportTranscriptionService,
-            analysisService: negotiationAnalysis,
+            analysisService: conversationAnalysis,
             fileStore: fileStore,
             isAnalysisConfigured: { [weak self] in self?.isAnalysisConfigured ?? false },
             loadProject: { [weak self] id in
@@ -72,6 +74,7 @@ final class AppEnvironment {
         localTranscription: any LocalTranscriptionServicing = AppleSpeechTranscriptionService(),
         diarization: any DiarizationServicing = OpenAIDiarizationService(),
         negotiationAnalysis: any NegotiationAnalysisServicing = KimiAnalysisService(),
+        conversationAnalysis: (any ConversationAnalysisServicing)? = nil,
         exporter: (any MeetingExportServicing)? = nil,
         audioImport: (any AudioImportServicing)? = nil,
         makeImportTranscriptionService: (() -> any LocalTranscriptionServicing)? = nil,
@@ -85,6 +88,7 @@ final class AppEnvironment {
         self.localTranscription = localTranscription
         self.diarization = diarization
         self.negotiationAnalysis = negotiationAnalysis
+        self.conversationAnalysis = conversationAnalysis ?? KimiConversationAnalysisService()
         self.exporter = exporter ?? LocalMeetingExportService(meetingStore: meetingStore)
         self.audioImport = audioImport ?? AVFoundationAudioImportService(fileStore: fileStore)
         self.makeImportTranscriptionService = makeImportTranscriptionService ?? { AppleSpeechTranscriptionService() }

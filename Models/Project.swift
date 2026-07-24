@@ -113,9 +113,10 @@ final class Project: Identifiable, Codable {
     var speakers: [Speaker] = []
     /// 转写片段
     var segments: [TranscriptSegment] = []
-    /// 旧谈判分析快照：按 legacy 原样保留，供历史数据回看；
-    /// V2 通用 ConversationAnalysisSnapshot 属阶段 D，本阶段不实现
+    /// 旧谈判分析快照：按 legacy 原样保留，供历史数据回看
     var legacySnapshots: [AnalysisSnapshot] = []
+    /// V2 通用分析快照（阶段 D，03 §8.4）：新分析的权威存储
+    var analysisSnapshots: [ConversationAnalysisSnapshot] = []
     /// 旧 Meeting 专属字段存档（谈判背景/目标/底线/词汇等）；迁移时必有值，新建 V2 项目为 nil
     var legacyMetadata: LegacyMeetingMetadata?
     /// 项目笔记
@@ -145,6 +146,7 @@ final class Project: Identifiable, Codable {
         speakers: [Speaker] = [],
         segments: [TranscriptSegment] = [],
         legacySnapshots: [AnalysisSnapshot] = [],
+        analysisSnapshots: [ConversationAnalysisSnapshot] = [],
         legacyMetadata: LegacyMeetingMetadata? = nil,
         note: NoteDocument = NoteDocument(markdown: "", updatedAt: Date()),
         processingJobs: [ProcessingJob] = [],
@@ -169,6 +171,7 @@ final class Project: Identifiable, Codable {
         self.speakers = speakers
         self.segments = segments
         self.legacySnapshots = legacySnapshots
+        self.analysisSnapshots = analysisSnapshots
         self.legacyMetadata = legacyMetadata
         self.note = note
         self.processingJobs = processingJobs
@@ -197,6 +200,8 @@ final class Project: Identifiable, Codable {
         speakers = try container.decodeIfPresent([Speaker].self, forKey: .speakers) ?? []
         segments = try container.decodeIfPresent([TranscriptSegment].self, forKey: .segments) ?? []
         legacySnapshots = try container.decodeIfPresent([AnalysisSnapshot].self, forKey: .legacySnapshots) ?? []
+        // 兼容阶段 D 之前的 Project JSON（无 analysisSnapshots 键）
+        analysisSnapshots = try container.decodeIfPresent([ConversationAnalysisSnapshot].self, forKey: .analysisSnapshots) ?? []
         // 兼容补强前生成的 Project JSON（无 legacyMetadata 键）
         legacyMetadata = try container.decodeIfPresent(LegacyMeetingMetadata.self, forKey: .legacyMetadata)
         note = try container.decodeIfPresent(NoteDocument.self, forKey: .note) ?? NoteDocument(markdown: "", updatedAt: createdAt)

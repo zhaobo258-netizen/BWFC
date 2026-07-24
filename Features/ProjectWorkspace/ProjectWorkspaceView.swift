@@ -20,7 +20,7 @@ struct ProjectWorkspaceView: View {
     @State private var recorder: MeetingRecordingService?
     @State private var transcription: LocalTranscriptionController?
     @State private var diarization: DiarizationController?
-    @State private var analysis: NegotiationAnalysisController?
+    @State private var analysis: ConversationAnalysisController?
     @State private var noteController: NoteController?
     @State private var operationError: String?
     @State private var highlightedSegmentID: UUID?
@@ -283,6 +283,9 @@ struct ProjectWorkspaceView: View {
                 Text("AI 工作区")
                     .font(.subheadline)
                     .fontWeight(.semibold)
+                if let project {
+                    scenarioPicker(project: project)
+                }
                 Spacer()
                 Picker("", selection: $centerTab) {
                     ForEach(CenterTab.allCases, id: \.self) { tab in
@@ -296,24 +299,78 @@ struct ProjectWorkspaceView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
 
+            // 旧谈判项目（仅有迁移快照、无 V2 快照）继续用旧渲染（03 §16D 兼容显示）
+            let showLegacy = analysis?.currentSnapshot == nil
+                && !(project?.legacySnapshots.isEmpty ?? true)
             switch centerTab {
             case .summary:
-                StructureSummaryView(
-                    snapshot: analysis?.currentSnapshot,
-                    participants: meeting.participants,
-                    segments: transcription?.segments ?? meeting.segments,
-                    onEvidenceTap: locateEvidence
-                )
+                if showLegacy {
+                    StructureSummaryView(
+                        snapshot: legacySnapshot,
+                        participants: meeting.participants,
+                        segments: transcription?.segments ?? meeting.segments,
+                        onEvidenceTap: locateEvidence
+                    )
+                } else {
+                    ConversationAnalysisView(
+                        snapshot: analysis?.currentSnapshot,
+                        summaryTab: true,
+                        speakers: project?.speakers ?? [],
+                        onEvidenceTap: locateEvidence
+                    )
+                }
             case .insights:
-                InsightCardListView(
-                    snapshot: analysis?.currentSnapshot,
-                    participants: meeting.participants,
-                    segments: transcription?.segments ?? meeting.segments,
-                    onEvidenceTap: locateEvidence
-                )
+                if showLegacy {
+                    InsightCardListView(
+                        snapshot: legacySnapshot,
+                        participants: meeting.participants,
+                        segments: transcription?.segments ?? meeting.segments,
+                        onEvidenceTap: locateEvidence
+                    )
+                } else {
+                    ConversationAnalysisView(
+                        snapshot: analysis?.currentSnapshot,
+                        summaryTab: false,
+                        speakers: project?.speakers ?? [],
+                        onEvidenceTap: locateEvidence
+                    )
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    /// 旧谈判快照（迁移项目回看）
+    private var legacySnapshot: AnalysisSnapshot? {
+        project?.legacySnapshots.max(by: { $0.version < $1.version })
+    }
+
+    /// 场景选择器（03 §3.2：自动建议 + 用户随时修正；不阻塞任何流程）
+    private func scenarioPicker(project: Project) -> some View {
+        Menu {
+            ForEach(ProjectScenario.allCases, id: \.self) { scenario in
+                Button {
+                    project.scenario = scenario
+                    project.scenarioWasUserSelected = true
+                    persistProject()
+                } label: {
+                    if project.scenario == scenario {
+                        Label(scenario.displayName, systemImage: "checkmark")
+                    } else {
+                        Text(scenario.displayName)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "tag")
+                Text(project.scenario?.displayName ?? "场景：自动")
+            }
+            .font(.caption)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help(project.scenarioWasUserSelected ? "场景（已手动选择）" : "场景（自动建议，可修正）")
     }
 
     private var noteColumn: some View {
@@ -645,13 +702,14 @@ struct ProjectWorkspaceView: View {
         project.runtimeAssetRelativePath = fresh.runtimeAssetRelativePath
         project.endedAt = fresh.endedAt
         project.legacySnapshots = fresh.legacySnapshots
+        project.analysisSnapshots = fresh.analysisSnapshots
         project.segments = fresh.segments
         if let meeting {
             meeting.status = ProjectRuntimeSession.runtimeStatus(for: fresh.status)
             meeting.segments = fresh.segments
             meeting.snapshots = fresh.legacySnapshots
-            // 分析快照刷新（导入流水线的最终分析在后台生成）
-            analysis?.attach(to: meeting)
+            // 分析快照刷新（导入流水线的最终分析在后台生成；V2 快照直接挂在 Project 上）
+            analysis?.attach(to: project)
         }
     }
 
@@ -706,11 +764,11 @@ struct ProjectWorkspaceView: View {
             keyStore: environment.keyStore(for: .diarization)
         )
 
-        let analysisController = NegotiationAnalysisController(service: environment.negotiationAnalysis)
-        analysisController.attach(to: meeting)
+        let analysisController = ConversationAnalysisController(service: environment.conversationAnalysis)
+        analysisController.attach(to: project)
         analysisController.onSnapshotUpdated = { [environment] in
+            // V2 快照直接写在 Project 上，无需运行时桥接
             do {
-                try ProjectRuntimeSession.applyRuntime(meeting, to: project)
                 try environment.persist(project)
             } catch {
                 Task { @MainActor in self.operationError = "项目保存失败（\(String(describing: type(of: error)))）" }
@@ -852,7 +910,7 @@ struct ProjectWorkspaceView: View {
 private struct ProcessingDetailsButton: View {
     let transcription: LocalTranscriptionController?
     let diarization: DiarizationController?
-    let analysis: NegotiationAnalysisController?
+    let analysis: ConversationAnalysisController?
     let microphoneName: String?
     let isAnalysisConfigured: Bool
     let isDiarizationConfigured: Bool

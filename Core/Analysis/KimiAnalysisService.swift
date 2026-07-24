@@ -32,6 +32,16 @@ struct KimiAnalysisService: NegotiationAnalysisServicing {
     // MARK: - NegotiationAnalysisServicing
 
     func analyze(instructions: String, inputJSON: String) async throws -> AnalysisOutputDTO {
+        let text = try await rawAnalysisText(
+            system: instructions + "\n\n" + AnalysisSystemPrompt.jsonOutputSuffix,
+            inputJSON: inputJSON
+        )
+        return try decodeOutput(text)
+    }
+
+    /// 通用传输入口（V1 谈判分析与 V2 通用分析共用同一 HTTP/解析/日志路径）：
+    /// 发送 system + user 消息，返回模型的 text 块拼接文本。
+    func rawAnalysisText(system: String, inputJSON: String) async throws -> String {
         guard let apiKey = try apiKeyStore.readKey(), !apiKey.isEmpty else {
             throw AnalysisAPIError.missingAPIKey
         }
@@ -42,8 +52,7 @@ struct KimiAnalysisService: NegotiationAnalysisServicing {
             // 关闭思考：实测网关支持，消除 thinking 预算挤占 text 导致的 JSON 截断，
             // 且响应更快（探针验证 1.25s vs 2.47s）
             "thinking": ["type": "disabled"],
-            // 系统指令 = 8 条分析约束 + 纯文本 JSON 输出约束
-            "system": instructions + "\n\n" + AnalysisSystemPrompt.jsonOutputSuffix,
+            "system": system,
             "messages": [
                 ["role": "user", "content": inputJSON]
             ]
@@ -60,9 +69,8 @@ struct KimiAnalysisService: NegotiationAnalysisServicing {
         let startedAt = Date()
         do {
             let (data, response) = try await perform(request)
-            let text = try parse(data: data, response: response,
-                                 durationMs: Self.ms(since: startedAt))
-            return try decodeOutput(text)
+            return try parse(data: data, response: response,
+                             durationMs: Self.ms(since: startedAt))
         } catch let error as AnalysisAPIError {
             throw error
         } catch {
@@ -166,8 +174,8 @@ struct KimiAnalysisService: NegotiationAnalysisServicing {
         return text
     }
 
-    /// 剥离可能的 ```json 围栏并走统一严格解码（失败即 invalidResponse，保留上一版）
-    private func decodeOutput(_ text: String) throws -> AnalysisOutputDTO {
+    /// 剥离可能的 ```json 围栏（V1/V2 解码共用）
+    static func strippedJSONText(_ text: String) -> String {
         var trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.hasPrefix("```") {
             // 去掉首行围栏（```json 或 ```）与结尾围栏
@@ -179,6 +187,12 @@ struct KimiAnalysisService: NegotiationAnalysisServicing {
             }
             trimmed = trimmed.trimmingCharacters(in: .whitespacesAndNewlines)
         }
+        return trimmed
+    }
+
+    /// 剥离围栏并走统一严格解码（失败即 invalidResponse，保留上一版）
+    private func decodeOutput(_ text: String) throws -> AnalysisOutputDTO {
+        let trimmed = Self.strippedJSONText(text)
         guard let data = trimmed.data(using: .utf8),
               let dto = try? JSONDecoder().decode(AnalysisOutputDTO.self, from: data) else {
             // 截断迹象公开记录：输出长度与结尾是否闭合（不记内容）

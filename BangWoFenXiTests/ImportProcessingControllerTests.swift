@@ -11,7 +11,7 @@ final class ImportProcessingControllerTests {
     private let fileStore: MeetingFileStore
     private let store = InMemoryProjectStore()
     private let importMock: MockAudioImportService
-    private let analysisMock = MockNegotiationAnalysisService()
+    private let analysisMock = MockConversationAnalysisService()
     private var transcriptionMockFactory: @Sendable () -> MockLocalTranscriptionService
     private var analysisConfigured = false
 
@@ -101,7 +101,7 @@ final class ImportProcessingControllerTests {
         #expect(project.status == .ready)
         #expect(project.processingJobs.map(\.kind) == [.audioExtraction, .transcription, .analysis])
         #expect(project.processingJobs.allSatisfy { $0.status == .completed })
-        #expect(project.legacySnapshots.count == 1, "最终分析快照必须落库")
+        #expect(project.analysisSnapshots.count == 1, "最终分析快照必须落库（阶段 D：V2 通用分析容器）")
         #expect(analysisMock.calls.count == 1)
     }
 
