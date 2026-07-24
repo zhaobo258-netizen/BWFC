@@ -1,7 +1,8 @@
 # Agent.md — 给后续维护本项目的 AI 协作者
 
-> 你是《帮我分析》Mac App 的维护者。这是一个面向线下中文商务谈判的 macOS SwiftUI App：本地录音 + Apple Speech 实时转写 + 云端说话人识别 + Kimi 网关谈判分析。
-> 动手前请读完本文件；产品边界以 `../01_帮我分析_Mac_MVP开发实施计划.md` 为准；历史排查过程见 `开发日志.md`。
+> 你是《帮我分析》Mac App 的维护者。这是一个"对话记录与理解"工具（知识花园版）：本地录音/音视频导入 + Apple Speech 本地转写 + Kimi 通用语义分析（四场景）+ 项目制三栏工作台。V1 谈判版功能全部保留兼容。
+> 动手前请读完本文件；当前产品边界以 `../03_帮我分析_知识花园版_产品开发文档_20260722.md` 为准（V1 历史见 `../01_…MVP开发实施计划.md`）；历史排查过程见 `开发日志.md`。
+> 阶段进度：A（V2 数据底座）✅ B（首页+三栏工作台）✅ C（音视频导入）✅ D（通用分析与场景模板）✅ → E（Obsidian 归档）→ F（知识花园）→ G（稳定性交付）。
 
 ## 1. 环境现实（重要）
 
@@ -16,7 +17,7 @@
 ```bash
 cd /Users/zhaobo/系统软件开发/帮我分析-同声翻译/帮我分析
 swift build                 # 编译，要求 0 警告（Swift 6 严格并发）
-Scripts/run_tests.sh        # 全部测试（当前 224 例，必须全绿）
+Scripts/run_tests.sh        # 全部测试（当前 345 例 55 套件，必须全绿；BWFX_IT_MEDIA=1 加真实媒体探针）
 Scripts/make_app.sh         # 产出 build/BangWoFenXi.app（ad-hoc 签名 + entitlements）
 Scripts/soak_test.sh 3600 1 # 60 分钟录音稳定性（尚未完整跑过）
 ```
@@ -36,36 +37,44 @@ open ~/Applications/BangWoFenXi.app
 ## 3. 架构速览
 
 ```
-App/        @main、AppEnvironment（协议注入全部服务）、AppRouter
-Models/     Meeting（含状态机）、Participant、TranscriptSegment、AnalysisSnapshot、Insight、TopicState
-Features/   MeetingList / MeetingSetup / LiveMeeting / MeetingReview / Settings
+App/        @main、AppEnvironment（协议注入全部服务）、AppRouter（projectHome 默认）
+Models/     V2：Project（权威模型，analysisSnapshots/legacy* 兼容字段）、Speaker、
+            ConversationAnalysis（20 类单一枚举）、ProcessingJob、ArchiveState
+            V1 保留：Meeting（运行时桥接用）、Participant、TranscriptSegment、AnalysisSnapshot、Insight
+Features/   ProjectHome（新首页）/ ProjectWorkspace（三栏工作台 + V2 分析控制器/视图）/
+            ProjectImport（导入流水线）；旧 MeetingList/LiveMeeting/MeetingReview/Settings 保留
 Core/
   Audio/        AVAudioEngine 采集、录音编排、回放、暂停时间轴
   Transcription/ SpeechTranscriber 封装、TranscriptReconciler（合并去重核心纯逻辑）
+  Import/       AudioImportService（检查/提取）、FileTranscriptionRunner、ImportPlanner（Job 编排/续跑）
   Diarization/  20s 分片、上传队列（持久化+退避）、OpenAI 兼容 diarize、SpeakerMapper
-  Analysis/     KimiAnalysisService、输入组装（不可信包裹）、Schema 校验、触发器
-  Persistence/  MeetingStoring 协议 + JSON 实现、会议专属目录（数据库只存相对路径）
+  Analysis/     V2：ConversationAnalysis{Prompt,Schema,InputAssembler,Service}（语义分析师）
+                V1：KimiAnalysisService（V1/V2 共用传输层 rawAnalysisText）、AnalysisSchema、触发器
+  Persistence/  ProjectStore + MeetingStore（JSON 原子写）、ProjectMigration（V1→V2）、ProjectAssetRepair
   Security/     KeychainService、CloudAPIKeyStore（按 provider 分条目）
   Logging/      OSLog + 脱敏；Export/ Markdown/JSON
 ```
 
 关键约定：
 
-- UI 只依赖协议（AudioCaptureServicing、LocalTranscriptionServicing、DiarizationServicing、NegotiationAnalysisServicing、MeetingStoring…），测试用 Mock 注入。
+- UI 只依赖协议（…Servicing、MeetingStoring、ProjectStoring），测试用 Mock 注入。
+- **Project 是权威数据**；录音/转写链路复用只认 Meeting，经 `ProjectRuntimeSession` 纯函数桥接双向同步。V2 分析快照直接挂 Project，不经桥接。
+- 导入流水线持久化为**字段级合并**（只写自己拥有的字段），不得整对象覆盖工作台并发编辑的笔记/标题。
 - 模型 ID、网关地址、超时、max_tokens 全部集中在 `Core/Analysis/CloudModelConfig.swift`，禁止散落。
-- 所有耗时纯逻辑（分片规划、退避、合并去重、触发器、时间轴换算）都是可单测的值类型；AVFoundation/Speech 只做薄壳。
+- 所有耗时纯逻辑（分片规划、退避、合并去重、触发器、时间轴换算、Job 编排）都是可单测的值类型；AVFoundation/Speech 只做薄壳。
 
 ## 4. 云端配置现状
 
 | 用途 | Provider | 端点 | Keychain account |
 |---|---|---|---|
-| 谈判文字分析 | Kimi | `https://agent-gw.kimi.com/coding/v1/messages`（Anthropic 格式，模型 `kimi-for-coding`，`thinking: disabled`，max_tokens 16384，超时 240s） | `kimi` |
+| 对话语义分析（V2 主用 + V1 遗留） | Kimi | `https://agent-gw.kimi.com/coding/v1/messages`（Anthropic 格式，模型 `kimi-for-coding`，`thinking: disabled`，max_tokens 16384，超时 240s） | `kimi` |
 | 说话人识别 | OpenAI 兼容 | `POST /v1/audio/transcriptions`，`gpt-4o-transcribe-diarize` | `diarization`（当前**未配置**，灰态零请求） |
 
+- ⚠️ **网关迁移风险（2026-07-24 实测确认）**：Kimi 已从 agent-gw 时代迁移到 kimi-code 体系。新体系 OAuth token 打 `agent-gw.kimi.com` 全部 401；新网关 `https://api.kimi.com/coding/v1/messages` 对 `x-api-key` 与 `Authorization: Bearer` 均 200。App 硬编码 agent-gw + 用户 7/21 存的旧 Key 目前是遗留通道，**随时可能失效**。若实机分析 401：需决策切换端点与 Key 方案（新体系 token 900 秒过期 + refresh，不适合静态存 Keychain，需要产品级决策）。V2 真实联调已用新网关探针验证一次通过（10 片段 74s，21/21 证据有效，场景识别正确，注入不服从）。
 - 两个 Key **互不外借**；某 provider 401 只暂停它自己。旧 `openai` 条目会在启动时自动迁移到 `kimi`。
 - Kimi 无音频分人接口——这是已确认的能力缺口，不是 bug。接新分人 provider 时实现 `DiarizationServicing` 协议即可。
-- Kimi 网关无 JSON Schema 强制能力 → 系统提示词约束 + 本地 `AnalysisSchema` 严格解码 + 证据存在性过滤兜底；不合规输出按 `invalidResponse` 丢弃并保留上一版。
-- 真实延迟参考：10 分钟会议上下文，单次分析约 95 秒。不要在调度层假设 60 秒内返回。
+- Kimi 网关无 JSON Schema 强制能力 → 系统提示词约束 + 本地严格解码（V1 `AnalysisSchema` / V2 `ConversationAnalysisSchema`）+ 证据存在性过滤兜底；不合规输出按 `invalidResponse` 丢弃并保留上一版。
+- 真实延迟参考：10 分钟会议上下文，单次分析约 75–95 秒。不要在调度层假设 60 秒内返回。
 
 ## 5. 血泪教训（不要再踩）
 
@@ -76,6 +85,9 @@ Core/
 5. **AVAudioFile.read 会短读**（如 536/676 帧），读取必须循环到满；`URLSession` 会把 `httpBody` 转 `httpBodyStream`，测试两种形态兼容。
 6. **URLProtocol Mock 与 swift-testing 并行冲突**：用套件内 `.serialized` + 套件专属存储。
 7. **deinit 里别释放捕获 self 的 handler 闭包**（释放环）；handler 一律静态化。
+8. **异步流消费的测试禁止固定睡眠**，一律条件轮询（5–10s 上限，原断言判定）。高负载下固定睡眠窗口必抖（2026-07-22/23 两轮加固实录）。
+9. **测试必须用独立 Keychain service + 每用例独立临时目录**。触碰生产条目会弹 SecurityAgent 授权框把全量测试拖死 200+ 秒（2026-07-24 实锤）；钥匙串被锁（休眠后）同样会拖死，跑测试前确认已解锁。
+10. **`guard let x` 解包后别再 `if let x`**（阶段 D 掉线遗留的编译错误）；给打开中的工作台刷新存储副本时，**新增 Project 字段记得同步补进 `reloadImportedProjectFromStore` 的字段级刷新清单**（漏了 analysisSnapshots 一次）。
 
 ## 6. 产品红线（来自计划书，违者返工）
 
@@ -87,8 +99,9 @@ Core/
 
 ## 7. 当前未决事项（接手先看）
 
-1. 长会议（10 分钟+）分析持续多版更新的实机复核（第六版 `29ba298` 修复后待用户回报）。
-2. 说话人识别 provider 决策：OpenAI Key / 讯飞 / 火山 / 维持手动标注。
-3. 60 分钟完整 soak 未跑；导出 Markdown/JSON 的实机操作未验。
-4. 装 Xcode 后的回迁项：SwiftData 宏、`swift test`。
-5. 分析延迟 1.5–2 分钟/版 vs 计划 60 秒目标的偏差，需记入交付说明.md「未达指标」。
+1. **Kimi 网关迁移决策**（§4 ⚠️）：agent-gw 遗留通道失效时如何切换端点与 Key 管理方案。
+2. 实机验收欠账（代码已就绪，`~/Applications` 已装 7/24 新包待用户测试）：阶段 B/C/D 全套 golden path；paused 真实录音项目启动自动资产补写；mp3/mp4/mov 真实样例导入；60 分钟录音 soak 与 60 分钟导入全链路。
+3. 说话人识别 provider 决策：OpenAI Key / 讯飞 / 火山 / 维持手动标注（Kimi 无音频接口）。
+4. 阶段 E（Obsidian 归档）尚未开始：需要用户提供 Vault 位置决策。
+5. 装 Xcode 后的回迁项：SwiftData 宏、`swift test`。
+6. 分析延迟 1–2 分钟/版 vs 计划 60 秒目标的偏差，需记入交付说明.md「未达指标」。
