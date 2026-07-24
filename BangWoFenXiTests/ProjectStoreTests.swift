@@ -17,10 +17,16 @@ final class ProjectStoreTests {
         try? FileManager.default.removeItem(at: tempDirectory)
     }
 
+    /// 每个用例一个独立临时目录（套件内并行执行，共享目录会互相覆盖 projects.json）
+    private func makeCaseDirectory(_ name: String) -> URL {
+        tempDirectory.appending(path: "\(name)-\(UUID().uuidString)", directoryHint: .isDirectory)
+    }
+
     /// 完整模型树：写入 → 换一个 store 实例重新读取 → 字段逐一校验
     @Test("完整模型读写")
     func fullModelRoundTrip() throws {
-        let store = try JSONProjectStore(directory: tempDirectory)
+        let directory = makeCaseDirectory("roundtrip")
+        let store = try JSONProjectStore(directory: directory)
 
         let createdAt = Date(timeIntervalSince1970: 1_753_000_000)
         let startedAt = Date(timeIntervalSince1970: 1_753_000_100)
@@ -118,7 +124,7 @@ final class ProjectStoreTests {
         try store.saveProjects([project])
 
         // 换一个 store 实例重新读取
-        let reloadedStore = try JSONProjectStore(directory: tempDirectory)
+        let reloadedStore = try JSONProjectStore(directory: directory)
         let loaded = try reloadedStore.loadProjects()
         #expect(loaded.count == 1)
         let restored = try #require(loaded.first)
@@ -211,19 +217,20 @@ final class ProjectStoreTests {
 
     @Test("空库返回空数组")
     func emptyStoreReturnsEmpty() throws {
-        let store = try JSONProjectStore(directory: tempDirectory)
+        let store = try JSONProjectStore(directory: makeCaseDirectory("empty"))
         #expect(try store.loadProjects().isEmpty)
     }
 
     @Test("覆盖保存反映删除")
     func overwriteReflectsDeletion() throws {
-        let store = try JSONProjectStore(directory: tempDirectory)
+        let directory = makeCaseDirectory("overwrite")
+        let store = try JSONProjectStore(directory: directory)
         let first = Project(title: "项目一", sourceType: .liveRecording)
         let second = Project(title: "项目二", sourceType: .importedAudio)
         try store.saveProjects([first, second])
         try store.saveProjects([second])
 
-        let reloadedStore = try JSONProjectStore(directory: tempDirectory)
+        let reloadedStore = try JSONProjectStore(directory: directory)
         let loaded = try reloadedStore.loadProjects()
         #expect(loaded.count == 1)
         #expect(loaded.first?.id == second.id)
