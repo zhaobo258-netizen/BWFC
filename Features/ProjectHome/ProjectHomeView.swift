@@ -1,8 +1,10 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
-/// 首页（阶段 B，03 文档 §6.1）：开始录音 / 导入音视频 双入口 + 最近项目。
+/// 首页（阶段 B/C，03 文档 §6.1）：开始录音 / 导入音视频 双入口 + 最近项目。
 /// 开始录音：零预填，首次仅一次录音知情确认，随后直达工作台并立即开录。
-/// 导入音视频：阶段 C 才实现完整导入——入口保留并明确标注未上线，不伪造可用状态。
+/// 导入音视频（阶段 C）：文件选择或拖放；检查通过即创建项目直达工作台，
+/// 提取/转写/分析在后台流水线执行，重启后可续跑。
 struct ProjectHomeView: View {
     @Environment(AppEnvironment.self) private var environment
     @Environment(AppRouter.self) private var router
@@ -10,7 +12,8 @@ struct ProjectHomeView: View {
     @State private var projects: [Project] = []
     @State private var loadError: String?
     @State private var showConsent = false
-    @State private var showImportHint = false
+    @State private var importErrorMessage: String?
+    @State private var isDropTargeted = false
     /// 首次录音知情确认只做一次（03 §6.1）
     @AppStorage("bwfx.recordingConsentConfirmed") private var consentConfirmed = false
 
@@ -45,10 +48,16 @@ struct ProjectHomeView: View {
         } message: {
             Text("请确认参与者已知晓本次录音。\n录音、文稿与笔记默认只保存在本机；配置云端分析或说话人识别服务后，仅对应内容按需发送给对应服务，API Key 仅存于系统钥匙串。")
         }
-        .alert("音视频导入", isPresented: $showImportHint) {
+        .alert("无法导入", isPresented: Binding(
+            get: { importErrorMessage != nil },
+            set: { if !$0 { importErrorMessage = nil } }
+        )) {
             Button("知道了", role: .cancel) {}
         } message: {
-            Text("音视频导入将在后续版本提供。当前版本请使用「开始录音」。")
+            Text(importErrorMessage ?? "")
+        }
+        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
+            handleDrop(providers)
         }
     }
 
@@ -90,17 +99,21 @@ struct ProjectHomeView: View {
             .controlSize(.large)
 
             Button {
-                showImportHint = true
+                pickAndImportFile()
             } label: {
-                Label("导入音视频", systemImage: "square.and.arrow.down")
+                Label(environment.importProcessing.isRunning ? "导入处理中…" : "导入音视频",
+                      systemImage: "square.and.arrow.down")
                     .font(.headline)
                     .frame(maxWidth: .infinity, minHeight: 64)
             }
             .buttonStyle(.bordered)
             .controlSize(.large)
+            .disabled(environment.importProcessing.isRunning)
         }
         .overlay(alignment: .bottomTrailing) {
-            Text("导入将在后续版本提供")
+            Text(environment.importProcessing.isRunning
+                 ? "已有导入在后台处理，完成后可导入下一个"
+                 : "支持 m4a / mp3 / wav / caf / mp4 / mov，也可直接拖入本窗口")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .offset(y: 18)
@@ -230,6 +243,49 @@ struct ProjectHomeView: View {
         } catch {
             projects = []
             loadError = String(describing: type(of: error))
+        }
+    }
+
+    // MARK: - 导入音视频（阶段 C，03 §6.2）
+
+    /// 文件选择导入：检查通过即创建项目并直达工作台，处理在后台流水线继续
+    private func pickAndImportFile() {
+        let panel = NSOpenPanel()
+        panel.title = "导入音视频"
+        panel.allowsMultipleSelection = false // 首版一次一个文件（03 §6.2）
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.audio, .movie]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        beginImport(url: url)
+    }
+
+    /// 拖放导入：只取第一个文件（首版一次一个）
+    private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }) else {
+            return false
+        }
+        _ = provider.loadObject(ofClass: URL.self) { url, _ in
+            guard let url else { return }
+            Task { @MainActor in
+                beginImport(url: url)
+            }
+        }
+        return true
+    }
+
+    private func beginImport(url: URL) {
+        Task {
+            do {
+                let projectID = try await environment.importProcessing.beginImport(url: url)
+                reload()
+                router.showProjectWorkspace(projectID, autoStart: false)
+            } catch let error as AudioImportError {
+                importErrorMessage = error.userMessage
+            } catch let error as ImportBusyError {
+                importErrorMessage = error.userMessage
+            } catch {
+                importErrorMessage = "导入失败：\(error.localizedDescription)"
+            }
         }
     }
 }

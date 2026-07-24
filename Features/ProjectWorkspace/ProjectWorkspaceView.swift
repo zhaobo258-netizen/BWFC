@@ -59,11 +59,15 @@ struct ProjectWorkspaceView: View {
                 if case .suspended(let reason) = analysis?.state {
                     analysisSuspendedBanner(reason: reason)
                 }
-                if meeting.status.isAbnormalIfAppRelaunched, !isFinishing, !didStartSessionThisView {
+                if meeting.status.isAbnormalIfAppRelaunched, !isFinishing, !didStartSessionThisView,
+                   environment.importProcessing.activeProjectID != project.id {
                     abnormalBanner(meeting: meeting)
                 }
                 if let operationError {
                     errorBanner(text: operationError)
+                }
+                if project.sourceType != .liveRecording {
+                    importProgressSection(project: project)
                 }
                 ThreeColumnLayout {
                     transcriptColumn(meeting: meeting)
@@ -89,6 +93,9 @@ struct ProjectWorkspaceView: View {
         .onReceive(chunkPollTimer) { _ in
             diarization?.pollProgress()
             Task { await analysis?.tick() }
+        }
+        .onChange(of: importJobsStatusKey) { _, _ in
+            reloadImportedProjectFromStore()
         }
         .confirmationDialog("结束录音？", isPresented: $showEndConfirmation, titleVisibility: .visible) {
             Button("结束录音", role: .destructive) { finishRecording() }
@@ -241,7 +248,8 @@ struct ProjectWorkspaceView: View {
         VStack(alignment: .leading, spacing: 0) {
             columnHeader("录音文稿")
             TranscriptPanelView(
-                segments: transcription?.segments ?? meeting.segments,
+                // 控制器只反映本会话实时转写；只读回看与导入项目用已持久化片段
+                segments: (transcription?.segments.isEmpty ?? true) ? meeting.segments : (transcription?.segments ?? []),
                 participants: meeting.participants,
                 unknownSpeakerDisplay: { segment in
                     guard segment.participantId == nil else { return nil }
@@ -540,6 +548,111 @@ struct ProjectWorkspaceView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(.red.opacity(0.1))
+    }
+
+    // MARK: - 导入处理进度（阶段 C，03 §6.2：每个阶段独立显示进度，失败可从失败阶段重试）
+
+    /// 导入 Job 阶段的中文名
+    static func importStageName(_ kind: ProcessingJobKind) -> String {
+        switch kind {
+        case .audioExtraction: return "提取音轨"
+        case .transcription: return "转写"
+        case .diarization: return "分人"
+        case .analysis: return "分析"
+        case .knowledgeExpansion: return "知识关联"
+        case .obsidianArchive: return "归档"
+        }
+    }
+
+    private func importProgressSection(project: Project) -> some View {
+        let importer = environment.importProcessing
+        let isActive = importer.activeProjectID == project.id
+        let jobs = isActive ? importer.jobs : project.processingJobs
+        let hasRetryable = jobs.contains { $0.status == .failedRetryable }
+        let needsAttention = project.status == .processing || hasRetryable
+
+        return Group {
+            if isActive || needsAttention {
+                HStack(spacing: 12) {
+                    if isActive {
+                        ProgressView().controlSize(.small)
+                    }
+                    ForEach(jobs) { job in
+                        HStack(spacing: 4) {
+                            switch job.status {
+                            case .completed:
+                                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                            case .running:
+                                Image(systemName: "arrow.triangle.2.circlepath").foregroundStyle(.blue)
+                            case .pending:
+                                Image(systemName: "circle.dotted").foregroundStyle(.secondary)
+                            case .failedRetryable, .failedFinal:
+                                Image(systemName: "xmark.circle.fill").foregroundStyle(.orange)
+                            }
+                            Text(Self.importStageName(job.kind))
+                            if job.status == .running, let progress = job.progress, progress > 0 {
+                                Text("\(Int(progress * 100))%")
+                                    .monospacedDigit()
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .font(.callout)
+                    }
+                    Spacer()
+                    if let message = importer.lastErrorMessage, !isActive {
+                        Text(message)
+                            .font(.callout)
+                            .foregroundStyle(.orange)
+                            .lineLimit(1)
+                    }
+                    if !isActive, needsAttention {
+                        Button("继续处理") {
+                            environment.importProcessing.resume(projectID: project.id)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
+                    if isActive {
+                        Button("暂停处理") {
+                            environment.importProcessing.cancel()
+                        }
+                        .controlSize(.small)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(.blue.opacity(0.06))
+            }
+        }
+    }
+
+    /// 导入 Job 状态签名（进度百分比变化不触发重载，状态迁移才触发）
+    private var importJobsStatusKey: String {
+        environment.importProcessing.jobs
+            .map { "\($0.kind.rawValue):\($0.status.rawValue)" }
+            .joined(separator: ",")
+    }
+
+    /// 流水线阶段完成后，从存储刷新本视图的项目副本（字段级更新，不重建控制器；
+    /// 笔记与标题归工作台所有，不从存储回灌，避免覆盖正在编辑的内容）
+    private func reloadImportedProjectFromStore() {
+        guard let project, project.sourceType != .liveRecording,
+              let fresh = try? environment.allProjects().first(where: { $0.id == projectID }) else {
+            return
+        }
+        project.status = fresh.status
+        project.processingJobs = fresh.processingJobs
+        project.runtimeAssetRelativePath = fresh.runtimeAssetRelativePath
+        project.endedAt = fresh.endedAt
+        project.legacySnapshots = fresh.legacySnapshots
+        project.segments = fresh.segments
+        if let meeting {
+            meeting.status = ProjectRuntimeSession.runtimeStatus(for: fresh.status)
+            meeting.segments = fresh.segments
+            meeting.snapshots = fresh.legacySnapshots
+            // 分析快照刷新（导入流水线的最终分析在后台生成）
+            analysis?.attach(to: meeting)
+        }
     }
 
     // MARK: - 装配与持久化桥接

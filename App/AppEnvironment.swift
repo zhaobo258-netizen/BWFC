@@ -23,6 +23,31 @@ final class AppEnvironment {
     let negotiationAnalysis: any NegotiationAnalysisServicing
     /// 导出（阶段 5 实现：生成 Markdown/JSON 内容，保存位置由用户选择）
     let exporter: any MeetingExportServicing
+    /// 音视频导入（阶段 C 实现：检查 + 音轨提取）
+    let audioImport: any AudioImportServicing
+    /// 导入用转写服务工厂：每次导入独立实例，不与实时录音会话争抢
+    let makeImportTranscriptionService: () -> any LocalTranscriptionServicing
+
+    /// 导入处理控制器（App 级单例：离开工作台后后台继续；首版一次一个导入）
+    private var _importProcessing: ImportProcessingController?
+    var importProcessing: ImportProcessingController {
+        if let existing = _importProcessing { return existing }
+        let controller = ImportProcessingController(
+            importService: audioImport,
+            makeTranscriptionService: makeImportTranscriptionService,
+            analysisService: negotiationAnalysis,
+            fileStore: fileStore,
+            isAnalysisConfigured: { [weak self] in self?.isAnalysisConfigured ?? false },
+            loadProject: { [weak self] id in
+                try self?.allProjects().first(where: { $0.id == id })
+            },
+            persistProject: { [weak self] project in
+                try self?.persist(project)
+            }
+        )
+        _importProcessing = controller
+        return controller
+    }
 
     /// 各 provider 的 Keychain 存储（Key 分家，互不外借）
     private let keyStores: [CloudProvider: CloudAPIKeyStore]
@@ -48,6 +73,8 @@ final class AppEnvironment {
         diarization: any DiarizationServicing = OpenAIDiarizationService(),
         negotiationAnalysis: any NegotiationAnalysisServicing = KimiAnalysisService(),
         exporter: (any MeetingExportServicing)? = nil,
+        audioImport: (any AudioImportServicing)? = nil,
+        makeImportTranscriptionService: (() -> any LocalTranscriptionServicing)? = nil,
         keychainServiceName: String = CloudAPIKeyStore.defaultService,
         isPersistentStorageUnavailable: Bool = false
     ) {
@@ -59,6 +86,8 @@ final class AppEnvironment {
         self.diarization = diarization
         self.negotiationAnalysis = negotiationAnalysis
         self.exporter = exporter ?? LocalMeetingExportService(meetingStore: meetingStore)
+        self.audioImport = audioImport ?? AVFoundationAudioImportService(fileStore: fileStore)
+        self.makeImportTranscriptionService = makeImportTranscriptionService ?? { AppleSpeechTranscriptionService() }
         self.isPersistentStorageUnavailable = isPersistentStorageUnavailable
 
         var stores: [CloudProvider: CloudAPIKeyStore] = [:]

@@ -61,12 +61,21 @@ final class MockLocalTranscriptionService: LocalTranscriptionServicing, @uncheck
         fedBufferCount += 1
     }
 
+    /// finishSession 时结束结果流（真实服务行为；文件转写 Runner 测试需要）
+    var finishEndsStream = false
+
     func finishSession() async {
         finishCount += 1
+        if finishEndsStream {
+            continuation?.finish()
+        }
     }
 
     func cancelSession() async {
         cancelCount += 1
+        if finishEndsStream {
+            continuation?.finish()
+        }
     }
 
     // MARK: - 测试辅助
