@@ -23,9 +23,29 @@ final class RenderingStormRegressionTests {
     /// 轮询等待会议片段数达到预期（并行高负载下消费任务调度可能超过固定睡眠窗口；
     /// 超时后退出循环，由后续断言如实判定——同步方式加固，不降低断言强度）
     private func waitForMeetingSegmentCount(_ expected: Int, in meeting: Meeting,
-                                            timeout: Duration = .seconds(2)) async {
+                                            timeout: Duration = .seconds(5)) async {
         let deadline = ContinuousClock.now.advanced(by: timeout)
         while ContinuousClock.now < deadline, meeting.segments.count != expected {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    /// 轮询等待控制器最后一个片段包含指定文字（尾随刷新可能被高负载推迟）
+    private func waitForMeetingSegmentText(containing text: String,
+                                           in controller: LocalTranscriptionController,
+                                           timeout: Duration = .seconds(5)) async {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline,
+              controller.segments.last?.text.contains(text) != true {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    /// 轮询等待发布计数达到下限（首次发布可能被高负载推迟）
+    private func waitForPublishCount(atLeast expected: Int, in controller: LocalTranscriptionController,
+                                     timeout: Duration = .seconds(5)) async {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline, controller.segmentsPublishCount < expected {
             try? await Task.sleep(for: .milliseconds(10))
         }
     }
@@ -57,7 +77,7 @@ final class RenderingStormRegressionTests {
                 "高频临时结果期间发布次数必须受限（≤3），实际 \(publishedDuringBurst)")
 
         // 等待尾随刷新：最后一版文字必须可见（不丢最终状态）
-        try await settle(400)
+        await waitForMeetingSegmentText(containing: "第49版", in: controller)
         #expect(controller.segments.last?.text.contains("第49版") == true,
                 "尾随刷新后必须呈现最后一版临时文字")
         await controller.cancel()
@@ -71,7 +91,7 @@ final class RenderingStormRegressionTests {
         try await controller.start(for: meeting) { nil }
 
         mock.emit(LocalTranscriptResult(startAudioMs: 0, endAudioMs: 1000, text: "第一版", isFinal: false))
-        try await settle(120)
+        await waitForPublishCount(atLeast: 1, in: controller)
         let afterFirst = controller.segmentsPublishCount
         #expect(afterFirst >= 1, "第一个临时结果应立即发布")
 

@@ -29,11 +29,11 @@ final class LocalTranscriptionControllerTests {
         try await Task.sleep(for: .milliseconds(100))
     }
 
-    /// 轮询等待片段数达到预期（并行高负载下消费任务调度可能超过固定睡眠窗口；
+    /// 轮询等待条件达成（并行高负载下消费任务调度可能超过固定睡眠窗口；
     /// 超时后退出循环，由后续断言如实判定——同步方式加固，不降低断言强度）
-    private func waitForSegmentCount(_ expected: Int, timeout: Duration = .seconds(2)) async {
+    private func waitFor(_ condition: () -> Bool, timeout: Duration = .seconds(5)) async {
         let deadline = ContinuousClock.now.advanced(by: timeout)
-        while ContinuousClock.now < deadline, controller.segments.count != expected {
+        while ContinuousClock.now < deadline, !condition() {
             try? await Task.sleep(for: .milliseconds(10))
         }
     }
@@ -79,14 +79,14 @@ final class LocalTranscriptionControllerTests {
 
         mock.emit(LocalTranscriptResult(startAudioMs: 1000, endAudioMs: 2500,
                                         text: "如果年度量能", isFinal: false))
-        try await settle()
+        await waitFor { self.controller.segments.count == 1 }
         #expect(controller.segments.count == 1)
         #expect(controller.segments.first?.state == .provisional)
         #expect(meeting.segments.isEmpty, "临时片段不入库")
 
         mock.emit(LocalTranscriptResult(startAudioMs: 1000, endAudioMs: 2500,
                                         text: "如果年度量能能保证，我们可以再讨论两个点。", isFinal: true))
-        try await settle()
+        await waitFor { self.controller.segments.first?.state == .final }
         #expect(controller.segments.count == 1, "临时被最终替换后不得残留两条")
         #expect(controller.segments.first?.state == .final)
         #expect(meeting.segments.count == 1, "最终片段必须入库")
@@ -103,7 +103,7 @@ final class LocalTranscriptionControllerTests {
                                          text: "返点需要和回款周期一起确认。", isFinal: true)
         mock.emit(result)
         mock.emit(result) // 引擎重发
-        try await settle()
+        await waitFor { meeting.segments.count == 1 }
         #expect(meeting.segments.count == 1)
         await controller.cancel()
     }
@@ -121,7 +121,7 @@ final class LocalTranscriptionControllerTests {
 
         mock.emit(LocalTranscriptResult(startAudioMs: 5_000, endAudioMs: 7_000,
                                         text: "恢复后的第一句。", isFinal: true))
-        try await settle()
+        await waitFor { meeting.segments.count == 1 }
         let segment = try #require(meeting.segments.first)
         #expect(segment.startMs == 8_000, "音频 5s 应映射到墙钟 8s（暂停 3s）")
         #expect(segment.endMs == 10_000)
@@ -137,7 +137,7 @@ final class LocalTranscriptionControllerTests {
                                         text: "已确认的一句。", isFinal: true))
         mock.emit(LocalTranscriptResult(startAudioMs: 1000, endAudioMs: 2000,
                                         text: "尚未确认的半句", isFinal: false))
-        await waitForSegmentCount(2)
+        await waitFor { self.controller.segments.count == 2 }
         #expect(controller.segments.count == 2)
 
         await controller.finish()

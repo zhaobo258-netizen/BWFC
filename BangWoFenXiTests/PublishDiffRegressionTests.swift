@@ -20,6 +20,15 @@ final class PublishDiffRegressionTests {
         try await Task.sleep(for: .milliseconds(ms))
     }
 
+    /// 轮询等待条件达成（并行高负载下消费任务调度可能超过固定睡眠窗口；
+    /// 超时后退出循环，由后续断言如实判定——同步方式加固，不降低断言强度）
+    private func waitFor(_ condition: () -> Bool, timeout: Duration = .seconds(5)) async {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline, !condition() {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
     @Test("同一临时文字反复到达：只有第一次发布，其余被差分跳过")
     func identicalContentNotRepublished() async throws {
         PerfCounters.reset()
@@ -28,7 +37,7 @@ final class PublishDiffRegressionTests {
         try await controller.start(for: makeMeeting()) { nil }
 
         mock.emit(LocalTranscriptResult(startAudioMs: 0, endAudioMs: 1000, text: "同一句临时文字", isFinal: false))
-        try await settle(150)
+        await waitFor { controller.segmentsPublishCount == 1 }
         let afterFirst = controller.segmentsPublishCount
         #expect(afterFirst == 1, "首次临时结果应发布一次")
 
@@ -42,7 +51,7 @@ final class PublishDiffRegressionTests {
 
         // 内容变化：必须发布
         mock.emit(LocalTranscriptResult(startAudioMs: 0, endAudioMs: 1000, text: "同一句临时文字，变长了", isFinal: false))
-        try await settle(500)
+        await waitFor { controller.segmentsPublishCount == afterFirst + 1 }
         #expect(controller.segmentsPublishCount == afterFirst + 1)
         await controller.cancel()
     }
@@ -65,7 +74,7 @@ final class PublishDiffRegressionTests {
         #expect(published <= 6,
                 "突发期间发布必须有硬上限（≤6），实际 \(published)")
 
-        try await settle(400) // 尾随刷新
+        await waitFor { controller.segments.last?.text == "高频临时结果第199版" }
         #expect(controller.segments.last?.text == "高频临时结果第199版",
                 "节流后必须收敛到最后一版文字")
         await controller.cancel()
@@ -82,7 +91,7 @@ final class PublishDiffRegressionTests {
         try await settle(150)
         mock.emit(LocalTranscriptResult(startAudioMs: 0, endAudioMs: 1000,
                                         text: "如果年度量能能保证。", isFinal: true))
-        try await settle(150)
+        await waitFor { controller.segments.first?.state == .final }
         #expect(controller.segments.count == 1)
         #expect(controller.segments.first?.state == .final)
         #expect(meeting.segments.count == 1)
