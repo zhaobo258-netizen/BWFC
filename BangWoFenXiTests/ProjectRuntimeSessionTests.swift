@@ -1,0 +1,177 @@
+import Foundation
+import Testing
+@testable import BangWoFenXi
+
+/// Project ⇄ 运行时 Meeting 桥接测试（阶段 B）：
+/// 状态映射、字段还原、深拷贝隔离、回写一致性与往返稳定。
+@Suite("Project 运行时桥接")
+final class ProjectRuntimeSessionTests {
+
+    /// 造一个字段齐全的 Project
+    private func makeProject(status: ProjectStatus = .ready) -> Project {
+        let startedAt = Date(timeIntervalSince1970: 1_753_000_000)
+        let endedAt = Date(timeIntervalSince1970: 1_753_003_600)
+        let speaker = Speaker(
+            id: UUID(), cloudAlias: "p_01", displayName: "对方", role: "采购",
+            colorToken: "blue", isUserConfirmed: true, legacySide: "counterpart",
+            legacyVoiceReferencePath: "Meetings/x/samples/y.wav",
+            legacyVoiceReferenceDurationMs: 4_200
+        )
+        let segment = TranscriptSegment(
+            startMs: 1_000, endMs: 5_000, text: "原话",
+            participantId: speaker.id, source: .cloud, state: .final,
+            createdAt: startedAt, updatedAt: startedAt
+        )
+        let snapshot = AnalysisSnapshot(version: 1, createdAt: startedAt, analyzedThroughMs: 5_000)
+        return Project(
+            id: UUID(), title: "桥接项目", sourceType: .liveRecording,
+            status: status, createdAt: startedAt, startedAt: startedAt, endedAt: endedAt,
+            lastActivityAt: endedAt,
+            runtimeAssetRelativePath: "Meetings/x/recording.caf",
+            durationMs: 3_600_000, preferredInputDeviceID: "device-1",
+            pauseIntervals: [PauseInterval(startMs: 60_000, endMs: 90_000)],
+            speakers: [speaker], segments: [segment], legacySnapshots: [snapshot],
+            legacyMetadata: LegacyMeetingMetadata(
+                background: "背景", ourGoal: "目标", ourBottomLine: "底线",
+                counterpartContext: "对方背景", glossary: ["返点"],
+                audioUploadConsentAt: startedAt, lastAnalyzedSegmentEndMs: 5_000
+            )
+        )
+    }
+
+    @Test("运行时状态映射：creating→ready、processing→finalizing、ready 族→completed")
+    func runtimeStatusMapping() {
+        #expect(ProjectRuntimeSession.runtimeStatus(for: .creating) == .ready)
+        #expect(ProjectRuntimeSession.runtimeStatus(for: .recording) == .recording)
+        #expect(ProjectRuntimeSession.runtimeStatus(for: .paused) == .paused)
+        #expect(ProjectRuntimeSession.runtimeStatus(for: .processing) == .finalizing)
+        #expect(ProjectRuntimeSession.runtimeStatus(for: .ready) == .completed)
+        #expect(ProjectRuntimeSession.runtimeStatus(for: .readyWithWarnings) == .completed)
+        #expect(ProjectRuntimeSession.runtimeStatus(for: .failed) == .completed)
+    }
+
+    @Test("水合：参与者、legacy 字段与状态完整还原，片段深拷贝隔离")
+    func rehydrateRestoresFields() throws {
+        let project = makeProject(status: .ready)
+        let meeting = try ProjectRuntimeSession.makeRuntimeMeeting(from: project)
+
+        #expect(meeting.id == project.id)
+        #expect(meeting.title == "桥接项目")
+        #expect(meeting.status == .completed) // ready → completed
+        #expect(meeting.background == "背景")
+        #expect(meeting.ourGoal == "目标")
+        #expect(meeting.ourBottomLine == "底线")
+        #expect(meeting.counterpartContext == "对方背景")
+        #expect(meeting.glossary == ["返点"])
+        #expect(meeting.audioRelativePath == "Meetings/x/recording.caf")
+        #expect(meeting.preferredInputDeviceID == "device-1")
+        #expect(meeting.pauseIntervals == [PauseInterval(startMs: 60_000, endMs: 90_000)])
+        #expect(meeting.lastAnalyzedSegmentEndMs == 5_000)
+
+        #expect(meeting.participants.count == 1)
+        let participant = try #require(meeting.participants.first)
+        #expect(participant.id == project.speakers[0].id)
+        #expect(participant.side == .counterpart)
+        #expect(participant.role == "采购")
+        #expect(participant.voiceReferencePath == "Meetings/x/samples/y.wav")
+        #expect(participant.voiceReferenceDurationMs == 4_200)
+
+        #expect(meeting.segments.count == 1)
+        #expect(meeting.segments[0].id == project.segments[0].id)
+        #expect(meeting.snapshots.count == 1)
+
+        // 深拷贝隔离：改运行时不影响 Project
+        meeting.segments[0].text = "被运行时改写"
+        #expect(project.segments[0].text == "原话")
+    }
+
+    @Test("无 legacyMetadata 的新 V2 项目：水合回退默认，不报错")
+    func rehydrateWithoutLegacyMetadata() throws {
+        let project = Project(title: "纯 V2 项目", sourceType: .liveRecording, status: .creating)
+        let meeting = try ProjectRuntimeSession.makeRuntimeMeeting(from: project)
+        #expect(meeting.status == .ready)
+        #expect(meeting.background == "")
+        #expect(meeting.participants.isEmpty)
+        #expect(meeting.segments.isEmpty)
+    }
+
+    @Test("回写：状态、时间轴、片段、快照与游标同步进 Project")
+    func applyRuntimeWritesBack() throws {
+        let project = makeProject(status: .creating)
+        let meeting = try ProjectRuntimeSession.makeRuntimeMeeting(from: project)
+        let now = Date(timeIntervalSince1970: 1_754_000_000)
+
+        // 模拟录音进行：状态、暂停区间、新片段、新快照、分析游标
+        try meeting.transition(to: .recording)
+        meeting.pauseIntervals.append(PauseInterval(startMs: 120_000, endMs: 150_000))
+        let newSegment = TranscriptSegment(startMs: 6_000, endMs: 9_000, text: "新句",
+                                           source: .local, state: .final)
+        meeting.segments.append(newSegment)
+        meeting.snapshots.append(AnalysisSnapshot(version: 2, analyzedThroughMs: 9_000))
+        meeting.lastAnalyzedSegmentEndMs = 9_000
+
+        try ProjectRuntimeSession.applyRuntime(meeting, to: project, at: now)
+
+        #expect(project.status == .recording)
+        #expect(project.pauseIntervals.count == 2)
+        #expect(project.segments.count == 2)
+        #expect(project.segments[1].id == newSegment.id)
+        #expect(project.legacySnapshots.count == 2)
+        #expect(project.legacyMetadata?.lastAnalyzedSegmentEndMs == 9_000)
+        #expect(project.lastActivityAt == now)
+
+        // 回写同样是深拷贝：继续改运行时不影响已回写内容
+        meeting.segments[1].text = "再次改写"
+        #expect(project.segments[1].text == "新句")
+    }
+
+    @Test("回写状态映射与迁移器全分支一致，无两套口径")
+    func applyRuntimeMappingConsistentWithMigrator() {
+        for status in MeetingStatus.allCases {
+            #expect(ProjectRuntimeSession.projectStatus(for: status)
+                    == MeetingToProjectMigrator.projectStatus(for: status))
+        }
+    }
+
+    @Test("往返：Project → 运行时 → 回写 → 关键字段保持稳定")
+    func roundTripStable() throws {
+        let project = makeProject(status: .ready)
+        let meeting = try ProjectRuntimeSession.makeRuntimeMeeting(from: project)
+        let now = Date(timeIntervalSince1970: 1_754_000_000)
+        try ProjectRuntimeSession.applyRuntime(meeting, to: project, at: now)
+
+        #expect(project.status == .ready) // completed → ready
+        #expect(project.startedAt == meeting.startedAt)
+        #expect(project.endedAt == meeting.endedAt)
+        #expect(project.durationMs == 3_600_000)
+        #expect(project.pauseIntervals == [PauseInterval(startMs: 60_000, endMs: 90_000)])
+        #expect(project.segments.map(\.id) == [project.segments[0].id])
+        #expect(project.segments[0].text == "原话")
+        #expect(project.legacySnapshots.count == 1)
+        #expect(project.legacyMetadata?.background == "背景")
+        #expect(project.lastActivityAt == now)
+    }
+
+    @Test("录音资产关联：水合带入、回写写出并经 projectStore 持久化")
+    func audioAssetRoundTrip() throws {
+        // 水合：project.runtimeAssetRelativePath → meeting.audioRelativePath
+        let project = makeProject(status: .ready)
+        let meeting = try ProjectRuntimeSession.makeRuntimeMeeting(from: project)
+        #expect(meeting.audioRelativePath == "Meetings/x/recording.caf")
+
+        // 回写：meeting.audioRelativePath → project.runtimeAssetRelativePath
+        meeting.audioRelativePath = "Meetings/\(project.id.uuidString)/recording.caf"
+        try ProjectRuntimeSession.applyRuntime(meeting, to: project)
+        #expect(project.runtimeAssetRelativePath == meeting.audioRelativePath)
+
+        // 持久化往返：写入 JSONProjectStore 重读仍在
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appending(path: "BangWoFenXiTests-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+        let store = try JSONProjectStore(directory: tempDirectory)
+        try store.saveProjects([project])
+        let reread = try JSONProjectStore(directory: tempDirectory)
+        #expect(try reread.loadProjects().first?.runtimeAssetRelativePath
+                == "Meetings/\(project.id.uuidString)/recording.caf")
+    }
+}

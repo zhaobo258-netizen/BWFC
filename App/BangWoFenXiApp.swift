@@ -32,12 +32,16 @@ struct RootView: View {
     var body: some View {
         Group {
             switch router.route {
+            case .projectHome:
+                ProjectHomeView()
+            case .projectWorkspace(let id, let autoStart):
+                ProjectWorkspaceView(projectID: id, autoStart: autoStart)
+            case .settings:
+                SettingsView()
             case .meetingList:
                 MeetingListView()
             case .meetingSetup(let id):
                 MeetingSetupView(meetingID: id)
-            case .settings:
-                SettingsView()
             case .liveMeeting(let id):
                 LiveMeetingView(meetingID: id)
             case .meetingReview(let id):

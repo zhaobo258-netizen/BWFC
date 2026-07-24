@@ -55,7 +55,7 @@ struct SettingsView: View {
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
                 Button("返回") {
-                    router.showMeetingList()
+                    router.closeSettings()
                 }
             }
         }
