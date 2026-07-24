@@ -10,7 +10,7 @@ import Foundation
 /// - 不发送 store 字段（该接口无此概念）。
 struct KimiAnalysisService: NegotiationAnalysisServicing {
     private let session: URLSession
-    private let apiKeyStore: CloudAPIKeyStore
+    private let credentials: any KimiCredentialProviding
     private let baseURL: URL
     private let modelID: String
     private let maxTokens: Int
@@ -18,12 +18,14 @@ struct KimiAnalysisService: NegotiationAnalysisServicing {
     init(
         session: URLSession = .shared,
         apiKeyStore: CloudAPIKeyStore = CloudAPIKeyStore.store(for: .analysis),
+        credentials: (any KimiCredentialProviding)? = nil,
         baseURL: URL = CloudModelConfig.analysisBaseURL,
         modelID: String = CloudModelConfig.analysisModelID,
         maxTokens: Int = CloudModelConfig.analysisMaxTokens
     ) {
         self.session = session
-        self.apiKeyStore = apiKeyStore
+        // 凭证优先级：Kimi 账号登录（OAuth，自动刷新）> 静态分析 Key
+        self.credentials = credentials ?? KimiCredentialProvider(staticKeyStore: apiKeyStore)
         self.baseURL = baseURL
         self.modelID = modelID
         self.maxTokens = maxTokens
@@ -42,9 +44,8 @@ struct KimiAnalysisService: NegotiationAnalysisServicing {
     /// 通用传输入口（V1 谈判分析与 V2 通用分析共用同一 HTTP/解析/日志路径）：
     /// 发送 system + user 消息，返回模型的 text 块拼接文本。
     func rawAnalysisText(system: String, inputJSON: String) async throws -> String {
-        guard let apiKey = try apiKeyStore.readKey(), !apiKey.isEmpty else {
-            throw AnalysisAPIError.missingAPIKey
-        }
+        // 取当前可用凭证（OAuth 临期自动刷新；未配置抛 missingAPIKey，不发请求）
+        let apiKey = try await credentials.validCredential()
 
         let body: [String: Any] = [
             "model": modelID,
@@ -81,9 +82,7 @@ struct KimiAnalysisService: NegotiationAnalysisServicing {
     /// 连接测试（实施计划 5.1：只返回可用/不可用与脱敏错误）。
     /// 发起一次最小 messages 请求；非 2xx 按统一分类抛出。
     func testConnection() async throws -> Bool {
-        guard let apiKey = try apiKeyStore.readKey(), !apiKey.isEmpty else {
-            throw AnalysisAPIError.missingAPIKey
-        }
+        let apiKey = try await credentials.validCredential()
         let body: [String: Any] = [
             "model": modelID,
             "max_tokens": 8,

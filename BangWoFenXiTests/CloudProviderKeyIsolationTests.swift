@@ -16,7 +16,7 @@ final class CloudProviderKeyIsolationTests {
     }
 
     deinit {
-        for account in ["kimi", "diarization", CloudProvider.legacyAccount] {
+        for account in ["kimi", "diarization", CloudProvider.legacyAccount, KimiOAuthTokenStore.account] {
             try? KeychainService(service: serviceName).delete(account: account)
         }
     }
@@ -61,9 +61,16 @@ final class CloudProviderKeyIsolationTests {
     @Test("分析条目为空（分人条目有值）：分析服务 missingAPIKey 且不发请求")
     func analysisNeverBorrowsDiarizationKey() async throws {
         try store(for: .diarization).saveKey("openai-key")
+        let analysisStore = store(for: .analysis)
         let service = KimiAnalysisService(
             session: IsolationKimiMockURLProtocol.makeSession(),
-            apiKeyStore: store(for: .analysis)
+            apiKeyStore: analysisStore,
+            // OAuth 凭证存储同样隔离到测试 service（不触碰生产条目）
+            credentials: KimiCredentialProvider(
+                tokenStore: KimiOAuthTokenStore(service: serviceName),
+                staticKeyStore: analysisStore,
+                client: MockKimiOAuthClient()
+            )
         )
         IsolationKimiMockURLProtocol.storage.reset()
 
@@ -132,6 +139,19 @@ final class CloudProviderKeyIsolationTests {
         #expect(env.isCloudConfigured, "任一 provider 配置即视为云端可用")
         #expect(env.isConfigured(.diarization))
         #expect(!env.isConfigured(.analysis))
+
+        // Kimi 账号登录（OAuth 凭证存在）同样计入「分析已配置」
+        try env.kimiOAuthTokenStore.save(KimiOAuthTokens(
+            accessToken: "at", refreshToken: "rt",
+            expiresAt: Date().addingTimeInterval(900)
+        ))
+        env.refreshCloudConfiguration()
+        #expect(env.isAnalysisConfigured, "账号登录后无需静态 Key 即视为已配置")
+        #expect(!env.isConfigured(.analysis), "静态 Key 条目本身仍为空")
+
+        try env.kimiOAuthTokenStore.delete()
+        env.refreshCloudConfiguration()
+        #expect(!env.isAnalysisConfigured)
     }
 }
 

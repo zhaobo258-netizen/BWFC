@@ -53,7 +53,9 @@ final class AppEnvironment {
 
     /// 各 provider 的 Keychain 存储（Key 分家，互不外借）
     private let keyStores: [CloudProvider: CloudAPIKeyStore]
-    /// 分析（Kimi）Key 是否已配置
+    /// Kimi 账号 OAuth 凭证存储（设备码登录；与静态分析 Key 独立条目）
+    let kimiOAuthTokenStore: KimiOAuthTokenStore
+    /// 分析（Kimi）是否已配置（账号已登录或静态 Key 已保存）
     private(set) var isAnalysisConfigured: Bool
     /// 分人（OpenAI 兼容）Key 是否已配置
     private(set) var isDiarizationConfigured: Bool
@@ -99,7 +101,9 @@ final class AppEnvironment {
             stores[provider] = CloudAPIKeyStore.store(for: provider, service: keychainServiceName)
         }
         self.keyStores = stores
-        self.isAnalysisConfigured = stores[.analysis]?.hasConfiguredKey ?? false
+        let oauthStore = KimiOAuthTokenStore(service: keychainServiceName)
+        self.kimiOAuthTokenStore = oauthStore
+        self.isAnalysisConfigured = (stores[.analysis]?.hasConfiguredKey ?? false) || oauthStore.hasTokens
         self.isDiarizationConfigured = stores[.diarization]?.hasConfiguredKey ?? false
     }
 
@@ -116,9 +120,9 @@ final class AppEnvironment {
         keyStore(for: provider).hasConfiguredKey
     }
 
-    /// API Key 变更后刷新各 provider 配置状态
+    /// API Key / 登录状态变更后刷新各 provider 配置状态
     func refreshCloudConfiguration() {
-        isAnalysisConfigured = isConfigured(.analysis)
+        isAnalysisConfigured = isConfigured(.analysis) || kimiOAuthTokenStore.hasTokens
         isDiarizationConfigured = isConfigured(.diarization)
     }
 

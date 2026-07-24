@@ -9,20 +9,29 @@ import Testing
 final class KimiAnalysisAPITests {
     let service: KimiAnalysisService
     let keychainServiceName = "com.zhaobo.BangWoFenXi.tests.\(UUID().uuidString)"
+    let oauthClient = MockKimiOAuthClient()
 
     private var storage: MockURLProtocolStorage { KimiMockURLProtocol.storage }
 
     init() {
         KimiMockURLProtocol.storage.reset()
+        // 凭证提供者与静态 Key 存储全部隔离到测试 service（血泪教训 9：不触碰生产条目）
+        let staticStore = CloudAPIKeyStore(service: keychainServiceName, account: "test-key")
         service = KimiAnalysisService(
             session: KimiMockURLProtocol.makeSession(),
-            apiKeyStore: CloudAPIKeyStore(service: keychainServiceName, account: "test-key")
+            apiKeyStore: staticStore,
+            credentials: KimiCredentialProvider(
+                tokenStore: KimiOAuthTokenStore(service: keychainServiceName),
+                staticKeyStore: staticStore,
+                client: oauthClient
+            )
         )
     }
 
     deinit {
         // 不重置 protocol 存储（避免释放环；下个用例 init 时重置）
         try? KeychainService(service: keychainServiceName).delete(account: "test-key")
+        try? KeychainService(service: keychainServiceName).delete(account: KimiOAuthTokenStore.account)
     }
 
     private func saveTestKey() throws {
@@ -68,7 +77,8 @@ final class KimiAnalysisAPITests {
         _ = try await service.analyze(instructions: AnalysisSystemPrompt.text, inputJSON: "{\"probe\":1}")
 
         let request = try #require(storage.capturedRequests.first)
-        #expect(request.url?.absoluteString == "https://agent-gw.kimi.com/coding/v1/messages")
+        #expect(request.url?.absoluteString == "https://api.kimi.com/coding/v1/messages",
+                "2026-07-24 起必须使用 kimi-code 新体系网关")
         #expect(request.httpMethod == "POST")
         #expect(request.value(forHTTPHeaderField: "x-api-key") == "sk-test-fake-key")
         #expect(request.value(forHTTPHeaderField: "anthropic-version") == "2023-06-01")
@@ -203,6 +213,63 @@ final class KimiAnalysisAPITests {
             _ = try await service.analyze(instructions: "", inputJSON: "{}")
         }
         #expect(storage.capturedRequests.isEmpty)
+    }
+
+    // MARK: - OAuth 登录凭证
+
+    @Test("已登录：x-api-key 使用 OAuth access_token，优先于静态 Key")
+    func oauthTokenUsedWhenLoggedIn() async throws {
+        try saveTestKey()
+        try KimiOAuthTokenStore(service: keychainServiceName).save(KimiOAuthTokens(
+            accessToken: "oauth-access-token", refreshToken: "rt-x",
+            expiresAt: Date().addingTimeInterval(900)
+        ))
+        let segmentID = UUID()
+        storage.requestHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Self.messagesEnvelope(text: Self.validOutputJSON(segmentID: segmentID)))
+        }
+        _ = try await service.analyze(instructions: "", inputJSON: "{}")
+        let request = try #require(storage.capturedRequests.first)
+        #expect(request.value(forHTTPHeaderField: "x-api-key") == "oauth-access-token")
+        #expect(oauthClient.refreshCalls.isEmpty, "未临期不得刷新")
+    }
+
+    @Test("已登录但临期：先刷新再请求，请求头用新 token，轮换凭证已落库")
+    func oauthTokenRefreshedBeforeRequest() async throws {
+        let store = KimiOAuthTokenStore(service: keychainServiceName)
+        try store.save(KimiOAuthTokens(
+            accessToken: "stale-token", refreshToken: "rt-old",
+            expiresAt: Date().addingTimeInterval(30)
+        ))
+        let rotated = KimiOAuthTokens(
+            accessToken: "fresh-token", refreshToken: "rt-new",
+            expiresAt: Date().addingTimeInterval(900)
+        )
+        oauthClient.refreshResults = [.success(rotated)]
+        let segmentID = UUID()
+        storage.requestHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Self.messagesEnvelope(text: Self.validOutputJSON(segmentID: segmentID)))
+        }
+        _ = try await service.analyze(instructions: "", inputJSON: "{}")
+        let request = try #require(storage.capturedRequests.first)
+        #expect(request.value(forHTTPHeaderField: "x-api-key") == "fresh-token")
+        #expect(oauthClient.refreshCalls == ["rt-old"])
+        #expect(try store.read() == rotated)
+    }
+
+    @Test("已登录但刷新被拒 → unauthorized，不发分析请求")
+    func oauthRefreshRejectedNoRequest() async throws {
+        try KimiOAuthTokenStore(service: keychainServiceName).save(KimiOAuthTokens(
+            accessToken: "stale-token", refreshToken: "rt-dead",
+            expiresAt: Date().addingTimeInterval(30)
+        ))
+        oauthClient.refreshResults = [.failure(.unauthorized)]
+        await #expect(throws: AnalysisAPIError.unauthorized) {
+            _ = try await service.analyze(instructions: "", inputJSON: "{}")
+        }
+        #expect(storage.capturedRequests.isEmpty, "凭证不可用时不得把过期 token 发出去")
     }
 
     // MARK: - 连接测试

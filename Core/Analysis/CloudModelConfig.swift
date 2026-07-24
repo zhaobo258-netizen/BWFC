@@ -22,8 +22,10 @@ enum CloudModelConfig {
     static let analysisProviderName = "Kimi"
     /// 分析模型（Anthropic 风格 messages 接口）
     static let analysisModelID = "kimi-for-coding"
-    /// 分析网关基础地址（以 / 结尾；消息路径见 analysisMessagesPath）
-    static let analysisBaseURL = URL(string: "https://agent-gw.kimi.com/coding/")!
+    /// 分析网关基础地址（以 / 结尾；消息路径见 analysisMessagesPath）。
+    /// 2026-07-24 起切换到 kimi-code 新体系网关（旧 agent-gw.kimi.com 为遗留通道，
+    /// 新体系 OAuth token 在旧通道全部 401，实测确认）。
+    static let analysisBaseURL = URL(string: "https://api.kimi.com/coding/")!
     /// messages 接口路径（相对基础地址）
     static let analysisMessagesPath = "v1/messages"
     /// 单次分析最大输出 token 数（含思考预算；调大防止长上下文下 JSON 被截断）
@@ -32,4 +34,18 @@ enum CloudModelConfig {
     static let analysisRequestTimeout: TimeInterval = 240
     /// Anthropic messages 协议版本头
     static let anthropicVersion = "2023-06-01"
+
+    // MARK: - Kimi 账号 OAuth（设备码登录 + 自动刷新）
+
+    /// 授权服务器（kimi-code 体系；与 kimi CLI 同一套流程与 client_id）
+    static let kimiOAuthHost = URL(string: "https://auth.kimi.com")!
+    /// 设备码授权路径
+    static let kimiOAuthDeviceAuthorizationPath = "api/oauth/device_authorization"
+    /// token 颁发/刷新路径
+    static let kimiOAuthTokenPath = "api/oauth/token"
+    /// 公开 client_id（设备码流程无密钥；该值编译在官方 kimi CLI 内，非机密）
+    static let kimiOAuthClientID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+    /// access_token 剩余有效期低于该秒数时先刷新再发请求
+    /// （token 实际有效期 900 秒；分析请求最长可跑 240 秒，留足余量）
+    static let kimiOAuthRefreshLeewaySeconds: TimeInterval = 300
 }
