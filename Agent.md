@@ -95,6 +95,7 @@ Core/
 10. **`guard let x` 解包后别再 `if let x`**（阶段 D 掉线遗留的编译错误）；给打开中的工作台刷新存储副本时，**新增 Project 字段记得同步补进 `reloadImportedProjectFromStore` 的字段级刷新清单**（漏了 analysisSnapshots 一次）。
 11. **OAuth refresh_token 轮换语义**：Kimi 每次刷新都发新 refresh_token 并作废旧的——刷新成功必须先持久化再返回；多方（App/CLI/测试）共用一个 token 家族会互相刷失效。真实探针消费 CLI 凭证后必须把轮换值写回 CLI 文件。另：`Date` 经 JSON 秒数往返有浮点误差，凭证过期时刻要归一化整秒才能做整组相等断言。
 12. **actor 串行不等于异步操作单飞**：actor 方法在 `await` 时允许重入；多个临期请求仍可能同时拿同一个轮换型 refresh_token 发刷新。必须在 actor 内缓存并共享同一个 in-flight `Task`，并让 V1/V2 服务复用同一凭证提供者实例。
+13. **AsyncStream 不 finish 就是悬挂**：服务把结果流做成 init 时创建的单一 AsyncStream、会话结束不 finish，靠「流自然结束」收尾的消费方（导入整篇转写）会在 await 处永久悬挂——任务卡 running、0% CPU、无错误无日志。结果流必须每会话新建、cleanup 显式 finish；「等流结束」的一方永远要问一句：谁负责终结这个流？
 
 ## 6. 产品红线（来自计划书，违者返工）
 

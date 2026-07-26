@@ -110,11 +110,18 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
     private var running = false
 
     private var resultsContinuation: AsyncStream<LocalTranscriptResult>.Continuation?
-    let results: AsyncStream<LocalTranscriptResult>
+    /// 当前会话的结果流。每次 startSession 新建，会话结束时显式 finish——
+    /// 导入链路（FileTranscriptionRunner）依赖流结束来收尾，
+    /// 流不终结会导致整篇转写在 await 收集任务处永久悬挂（血泪教训 #13）。
+    private var resultsStream: AsyncStream<LocalTranscriptResult>
+
+    var results: AsyncStream<LocalTranscriptResult> {
+        lock.withLock { resultsStream }
+    }
 
     init() {
         var continuation: AsyncStream<LocalTranscriptResult>.Continuation!
-        self.results = AsyncStream { continuation = $0 }
+        self.resultsStream = AsyncStream { continuation = $0 }
         self.resultsContinuation = continuation
     }
 
@@ -246,6 +253,11 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
         var inputContinuation: AsyncStream<AnalyzerInput>.Continuation!
         let inputStream = AsyncStream<AnalyzerInput> { inputContinuation = $0 }
 
+        // 本会话专属结果流（旧流已在上一会话 cleanup 时 finish）
+        var newResultsContinuation: AsyncStream<LocalTranscriptResult>.Continuation!
+        let newResultsStream = AsyncStream<LocalTranscriptResult> { newResultsContinuation = $0 }
+        let sessionContinuation = newResultsContinuation!
+
         // init(inputSequence:) 会立即开始消费输入序列
         let analyzer = SpeechAnalyzer(
             inputSequence: inputStream,
@@ -257,16 +269,17 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
             self.transcriber = transcriber
             self.analyzer = analyzer
             self.inputContinuation = inputContinuation
+            self.resultsStream = newResultsStream
+            self.resultsContinuation = sessionContinuation
             self.converter = nil
             self.targetFormat = nil
             self.running = true
         }
 
         // 收集转写结果 → LocalTranscriptResult 流
-        collectorTask = Task { [weak self, transcriber] in
+        collectorTask = Task { [transcriber] in
             do {
                 for try await result in transcriber.results {
-                    guard let self else { return }
                     guard result.range.isValid,
                           result.range.start.isNumeric,
                           result.range.duration.isNumeric else {
@@ -275,7 +288,7 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
                     let startSeconds = result.range.start.seconds
                     let endSeconds = startSeconds + result.range.duration.seconds
                     let text = String(result.text.characters)
-                    self.resultsContinuation?.yield(
+                    sessionContinuation.yield(
                         LocalTranscriptResult(
                             startAudioMs: Int64(startSeconds * 1000),
                             endAudioMs: Int64(endSeconds * 1000),
@@ -417,6 +430,9 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
 
     private func cleanup() {
         lock.withLock {
+            // 结果流终结：消费方（实时收集循环 / 导入收尾等待）随之退出
+            resultsContinuation?.finish()
+            resultsContinuation = nil
             inputContinuation = nil
             analyzer = nil
             transcriber = nil
