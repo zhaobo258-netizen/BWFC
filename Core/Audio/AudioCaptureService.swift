@@ -23,6 +23,8 @@ protocol AudioCaptureServicing: AnyObject, Sendable {
     var onLevel: (@Sendable (Float) -> Void)? { get set }
     /// 当前使用中的设备被拔出 / 失效回调（在后台线程触发）
     var onDeviceDisconnected: (@Sendable () -> Void)? { get set }
+    /// 连续写文件失败达到阈值后的单次回调（派发到主线程触发）
+    var onWriteFailure: (@Sendable () -> Void)? { get set }
     /// 原始缓冲回调（阶段 2：同时送入录音文件与 SpeechAnalyzer；
     /// 仅在「录音中」状态时触发，暂停期间不触发；在实时线程触发，不得阻塞）
     var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)? { get set }
@@ -87,12 +89,56 @@ enum AudioRecordingSettings {
     }
 }
 
+struct AudioWriteFailureEvent: Equatable, Sendable {
+    let shouldNotify: Bool
+    let errorType: String
+}
+
+struct AudioWriteFailureTracker {
+    private let threshold: Int
+    private var consecutiveFailures = 0
+    private var didNotify = false
+
+    init(threshold: Int = 5) {
+        self.threshold = threshold
+    }
+
+    mutating func attempt(_ write: () throws -> Void) -> AudioWriteFailureEvent? {
+        do {
+            try write()
+            consecutiveFailures = 0
+            return nil
+        } catch {
+            consecutiveFailures += 1
+            let shouldNotify = !didNotify && consecutiveFailures >= threshold
+            if shouldNotify {
+                didNotify = true
+            }
+            return AudioWriteFailureEvent(
+                shouldNotify: shouldNotify,
+                errorType: String(describing: type(of: error))
+            )
+        }
+    }
+
+    mutating func reset() {
+        consecutiveFailures = 0
+        didNotify = false
+    }
+}
+
 /// 基于 AVAudioEngine 的真实采集实现（阶段 1）。
 /// 线程安全：tap 回调在实时线程执行，内部状态由锁保护；
 /// 电平与断连回调均在后台线程触发，接收方需自行切换 actor。
 final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
+    private static let writeFailureLogQueue = DispatchQueue(
+        label: "com.zhaobo.BangWoFenXi.audio-write-log",
+        qos: .utility
+    )
+
     private let engine = AVAudioEngine()
     private let lock = NSLock()
+    private let writeFailureLock = NSLock()
 
     /// 当前打开的录音文件
     private var audioFile: AVAudioFile?
@@ -106,9 +152,11 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
     private var selectedDeviceID: String?
     /// 电平节流：每 N 个缓冲回调一次
     private var bufferCountSinceLevel = 0
+    private var writeFailureTracker = AudioWriteFailureTracker()
 
     var onLevel: (@Sendable (Float) -> Void)?
     var onDeviceDisconnected: (@Sendable () -> Void)?
+    var onWriteFailure: (@Sendable () -> Void)?
     var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
 
     private var disconnectObserver: NSObjectProtocol?
@@ -242,6 +290,9 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
             forWriting: fileURL,
             settings: AudioRecordingSettings.fileSettings(for: format)
         )
+        writeFailureLock.withLock {
+            writeFailureTracker.reset()
+        }
         fileFormat = format
         writingEnabled = true
         try startEngineLocked()
@@ -262,6 +313,9 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
         if let fileFormat, currentFormat.sampleRate != fileFormat.sampleRate {
             throw AudioCaptureError.incompatibleDeviceFormat
         }
+        writeFailureLock.withLock {
+            writeFailureTracker.reset()
+        }
         writingEnabled = true
         try startEngineLocked()
     }
@@ -272,6 +326,9 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
             engine.stop()
             audioFile = nil // 关闭文件句柄
             fileFormat = nil
+        }
+        writeFailureLock.withLock {
+            writeFailureTracker.reset()
         }
     }
 
@@ -313,7 +370,24 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
     private func processTapBuffer(_ buffer: AVAudioPCMBuffer) {
         let (file, shouldWrite) = lock.withLock { (audioFile, writingEnabled) }
         if shouldWrite, let file {
-            try? file.write(from: buffer)
+            let failure = writeFailureLock.withLock {
+                writeFailureTracker.attempt {
+                    try file.write(from: buffer)
+                }
+            }
+            if let failure {
+                Self.writeFailureLogQueue.async {
+                    AppLog.logWarning(AppLog.audio, LogSanitizer.formatEvent(
+                        "audio_write_failed",
+                        error: failure.errorType
+                    ))
+                }
+                if failure.shouldNotify, let onWriteFailure {
+                    DispatchQueue.main.async {
+                        onWriteFailure()
+                    }
+                }
+            }
         }
         // 阶段 2：录音中把缓冲同时分发给语音分析（暂停期间不分发）
         if shouldWrite {

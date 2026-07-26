@@ -104,4 +104,38 @@ final class AudioFileWriteReadTests {
         memset(silent.floatChannelData![0], 0, 4410 * MemoryLayout<Float>.stride)
         #expect(AVAudioCaptureService.rmsLevel(of: silent) == 0)
     }
+
+    @Test("连续 5 次写失败只触发一次通知")
+    func consecutiveWriteFailuresNotifyOnce() {
+        var tracker = AudioWriteFailureTracker(threshold: 5)
+        var notifications = 0
+
+        for _ in 0..<8 {
+            let event = tracker.attempt {
+                throw SyntheticAudioWriteError.failed
+            }
+            if event?.shouldNotify == true {
+                notifications += 1
+            }
+        }
+
+        #expect(notifications == 1)
+    }
+
+    @Test("偶发写失败被成功写入打断，不触发自动暂停")
+    func intermittentWriteFailureDoesNotNotify() {
+        var tracker = AudioWriteFailureTracker(threshold: 5)
+
+        for _ in 0..<3 {
+            #expect(tracker.attempt { throw SyntheticAudioWriteError.failed }?.shouldNotify == false)
+        }
+        #expect(tracker.attempt {} == nil)
+        for _ in 0..<4 {
+            #expect(tracker.attempt { throw SyntheticAudioWriteError.failed }?.shouldNotify == false)
+        }
+    }
+}
+
+private enum SyntheticAudioWriteError: Error {
+    case failed
 }

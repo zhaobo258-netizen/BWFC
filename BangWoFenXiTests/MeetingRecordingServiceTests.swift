@@ -30,6 +30,13 @@ final class MeetingRecordingServiceTests {
         return meeting
     }
 
+    private func waitFor(_ condition: () -> Bool, timeout: Duration = .seconds(10)) async {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline, !condition() {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
     @Test("完整生命周期：ready → 录音 → 暂停 → 继续 → 结束")
     func fullLifecycle() throws {
         let meeting = makeReadyMeeting()
@@ -136,6 +143,28 @@ final class MeetingRecordingServiceTests {
 
         try service.resumeRecording()
         #expect(meeting.status == .recording)
+    }
+
+    @Test("录音写入失败：自动暂停并记录暂停区间，修复后可继续")
+    func writeFailureAutoPausesAndCanResume() async throws {
+        let meeting = makeReadyMeeting()
+        try service.startRecording(for: meeting, deviceID: nil)
+
+        mock.simulateWriteFailure()
+        await waitFor { service.writeFailureInterrupted }
+
+        #expect(meeting.status == .paused)
+        #expect(service.interruptionReason == .fileWriteFailure)
+        #expect(!service.deviceInterrupted)
+        #expect(mock.pauseCount == 1)
+        #expect(service.timeline?.isPaused == true)
+        #expect(service.lastErrorDescription == RecordingInterruptionReason.fileWriteFailure.userMessage)
+
+        try service.resumeRecording()
+
+        #expect(meeting.status == .recording)
+        #expect(service.interruptionReason == nil)
+        #expect(meeting.pauseIntervals.count == 1)
     }
 
     @Test("暂停中结束：闭合暂停区间并完成会议")

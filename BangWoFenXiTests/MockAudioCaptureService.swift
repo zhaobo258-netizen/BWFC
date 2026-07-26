@@ -27,6 +27,7 @@ final class MockAudioCaptureService: AudioCaptureServicing, @unchecked Sendable 
 
     var onLevel: (@Sendable (Float) -> Void)?
     var onDeviceDisconnected: (@Sendable () -> Void)?
+    var onWriteFailure: (@Sendable () -> Void)?
     var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
 
     private(set) var activeDeviceID: String?
@@ -65,6 +66,11 @@ final class MockAudioCaptureService: AudioCaptureServicing, @unchecked Sendable 
     /// 模拟设备断开（触发与真实实现相同的回调路径）
     func simulateDeviceDisconnect() {
         onDeviceDisconnected?()
+    }
+
+    /// 模拟录音文件连续写失败达到采集层阈值后的回调
+    func simulateWriteFailure() {
+        onWriteFailure?()
     }
 
     /// 模拟上报一次电平

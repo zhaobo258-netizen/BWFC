@@ -33,7 +33,9 @@ struct LiveMeetingView: View {
             if let meeting {
                 statusBar(meeting: meeting)
                 Divider()
-                if recorder?.deviceInterrupted == true {
+                if recorder?.writeFailureInterrupted == true {
+                    writeFailureBanner
+                } else if recorder?.deviceInterrupted == true {
                     deviceInterruptedBanner(meeting: meeting)
                 }
                 if transcription?.availability?.assetState == .supportedNotInstalled
@@ -269,10 +271,22 @@ struct LiveMeetingView: View {
 
     // MARK: - 设备中断提示（实施计划 11.2：麦克风拔出）
 
+    private var writeFailureBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "externaldrive.badge.exclamationmark")
+            Text(RecordingInterruptionReason.fileWriteFailure.userMessage)
+                .font(.callout)
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.red.opacity(0.1))
+    }
+
     private func deviceInterruptedBanner(meeting: Meeting) -> some View {
         HStack(spacing: 8) {
             Image(systemName: "mic.slash")
-            Text("麦克风已断开。录音已自动暂停，请选择新设备后继续。")
+            Text(RecordingInterruptionReason.deviceDisconnected.userMessage)
                 .font(.callout)
             Picker("新设备", selection: $newDeviceID) {
                 Text("选择设备").tag(String?.none)

@@ -1,5 +1,19 @@
 import Foundation
 
+enum RecordingInterruptionReason: Equatable {
+    case deviceDisconnected
+    case fileWriteFailure
+
+    var userMessage: String {
+        switch self {
+        case .deviceDisconnected:
+            return "麦克风已断开。录音已自动暂停，请选择新设备后继续。"
+        case .fileWriteFailure:
+            return "录音写入失败（磁盘空间不足或文件不可写），已自动暂停。请排除存储问题后再继续。"
+        }
+    }
+}
+
 /// 会议录音编排服务（阶段 1）：
 /// 把 AudioCaptureServicing、MeetingFileStore、RecordingTimeline 与会议状态机串起来。
 /// 全部运行在 MainActor；硬件细节由协议隔离，单元测试用 Mock 驱动。
@@ -13,8 +27,10 @@ final class MeetingRecordingService {
     private(set) var activeMeeting: Meeting?
     /// 录音时间线（暂停区间与文件时长换算）
     private(set) var timeline: RecordingTimeline?
-    /// 设备中断标记：麦克风拔出后置为 true，等待用户选择新设备
-    private(set) var deviceInterrupted = false
+    /// 当前自动暂停原因
+    private(set) var interruptionReason: RecordingInterruptionReason?
+    var deviceInterrupted: Bool { interruptionReason == .deviceDisconnected }
+    var writeFailureInterrupted: Bool { interruptionReason == .fileWriteFailure }
     /// 最近一次操作的脱敏错误描述（用于界面提示）
     private(set) var lastErrorDescription: String?
 
@@ -24,6 +40,11 @@ final class MeetingRecordingService {
         self.capture.onDeviceDisconnected = { [weak self] in
             Task { @MainActor in
                 self?.handleDeviceDisconnected()
+            }
+        }
+        self.capture.onWriteFailure = { [weak self] in
+            Task { @MainActor in
+                self?.handleWriteFailure()
             }
         }
     }
@@ -58,7 +79,7 @@ final class MeetingRecordingService {
             meeting.audioRelativePath = relativePath
             timeline = RecordingTimeline(startedAt: meeting.startedAt ?? Date())
             activeMeeting = meeting
-            deviceInterrupted = false
+            interruptionReason = nil
             lastErrorDescription = nil
         } catch {
             // 失败回滚：不留下半开状态；只保留脱敏错误类型
@@ -95,7 +116,8 @@ final class MeetingRecordingService {
             meeting.pauseIntervals.append(interval)
         }
         try meeting.transition(to: .recording)
-        deviceInterrupted = false
+        interruptionReason = nil
+        lastErrorDescription = nil
     }
 
     /// 结束录音：recording/paused → finalizing → completed。
@@ -134,24 +156,47 @@ final class MeetingRecordingService {
         }
         try meeting.transition(to: .completed)
         activeMeeting = nil
+        interruptionReason = nil
     }
 
     /// 设备拔出 / 配置变化（实施计划 11.2：立即提示并暂停录音，允许选择新设备继续）
     func handleDeviceDisconnected() {
+        handleCaptureInterruption(
+            .deviceDisconnected,
+            logEvent: "capture_device_disconnected"
+        )
+    }
+
+    func handleWriteFailure() {
+        handleCaptureInterruption(
+            .fileWriteFailure,
+            logEvent: "capture_write_failure_paused"
+        )
+    }
+
+    private func handleCaptureInterruption(
+        _ reason: RecordingInterruptionReason,
+        logEvent: String
+    ) {
         guard let meeting = activeMeeting else { return }
         if meeting.status == .recording {
             try? pauseRecording()
         }
         if meeting.status == .paused || meeting.status == .recording {
-            deviceInterrupted = true
-            AppLog.logWarning(AppLog.audio, LogSanitizer.formatEvent("capture_device_disconnected"))
+            interruptionReason = reason
+            if reason == .fileWriteFailure {
+                lastErrorDescription = reason.userMessage
+            }
+            AppLog.logWarning(AppLog.audio, LogSanitizer.formatEvent(logEvent))
         }
     }
 
     /// 设备中断后选择新设备（之后由用户点击「继续」恢复录音）
     func switchInputDevice(to deviceID: String) throws {
         try capture.selectInputDevice(id: deviceID)
-        deviceInterrupted = false
+        if interruptionReason == .deviceDisconnected {
+            interruptionReason = nil
+        }
     }
 
     /// 放弃当前会话状态（会议被删除等场景使用）
@@ -159,7 +204,7 @@ final class MeetingRecordingService {
         capture.stopCapture()
         activeMeeting = nil
         timeline = nil
-        deviceInterrupted = false
+        interruptionReason = nil
     }
 }
 
