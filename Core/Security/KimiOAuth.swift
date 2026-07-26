@@ -136,7 +136,7 @@ struct KimiOAuthClient: KimiOAuthClientProtocol {
         session: URLSession = .shared,
         host: URL = CloudModelConfig.kimiOAuthHost,
         clientID: String = CloudModelConfig.kimiOAuthClientID,
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.session = session
         self.host = host
@@ -301,7 +301,7 @@ actor KimiCredentialProvider: KimiCredentialProviding {
         tokenStore: KimiOAuthTokenStore = KimiOAuthTokenStore(),
         staticKeyStore: CloudAPIKeyStore = CloudAPIKeyStore.store(for: .analysis),
         client: any KimiOAuthClientProtocol = KimiOAuthClient(),
-        now: @escaping @Sendable () -> Date = Date.init,
+        now: @escaping @Sendable () -> Date = { Date() },
         refreshLeeway: TimeInterval = CloudModelConfig.kimiOAuthRefreshLeewaySeconds
     ) {
         self.tokenStore = tokenStore
