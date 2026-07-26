@@ -155,6 +155,9 @@ final class ConversationAnalysisController {
             )
             // 原子替换 + 落库容器
             project.analysisSnapshots.append(snapshot)
+            project.analysisSnapshots = ConversationAnalysisSnapshotRetention.keepingMostRecent(
+                project.analysisSnapshots
+            )
             currentSnapshot = snapshot
             // 场景自动建议：用户未手选且模型给出建议时采纳（用户随时可改）
             if !project.scenarioWasUserSelected,

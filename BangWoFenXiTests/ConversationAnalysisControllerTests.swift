@@ -342,6 +342,40 @@ final class ConversationAnalysisControllerTests {
         #expect(controller.currentSnapshot?.analyzedThroughMs == 88_000)
     }
 
+    @Test("快照不足五版时保持原序列")
+    func snapshotRetentionKeepsShortHistory() {
+        let snapshots = (1...4).map {
+            ConversationAnalysisSnapshot(version: $0, analyzedThroughMs: Int64($0 * 1_000), items: [])
+        }
+
+        let retained = ConversationAnalysisSnapshotRetention.keepingMostRecent(snapshots)
+
+        #expect(retained.map(\.version) == [1, 2, 3, 4])
+    }
+
+    @Test("快照超过五版时移除最旧版本")
+    func snapshotRetentionRemovesOldest() {
+        let snapshots = (1...7).map {
+            ConversationAnalysisSnapshot(version: $0, analyzedThroughMs: Int64($0 * 1_000), items: [])
+        }
+
+        let retained = ConversationAnalysisSnapshotRetention.keepingMostRecent(snapshots)
+
+        #expect(retained.map(\.version) == [3, 4, 5, 6, 7])
+    }
+
+    @Test("修剪后下一版版本号继续单调递增")
+    func snapshotVersionContinuesAfterRetention() {
+        let snapshots = (1...8).map {
+            ConversationAnalysisSnapshot(version: $0, analyzedThroughMs: Int64($0 * 1_000), items: [])
+        }
+        let retained = ConversationAnalysisSnapshotRetention.keepingMostRecent(snapshots)
+        let nextVersion = (retained.map(\.version).max() ?? 0) + 1
+
+        #expect(retained.map(\.version) == [4, 5, 6, 7, 8])
+        #expect(nextVersion == 9)
+    }
+
     private func waitUntil(
         _ condition: () -> Bool,
         timeout: Duration = .seconds(10)
