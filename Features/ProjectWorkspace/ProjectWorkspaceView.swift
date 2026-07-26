@@ -304,6 +304,9 @@ struct ProjectWorkspaceView: View {
                 onToggleStar: { segment in
                     MeetingTranscriptEditor.toggleStar(segment)
                     persistAndRefresh(meeting)
+                },
+                onGlobalCorrect: { wrong, right in
+                    globalCorrect(wrong: wrong, right: right, meeting: meeting)
                 }
             )
         }
@@ -818,6 +821,8 @@ struct ProjectWorkspaceView: View {
         recorder = recordingService
 
         let controller = LocalTranscriptionController(service: environment.localTranscription)
+        controller.extraContextualStrings = environment.lexiconTerms
+        controller.correctionRules = environment.correctionRules
         let runtimePersistence = ProjectRuntimePersistenceController(
             meeting: meeting,
             project: project,
@@ -849,6 +854,7 @@ struct ProjectWorkspaceView: View {
             service: environment.conversationAnalysis,
             triggerConfig: project.sourceType == .liveRecording ? .liveRecording : AnalysisTrigger()
         )
+        analysisController.knownTermsProvider = { [environment] in environment.lexiconTerms }
         analysisController.attach(to: project)
         analysisController.onSnapshotUpdated = { [environment] in
             // V2 快照直接写在 Project 上，无需运行时桥接
@@ -904,6 +910,24 @@ struct ProjectWorkspaceView: View {
     /// 点击中栏证据：左栏滚动并高亮对应片段
     private func locateEvidence(segmentID: UUID) {
         highlightedSegmentID = segmentID
+    }
+
+    /// 全局纠错（老板 2026-07-27 需求 2）：
+    /// 整场替换 + 规则入库（后续转写自动纠正、正词进词库）+ 运行中控制器同步。
+    /// 修改过的片段标记人工已修订，不再被云端结果覆盖。
+    private func globalCorrect(wrong: String, right: String, meeting: Meeting) -> Int {
+        let changed = TranscriptCorrector.applyGlobal(
+            wrong: wrong, right: right, segments: meeting.segments)
+        do {
+            try environment.addCorrectionRule(wrong: wrong, right: right)
+        } catch {
+            operationError = "纠错规则保存失败（\(String(describing: type(of: error)))）"
+        }
+        transcription?.correctionRules = environment.correctionRules
+        if changed > 0 {
+            persistAndRefresh(meeting)
+        }
+        return changed
     }
 
     // MARK: - 录音控制

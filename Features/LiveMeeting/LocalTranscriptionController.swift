@@ -29,6 +29,11 @@ final class LocalTranscriptionController {
     private var collectTask: Task<Void, Never>?
     private var timelineProvider: (() -> RecordingTimeline?)?
     private weak var meeting: Meeting?
+    /// 全局词库词条（视图层注入；随参会人信息一并作为识别上下文）
+    var extraContextualStrings: [String] = []
+    /// 纠错规则（视图层注入；本地与云端最终文字在合并点统一套用，
+    /// 保证两侧文字一致不影响去重判定；临时片段不改，避免视觉跳动）
+    var correctionRules: [CorrectionRule] = []
     /// 最终片段入库回调（由视图层注入持久化）
     var onFinalSegment: (() -> Void)?
     /// 新最终片段到达回调（阶段 4：驱动分析调度器）
@@ -126,6 +131,7 @@ final class LocalTranscriptionController {
         segments = []
 
         let contextual = meeting.glossary
+            + extraContextualStrings
             + meeting.participants.map(\.displayName)
             + meeting.participants.map(\.role).filter { !$0.isEmpty }
         do {
@@ -252,7 +258,7 @@ final class LocalTranscriptionController {
         let outcome = reconciler.applyCloudFinal(
             startMs: wallStartMs,
             endMs: wallEndMs,
-            text: text,
+            text: TranscriptCorrector.autoCorrect(text, rules: correctionRules),
             participantId: participantId,
             remoteSpeakerLabel: remoteSpeakerLabel
         )
@@ -288,7 +294,7 @@ final class LocalTranscriptionController {
             let outcome = reconciler.applyFinal(
                 startMs: startWallMs,
                 endMs: endWallMs,
-                text: result.text
+                text: TranscriptCorrector.autoCorrect(result.text, rules: correctionRules)
             )
             if case .inserted(let segment) = outcome {
                 meeting?.segments.append(segment)

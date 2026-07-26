@@ -28,6 +28,8 @@ final class ConversationAnalysisController {
     private weak var project: Project?
     /// 快照更新后的持久化回调（视图/流水线注入）
     var onSnapshotUpdated: (() -> Void)?
+    /// 全局词库（已知名词表；环境注入，进入系统指令帮助还原同音误写）
+    var knownTermsProvider: () -> [String] = { [] }
     /// 模型建议场景被采纳后的回调（UI 刷新场景标签）
     var onScenarioSuggested: (() -> Void)?
 
@@ -137,7 +139,10 @@ final class ConversationAnalysisController {
                 newSegments: newSegments
             )
             let dto = try await service.analyze(
-                instructions: ConversationAnalysisPrompt.text(scenario: effectiveScenario(of: project)),
+                instructions: ConversationAnalysisPrompt.text(
+                    scenario: effectiveScenario(of: project),
+                    knownTerms: knownTermsProvider()
+                ),
                 inputJSON: inputJSON
             )
             let validIds = Set(project.segments.map(\.id))

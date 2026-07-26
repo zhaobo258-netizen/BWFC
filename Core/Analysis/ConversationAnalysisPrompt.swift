@@ -81,9 +81,24 @@ enum ConversationAnalysisPrompt {
         }
     }
 
+    /// 已知名词表段（全局词库）：帮助模型把同音误写还原为正确名词。
+    /// 只影响理解与表述，不改变红线；证据引用仍用片段 ID 保持原文。
+    static func knownTermsSection(_ terms: [String]) -> String {
+        guard !terms.isEmpty else { return "" }
+        // 控制规模：最多 200 词，避免指令膨胀
+        let capped = terms.prefix(200).joined(separator: "、")
+        return """
+
+        已知专有名词表（用户预先登记，转写可能把它们听错成同音字）：\(capped)。
+        理解与输出时遇到与这些名词同音或形近的词，应按名词表还原；\
+        证据引用仍用片段 ID，不改写原文。
+        """
+    }
+
     /// 组装完整系统指令
-    static func text(scenario: ProjectScenario?) -> String {
+    static func text(scenario: ProjectScenario?, knownTerms: [String] = []) -> String {
         persona + "\n\n" + rules + "\n\n" + scenarioRules(for: scenario)
+            + knownTermsSection(knownTerms)
     }
 
     /// 纯文本 JSON 输出约束（Kimi 网关无 Schema 强制；本地严格解码兜底）

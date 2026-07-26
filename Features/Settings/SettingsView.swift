@@ -16,9 +16,12 @@ struct SettingsView: View {
     @State private var testingProvider: CloudProvider?
     @State private var testResults: [CloudProvider: (ok: Bool, text: String)] = [:]
     @State private var login: KimiLoginController?
+    @State private var lexiconPaste: String = ""
+    @State private var lexiconMessage: String?
 
     var body: some View {
         Form {
+            lexiconSection
             kimiAccountSection
             keySection(
                 provider: .analysis,
@@ -62,6 +65,91 @@ struct SettingsView: View {
                     router.closeSettings()
                 }
             }
+        }
+    }
+
+    // MARK: - 专业词库与纠错（老板 2026-07-27）
+
+    @ViewBuilder
+    private var lexiconSection: some View {
+        Section {
+            HStack {
+                Text("已导入 \(environment.lexiconTerms.count) 个词条")
+                Spacer()
+                Button("从文件导入…") { importLexiconFromFile() }
+                Button("清空词库") {
+                    try? environment.clearLexicon()
+                    lexiconMessage = "已清空。"
+                }
+                .disabled(environment.lexiconTerms.isEmpty)
+            }
+            TextField("或在此粘贴词条（每行一个，兼容顿号/逗号分隔）", text: $lexiconPaste, axis: .vertical)
+                .lineLimit(2...4)
+                .textFieldStyle(.roundedBorder)
+            HStack {
+                Button("导入粘贴内容") {
+                    importLexicon(text: lexiconPaste)
+                    lexiconPaste = ""
+                }
+                .disabled(lexiconPaste.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if let lexiconMessage {
+                    Text(lexiconMessage)
+                        .font(.footnote)
+                        .foregroundStyle(.green)
+                }
+                Spacer()
+            }
+            if !environment.correctionRules.isEmpty {
+                DisclosureGroup("纠错规则（\(environment.correctionRules.count) 条，转写自动套用）") {
+                    ForEach(environment.correctionRules) { rule in
+                        HStack {
+                            Text("\(rule.wrong) → \(rule.right)")
+                                .font(.callout)
+                            Spacer()
+                            Button {
+                                try? environment.removeCorrectionRule(rule)
+                            } label: {
+                                Image(systemName: "trash")
+                                    .font(.caption)
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            Text("词条在录音与导入转写时作为识别上下文（只改善识别，不改写原意），并作为分析的已知名词。纠错规则来自工作台文稿右键「纠错」，也在此管理。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        } header: {
+            Text("专业词库")
+        }
+    }
+
+    private func importLexiconFromFile() {
+        let panel = NSOpenPanel()
+        panel.title = "导入词库"
+        panel.allowedContentTypes = [.plainText, .commaSeparatedText]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard url.startAccessingSecurityScopedResource() else {
+            lexiconMessage = "无法访问所选文件。"
+            return
+        }
+        defer { url.stopAccessingSecurityScopedResource() }
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else {
+            lexiconMessage = "文件读取失败（需为 UTF-8 文本）。"
+            return
+        }
+        importLexicon(text: text)
+    }
+
+    private func importLexicon(text: String) {
+        do {
+            let added = try environment.importLexicon(text: text)
+            lexiconMessage = added > 0 ? "新增 \(added) 个词条。" : "没有新词条（已全部存在）。"
+        } catch {
+            lexiconMessage = "保存失败：\(error.localizedDescription)"
         }
     }
 

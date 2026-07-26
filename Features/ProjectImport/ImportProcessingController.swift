@@ -20,6 +20,9 @@ final class ImportProcessingController {
     private let loadProject: (UUID) throws -> Project?
     private let persistProject: (Project, ProjectFieldOwnership) throws -> Void
     private let isAnalysisConfigured: () -> Bool
+    /// 全局词库（导入转写的识别上下文；纠错规则由环境注入）
+    var lexiconProvider: () -> [String] = { [] }
+    var correctionRulesProvider: () -> [CorrectionRule] = { [] }
 
     // MARK: - 可观察状态
 
@@ -234,13 +237,17 @@ final class ImportProcessingController {
         }
         do {
             let runner = FileTranscriptionRunner(service: service)
+            let rules = correctionRulesProvider()
             let segments = try await runner.run(
                 audioURL: audioURL,
-                contextualStrings: [] // 导入无会前词汇；场景模板属阶段 D
+                contextualStrings: lexiconProvider() // 全局词库改善识别
             ) { [weak self] progress in
                 Task { @MainActor in
                     self?.updateJobProgress(.transcription, progress: progress)
                 }
+            }
+            for segment in segments {
+                segment.text = TranscriptCorrector.autoCorrect(segment.text, rules: rules)
             }
             project.segments = segments
             persistQuietly(project)
@@ -263,6 +270,7 @@ final class ImportProcessingController {
             return .completed
         }
         let controller = ConversationAnalysisController(service: analysisService)
+        controller.knownTermsProvider = lexiconProvider
         controller.attach(to: project)
         await controller.generateFinalAnalysis()
         if Task.isCancelled { return .cancelled }

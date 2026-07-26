@@ -193,9 +193,16 @@ final class AppEnvironment {
                 try self?.persist(project, fields: fields)
             }
         )
+        controller.lexiconProvider = { [weak self] in self?.lexiconTerms ?? [] }
+        controller.correctionRulesProvider = { [weak self] in self?.correctionRules ?? [] }
         _importProcessing = controller
         return controller
     }
+
+    /// 全局专业词库与纠错规则（App 级；转写上下文 + 分析已知名词 + 自动纠错）
+    let lexiconStore: LexiconStore
+    private(set) var lexiconTerms: [String] = []
+    private(set) var correctionRules: [CorrectionRule] = []
 
     /// 各 provider 的 Keychain 存储（Key 分家，互不外借）
     private let keyStores: [CloudProvider: CloudAPIKeyStore]
@@ -260,10 +267,52 @@ final class AppEnvironment {
         self.makeImportTranscriptionService = makeImportTranscriptionService ?? { AppleSpeechTranscriptionService() }
         self.isPersistentStorageUnavailable = isPersistentStorageUnavailable
 
+        self.lexiconStore = LexiconStore(baseDirectory: fileStore.baseDirectory)
+        let loaded = lexiconStore.load()
+        self.lexiconTerms = loaded.terms
+        self.correctionRules = loaded.corrections
+
         self.keyStores = stores
         self.kimiOAuthTokenStore = oauthStore
         self.isAnalysisConfigured = (stores[.analysis]?.hasConfiguredKey ?? false) || oauthStore.hasTokens
         self.isDiarizationConfigured = stores[.diarization]?.hasConfiguredKey ?? false
+    }
+
+    // MARK: - 专业词库与纠错规则
+
+    /// 导入词库文本（追加合并，去重保序）；返回新增词数
+    @discardableResult
+    func importLexicon(text: String) throws -> Int {
+        let parsed = LexiconStore.parse(text)
+        let merged = LexiconStore.merge(lexiconTerms, adding: parsed)
+        let added = merged.count - lexiconTerms.count
+        try lexiconStore.save(terms: merged, corrections: correctionRules)
+        lexiconTerms = merged
+        return added
+    }
+
+    /// 清空词库（纠错规则保留）
+    func clearLexicon() throws {
+        try lexiconStore.save(terms: [], corrections: correctionRules)
+        lexiconTerms = []
+    }
+
+    /// 记录纠错规则（同错词后写覆盖）；正词自动进入词库供后续识别
+    func addCorrectionRule(wrong: String, right: String) throws {
+        guard TranscriptCorrector.isValidRule(wrong: wrong, right: right) else { return }
+        let rule = CorrectionRule(wrong: wrong, right: right)
+        let rules = TranscriptCorrector.mergeRule(rule, into: correctionRules)
+        let terms = LexiconStore.merge(lexiconTerms, adding: [right])
+        try lexiconStore.save(terms: terms, corrections: rules)
+        correctionRules = rules
+        lexiconTerms = terms
+    }
+
+    /// 删除纠错规则
+    func removeCorrectionRule(_ rule: CorrectionRule) throws {
+        let rules = correctionRules.filter { $0.id != rule.id }
+        try lexiconStore.save(terms: lexiconTerms, corrections: rules)
+        correctionRules = rules
     }
 
     /// 指定 provider 的 Keychain 存储（视图层读写 Key 的唯一入口）

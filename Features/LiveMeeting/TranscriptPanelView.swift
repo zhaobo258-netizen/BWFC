@@ -68,12 +68,16 @@ struct TranscriptPanelView: View {
     var onAssignSpeaker: ((TranscriptSegment, Participant?) -> Void)?
     var onEditText: ((TranscriptSegment, String) -> Void)?
     var onToggleStar: ((TranscriptSegment) -> Void)?
+    /// 全局纠错（错词, 正词）→ 由父视图执行替换、持久化并记住规则
+    var onGlobalCorrect: ((String, String) -> Int)?
 
     /// 是否贴底自动滚动
     @State private var pinnedToBottom = true
     /// 正在编辑文字的片段
     @State private var editingTextSegment: TranscriptSegment?
     @State private var editingText: String = ""
+    /// 纠错弹层：源片段（提供原文参照）
+    @State private var correctingSegment: TranscriptSegment?
 
     var body: some View {
         let _ = PerfCounters.incrementPanelBodyEval() // 求值计数（自激排查；写非观测全局，安全）
@@ -160,6 +164,17 @@ struct TranscriptPanelView: View {
             .padding(20)
             .frame(width: 480, height: 260)
         }
+        .sheet(item: $correctingSegment) { segment in
+            GlobalCorrectionSheet(
+                sourceText: segment.text,
+                matchCount: { wrong in
+                    TranscriptCorrector.matchCount(of: wrong, in: segments)
+                },
+                onApply: { wrong, right in
+                    onGlobalCorrect?(wrong, right) ?? 0
+                }
+            )
+        }
     }
 
     /// 片段 → 行数据（纯映射；行 Equatable 保证未变化行零重建）
@@ -209,6 +224,10 @@ struct TranscriptPanelView: View {
             guard let segment = segment(for: row) else { return }
             editingText = segment.text
             editingTextSegment = segment
+        }
+        Button("纠错（全局替换）…") {
+            guard let segment = segment(for: row) else { return }
+            correctingSegment = segment
         }
         Divider()
         Button(row.isStarred ? "取消星标" : "加星标") {
@@ -321,5 +340,85 @@ struct TranscriptRowView: View, Equatable {
     static func formatMs(_ ms: Int64) -> String {
         let totalSeconds = max(0, ms / 1000)
         return String(format: "%02d:%02d", totalSeconds / 60, totalSeconds % 60)
+    }
+}
+
+/// 全局纠错弹层（老板 2026-07-27 需求 2）：
+/// 从原文中选中/输入错词 → 输入正词 → 预览命中片段数 → 一键全局替换。
+/// 替换同时记为纠错规则：之后到达的转写（本地与云端）自动套用；正词进入词库。
+struct GlobalCorrectionSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    let sourceText: String
+    let matchCount: (String) -> Int
+    /// 执行纠错，返回实际修改的片段数
+    let onApply: (String, String) -> Int
+
+    @State private var wrong: String = ""
+    @State private var right: String = ""
+    @State private var resultMessage: String?
+
+    private var trimmedWrong: String { wrong.trimmingCharacters(in: .whitespaces) }
+    private var trimmedRight: String { right.trimmingCharacters(in: .whitespaces) }
+    private var canApply: Bool {
+        TranscriptCorrector.isValidRule(wrong: trimmedWrong, right: trimmedRight)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("转写纠错")
+                .font(.headline)
+            Text("原文（选中错词后可直接拷贝）：")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ScrollView {
+                Text(sourceText)
+                    .font(.callout)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 80)
+            .padding(8)
+            .background(BWTheme.columnBackground, in: RoundedRectangle(cornerRadius: 8))
+
+            HStack(spacing: 8) {
+                TextField("听错的词", text: $wrong)
+                    .textFieldStyle(.roundedBorder)
+                Image(systemName: "arrow.right")
+                    .foregroundStyle(.secondary)
+                TextField("正确的词", text: $right)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            if !trimmedWrong.isEmpty {
+                let hits = matchCount(trimmedWrong)
+                Text(hits > 0 ? "将替换 \(hits) 个片段中的「\(trimmedWrong)」" : "当前文稿未找到「\(trimmedWrong)」")
+                    .font(.caption)
+                    .foregroundStyle(hits > 0 ? Color.secondary : Color.orange)
+            }
+            Text("替换整场文稿并记住这条纠错：之后的转写自动纠正，正词加入词库优先识别。")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+
+            if let resultMessage {
+                Text(resultMessage)
+                    .font(.caption)
+                    .foregroundStyle(.green)
+            }
+
+            HStack {
+                Spacer()
+                Button("取消") { dismiss() }
+                Button("全局纠错") {
+                    let changed = onApply(trimmedWrong, trimmedRight)
+                    resultMessage = "已纠正 \(changed) 个片段，并记住该规则。"
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { dismiss() }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canApply)
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
     }
 }
