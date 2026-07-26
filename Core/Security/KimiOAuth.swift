@@ -46,13 +46,25 @@ struct KimiOAuthTokenStore: Sendable {
 
     /// 读取凭证；不存在或数据损坏返回 nil（损坏视为未登录，不猜测修复）
     func read() throws -> KimiOAuthTokens? {
-        guard let raw = try keychain.read(account: Self.account),
-              let data = raw.data(using: .utf8) else {
+        guard let raw = try keychain.read(account: Self.account) else {
+            return nil
+        }
+        guard let data = raw.data(using: .utf8) else {
+            AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent(
+                "kimi_oauth_credentials_corrupted"
+            ))
             return nil
         }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .secondsSince1970
-        return try? decoder.decode(KimiOAuthTokens.self, from: data)
+        do {
+            return try decoder.decode(KimiOAuthTokens.self, from: data)
+        } catch {
+            AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent(
+                "kimi_oauth_credentials_corrupted"
+            ))
+            return nil
+        }
     }
 
     /// 保存凭证（覆盖更新）
@@ -178,6 +190,7 @@ struct KimiOAuthClient: KimiOAuthClientProtocol {
                 "kimi_oauth_poll_failed", statusCode: status
             ))
             if status == 401 || status == 403 { throw KimiOAuthError.unauthorized }
+            if payload.isEmpty { throw KimiOAuthError.network }
             throw KimiOAuthError.invalidResponse
         }
     }
@@ -199,6 +212,9 @@ struct KimiOAuthClient: KimiOAuthClientProtocol {
         ))
         if status == 401 || status == 403 || payload["error"] as? String == "invalid_grant" {
             throw KimiOAuthError.unauthorized
+        }
+        if payload.isEmpty {
+            throw KimiOAuthError.network
         }
         if (500...599).contains(status) {
             // 服务端故障按网络类处理（上层可重试，不清除凭证）

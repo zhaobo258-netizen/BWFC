@@ -107,6 +107,23 @@ final class KimiOAuthTests {
         #expect(body.contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"))
     }
 
+    @Test("设备码轮询收到非 JSON 错误页时归类为可重试网络错误")
+    func pollHTMLResponseIsNetworkError() async {
+        storage.requestHandler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 400,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "text/html"]
+            )!
+            return (response, Data("<html>gateway error</html>".utf8))
+        }
+
+        await #expect(throws: KimiOAuthError.network) {
+            _ = try await makeClient().pollDeviceToken(deviceCode: "dev-123")
+        }
+    }
+
     @Test("刷新：请求形态正确；401/invalid_grant → unauthorized；5xx → network")
     func refreshClassification() async throws {
         let client = makeClient()
@@ -147,6 +164,23 @@ final class KimiOAuthTests {
         }
         await #expect(throws: KimiOAuthError.network) {
             _ = try await client.refresh(refreshToken: "rt-1")
+        }
+    }
+
+    @Test("刷新收到非 JSON 错误页时归类为可重试网络错误")
+    func refreshHTMLResponseIsNetworkError() async {
+        storage.requestHandler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 400,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "text/html"]
+            )!
+            return (response, Data("<html>gateway error</html>".utf8))
+        }
+
+        await #expect(throws: KimiOAuthError.network) {
+            _ = try await makeClient().refresh(refreshToken: "rt-1")
         }
     }
 
