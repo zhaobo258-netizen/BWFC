@@ -5,6 +5,7 @@ import Testing
 /// Project ⇄ 运行时 Meeting 桥接测试（阶段 B）：
 /// 状态映射、字段还原、深拷贝隔离、回写一致性与往返稳定。
 @Suite("Project 运行时桥接")
+@MainActor
 final class ProjectRuntimeSessionTests {
 
     /// 造一个字段齐全的 Project
@@ -173,5 +174,85 @@ final class ProjectRuntimeSessionTests {
         let reread = try JSONProjectStore(directory: tempDirectory)
         #expect(try reread.loadProjects().first?.runtimeAssetRelativePath
                 == "Meetings/\(project.id.uuidString)/recording.caf")
+    }
+
+    @Test("连续最终片段在窗口内合并为一次落盘")
+    func finalSegmentsAreBatched() async throws {
+        let project = Project(
+            title: "连续转写",
+            sourceType: .liveRecording,
+            status: .creating
+        )
+        let meeting = try ProjectRuntimeSession.makeRuntimeMeeting(from: project)
+        var persistCount = 0
+        let controller = ProjectRuntimePersistenceController(
+            meeting: meeting,
+            project: project,
+            persist: { _ in persistCount += 1 },
+            debounce: .milliseconds(50)
+        )
+
+        for index in 0..<20 {
+            meeting.segments.append(TranscriptSegment(
+                startMs: Int64(index * 1_000),
+                endMs: Int64((index + 1) * 1_000),
+                text: "片段 \(index)",
+                source: .local,
+                state: .final
+            ))
+            controller.schedule()
+        }
+
+        await waitUntil { persistCount == 1 && !controller.hasPendingChanges }
+
+        #expect(persistCount == 1)
+        #expect(persistCount < meeting.segments.count)
+        #expect(project.segments.count == 20)
+        #expect(project.segments.last?.text == "片段 19")
+    }
+
+    @Test("结束录音强制落盘防抖窗口内的最后片段")
+    func finishFlushesLastSegment() throws {
+        let project = Project(
+            title: "结束落盘",
+            sourceType: .liveRecording,
+            status: .creating
+        )
+        let meeting = try ProjectRuntimeSession.makeRuntimeMeeting(from: project)
+        try meeting.transition(to: .recording)
+        var persistCount = 0
+        let controller = ProjectRuntimePersistenceController(
+            meeting: meeting,
+            project: project,
+            persist: { _ in persistCount += 1 },
+            debounce: .seconds(60)
+        )
+
+        meeting.segments.append(TranscriptSegment(
+            startMs: 0,
+            endMs: 2_000,
+            text: "结束前最后一句",
+            source: .local,
+            state: .final
+        ))
+        controller.schedule()
+        try meeting.transition(to: .finalizing)
+
+        #expect(persistCount == 0)
+        #expect(controller.flush(force: true))
+        #expect(persistCount == 1)
+        #expect(project.status == .processing)
+        #expect(project.segments.last?.text == "结束前最后一句")
+        #expect(!controller.hasPendingChanges)
+    }
+
+    private func waitUntil(
+        _ condition: () -> Bool,
+        timeout: Duration = .seconds(10)
+    ) async {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline, !condition() {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
     }
 }

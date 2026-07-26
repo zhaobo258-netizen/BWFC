@@ -22,6 +22,7 @@ struct ProjectWorkspaceView: View {
     @State private var diarization: DiarizationController?
     @State private var analysis: ConversationAnalysisController?
     @State private var noteController: NoteController?
+    @State private var runtimePersistence: ProjectRuntimePersistenceController?
     @State private var operationError: String?
     @State private var highlightedSegmentID: UUID?
     @State private var showEndConfirmation = false
@@ -91,7 +92,10 @@ struct ProjectWorkspaceView: View {
         }
         .navigationTitle(project?.title ?? "项目")
         .onAppear { loadProject() }
-        .onDisappear { noteController?.saveNow() }
+        .onDisappear {
+            noteController?.saveNow()
+            runtimePersistence?.flush()
+        }
         .onReceive(chunkPollTimer) { _ in
             diarization?.pollProgress()
             Task { await analysis?.tick() }
@@ -767,15 +771,23 @@ struct ProjectWorkspaceView: View {
         recorder = recordingService
 
         let controller = LocalTranscriptionController(service: environment.localTranscription)
-        controller.onFinalSegment = { [environment] in
-            do {
-                try ProjectRuntimeSession.applyRuntime(meeting, to: project)
-                // 实时录音项目没有并发导入流水线，工作台持有唯一运行时写副本，
-                // 因而可整对象保存；导入项目的写入全部走字段合并入口。
-                try environment.persist(project, fields: .all)
-            } catch {
-                Task { @MainActor in self.operationError = "项目保存失败（\(String(describing: type(of: error)))）" }
+        let runtimePersistence = ProjectRuntimePersistenceController(
+            meeting: meeting,
+            project: project,
+            persist: { [environment] project in
+                // 实时录音没有并发导入流水线，工作台持有唯一写副本，可整对象保存。
+                let fields: ProjectFieldOwnership = project.sourceType == .liveRecording
+                    ? .all
+                    : .manualSegments
+                try environment.persist(project, fields: fields)
+            },
+            onFailure: { error in
+                self.operationError = "项目保存失败（\(String(describing: type(of: error)))）"
             }
+        )
+        self.runtimePersistence = runtimePersistence
+        controller.onFinalSegment = {
+            runtimePersistence.schedule()
         }
         transcription = controller
 
@@ -806,6 +818,12 @@ struct ProjectWorkspaceView: View {
     /// 运行时 → Project 回写并落库（所有状态变化的统一出口）
     private func syncAndPersist(_ meeting: Meeting) {
         guard let project else { return }
+        if let runtimePersistence {
+            if runtimePersistence.flush(force: true) {
+                operationError = nil
+            }
+            return
+        }
         do {
             try ProjectRuntimeSession.applyRuntime(meeting, to: project)
             let fields: ProjectFieldOwnership = project.sourceType == .liveRecording

@@ -116,3 +116,63 @@ enum ProjectRuntimeSession {
         project.lastActivityAt = now
     }
 }
+
+@MainActor
+final class ProjectRuntimePersistenceController {
+    private let meeting: Meeting
+    private let project: Project
+    private let persist: (Project) throws -> Void
+    private let debounce: Duration
+    private let onFailure: (Error) -> Void
+    private var flushTask: Task<Void, Never>?
+
+    private(set) var hasPendingChanges = false
+    private(set) var saveError: String?
+
+    init(
+        meeting: Meeting,
+        project: Project,
+        persist: @escaping (Project) throws -> Void,
+        debounce: Duration = .seconds(2),
+        onFailure: @escaping (Error) -> Void = { _ in }
+    ) {
+        self.meeting = meeting
+        self.project = project
+        self.persist = persist
+        self.debounce = debounce
+        self.onFailure = onFailure
+    }
+
+    func schedule() {
+        hasPendingChanges = true
+        // 窗口从第一条未保存片段起算，持续转写时也能保证最多约 2 秒未落盘。
+        guard flushTask == nil else { return }
+        flushTask = Task { [weak self, debounce] in
+            try? await Task.sleep(for: debounce)
+            guard let self, !Task.isCancelled else { return }
+            self.flushTask = nil
+            self.writeThrough()
+        }
+    }
+
+    @discardableResult
+    func flush(force: Bool = false) -> Bool {
+        flushTask?.cancel()
+        flushTask = nil
+        guard hasPendingChanges || force else { return saveError == nil }
+        writeThrough()
+        return saveError == nil
+    }
+
+    private func writeThrough() {
+        do {
+            try ProjectRuntimeSession.applyRuntime(meeting, to: project)
+            try persist(project)
+            hasPendingChanges = false
+            saveError = nil
+        } catch {
+            saveError = String(describing: type(of: error))
+            onFailure(error)
+        }
+    }
+}
