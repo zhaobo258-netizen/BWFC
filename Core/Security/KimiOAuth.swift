@@ -278,6 +278,8 @@ actor KimiCredentialProvider: KimiCredentialProviding {
     private let client: any KimiOAuthClientProtocol
     private let now: @Sendable () -> Date
     private let refreshLeeway: TimeInterval
+    private var refreshTask: Task<KimiOAuthTokens, Error>?
+    private var refreshGeneration = 0
 
     init(
         tokenStore: KimiOAuthTokenStore = KimiOAuthTokenStore(),
@@ -298,18 +300,37 @@ actor KimiCredentialProvider: KimiCredentialProviding {
             if tokens.expiresAt.timeIntervalSince(now()) > refreshLeeway {
                 return tokens.accessToken
             }
-            do {
-                let fresh = try await client.refresh(refreshToken: tokens.refreshToken)
-                do {
-                    try tokenStore.save(fresh)
-                } catch {
-                    // 轮换后的 refresh_token 若保存失败，旧值已被服务端作废，
-                    // 下次刷新将被迫重新登录——必须公开记录（脱敏）
-                    AppLog.logError(AppLog.analysis, LogSanitizer.formatEvent(
-                        "kimi_oauth_token_persist_failed",
-                        error: String(describing: type(of: error))
-                    ))
+            let task: Task<KimiOAuthTokens, Error>
+            let generation: Int
+            if let inFlight = refreshTask {
+                task = inFlight
+                generation = refreshGeneration
+            } else {
+                refreshGeneration += 1
+                generation = refreshGeneration
+                let client = self.client
+                let tokenStore = self.tokenStore
+                task = Task {
+                    let fresh = try await client.refresh(refreshToken: tokens.refreshToken)
+                    do {
+                        try tokenStore.save(fresh)
+                    } catch {
+                        AppLog.logError(AppLog.analysis, LogSanitizer.formatEvent(
+                            "kimi_oauth_token_persist_failed",
+                            error: String(describing: type(of: error))
+                        ))
+                    }
+                    return fresh
                 }
+                refreshTask = task
+            }
+            defer {
+                if generation == refreshGeneration {
+                    refreshTask = nil
+                }
+            }
+            do {
+                let fresh = try await task.value
                 return fresh.accessToken
             } catch KimiOAuthError.unauthorized {
                 // 凭证失效：保留条目供设置页展示状态，由用户重新登录覆盖

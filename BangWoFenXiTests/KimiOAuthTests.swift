@@ -220,6 +220,44 @@ final class KimiOAuthTests {
                 "refresh_token 轮换语义：新凭证必须立即写回 Keychain")
     }
 
+    @Test("凭证提供者：并发临期请求共享一次刷新与同一轮换凭证")
+    func concurrentRefreshIsSingleFlight() async throws {
+        let client = MockKimiOAuthClient()
+        let gate = RefreshContinuationBox()
+        let rotated = Self.tokens(
+            access: "at-rotated",
+            refresh: "rt-rotated",
+            expiresAt: Date(timeIntervalSince1970: 1_000_900)
+        )
+        client.refreshHandler = { _ in
+            try await gate.wait()
+        }
+        let (provider, store, _) = makeProvider(client: client)
+        try store.save(Self.tokens(expiresAt: Date(timeIntervalSince1970: 1_000_100)))
+
+        let callers = (0..<12).map { _ in
+            Task { try await provider.validCredential() }
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while ContinuousClock.now < deadline, gate.waitingCount == 0 {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        for _ in 0..<100 {
+            await Task.yield()
+        }
+        let refreshCallsBeforeRelease = client.refreshCalls
+        gate.resumeAll(returning: rotated)
+
+        var credentials: [String] = []
+        for caller in callers {
+            credentials.append(try await caller.value)
+        }
+
+        #expect(refreshCallsBeforeRelease == ["rt-1"])
+        #expect(Set(credentials) == ["at-rotated"])
+        #expect(try store.read() == rotated)
+    }
+
     @Test("凭证提供者：刷新被拒 → unauthorized（凭证保留，待用户重新登录）")
     func refreshUnauthorized() async throws {
         let client = MockKimiOAuthClient()
@@ -269,6 +307,38 @@ final class KimiOAuthTests {
         try store.save(Self.tokens(expiresAt: Date(timeIntervalSince1970: 1_000_900)))
 
         #expect(try await provider.validCredential() == "at-1")
+    }
+
+    @Test("AppEnvironment 默认 V1 与 V2 分析路径共享同一凭证提供者")
+    @MainActor
+    func appEnvironmentSharesCredentialsAcrossAnalysisPaths() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "bwfx-kimi-env-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let credentials = CountingFailingKimiCredentials()
+        let environment = AppEnvironment(
+            meetingStore: InMemoryMeetingStore(),
+            fileStore: MeetingFileStore(baseDirectory: directory),
+            kimiCredentials: credentials,
+            keychainServiceName: keychainServiceName
+        )
+
+        await #expect(throws: AnalysisAPIError.network) {
+            _ = try await environment.negotiationAnalysis.analyze(
+                instructions: "test",
+                inputJSON: "{}"
+            )
+        }
+        await #expect(throws: AnalysisAPIError.network) {
+            _ = try await environment.conversationAnalysis.analyze(
+                instructions: "test",
+                inputJSON: "{}"
+            )
+        }
+        let callCount = await credentials.callCount()
+        #expect(callCount == 2)
     }
 
     // MARK: - 登录控制器
@@ -355,4 +425,43 @@ final class OpenedURLBox: @unchecked Sendable {
     private var _urls: [URL] = []
     var urls: [URL] { lock.withLock { _urls } }
     func append(_ url: URL) { lock.withLock { _urls.append(url) } }
+}
+
+final class RefreshContinuationBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuations: [CheckedContinuation<KimiOAuthTokens, Error>] = []
+
+    var waitingCount: Int { lock.withLock { continuations.count } }
+
+    func wait() async throws -> KimiOAuthTokens {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.withLock {
+                continuations.append(continuation)
+            }
+        }
+    }
+
+    func resumeAll(returning tokens: KimiOAuthTokens) {
+        let waiting = lock.withLock {
+            let waiting = continuations
+            continuations.removeAll()
+            return waiting
+        }
+        for continuation in waiting {
+            continuation.resume(returning: tokens)
+        }
+    }
+}
+
+actor CountingFailingKimiCredentials: KimiCredentialProviding {
+    private var calls = 0
+
+    func validCredential() async throws -> String {
+        calls += 1
+        throw AnalysisAPIError.network
+    }
+
+    func callCount() -> Int {
+        calls
+    }
 }

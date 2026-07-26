@@ -17,6 +17,7 @@ final class MockKimiOAuthClient: KimiOAuthClientProtocol, @unchecked Sendable {
     var pollResults: [Result<KimiOAuthTokens, KimiOAuthError>] = []
     /// 刷新结果队列（依次消费；耗尽后重复最后一个）
     var refreshResults: [Result<KimiOAuthTokens, KimiOAuthError>] = []
+    private var _refreshHandler: (@Sendable (String) async throws -> KimiOAuthTokens)?
 
     private var _startCalls = 0
     private var _pollCalls: [String] = []
@@ -25,6 +26,10 @@ final class MockKimiOAuthClient: KimiOAuthClientProtocol, @unchecked Sendable {
     var startCalls: Int { lock.withLock { _startCalls } }
     var pollCalls: [String] { lock.withLock { _pollCalls } }
     var refreshCalls: [String] { lock.withLock { _refreshCalls } }
+    var refreshHandler: (@Sendable (String) async throws -> KimiOAuthTokens)? {
+        get { lock.withLock { _refreshHandler } }
+        set { lock.withLock { _refreshHandler = newValue } }
+    }
 
     func startDeviceAuthorization() async throws -> KimiDeviceAuthorization {
         lock.withLock { _startCalls += 1 }
@@ -43,11 +48,19 @@ final class MockKimiOAuthClient: KimiOAuthClientProtocol, @unchecked Sendable {
     }
 
     func refresh(refreshToken: String) async throws -> KimiOAuthTokens {
-        let result: Result<KimiOAuthTokens, KimiOAuthError>? = lock.withLock {
+        let (handler, result): (
+            (@Sendable (String) async throws -> KimiOAuthTokens)?,
+            Result<KimiOAuthTokens, KimiOAuthError>?
+        ) = lock.withLock {
             _refreshCalls.append(refreshToken)
-            guard !refreshResults.isEmpty else { return nil }
-            return refreshResults.count > 1 ? refreshResults.removeFirst() : refreshResults[0]
+            if let handler = _refreshHandler {
+                return (handler, nil)
+            }
+            guard !refreshResults.isEmpty else { return (nil, nil) }
+            let result = refreshResults.count > 1 ? refreshResults.removeFirst() : refreshResults[0]
+            return (nil, result)
         }
+        if let handler { return try await handler(refreshToken) }
         guard let result else { throw KimiOAuthError.invalidResponse }
         return try result.get()
     }

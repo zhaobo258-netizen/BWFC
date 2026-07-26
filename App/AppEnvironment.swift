@@ -75,33 +75,46 @@ final class AppEnvironment {
         audioCapture: any AudioCaptureServicing = AVAudioCaptureService(),
         localTranscription: any LocalTranscriptionServicing = AppleSpeechTranscriptionService(),
         diarization: any DiarizationServicing = OpenAIDiarizationService(),
-        negotiationAnalysis: any NegotiationAnalysisServicing = KimiAnalysisService(),
+        negotiationAnalysis: (any NegotiationAnalysisServicing)? = nil,
         conversationAnalysis: (any ConversationAnalysisServicing)? = nil,
+        kimiCredentials: (any KimiCredentialProviding)? = nil,
         exporter: (any MeetingExportServicing)? = nil,
         audioImport: (any AudioImportServicing)? = nil,
         makeImportTranscriptionService: (() -> any LocalTranscriptionServicing)? = nil,
         keychainServiceName: String = CloudAPIKeyStore.defaultService,
         isPersistentStorageUnavailable: Bool = false
     ) {
+        var stores: [CloudProvider: CloudAPIKeyStore] = [:]
+        for provider in CloudProvider.allCases {
+            stores[provider] = CloudAPIKeyStore.store(for: provider, service: keychainServiceName)
+        }
+        let oauthStore = KimiOAuthTokenStore(service: keychainServiceName)
+        let analysisKeyStore = stores[.analysis]
+            ?? CloudAPIKeyStore.store(for: .analysis, service: keychainServiceName)
+        let sharedCredentials = kimiCredentials ?? KimiCredentialProvider(
+            tokenStore: oauthStore,
+            staticKeyStore: analysisKeyStore
+        )
+        let sharedTransport = KimiAnalysisService(
+            apiKeyStore: analysisKeyStore,
+            credentials: sharedCredentials
+        )
+
         self.meetingStore = meetingStore
         self.fileStore = fileStore
         self.projectStore = projectStore ?? InMemoryProjectStore()
         self.audioCapture = audioCapture
         self.localTranscription = localTranscription
         self.diarization = diarization
-        self.negotiationAnalysis = negotiationAnalysis
-        self.conversationAnalysis = conversationAnalysis ?? KimiConversationAnalysisService()
+        self.negotiationAnalysis = negotiationAnalysis ?? sharedTransport
+        self.conversationAnalysis = conversationAnalysis
+            ?? KimiConversationAnalysisService(transport: sharedTransport)
         self.exporter = exporter ?? LocalMeetingExportService(meetingStore: meetingStore)
         self.audioImport = audioImport ?? AVFoundationAudioImportService(fileStore: fileStore)
         self.makeImportTranscriptionService = makeImportTranscriptionService ?? { AppleSpeechTranscriptionService() }
         self.isPersistentStorageUnavailable = isPersistentStorageUnavailable
 
-        var stores: [CloudProvider: CloudAPIKeyStore] = [:]
-        for provider in CloudProvider.allCases {
-            stores[provider] = CloudAPIKeyStore.store(for: provider, service: keychainServiceName)
-        }
         self.keyStores = stores
-        let oauthStore = KimiOAuthTokenStore(service: keychainServiceName)
         self.kimiOAuthTokenStore = oauthStore
         self.isAnalysisConfigured = (stores[.analysis]?.hasConfiguredKey ?? false) || oauthStore.hasTokens
         self.isDiarizationConfigured = stores[.diarization]?.hasConfiguredKey ?? false
