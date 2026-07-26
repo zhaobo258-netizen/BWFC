@@ -24,6 +24,7 @@ rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/${BINARY_NAME}"
 cp "$ROOT/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
+cp "$ROOT/Resources/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 
 # SPM 资源 bundle（本阶段暂无资源；存在则一并拷入）
 RESOURCE_BUNDLE="$(swift build -c "$CONFIG" --show-bin-path)/${BINARY_NAME}_${BINARY_NAME}.bundle"

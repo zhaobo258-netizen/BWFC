@@ -8,6 +8,8 @@
 	<string>帮我分析</string>
 	<key>CFBundleExecutable</key>
 	<string>BangWoFenXi</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.zhaobo.BangWoFenXi</string>
 	<key>CFBundleInfoDictionaryVersion</key>
