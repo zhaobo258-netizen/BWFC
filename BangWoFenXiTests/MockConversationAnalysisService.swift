@@ -8,11 +8,21 @@ final class MockConversationAnalysisService: ConversationAnalysisServicing, @unc
     var persistentError: (any Error)?
     /// 每次调用前的人为延迟（毫秒）
     var delayMs: UInt64 = 0
+    var suspendNextCall = false
 
     private(set) var calls: [(instructions: String, inputJSON: String)] = []
+    private(set) var hasSuspendedCall = false
+    private var suspendedContinuation: CheckedContinuation<Void, Never>?
 
     func analyze(instructions: String, inputJSON: String) async throws -> ConversationAnalysisOutputDTO {
         calls.append((instructions, inputJSON))
+        if suspendNextCall {
+            suspendNextCall = false
+            await withCheckedContinuation { continuation in
+                hasSuspendedCall = true
+                suspendedContinuation = continuation
+            }
+        }
         if delayMs > 0 {
             try? await Task.sleep(for: .milliseconds(delayMs))
         }
@@ -23,5 +33,12 @@ final class MockConversationAnalysisService: ConversationAnalysisServicing, @unc
         return ConversationAnalysisOutputDTO(
             headline: nil, detectedScenario: nil, scenarioConfidence: nil, items: []
         )
+    }
+
+    func resumeSuspendedCall() {
+        hasSuspendedCall = false
+        let continuation = suspendedContinuation
+        suspendedContinuation = nil
+        continuation?.resume()
     }
 }

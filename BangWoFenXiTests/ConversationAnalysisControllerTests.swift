@@ -161,6 +161,54 @@ final class ConversationAnalysisControllerTests {
         #expect(callCount <= 2, "同一时间最多一个请求；新内容合并到下一次，实际 \(callCount) 次")
     }
 
+    @Test("分析期间新增片段须重新满足防抖后才补发")
+    func pendingFireRechecksDebounce() async {
+        var trigger = AnalysisTrigger()
+        trigger.minNewSegments = 1
+        trigger.failureRetryMs = 0
+        let clock = LockedBox<Int64>(2_000_000)
+        let service = MockConversationAnalysisService()
+        service.suspendNextCall = true
+        service.errorQueue = [AnalysisAPIError.invalidResponse]
+        let controller = ConversationAnalysisController(
+            service: service,
+            triggerConfig: trigger,
+            nowMs: { clock.withLock { $0 } }
+        )
+        let project = Project(title: "防抖复核", sourceType: .liveRecording)
+        controller.attach(to: project)
+
+        func addSegment(_ index: Int) {
+            project.segments.append(TranscriptSegment(
+                startMs: Int64(index * 2_000),
+                endMs: Int64((index + 1) * 2_000),
+                text: "片段 \(index)",
+                source: .local,
+                state: .final
+            ))
+            controller.noteNewFinalSegment()
+        }
+
+        addSegment(0)
+        clock.withLock { $0 += 10_100 }
+        async let first: Void = controller.tick()
+        await waitUntil { service.hasSuspendedCall }
+
+        addSegment(1)
+        clock.withLock { $0 += 10_100 }
+        await controller.tick()
+        addSegment(2)
+
+        service.resumeSuspendedCall()
+        await first
+
+        #expect(service.calls.count == 1, "最新片段重置防抖后不得立即补发")
+
+        clock.withLock { $0 += 10_100 }
+        await controller.tick()
+        #expect(service.calls.count == 2, "推进假时钟越过防抖后才补发")
+    }
+
     @Test("非法 JSON：保留上一版快照，不推进游标，状态如实提示")
     func invalidResponseKeepsPreviousSnapshot() async throws {
         addThreeSegments()
@@ -292,5 +340,15 @@ final class ConversationAnalysisControllerTests {
         controller.attach(to: project)
         #expect(controller.currentSnapshot?.version == 4)
         #expect(controller.currentSnapshot?.analyzedThroughMs == 88_000)
+    }
+
+    private func waitUntil(
+        _ condition: () -> Bool,
+        timeout: Duration = .seconds(10)
+    ) async {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline, !condition() {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
     }
 }

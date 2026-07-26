@@ -199,7 +199,10 @@ final class ConversationAnalysisController {
 
         if pendingFire {
             pendingFire = false
-            await fire()
+            let now = nowMs()
+            if trigger.readyToFire(atMs: now) {
+                await fire()
+            }
         }
     }
 
