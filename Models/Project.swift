@@ -75,6 +75,8 @@ struct NoteDocument: Codable, Sendable, Hashable {
 
 /// V2 项目（产品文档 03 号 §8.1）：一次对话/一份素材的完整载体。
 /// schemaVersion 当前为 2；V1（Meeting）数据经 ProjectMigration 一次性迁移。
+/// 新增存储属性必须同步登记 ProjectRuntimeSession.applyRuntime、
+/// ProjectPersistence.fieldOwnership 与 ProjectWorkspaceView.reloadImportedProjectFromStore。
 final class Project: Identifiable, Codable {
     /// 数据结构版本（V2 恒为 2）
     var schemaVersion: Int

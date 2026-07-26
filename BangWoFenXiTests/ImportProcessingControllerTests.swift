@@ -45,13 +45,9 @@ final class ImportProcessingControllerTests {
             loadProject: { [store] id in
                 try store.loadProjects().first { $0.id == id }
             },
-            persistProject: { [store] project in
+            persistProject: { [store] project, fields in
                 var projects = try store.loadProjects()
-                if let index = projects.firstIndex(where: { $0.id == project.id }) {
-                    projects[index] = project
-                } else {
-                    projects.append(project)
-                }
+                ProjectPersistence.upsert(project, into: &projects, fields: fields)
                 try store.saveProjects(projects)
             }
         )

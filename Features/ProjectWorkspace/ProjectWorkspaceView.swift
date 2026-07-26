@@ -152,7 +152,7 @@ struct ProjectWorkspaceView: View {
                     project.title = newTitle
                     meeting.title = newTitle
                     project.lastActivityAt = Date()
-                    persistProject()
+                    persistProject(fields: .title)
                 }
             ))
 
@@ -352,7 +352,7 @@ struct ProjectWorkspaceView: View {
                 Button {
                     project.scenario = scenario
                     project.scenarioWasUserSelected = true
-                    persistProject()
+                    persistProject(fields: .userScenario)
                 } label: {
                     if project.scenario == scenario {
                         Label(scenario.displayName, systemImage: "checkmark")
@@ -697,13 +697,7 @@ struct ProjectWorkspaceView: View {
               let fresh = try? environment.allProjects().first(where: { $0.id == projectID }) else {
             return
         }
-        project.status = fresh.status
-        project.processingJobs = fresh.processingJobs
-        project.runtimeAssetRelativePath = fresh.runtimeAssetRelativePath
-        project.endedAt = fresh.endedAt
-        project.legacySnapshots = fresh.legacySnapshots
-        project.analysisSnapshots = fresh.analysisSnapshots
-        project.segments = fresh.segments
+        Self.applyImportedStorageRefresh(from: fresh, to: project)
         if let meeting {
             meeting.status = ProjectRuntimeSession.runtimeStatus(for: fresh.status)
             meeting.segments = fresh.segments
@@ -711,6 +705,18 @@ struct ProjectWorkspaceView: View {
             // 分析快照刷新（导入流水线的最终分析在后台生成；V2 快照直接挂在 Project 上）
             analysis?.attach(to: project)
         }
+    }
+
+    static func applyImportedStorageRefresh(from fresh: Project, to project: Project) {
+        project.status = fresh.status
+        project.processingJobs = fresh.processingJobs
+        project.runtimeAssetRelativePath = fresh.runtimeAssetRelativePath
+        project.endedAt = fresh.endedAt
+        project.legacySnapshots = fresh.legacySnapshots
+        project.analysisSnapshots = fresh.analysisSnapshots
+        project.segments = fresh.segments
+        project.scenario = fresh.scenario
+        project.scenarioWasUserSelected = fresh.scenarioWasUserSelected
     }
 
     // MARK: - 装配与持久化桥接
@@ -729,7 +735,7 @@ struct ProjectWorkspaceView: View {
             operationError = "项目读取失败（\(String(describing: type(of: error)))"
         }
         noteController = NoteController(project: loaded) { [environment] in
-            try environment.persist($0)
+            try environment.persist($0, fields: .note)
         }
         // 进入界面即检查本地转写可用性（不可用时显示真实原因）
         Task { await transcription?.checkAvailability() }
@@ -750,7 +756,9 @@ struct ProjectWorkspaceView: View {
         controller.onFinalSegment = { [environment] in
             do {
                 try ProjectRuntimeSession.applyRuntime(meeting, to: project)
-                try environment.persist(project)
+                // 实时录音项目没有并发导入流水线，工作台持有唯一运行时写副本，
+                // 因而可整对象保存；导入项目的写入全部走字段合并入口。
+                try environment.persist(project, fields: .all)
             } catch {
                 Task { @MainActor in self.operationError = "项目保存失败（\(String(describing: type(of: error)))）" }
             }
@@ -769,7 +777,7 @@ struct ProjectWorkspaceView: View {
         analysisController.onSnapshotUpdated = { [environment] in
             // V2 快照直接写在 Project 上，无需运行时桥接
             do {
-                try environment.persist(project)
+                try environment.persist(project, fields: .analysis)
             } catch {
                 Task { @MainActor in self.operationError = "项目保存失败（\(String(describing: type(of: error)))）" }
             }
@@ -786,17 +794,20 @@ struct ProjectWorkspaceView: View {
         guard let project else { return }
         do {
             try ProjectRuntimeSession.applyRuntime(meeting, to: project)
-            try environment.persist(project)
+            let fields: ProjectFieldOwnership = project.sourceType == .liveRecording
+                ? .all
+                : .manualSegments
+            try environment.persist(project, fields: fields)
             operationError = nil
         } catch {
             operationError = "项目保存失败（\(String(describing: type(of: error)))）"
         }
     }
 
-    private func persistProject() {
+    private func persistProject(fields: ProjectFieldOwnership) {
         guard let project else { return }
         do {
-            try environment.persist(project)
+            try environment.persist(project, fields: fields)
         } catch {
             operationError = "项目保存失败（\(String(describing: type(of: error)))）"
         }

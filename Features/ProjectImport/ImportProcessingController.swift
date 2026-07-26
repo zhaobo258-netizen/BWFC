@@ -18,7 +18,7 @@ final class ImportProcessingController {
     private let analysisService: any ConversationAnalysisServicing
     private let fileStore: MeetingFileStore
     private let loadProject: (UUID) throws -> Project?
-    private let persistProject: (Project) throws -> Void
+    private let persistProject: (Project, ProjectFieldOwnership) throws -> Void
     private let isAnalysisConfigured: () -> Bool
 
     // MARK: - 可观察状态
@@ -43,7 +43,7 @@ final class ImportProcessingController {
         fileStore: MeetingFileStore,
         isAnalysisConfigured: @escaping () -> Bool,
         loadProject: @escaping (UUID) throws -> Project?,
-        persistProject: @escaping (Project) throws -> Void
+        persistProject: @escaping (Project, ProjectFieldOwnership) throws -> Void
     ) {
         self.importService = importService
         self.makeTranscriptionService = makeTranscriptionService
@@ -80,7 +80,7 @@ final class ImportProcessingController {
             durationMs: info.durationMs,
             processingJobs: ImportPlanner.planJobs(analysisConfigured: isAnalysisConfigured())
         )
-        try persistProject(project)
+        try persistProject(project, .importPipeline)
 
         startPipeline(projectID: project.id, sourceURL: url)
         return project.id
@@ -299,32 +299,10 @@ final class ImportProcessingController {
         jobs = project.processingJobs
     }
 
-    /// 持久化（字段级合并）：流水线只写自己拥有的字段
-    /// （状态 / Job 流水 / 片段 / 资产路径 / 快照 / 时间），
-    /// 笔记、标题、场景、说话人等用户可编辑字段以存储现值为准——
-    /// 工作台与流水线各持一份 Project 副本，整对象覆盖会互相冲掉对方的写入。
+    /// 流水线只提交自己拥有的字段，合并规则由统一持久层维护。
     private func persistQuietly(_ project: Project) {
         do {
-            if let stored = try loadProject(project.id), stored !== project {
-                stored.status = project.status
-                stored.processingJobs = project.processingJobs
-                stored.segments = project.segments
-                stored.legacySnapshots = project.legacySnapshots
-                stored.analysisSnapshots = project.analysisSnapshots
-                // 场景自动建议由分析产生，属流水线拥有字段；用户手选（工作台写入
-                // scenarioWasUserSelected=true 并落库）优先，不被建议覆盖
-                if !stored.scenarioWasUserSelected {
-                    stored.scenario = project.scenario
-                }
-                stored.runtimeAssetRelativePath = project.runtimeAssetRelativePath
-                stored.startedAt = project.startedAt
-                stored.endedAt = project.endedAt
-                stored.durationMs = project.durationMs
-                stored.lastActivityAt = project.lastActivityAt
-                try persistProject(stored)
-            } else {
-                try persistProject(project)
-            }
+            try persistProject(project, .importPipeline)
         } catch {
             AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent(
                 "import_persist_failed", error: String(describing: type(of: error))))

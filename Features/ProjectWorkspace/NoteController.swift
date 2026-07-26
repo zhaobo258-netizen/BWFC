@@ -25,7 +25,7 @@ final class NoteController {
 
     /// - Parameters:
     ///   - project: 目标项目（引用语义，保存时原地更新 note）
-    ///   - persist: 持久化入口（生产为 environment.persist(project)；测试注入模拟）
+    ///   - persist: 持久化入口（生产只合并 Project.note；测试注入模拟）
     ///   - debounce: 防抖窗口，默认 0.8s（满足 1 秒内落盘合同）
     init(
         project: Project,

@@ -314,4 +314,141 @@ final class ProjectStoreTests {
         #expect(projects.count == 1)
         #expect(projects.first?.id == project.id)
     }
+
+    @Test("字段所有权表覆盖 Project 全部存储属性")
+    func fieldOwnershipCoversEveryProjectProperty() {
+        let project = Project(title: "字段守护", sourceType: .importedAudio)
+        let modelFields = Set(
+            Mirror(reflecting: project).children.compactMap(\.label)
+        )
+        let registeredFields = Set(ProjectPersistence.fieldOwnership.keys)
+
+        #expect(modelFields == registeredFields)
+    }
+
+    @Test("流水线先写片段后，工作台旧副本只合并笔记且不冲掉片段")
+    @MainActor
+    func staleWorkspaceNoteDoesNotOverwritePipelineSegments() throws {
+        let directory = makeCaseDirectory("field-merge")
+        let store = try JSONProjectStore(directory: directory)
+        let environment = AppEnvironment(
+            meetingStore: InMemoryMeetingStore(),
+            fileStore: MeetingFileStore(baseDirectory: directory.appending(path: "files")),
+            projectStore: store,
+            keychainServiceName: "com.zhaobo.BangWoFenXi.tests.field-merge.\(UUID().uuidString)"
+        )
+        let initial = Project(
+            title: "并发导入",
+            sourceType: .importedAudio,
+            status: .processing
+        )
+        try environment.persist(initial)
+
+        let staleWorkspace = try #require(environment.allProjects().first)
+        let pipelineCopy = try #require(environment.allProjects().first)
+        pipelineCopy.segments = [
+            TranscriptSegment(
+                startMs: 0,
+                endMs: 2_000,
+                text: "流水线新片段",
+                source: .local,
+                state: .final
+            )
+        ]
+        try environment.persist(pipelineCopy, fields: .importPipeline)
+
+        let noteController = NoteController(
+            project: staleWorkspace,
+            persist: { try environment.persist($0, fields: .note) },
+            debounce: .seconds(60)
+        )
+        noteController.update(markdown: "工作台旧副本里的新笔记")
+        #expect(noteController.saveNow())
+
+        let saved = try #require(environment.allProjects().first)
+        #expect(saved.note.markdown == "工作台旧副本里的新笔记")
+        #expect(saved.segments.count == 1)
+        #expect(saved.segments.first?.text == "流水线新片段")
+    }
+
+    @Test("流水线合并保留人工片段修订与用户手选场景")
+    func pipelineMergePreservesWorkspaceOverrides() {
+        let projectID = UUID()
+        let segmentID = UUID()
+        let edited = TranscriptSegment(
+            id: segmentID,
+            startMs: 0,
+            endMs: 1_000,
+            text: "人工修订",
+            source: .manual,
+            state: .edited,
+            isStarred: true
+        )
+        let stored = Project(
+            id: projectID,
+            title: "存储项目",
+            sourceType: .importedAudio,
+            scenario: .clientVisit,
+            scenarioWasUserSelected: true,
+            segments: [edited]
+        )
+        let pipeline = Project(
+            id: projectID,
+            title: "流水线旧副本",
+            sourceType: .importedAudio,
+            scenario: .classLearning,
+            segments: [
+                TranscriptSegment(
+                    id: segmentID,
+                    startMs: 0,
+                    endMs: 1_000,
+                    text: "机器旧文本",
+                    source: .local,
+                    state: .final
+                ),
+                TranscriptSegment(
+                    startMs: 1_000,
+                    endMs: 2_000,
+                    text: "流水线新增",
+                    source: .local,
+                    state: .final
+                )
+            ]
+        )
+        var projects = [stored]
+
+        ProjectPersistence.upsert(pipeline, into: &projects, fields: .importPipeline)
+
+        let merged = projects[0]
+        #expect(merged.scenario == .clientVisit)
+        #expect(merged.scenarioWasUserSelected)
+        #expect(merged.segments.count == 2)
+        #expect(merged.segments.first?.text == "人工修订")
+        #expect(merged.segments.first?.state == .edited)
+        #expect(merged.segments.first?.isStarred == true)
+    }
+
+    @Test("导入项目刷新清单包含后台场景建议与选择来源")
+    @MainActor
+    func importedRefreshIncludesScenarioSuggestion() {
+        let id = UUID()
+        let workspace = Project(
+            id: id,
+            title: "打开中的工作台",
+            sourceType: .importedAudio
+        )
+        let fresh = Project(
+            id: id,
+            title: "存储副本",
+            sourceType: .importedAudio,
+            scenario: .journalistInterview,
+            scenarioWasUserSelected: false,
+            status: .ready
+        )
+
+        ProjectWorkspaceView.applyImportedStorageRefresh(from: fresh, to: workspace)
+
+        #expect(workspace.scenario == .journalistInterview)
+        #expect(workspace.scenarioWasUserSelected == false)
+    }
 }

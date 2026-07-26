@@ -1,5 +1,151 @@
 import Foundation
 
+enum ProjectFieldOwnership: Sendable, Equatable {
+    case all
+    case note
+    case title
+    case userScenario
+    case speakers
+    case manualSegments
+    case analysis
+    case importPipeline
+}
+
+enum ProjectFieldOwner: String, Sendable {
+    case identity
+    case workspace
+    case runtime
+    case shared
+}
+
+enum ProjectPersistence {
+    static let fieldOwnership: [String: ProjectFieldOwner] = [
+        "schemaVersion": .identity,
+        "id": .identity,
+        "title": .workspace,
+        "sourceType": .identity,
+        "scenario": .shared,
+        "scenarioWasUserSelected": .shared,
+        "status": .runtime,
+        "createdAt": .identity,
+        "startedAt": .runtime,
+        "endedAt": .runtime,
+        "lastActivityAt": .shared,
+        "runtimeAssetRelativePath": .runtime,
+        "originalFileName": .identity,
+        "durationMs": .runtime,
+        "preferredInputDeviceID": .runtime,
+        "pauseIntervals": .runtime,
+        "speakers": .workspace,
+        "segments": .shared,
+        "legacySnapshots": .runtime,
+        "analysisSnapshots": .runtime,
+        "legacyMetadata": .runtime,
+        "note": .workspace,
+        "processingJobs": .runtime,
+        "archive": .runtime
+    ]
+
+    static func upsert(
+        _ incoming: Project,
+        into projects: inout [Project],
+        fields: ProjectFieldOwnership
+    ) {
+        guard let index = projects.firstIndex(where: { $0.id == incoming.id }) else {
+            projects.append(incoming)
+            return
+        }
+        guard fields != .all else {
+            projects[index] = incoming
+            return
+        }
+
+        let stored = projects[index]
+        switch fields {
+        case .all:
+            break
+        case .note:
+            stored.note = incoming.note
+        case .title:
+            stored.title = incoming.title
+            stored.lastActivityAt = incoming.lastActivityAt
+        case .userScenario:
+            guard incoming.scenarioWasUserSelected else { return }
+            stored.scenario = incoming.scenario
+            stored.scenarioWasUserSelected = true
+        case .speakers:
+            stored.speakers = incoming.speakers
+        case .manualSegments:
+            mergeManualSegments(incoming.segments, into: stored)
+            stored.lastActivityAt = incoming.lastActivityAt
+        case .analysis:
+            stored.analysisSnapshots = incoming.analysisSnapshots
+            if !stored.scenarioWasUserSelected {
+                stored.scenario = incoming.scenario
+                stored.scenarioWasUserSelected = incoming.scenarioWasUserSelected
+            }
+        case .importPipeline:
+            stored.status = incoming.status
+            stored.processingJobs = incoming.processingJobs
+            mergePipelineSegments(incoming.segments, into: stored)
+            stored.legacySnapshots = incoming.legacySnapshots
+            stored.analysisSnapshots = incoming.analysisSnapshots
+            if !stored.scenarioWasUserSelected {
+                stored.scenario = incoming.scenario
+            }
+            stored.runtimeAssetRelativePath = incoming.runtimeAssetRelativePath
+            stored.startedAt = incoming.startedAt
+            stored.endedAt = incoming.endedAt
+            stored.durationMs = incoming.durationMs
+            stored.lastActivityAt = incoming.lastActivityAt
+        }
+    }
+
+    private static func mergeManualSegments(
+        _ incoming: [TranscriptSegment],
+        into stored: Project
+    ) {
+        let storedByID = Dictionary(
+            stored.segments.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let manualChanges = Dictionary(
+            uniqueKeysWithValues: incoming.compactMap { segment -> (UUID, TranscriptSegment)? in
+                guard let existing = storedByID[segment.id],
+                      segment.state == .edited || segment.isStarred != existing.isStarred else {
+                    return nil
+                }
+                return (segment.id, segment)
+            }
+        )
+        stored.segments = stored.segments.map { manualChanges[$0.id] ?? $0 }
+    }
+
+    private static func mergePipelineSegments(
+        _ incoming: [TranscriptSegment],
+        into stored: Project
+    ) {
+        let storedByID = Dictionary(
+            stored.segments.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let incomingIDs = Set(incoming.map(\.id))
+        var merged = incoming.map { segment in
+            guard let existing = storedByID[segment.id],
+                  existing.state == .edited || existing.isStarred != segment.isStarred else {
+                return segment
+            }
+            return existing
+        }
+        merged.append(contentsOf: stored.segments.filter {
+            !incomingIDs.contains($0.id) && ($0.state == .edited || $0.isStarred)
+        })
+        stored.segments = merged.sorted {
+            $0.startMs == $1.startMs ? $0.endMs < $1.endMs : $0.startMs < $1.startMs
+        }
+    }
+}
+
 /// 全局运行环境：集中持有持久化存储、密钥存储与各服务依赖。
 /// 音频、转写、分人、分析、导出均以协议注入（实施计划第 8 节：
 /// 让 UI 通过明确的服务协议依赖各模块，便于测试替换）。
@@ -43,8 +189,8 @@ final class AppEnvironment {
             loadProject: { [weak self] id in
                 try self?.allProjects().first(where: { $0.id == id })
             },
-            persistProject: { [weak self] project in
-                try self?.persist(project)
+            persistProject: { [weak self] project, fields in
+                try self?.persist(project, fields: fields)
             }
         )
         _importProcessing = controller
@@ -175,14 +321,13 @@ final class AppEnvironment {
         try projectStore.loadProjects()
     }
 
-    /// 保存单个项目（按 id 覆盖；不存在则追加）
-    func persist(_ project: Project) throws {
+    /// 保存单个项目；导入项目按调用方字段所有权合并，避免并发副本互相覆盖。
+    func persist(
+        _ project: Project,
+        fields: ProjectFieldOwnership = .all
+    ) throws {
         var projects = try projectStore.loadProjects()
-        if let index = projects.firstIndex(where: { $0.id == project.id }) {
-            projects[index] = project
-        } else {
-            projects.append(project)
-        }
+        ProjectPersistence.upsert(project, into: &projects, fields: fields)
         try projectStore.saveProjects(projects)
     }
 
