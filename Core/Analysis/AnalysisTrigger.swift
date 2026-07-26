@@ -25,6 +25,17 @@ struct AnalysisTrigger: Equatable, Sendable {
 
     init() {}
 
+    /// 实时录音预设（老板 2026-07-26 优化指示）：现场对话更看重跟手感——
+    /// 2 个新片段即可触发、防抖 5 秒、闲置上限 30 秒；失败退避保持 30 秒防热循环。
+    /// 导入流水线与默认值不变（批处理不需要抢节奏）。
+    static var liveRecording: AnalysisTrigger {
+        var trigger = AnalysisTrigger()
+        trigger.minNewSegments = 2
+        trigger.maxIdleMs = 30_000
+        trigger.debounceMs = 5_000
+        return trigger
+    }
+
     /// 新最终片段到达
     mutating func noteNewSegment(atMs now: Int64) {
         newSegmentCount += 1
