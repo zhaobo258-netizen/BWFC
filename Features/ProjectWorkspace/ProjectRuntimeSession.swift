@@ -60,8 +60,8 @@ enum ProjectRuntimeSession {
                 side: speaker.legacySide.flatMap { ParticipantSide(rawValue: $0) } ?? .neutral,
                 role: speaker.role ?? "",
                 colorToken: speaker.colorToken,
-                voiceReferencePath: speaker.legacyVoiceReferencePath,
-                voiceReferenceDurationMs: speaker.legacyVoiceReferenceDurationMs
+                voiceReferencePath: speaker.voiceSamplePath ?? speaker.legacyVoiceReferencePath,
+                voiceReferenceDurationMs: speaker.voiceSampleDurationMs ?? speaker.legacyVoiceReferenceDurationMs
             )
         }
         // 深拷贝：与迁移器同一 iso8601 配置

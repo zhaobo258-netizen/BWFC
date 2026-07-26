@@ -21,6 +21,11 @@ final class Speaker: Identifiable, Codable {
     var legacyVoiceReferencePath: String?
     /// 旧声音样本时长（毫秒）
     var legacyVoiceReferenceDurationMs: Int64?
+    /// V2 声纹样本相对路径（工作台「说话人」面板录制，2–10 秒；仅本地保存，
+    /// 云端识别时随分片上传用于已知说话人匹配）
+    var voiceSamplePath: String?
+    /// V2 声纹样本时长（毫秒）
+    var voiceSampleDurationMs: Int64?
 
     init(
         id: UUID = UUID(),
@@ -31,7 +36,9 @@ final class Speaker: Identifiable, Codable {
         isUserConfirmed: Bool = false,
         legacySide: String? = nil,
         legacyVoiceReferencePath: String? = nil,
-        legacyVoiceReferenceDurationMs: Int64? = nil
+        legacyVoiceReferenceDurationMs: Int64? = nil,
+        voiceSamplePath: String? = nil,
+        voiceSampleDurationMs: Int64? = nil
     ) {
         self.id = id
         self.cloudAlias = cloudAlias
@@ -42,5 +49,7 @@ final class Speaker: Identifiable, Codable {
         self.legacySide = legacySide
         self.legacyVoiceReferencePath = legacyVoiceReferencePath
         self.legacyVoiceReferenceDurationMs = legacyVoiceReferenceDurationMs
+        self.voiceSamplePath = voiceSamplePath
+        self.voiceSampleDurationMs = voiceSampleDurationMs
     }
 }

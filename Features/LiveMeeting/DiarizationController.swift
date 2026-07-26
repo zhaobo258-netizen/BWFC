@@ -105,6 +105,13 @@ final class DiarizationController {
         kickProcessing()
     }
 
+    /// 说话人列表变化后刷新映射（工作台「说话人」面板编辑后调用；
+    /// 后续分片按新映射解析，已确认片段不回改）
+    func refreshKnownSpeakers() {
+        guard let meeting else { return }
+        mapper = SpeakerMapper(participants: meeting.participants)
+    }
+
     /// 停止编排（不等待队列完成；结束会议请用 finishAndDrain）
     func cancel() {
         processingTask?.cancel()
