@@ -37,6 +37,7 @@ struct ProjectHomeView: View {
                 .frame(maxWidth: .infinity)
             }
         }
+        .background(BWTheme.paper)
         .navigationTitle("帮我分析")
         .onAppear(perform: reload)
         .confirmationDialog("开始录音前请确认", isPresented: $showConsent, titleVisibility: .visible) {
@@ -64,20 +65,30 @@ struct ProjectHomeView: View {
     // MARK: - 顶部
 
     private var header: some View {
-        HStack {
-            Text("帮我分析")
-                .font(.title2)
-                .fontWeight(.bold)
+        HStack(spacing: 10) {
+            BWBrandMark(size: 30)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("帮我分析")
+                    .font(.title3)
+                    .fontWeight(.bold)
+                Text("录音 · 转写 · 实时分析")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
             Spacer()
             Button {
                 router.showSettings()
             } label: {
                 Image(systemName: "gearshape")
+                    .font(.system(size: 15))
+                    .foregroundStyle(.secondary)
             }
+            .buttonStyle(.plain)
             .help("设置")
         }
         .padding(.horizontal, 24)
-        .padding(.vertical, 14)
+        .padding(.vertical, 12)
+        .background(.bar)
     }
 
     // MARK: - 主动作区
@@ -91,34 +102,61 @@ struct ProjectHomeView: View {
                     showConsent = true
                 }
             } label: {
-                Label("开始录音", systemImage: "record.circle")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity, minHeight: 64)
+                HStack(spacing: 14) {
+                    Image(systemName: "mic.fill")
+                        .font(.system(size: 22, weight: .semibold))
+                        .frame(width: 46, height: 46)
+                        .background(.white.opacity(0.18), in: Circle())
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("开始录音")
+                            .font(.headline)
+                        Text("边录边转写，AI 实时分析")
+                            .font(.caption)
+                            .opacity(0.85)
+                    }
+                    Spacer()
+                }
+                .foregroundStyle(.white)
+                .padding(16)
+                .frame(maxWidth: .infinity, minHeight: 80)
+                .background(BWTheme.accentGradient, in: RoundedRectangle(cornerRadius: 14))
+                .shadow(color: BWTheme.accent.opacity(0.35), radius: 8, y: 3)
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
+            .buttonStyle(.plain)
 
             Button {
                 pickAndImportFile()
             } label: {
-                Label(environment.importProcessing.isRunning ? "导入处理中…" : "导入音视频",
-                      systemImage: "square.and.arrow.down")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity, minHeight: 64)
+                HStack(spacing: 14) {
+                    Image(systemName: environment.importProcessing.isRunning
+                          ? "arrow.triangle.2.circlepath" : "square.and.arrow.down")
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundStyle(BWTheme.accent)
+                        .frame(width: 46, height: 46)
+                        .background(BWTheme.accent.opacity(0.12), in: Circle())
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(environment.importProcessing.isRunning ? "导入处理中…" : "导入音视频")
+                            .font(.headline)
+                        Text("m4a / mp3 / wav / mp4 · 可直接拖入")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                .padding(16)
+                .frame(maxWidth: .infinity, minHeight: 80)
+                .background(BWTheme.card, in: RoundedRectangle(cornerRadius: 14))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14)
+                        .strokeBorder(isDropTargeted ? BWTheme.accent : BWTheme.cardStroke,
+                                      lineWidth: isDropTargeted ? 2 : 1)
+                )
+                .shadow(color: .black.opacity(0.05), radius: 3, y: 1)
             }
-            .buttonStyle(.bordered)
-            .controlSize(.large)
+            .buttonStyle(.plain)
             .disabled(environment.importProcessing.isRunning)
         }
-        .overlay(alignment: .bottomTrailing) {
-            Text(environment.importProcessing.isRunning
-                 ? "已有导入在后台处理，完成后可导入下一个"
-                 : "支持 m4a / mp3 / wav / caf / mp4 / mov，也可直接拖入本窗口")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .offset(y: 18)
-        }
-        .padding(.bottom, 14)
+        .padding(.bottom, 6)
     }
 
     // MARK: - 异常项目提示（非阻塞）
@@ -190,18 +228,12 @@ struct ProjectHomeView: View {
                     .foregroundStyle(.tertiary)
             }
         }
-        .padding(12)
-        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
-        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .bwCard(padding: 14)
+        .contentShape(RoundedRectangle(cornerRadius: 12))
     }
 
     private func statusBadge(_ status: ProjectStatus) -> some View {
-        Text(status.displayName)
-            .font(.caption2)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(badgeColor(status).opacity(0.15), in: Capsule())
-            .foregroundStyle(.secondary)
+        BWBadge(text: status.displayName, color: badgeColor(status))
     }
 
     private func badgeColor(_ status: ProjectStatus) -> Color {

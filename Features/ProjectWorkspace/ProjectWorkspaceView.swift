@@ -28,6 +28,7 @@ struct ProjectWorkspaceView: View {
     @State private var showEndConfirmation = false
     @State private var isFinishing = false
     @State private var showBackConfirmation = false
+    @State private var showSpeakerPanel = false
     @State private var newDeviceID: String?
     /// 中栏页签：结构总结 / 分析卡片（阶段 D 换通用分析后扩展四页签）
     @State private var centerTab: CenterTab = .summary
@@ -74,10 +75,13 @@ struct ProjectWorkspaceView: View {
                 }
                 ThreeColumnLayout {
                     transcriptColumn(meeting: meeting)
+                        .background(BWTheme.columnBackground)
                 } center: {
                     analysisColumn(meeting: meeting)
+                        .background(BWTheme.paper)
                 } right: {
                     noteColumn
+                        .background(BWTheme.columnBackground)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 if meeting.status == .recording || meeting.status == .paused {
@@ -108,6 +112,20 @@ struct ProjectWorkspaceView: View {
             Button("取消", role: .cancel) {}
         } message: {
             Text("结束后将停止录音与转写，剩余分析在后台继续。录音与文稿已安全保存在本机。")
+        }
+        .sheet(isPresented: $showSpeakerPanel) {
+            if let project, let meeting {
+                SpeakerPanelView(
+                    project: project,
+                    meeting: meeting,
+                    microphoneBusy: meeting.status == .recording,
+                    onSpeakersChanged: {
+                        persistProject(fields: .speakers)
+                        diarization?.refreshKnownSpeakers()
+                    }
+                )
+                .environment(environment)
+            }
         }
         .confirmationDialog("录音仍在进行", isPresented: $showBackConfirmation, titleVisibility: .visible) {
             Button("结束录音并返回", role: .destructive) {
@@ -195,6 +213,14 @@ struct ProjectWorkspaceView: View {
 
             Spacer()
 
+            // 说话人与声纹面板
+            Button {
+                showSpeakerPanel = true
+            } label: {
+                Label("说话人", systemImage: "person.2")
+            }
+            .help("管理说话人与声纹样本")
+
             // 技术状态收进处理详情弹层
             ProcessingDetailsButton(
                 transcription: transcription,
@@ -216,6 +242,7 @@ struct ProjectWorkspaceView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+        .background(.bar)
     }
 
     /// 可单击编辑的项目标题
@@ -285,7 +312,10 @@ struct ProjectWorkspaceView: View {
 
     private func analysisColumn(meeting: Meeting) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
+            HStack(spacing: 7) {
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(BWTheme.accent)
+                    .frame(width: 3, height: 13)
                 Text("AI 工作区")
                     .font(.subheadline)
                     .fontWeight(.semibold)
@@ -293,6 +323,19 @@ struct ProjectWorkspaceView: View {
                     scenarioPicker(project: project)
                 }
                 Spacer()
+                if analysis?.state == .analyzing {
+                    HStack(spacing: 4) {
+                        ProgressView().controlSize(.mini)
+                        Text("分析中")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                } else if analysis?.hasRecentFailure == true {
+                    Image(systemName: "exclamationmark.circle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .help(analysis?.statusDescription ?? "")
+                }
                 Picker("", selection: $centerTab) {
                     ForEach(CenterTab.allCases, id: \.self) { tab in
                         Text(tab.rawValue).tag(tab)
@@ -424,14 +467,17 @@ struct ProjectWorkspaceView: View {
     }
 
     private func columnHeader(_ title: String) -> some View {
-        HStack {
+        HStack(spacing: 7) {
+            RoundedRectangle(cornerRadius: 1.5)
+                .fill(BWTheme.accent)
+                .frame(width: 3, height: 13)
             Text(title)
                 .font(.subheadline)
                 .fontWeight(.semibold)
             Spacer()
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 8)
+        .padding(.vertical, 10)
     }
 
     // MARK: - 底部录音条（录音/暂停时始终可达：暂停 / 继续 / 标记 / 结束）
@@ -483,6 +529,7 @@ struct ProjectWorkspaceView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+        .background(.bar)
     }
 
     // MARK: - 横幅（仅异常时出现，非阻塞）
@@ -798,7 +845,10 @@ struct ProjectWorkspaceView: View {
             keyStore: environment.keyStore(for: .diarization)
         )
 
-        let analysisController = ConversationAnalysisController(service: environment.conversationAnalysis)
+        let analysisController = ConversationAnalysisController(
+            service: environment.conversationAnalysis,
+            triggerConfig: project.sourceType == .liveRecording ? .liveRecording : AnalysisTrigger()
+        )
         analysisController.attach(to: project)
         analysisController.onSnapshotUpdated = { [environment] in
             // V2 快照直接写在 Project 上，无需运行时桥接

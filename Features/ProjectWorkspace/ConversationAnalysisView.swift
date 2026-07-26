@@ -23,12 +23,23 @@ struct ConversationAnalysisView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 if summaryTab, let headline = snapshot?.headline {
-                    Text(headline)
-                        .font(.callout)
-                        .fontWeight(.semibold)
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "sparkles")
+                            .font(.caption)
+                            .foregroundStyle(BWTheme.accent)
+                            .padding(.top, 2)
+                        Text(headline)
+                            .font(.callout)
+                            .fontWeight(.semibold)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(BWTheme.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .strokeBorder(BWTheme.accent.opacity(0.22), lineWidth: 1)
+                    )
                 }
 
                 let groups = groupedItems
@@ -40,10 +51,15 @@ struct ConversationAnalysisView: View {
                 }
                 ForEach(groups, id: \.category) { group in
                     VStack(alignment: .leading, spacing: 6) {
-                        Text(group.category.displayName)
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                            .foregroundStyle(.secondary)
+                        HStack(spacing: 6) {
+                            RoundedRectangle(cornerRadius: 1)
+                                .fill(BWTheme.accent.opacity(0.7))
+                                .frame(width: 2.5, height: 10)
+                            Text(group.category.displayName)
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                                .foregroundStyle(.secondary)
+                        }
                         ForEach(group.items) { item in
                             itemCard(item)
                         }
@@ -76,15 +92,8 @@ struct ConversationAnalysisView: View {
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 6) {
                 // 明确表达 / AI 推断：视觉必须可一眼区分（红线）
-                Text(item.epistemicStatus == .explicit ? "明确表达" : "AI 推断")
-                    .font(.caption2)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(
-                        item.epistemicStatus == .explicit
-                            ? Color.green.opacity(0.15) : Color.orange.opacity(0.18),
-                        in: Capsule()
-                    )
+                BWBadge(text: item.epistemicStatus == .explicit ? "明确表达" : "AI 推断",
+                        color: item.epistemicStatus == .explicit ? .green : .orange)
                 Text(confidenceLabel(item.confidence))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -103,14 +112,13 @@ struct ConversationAnalysisView: View {
                             .font(.caption2)
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(.blue)
+                    .foregroundStyle(BWTheme.accent)
                     .help("查看原话")
                 }
             }
         }
-        .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 8))
+        .bwCard(padding: 11)
     }
 
     private func confidenceLabel(_ confidence: Confidence) -> String {

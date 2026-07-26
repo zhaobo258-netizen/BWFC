@@ -241,48 +241,49 @@ struct TranscriptRowView: View, Equatable {
     }
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            // 开始时间
-            Text(Self.formatMs(row.startMs))
-                .font(.caption)
-                .monospacedDigit()
-                .foregroundStyle(.tertiary)
-                .frame(width: 48, alignment: .leading)
+        HStack(alignment: .top, spacing: 10) {
+            BWSpeakerDot(name: row.speakerName, color: speakerColor, size: 22)
+                .padding(.top, 1)
 
-            // 星标
-            if row.isStarred {
-                Image(systemName: "star.fill")
-                    .font(.caption2)
-                    .foregroundStyle(.yellow)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(row.speakerName)
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .foregroundStyle(speakerColor)
+                        .lineLimit(1)
+                    Text(Self.formatMs(row.startMs))
+                        .font(.caption2)
+                        .monospacedDigit()
+                        .foregroundStyle(.tertiary)
+                    if row.isStarred {
+                        Image(systemName: "star.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.yellow)
+                    }
+                    Spacer(minLength: 4)
+                    // 状态标签：仅非常态（识别中/人工修订/待重试）显示，减少视觉噪音
+                    if row.state != .final {
+                        Text(stateLabel)
+                            .font(.caption2)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1.5)
+                            .background(stateBackground, in: Capsule())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text(row.text)
+                    .font(.callout)
+                    .foregroundStyle(row.state == .provisional ? .secondary : .primary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-
-            // 说话人（未识别 → 识别中 / 待识别 A）
-            Text(row.speakerName)
-                .font(.caption)
-                .fontWeight(.medium)
-                .foregroundStyle(speakerColor)
-                .frame(width: 88, alignment: .leading)
-                .lineLimit(1)
-
-            // 正文：临时文字浅色
-            Text(row.text)
-                .font(.callout)
-                .foregroundStyle(row.state == .provisional ? .secondary : .primary)
-
-            Spacer(minLength: 8)
-
-            // 状态
-            Text(stateLabel)
-                .font(.caption2)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(stateBackground, in: Capsule())
-                .foregroundStyle(.secondary)
         }
-        .padding(.vertical, 2)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
         .background(
-            row.isHighlighted ? Color.yellow.opacity(0.25) : Color.clear,
-            in: RoundedRectangle(cornerRadius: 4)
+            row.isHighlighted ? BWTheme.accent.opacity(0.14) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 8)
         )
     }
 
@@ -290,7 +291,7 @@ struct TranscriptRowView: View, Equatable {
         if let token = row.speakerColorToken {
             return colorForToken(token)
         }
-        return .secondary
+        return .gray
     }
 
     /// 状态标签：按来源与状态区分（实施计划 6.5）
