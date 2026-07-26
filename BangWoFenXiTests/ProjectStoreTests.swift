@@ -221,6 +221,69 @@ final class ProjectStoreTests {
         #expect(try store.loadProjects().isEmpty)
     }
 
+    @Test("非法 JSON 读取时备份原始字节并抛出明确损坏错误")
+    func corruptedJSONIsBackedUp() throws {
+        let directory = makeCaseDirectory("corrupt-backup")
+        let store = try JSONProjectStore(directory: directory)
+        let projectsURL = directory.appending(path: "projects.json")
+        let corruptedData = Data(#"{"projects":"unterminated""#.utf8)
+        try corruptedData.write(to: projectsURL)
+        var backupFileName: String?
+
+        do {
+            _ = try store.loadProjects()
+            Issue.record("非法 JSON 必须抛出 dataCorrupted")
+        } catch let ProjectStoreError.dataCorrupted(name) {
+            backupFileName = name
+        }
+
+        let name = try #require(backupFileName)
+        #expect(name.hasPrefix("projects.corrupt-"))
+        #expect(name.hasSuffix(".json"))
+        let backupURL = directory.appending(path: name)
+        #expect(FileManager.default.fileExists(atPath: backupURL.path))
+        #expect(try Data(contentsOf: backupURL) == corruptedData)
+        #expect(!FileManager.default.fileExists(atPath: projectsURL.path))
+    }
+
+    @Test("损坏备份完成后可重建空库且备份不被吞掉")
+    func saveAfterCorruptionPreservesBackup() throws {
+        let directory = makeCaseDirectory("corrupt-rebuild")
+        let store = try JSONProjectStore(directory: directory)
+        let projectsURL = directory.appending(path: "projects.json")
+        let corruptedData = Data([0xFF, 0xFE, 0x00, 0x7B])
+        try corruptedData.write(to: projectsURL)
+        var backupFileName: String?
+
+        do {
+            _ = try store.loadProjects()
+        } catch let ProjectStoreError.dataCorrupted(name) {
+            backupFileName = name
+        }
+
+        let name = try #require(backupFileName)
+        let backupURL = directory.appending(path: name)
+        let rebuilt = Project(title: "重建项目", sourceType: .liveRecording)
+        try store.saveProjects([rebuilt])
+
+        #expect(try Data(contentsOf: backupURL) == corruptedData)
+        let reloaded = try JSONProjectStore(directory: directory).loadProjects()
+        #expect(reloaded.map(\.id) == [rebuilt.id])
+    }
+
+    @Test("首页对损坏库显示备份成功的真实文案")
+    func corruptedStoreLoadMessageIsTruthful() {
+        let message = ProjectHomeView.loadErrorMessage(
+            for: ProjectStoreError.dataCorrupted(
+                backupFileName: "projects.corrupt-2026-07-26T10:00:00Z.json"
+            )
+        )
+
+        #expect(message.contains("数据文件损坏"))
+        #expect(message.contains("已备份为 projects.corrupt-"))
+        #expect(message.contains("原始数据未丢失"))
+    }
+
     @Test("覆盖保存反映删除")
     func overwriteReflectsDeletion() throws {
         let directory = makeCaseDirectory("overwrite")

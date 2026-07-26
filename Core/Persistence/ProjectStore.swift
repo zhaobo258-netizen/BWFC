@@ -12,6 +12,7 @@ protocol ProjectStoring: Sendable {
 /// 项目持久化错误
 enum ProjectStoreError: Error, Equatable {
     case directoryUnavailable
+    case dataCorrupted(backupFileName: String?)
 }
 
 /// JSON 文件持久化：projects.json 与 meetings.json 同目录（Application Support/BangWoFenXi），
@@ -21,6 +22,7 @@ final class JSONProjectStore: ProjectStoring, @unchecked Sendable {
     private let lock = NSLock()
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
+    private var writeBlockedByIncompleteBackup = false
 
     /// - Parameter directory: 存储目录（会自动创建）
     init(directory: URL) throws {
@@ -53,12 +55,41 @@ final class JSONProjectStore: ProjectStoring, @unchecked Sendable {
             return []
         }
         let data = try Data(contentsOf: fileURL)
-        return try decoder.decode([Project].self, from: data)
+        do {
+            return try decoder.decode([Project].self, from: data)
+        } catch is DecodingError {
+            writeBlockedByIncompleteBackup = true
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let backupFileName = "projects.corrupt-\(formatter.string(from: Date())).json"
+            let backupURL = fileURL.deletingLastPathComponent()
+                .appending(path: backupFileName, directoryHint: .notDirectory)
+            do {
+                try FileManager.default.moveItem(at: fileURL, to: backupURL)
+                writeBlockedByIncompleteBackup = false
+                AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent(
+                    "project_store_corrupted",
+                    error: "backup_completed"
+                ))
+                throw ProjectStoreError.dataCorrupted(backupFileName: backupFileName)
+            } catch let error as ProjectStoreError {
+                throw error
+            } catch {
+                AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent(
+                    "project_store_corrupt_backup_failed",
+                    error: String(describing: type(of: error))
+                ))
+                throw ProjectStoreError.dataCorrupted(backupFileName: nil)
+            }
+        }
     }
 
     func saveProjects(_ projects: [Project]) throws {
         lock.lock()
         defer { lock.unlock() }
+        guard !writeBlockedByIncompleteBackup else {
+            throw ProjectStoreError.dataCorrupted(backupFileName: nil)
+        }
         let data = try encoder.encode(projects)
         // 原子写入：避免中途崩溃留下半个文件
         try data.write(to: fileURL, options: .atomic)

@@ -340,19 +340,23 @@ final class AppEnvironment {
             let projectStore = try JSONProjectStore.makeDefault()
             let fileStore = try MeetingFileStore.makeDefault()
             // V1 → V2 一次性迁移：失败只脱敏记录，绝不抛出、绝不影响启动与旧数据
+            var migrationSucceeded = true
             if let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
                 let directory = base.appending(path: "BangWoFenXi", directoryHint: .isDirectory)
                 do {
                     _ = try ProjectMigrationCoordinator(directory: directory).migrateIfNeeded()
                 } catch {
+                    migrationSucceeded = false
                     AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent("project_migration_failed", error: String(describing: type(of: error))))
                 }
             }
             // 录音资产缺失安全恢复（幂等；仅补写空路径且文件真实存在的项目，不动录音文件）
-            do {
-                _ = try ProjectAssetRepair.repairIfNeeded(store: projectStore, fileStore: fileStore)
-            } catch {
-                AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent("project_asset_repair_failed", error: String(describing: type(of: error))))
+            if migrationSucceeded {
+                do {
+                    _ = try ProjectAssetRepair.repairIfNeeded(store: projectStore, fileStore: fileStore)
+                } catch {
+                    AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent("project_asset_repair_failed", error: String(describing: type(of: error))))
+                }
             }
             return AppEnvironment(meetingStore: store, fileStore: fileStore, projectStore: projectStore)
         } catch {

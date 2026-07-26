@@ -242,8 +242,18 @@ struct ProjectHomeView: View {
             loadError = nil
         } catch {
             projects = []
-            loadError = String(describing: type(of: error))
+            loadError = Self.loadErrorMessage(for: error)
         }
+    }
+
+    static func loadErrorMessage(for error: Error) -> String {
+        guard case let ProjectStoreError.dataCorrupted(backupFileName) = error else {
+            return String(describing: type(of: error))
+        }
+        if let backupFileName {
+            return "数据文件损坏，已备份为 \(backupFileName)，原始数据未丢失。"
+        }
+        return "数据文件损坏，自动备份未完成，已阻止写入。"
     }
 
     // MARK: - 导入音视频（阶段 C，03 §6.2）
