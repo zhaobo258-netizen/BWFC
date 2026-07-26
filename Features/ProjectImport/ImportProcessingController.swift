@@ -63,6 +63,12 @@ final class ImportProcessingController {
             throw ImportBusyError()
         }
         lastErrorMessage = nil
+        let accessedSecurityScope = url.startAccessingSecurityScopedResource()
+        defer {
+            if accessedSecurityScope {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
         let info = try await importService.inspect(url: url)
 
         let project = Project(
@@ -179,6 +185,16 @@ final class ImportProcessingController {
             } else {
                 return .failed(category: "source_copy_missing", retryable: false,
                                message: "找不到导入时留存的原件副本，无法继续提取")
+            }
+            // 外部 URL 只在首轮提取存在；false 也可能表示 Powerbox 当前已授权，
+            // 不应视为错误。prepareAudio 先复制 source-original，再只读项目目录副本。
+            let accessedSecurityScope = sourceURL != nil
+                ? url.startAccessingSecurityScopedResource()
+                : false
+            defer {
+                if accessedSecurityScope {
+                    url.stopAccessingSecurityScopedResource()
+                }
             }
             _ = try await importService.prepareAudio(from: url, for: project.id) { [weak self] progress in
                 Task { @MainActor in

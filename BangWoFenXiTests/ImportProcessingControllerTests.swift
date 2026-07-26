@@ -119,7 +119,8 @@ final class ImportProcessingControllerTests {
     func retryableExtractionFailureThenResume() async throws {
         importMock.prepareError = .extractionFailed
         let controller = makeController()
-        let projectID = try await controller.beginImport(url: importMock.fakeSourceURL(named: "会失败.m4a"))
+        let externalURL = importMock.fakeSourceURL(named: "会失败.m4a")
+        let projectID = try await controller.beginImport(url: externalURL)
         await waitFor { !controller.isRunning }
 
         var project = try #require(try storedProject(projectID))
@@ -129,6 +130,7 @@ final class ImportProcessingControllerTests {
         #expect(project.processingJobs.first { $0.kind == .transcription }?.status == .pending, "后续阶段不执行")
 
         // 修复后续跑（不重新提供来源 URL：用项目目录中的原件副本）
+        try FileManager.default.removeItem(at: externalURL)
         importMock.prepareError = nil
         controller.resume(projectID: projectID)
         await waitFor { !controller.isRunning }
@@ -136,7 +138,8 @@ final class ImportProcessingControllerTests {
         project = try #require(try storedProject(projectID))
         #expect(project.status == .ready)
         #expect(project.processingJobs.allSatisfy { $0.status == .completed })
-        #expect(importMock.prepareCallsWithoutOriginalURL >= 1, "续跑必须使用留存副本而非原路径")
+        #expect(importMock.prepareCallsWithoutOriginalURL >= 1,
+                "外部原文件删除后，续跑仍必须只依赖 source-original 副本")
     }
 
     @Test("视频轨损坏（failedFinal）：项目进入 failed，不无限重试")

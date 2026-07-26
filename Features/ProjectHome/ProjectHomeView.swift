@@ -267,6 +267,8 @@ struct ProjectHomeView: View {
         _ = provider.loadObject(ofClass: URL.self) { url, _ in
             guard let url else { return }
             Task { @MainActor in
+                // provider 只交付 file URL；外部文件的 security scope 由导入控制器
+                // 覆盖检查与原件复制，后续阶段只读取项目目录内副本。
                 beginImport(url: url)
             }
         }
