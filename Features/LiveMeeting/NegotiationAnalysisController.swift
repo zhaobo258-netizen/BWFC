@@ -116,6 +116,7 @@ final class NegotiationAnalysisController {
         case .invalidResponse: return "结果不合规"
         case .unauthorized: return "Key 无效"
         case .missingAPIKey: return "未配置 Key"
+        case .credentialAccessRequired: return "凭证需重连"
         case .clientError: return "请求被拒"
         }
     }
@@ -209,6 +210,10 @@ final class NegotiationAnalysisController {
                 state = .suspended(reason: "分析 Key 无效（401）。请在设置中检查「分析（Kimi）Key」，说话人识别不受影响。")
             } else if error == .missingAPIKey {
                 state = .suspended(reason: "未配置分析（Kimi）Key。本地录音与转写正常。")
+            } else if error == .credentialAccessRequired {
+                state = .suspended(
+                    reason: "App 更新后需要重新连接 AI。本地录音与转写正常。"
+                )
             }
             AppLog.logError(AppLog.analysis, LogSanitizer.formatEvent(
                 "analysis_failed",

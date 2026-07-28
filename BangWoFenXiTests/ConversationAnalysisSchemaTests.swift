@@ -211,6 +211,38 @@ struct ConversationAnalysisSchemaTests {
         #expect(invalid.headline == nil, "空白 headline 如实为 nil")
     }
 
+    @Test("模型单条缺少可选字段时不应拖垮整版 JSON")
+    func tolerantItemDecoding() throws {
+        let data = Data("""
+        {
+          "headline": "讨论总结",
+          "items": [
+            {
+              "category": "fact",
+              "text": "有完整证据的事实",
+              "epistemic_status": "explicit",
+              "confidence": "high",
+              "evidence_segment_ids": ["\(UUID().uuidString)"]
+            },
+            {
+              "category": "topic",
+              "text": "模型漏掉了置信度"
+            }
+          ]
+        }
+        """.utf8)
+
+        let dto = try JSONDecoder().decode(
+            ConversationAnalysisOutputDTO.self,
+            from: data
+        )
+
+        #expect(dto.items.count == 2)
+        #expect(dto.items[0].subjectSpeakerId == nil)
+        #expect(dto.items[1].confidence.isEmpty)
+        #expect(dto.items[1].evidenceSegmentIds.isEmpty)
+    }
+
     // MARK: - 持久化兼容
 
     @Test("Project JSON 往返：analysisSnapshots 完整保留")

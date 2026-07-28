@@ -300,6 +300,11 @@ final class DiarizationController {
             // 运行中 Key 被删除：视为未配置，零请求
             queue[entryIndex].status = .pending
             cloudState = .unconfigured
+        case .credentialAccessRequired:
+            queue[entryIndex].status = .pending
+            cloudState = .suspended(
+                reason: "App 更新后需要重新保存分人 Key。本地录音与转写不受影响。"
+            )
         case .rateLimited, .serverError, .network:
             queue[entryIndex].attemptCount += 1
             if retryPolicy.shouldRetry(afterFailures: queue[entryIndex].attemptCount) {

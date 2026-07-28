@@ -88,6 +88,24 @@ enum TranscriptCorrector {
         return changed
     }
 
+    static func hasVerifiedMatch(
+        wrong: String,
+        right: String,
+        evidenceSegmentIDs: [UUID],
+        segments: [TranscriptSegment]
+    ) -> Bool {
+        guard isValidRule(wrong: wrong, right: right),
+              !evidenceSegmentIDs.isEmpty else {
+            return false
+        }
+        let evidence = Set(evidenceSegmentIDs)
+        return segments.contains {
+            evidence.contains($0.id)
+                && $0.state != .provisional
+                && $0.text.contains(wrong)
+        }
+    }
+
     /// 对一段文字套用规则集（转写合并点自动纠错；本地与云端两条路径都过这里，
     /// 保证同一段文字两侧结果一致，不影响去重判定）。
     static func autoCorrect(_ text: String, rules: [CorrectionRule]) -> String {

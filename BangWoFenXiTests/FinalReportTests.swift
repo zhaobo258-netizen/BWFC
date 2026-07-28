@@ -114,12 +114,19 @@ struct FinalReportTests {
             source: .local,
             state: .provisional
         )
+        let unreferencedFinal = TranscriptSegment(
+            startMs: 3_000,
+            endMs: 4_000,
+            text: "后半段新增了一条尚未进入分析账本的最终原话。",
+            source: .local,
+            state: .final
+        )
         let project = Project(
             title: "总结测试",
             sourceType: .importedAudio,
             scenario: .internalMeeting,
             speakers: [speaker],
-            segments: [segment, provisional],
+            segments: [segment, provisional, unreferencedFinal],
             note: NoteDocument(markdown: "不得发送的用户私密笔记")
         )
         let analysis = ConversationAnalysisSnapshot(
@@ -214,9 +221,97 @@ struct FinalReportTests {
         #expect(request.system.contains(PromptRegistry.sharedGuardrails))
         #expect(request.input.contains("untrusted_transcript_data"))
         #expect(request.input.contains("对账方案"))
+        #expect(request.input.contains("后半段新增了一条尚未进入分析账本的最终原话"))
         #expect(!request.input.contains("不得进入报告的临时片段"))
         #expect(!request.input.contains("临时内容不得作为证据"))
         #expect(!request.input.contains("不得发送的用户私密笔记"))
+    }
+
+    @Test("完整总结把用户想法与 AI 反馈放入独立共创章节")
+    func collaborationSummaryContract() async throws {
+        let segment = TranscriptSegment(
+            startMs: 0,
+            endMs: 2_000,
+            text: "品牌叙事需要回答新的消费理由。",
+            source: .local,
+            state: .final
+        )
+        let project = Project(
+            title: "品牌叙事",
+            sourceType: .liveRecording,
+            segments: [segment],
+            aiChatMessages: [
+                ProjectAIChatMessage(
+                    role: .user,
+                    text: "我的判断是人的主体性正在上升。"
+                ),
+                ProjectAIChatMessage(
+                    role: .assistant,
+                    text: "这个判断可以解释旧消费秩序为何失效。"
+                )
+            ],
+            noteAIContextEnabled: true,
+            note: NoteDocument(markdown: "此前笔记：不能只换广告词。")
+        )
+        let analysis = ConversationAnalysisSnapshot(
+            version: 1,
+            analyzedThroughMs: segment.endMs,
+            headline: "讨论品牌叙事",
+            items: [
+                AnalysisItem(
+                    category: .topic,
+                    text: "新的消费理由",
+                    epistemicStatus: .explicit,
+                    confidence: .high,
+                    evidenceSegmentIds: [segment.id]
+                )
+            ]
+        )
+        let output = """
+        {
+          "headline": "讨论聚焦品牌叙事的新消费理由",
+          "overview": "录音明确提出品牌叙事需要回应新的消费理由。",
+          "collaboration_summary": "用户进一步提出人的主体性上升，AI 反馈认为这一判断可解释旧消费秩序失效；这属于共创观点，仍需更多案例验证。",
+          "items": [
+            {
+              "category": "topic",
+              "text": "品牌叙事需要回答新的消费理由",
+              "subject_speaker_id": null,
+              "owner_speaker_id": null,
+              "deadline_text": null,
+              "epistemic_status": "explicit",
+              "confidence": "high",
+              "evidence_segment_ids": ["\(segment.id.uuidString)"]
+            }
+          ]
+        }
+        """
+        let service = FinalReportAIService(output: output)
+        let orchestrator = ProjectAIOrchestrator(
+            finalReportAgent: FinalReportAgent(generationService: service)
+        )
+
+        let report = try await orchestrator.generate(
+            project: project,
+            analysis: analysis,
+            knownTerms: [],
+            version: 1
+        )
+
+        #expect(report.collaborationSummary?.contains("人的主体性") == true)
+        let request = try #require(
+            await service.capturedRequests().first
+        )
+        #expect(request.input.contains("untrusted_collaboration_data"))
+        #expect(request.input.contains("user_thought"))
+        #expect(request.input.contains("ai_feedback"))
+        #expect(request.input.contains("此前笔记：不能只换广告词"))
+        let markdown = FinalReportMarkdownRenderer.makeMarkdown(
+            report: report,
+            project: project
+        )
+        #expect(markdown.contains("## 我的思考与 AI 共创"))
+        #expect(markdown.contains("不等同于录音事实"))
     }
 
     @Test("旧 Project 缺少完整总结字段仍可读取，版本最多保留三版")
@@ -236,6 +331,30 @@ struct FinalReportTests {
         )
         #expect(legacy.schemaVersion == 2)
         #expect(legacy.finalReportSnapshots.isEmpty)
+
+        let reportData = try JSONEncoder().encode(
+            FinalReportSnapshot(
+                version: 1,
+                providerID: "p",
+                providerName: "P",
+                modelID: "m",
+                promptVersion: "v",
+                inputFingerprint: "f",
+                headline: "旧报告",
+                overview: "旧概述",
+                items: []
+            )
+        )
+        var reportObject = try #require(
+            try JSONSerialization.jsonObject(with: reportData)
+                as? [String: Any]
+        )
+        reportObject.removeValue(forKey: "collaborationSummary")
+        let legacyReport = try JSONDecoder().decode(
+            FinalReportSnapshot.self,
+            from: JSONSerialization.data(withJSONObject: reportObject)
+        )
+        #expect(legacyReport.collaborationSummary == nil)
 
         let reports = (1...5).map {
             FinalReportSnapshot(
@@ -287,7 +406,18 @@ struct FinalReportTests {
         #expect(speakerChanged != scenarioChanged)
         segment.text = "人工修订内容"
         segment.state = .edited
-        #expect(FinalReportFingerprint.make(for: project) != speakerChanged)
+        let segmentChanged = FinalReportFingerprint.make(for: project)
+        #expect(segmentChanged != speakerChanged)
+        project.aiChatMessages.append(
+            ProjectAIChatMessage(role: .user, text: "新增共创想法")
+        )
+        let collaborationChanged = FinalReportFingerprint.make(for: project)
+        #expect(collaborationChanged != segmentChanged)
+        project.aiChatDraft = "尚未发送的草稿"
+        #expect(
+            FinalReportFingerprint.make(for: project)
+                == collaborationChanged
+        )
     }
 
     @Test("Markdown 原子更新前保存外部修改冲突副本")
@@ -406,6 +536,60 @@ struct FinalReportTests {
         #expect(coordinator.latestCompletion == nil)
     }
 
+    @Test("共创内容在总结生成中更新时，完成后只补跑一次")
+    func coordinatorQueuesOneCollaborationRefresh() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "bwfx-final-refresh-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileStore = MeetingFileStore(baseDirectory: directory)
+        let store = InMemoryProjectStore()
+        let segment = TranscriptSegment(
+            startMs: 0,
+            endMs: 1_000,
+            text: "真实片段",
+            source: .local,
+            state: .final
+        )
+        let project = Project(
+            title: "共创刷新",
+            sourceType: .liveRecording,
+            status: .ready,
+            segments: [segment]
+        )
+        try store.saveProjects([project])
+        let analysis = MockConversationAnalysisService()
+        let generator = CoordinatorFinalReportGenerator()
+        generator.delay = .milliseconds(80)
+        let coordinator = makeCoordinator(
+            analysis: analysis,
+            generator: generator,
+            fileStore: fileStore,
+            store: store
+        )
+
+        coordinator.start(projectID: project.id)
+        await waitUntil { generator.callCount == 1 }
+        coordinator.start(
+            projectID: project.id,
+            refreshIfRunning: true
+        )
+        coordinator.start(
+            projectID: project.id,
+            refreshIfRunning: true
+        )
+        await waitUntil {
+            generator.callCount == 2
+                && coordinator.state(for: project.id)
+                    == .completed(version: 2)
+        }
+
+        #expect(generator.callCount == 2)
+        let stored = try #require(
+            try store.loadProjects().first { $0.id == project.id }
+        )
+        #expect(stored.finalReportSnapshots.map(\.version) == [1, 2])
+    }
+
     @Test("生成失败保留上一版并留下可重试任务")
     func coordinatorFailureKeepsPreviousReport() async throws {
         let directory = FileManager.default.temporaryDirectory
@@ -487,6 +671,52 @@ struct FinalReportTests {
             stored.processingJobs.first { $0.kind == .finalReport }?.status
                 == .failedRetryable
         )
+    }
+
+    @Test("全量分析失败时仍从完整逐字稿生成总结")
+    func coordinatorFallsBackToFullTranscript() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "bwfx-final-fallback-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileStore = MeetingFileStore(baseDirectory: directory)
+        let store = InMemoryProjectStore()
+        let segment = TranscriptSegment(
+            startMs: 0,
+            endMs: 1_000,
+            text: "即使分析失败，这段最终逐字稿也必须进入完整总结。",
+            source: .local,
+            state: .final
+        )
+        let project = Project(
+            title: "总结兜底",
+            sourceType: .liveRecording,
+            status: .ready,
+            segments: [segment]
+        )
+        try store.saveProjects([project])
+        let analysis = MockConversationAnalysisService()
+        analysis.persistentError = AnalysisAPIError.invalidResponse
+        let generator = CoordinatorFinalReportGenerator()
+        let coordinator = makeCoordinator(
+            analysis: analysis,
+            generator: generator,
+            fileStore: fileStore,
+            store: store
+        )
+
+        coordinator.start(projectID: project.id)
+        await waitUntil {
+            if case .completed = coordinator.state(for: project.id) {
+                return true
+            }
+            return false
+        }
+
+        #expect(generator.callCount == 1)
+        let stored = try #require(
+            try store.loadProjects().first { $0.id == project.id }
+        )
+        #expect(stored.finalReportSnapshots.count == 1)
     }
 
     @Test("报告落库失败会回滚 Project 和 Markdown，上一版保持一致")

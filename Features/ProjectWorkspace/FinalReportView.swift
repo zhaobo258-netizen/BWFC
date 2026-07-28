@@ -28,6 +28,10 @@ struct FinalReportView: View {
                 if let report = selectedReport {
                     reportHeader(report)
                     generationStatusKeepingReport
+                    if let collaborationSummary =
+                        report.collaborationSummary {
+                        collaborationSection(collaborationSummary)
+                    }
                     ForEach(FinalReportItemCategory.allCases, id: \.self) { category in
                         let items = report.items.filter { $0.category == category }
                         if !items.isEmpty {
@@ -102,7 +106,7 @@ struct FinalReportView: View {
             if report.inputFingerprint != FinalReportFingerprint.make(for: project) {
                 HStack(spacing: 7) {
                     Image(systemName: "arrow.triangle.2.circlepath")
-                    Text("文稿、说话人或场景已变化，需要更新完整总结。旧版本仍可查看。")
+                    Text("文稿、说话人、场景或共创记录已变化，需要更新完整总结。旧版本仍可查看。")
                     Spacer()
                     Button("更新", action: onGenerate)
                         .controlSize(.small)
@@ -120,6 +124,39 @@ struct FinalReportView: View {
             RoundedRectangle(cornerRadius: 12)
                 .strokeBorder(BWTheme.accent.opacity(0.22), lineWidth: 1)
         )
+    }
+
+    private func collaborationSection(_ summary: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label(
+                "我的思考与 AI 共创",
+                systemImage: "bubble.left.and.text.bubble.right"
+            )
+            .font(.caption)
+            .fontWeight(.semibold)
+            .foregroundStyle(BWTheme.accent)
+
+            Text(summary)
+                .font(.callout)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Label(
+                "本节来自用户想法、此前笔记与 AI 反馈，不等同于录音事实",
+                systemImage: "person.crop.circle.badge.checkmark"
+            )
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .background(
+            BWTheme.accent.opacity(0.07),
+            in: RoundedRectangle(cornerRadius: 12)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(BWTheme.accent.opacity(0.2), lineWidth: 1)
+        }
     }
 
     @ViewBuilder
@@ -272,6 +309,16 @@ struct FinalReportView: View {
 
     private func reportItem(_ item: FinalReportItem) -> some View {
         VStack(alignment: .leading, spacing: 7) {
+            if item.category == .chapter,
+               let firstEvidenceID = item.evidenceSegmentIds.first,
+               let startMs = project.segments.first(where: {
+                   $0.id == firstEvidenceID
+               })?.startMs {
+                Text(timeString(startMs))
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(BWTheme.accent)
+            }
             Text(item.text)
                 .font(.callout)
                 .textSelection(.enabled)
@@ -344,6 +391,16 @@ struct FinalReportView: View {
         case .medium: return "中置信"
         case .high: return "高置信"
         }
+    }
+
+    private func timeString(_ milliseconds: Int64) -> String {
+        let seconds = max(0, milliseconds / 1_000)
+        return String(
+            format: "%02d:%02d:%02d",
+            seconds / 3_600,
+            (seconds % 3_600) / 60,
+            seconds % 60
+        )
     }
 
     private var hasInterruptedFinalReportJob: Bool {

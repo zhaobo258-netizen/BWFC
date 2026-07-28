@@ -158,9 +158,24 @@ struct KnowledgeGardenView: View {
     private func sourcesSection(_ seed: KnowledgeSeed) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             sectionTitle("相关知识", icon: "point.3.connected.trianglepath.dotted")
-            Text("来源结果与 AI 联想分开显示，点击可回到真实文件或网页。")
+            Text("检索到的来源摘录会发送给当前分析模型生成速览；再按需打开 Obsidian、网页或 MCP 原文。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            if let synthesis = seed.sourceSynthesis {
+                sourceSynthesisCard(synthesis, seed: seed)
+            } else if controller.state == .expanding && !seed.connections.isEmpty {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("正在把检索结果整理成一眼能懂的知识速览…")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 8)
+            }
+            if let message = controller.sourceSynthesisMessage {
+                sourceStatus(message)
+            }
 
             ForEach(controller.providerIDs(for: seed), id: \.self) { providerID in
                 let connections = seed.connections.filter {
@@ -192,6 +207,61 @@ struct KnowledgeGardenView: View {
                 .padding(.vertical, 8)
             }
         }
+    }
+
+    private func sourceSynthesisCard(
+        _ synthesis: KnowledgeSourceSynthesis,
+        seed: KnowledgeSeed
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Label("来源速览", systemImage: "sparkles.rectangle.stack")
+                .font(.caption)
+                .fontWeight(.semibold)
+                .foregroundStyle(BWTheme.accent)
+            Text(synthesis.summary)
+                .font(.callout)
+                .fontWeight(.semibold)
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach(Array(synthesis.keyPoints.enumerated()), id: \.offset) { _, point in
+                HStack(alignment: .firstTextBaseline, spacing: 7) {
+                    Circle()
+                        .fill(BWTheme.accent)
+                        .frame(width: 5, height: 5)
+                    Text(point)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Divider()
+            Text("和本场讨论的关系")
+                .font(.caption)
+                .fontWeight(.semibold)
+                .foregroundStyle(.secondary)
+            Text(synthesis.discussionRelevance)
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+            let citations = synthesis.sourceIds.compactMap { sourceID in
+                seed.connections.first {
+                    "\($0.stableProviderID)|\($0.sourceId)" == sourceID
+                }?.title
+            }
+            if !citations.isEmpty {
+                Text("依据：\(citations.joined(separator: " · "))")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(2)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(BWTheme.accent.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(BWTheme.accent.opacity(0.2), lineWidth: 1)
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("相关知识来源速览")
     }
 
     private func sourceCard(_ connection: KnowledgeConnection) -> some View {

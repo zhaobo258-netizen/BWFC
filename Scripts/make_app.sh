@@ -1,5 +1,5 @@
 #!/bin/bash
-# 《帮我分析》自制 .app 打包脚本（无 Xcode 环境：SPM 构建 + 手工组装 bundle + ad-hoc 签名）
+# 《帮我分析》自制 .app 打包脚本（无 Xcode 环境：SPM 构建 + 手工组装 bundle + 稳定本机签名）
 # 用法：Scripts/make_app.sh [debug|release]   默认 debug
 set -euo pipefail
 
@@ -7,8 +7,23 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG="${1:-debug}"
 BINARY_NAME="BangWoFenXi"
 APP_DIR="$ROOT/build/${BINARY_NAME}.app"
+LOCAL_SIGNING_IDENTITY="BangWoFenXi Local Code Signing"
+SIGNING_IDENTITY="${BWFX_CODESIGN_IDENTITY:-}"
 
 cd "$ROOT"
+
+if [[ -z "$SIGNING_IDENTITY" ]]; then
+    if security find-identity -v -p codesigning \
+        | grep -Fq "\"$LOCAL_SIGNING_IDENTITY\""; then
+        SIGNING_IDENTITY="$LOCAL_SIGNING_IDENTITY"
+    elif [[ "${BWFX_ALLOW_ADHOC:-0}" == "1" ]]; then
+        SIGNING_IDENTITY="-"
+    else
+        echo "错误：未找到稳定签名身份 \"$LOCAL_SIGNING_IDENTITY\"。" >&2
+        echo "安装包禁止使用 ad-hoc；仅临时测试可显式设置 BWFX_ALLOW_ADHOC=1。" >&2
+        exit 1
+    fi
+fi
 
 echo "==> swift build -c $CONFIG"
 swift build -c "$CONFIG"
@@ -32,8 +47,12 @@ if [[ -d "$RESOURCE_BUNDLE" ]]; then
     cp -R "$RESOURCE_BUNDLE" "$APP_DIR/Contents/Resources/"
 fi
 
-echo "==> ad-hoc 签名（含 Sandbox / 麦克风 / 出站网络 entitlements）"
-codesign --force --sign - --entitlements "$ROOT/Entitlements.plist" "$APP_DIR"
+if [[ "$SIGNING_IDENTITY" == "-" ]]; then
+    echo "==> ad-hoc 签名（仅临时测试；禁止覆盖已安装 App）"
+else
+    echo "==> 稳定身份签名：$SIGNING_IDENTITY"
+fi
+codesign --force --sign "$SIGNING_IDENTITY" --entitlements "$ROOT/Entitlements.plist" "$APP_DIR"
 
 echo "==> 签名校验"
 codesign -dv "$APP_DIR" 2>&1 | sed 's/^/    /'

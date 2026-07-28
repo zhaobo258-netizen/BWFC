@@ -12,19 +12,61 @@ enum AIProviderKind: String, Codable, Sendable, CaseIterable {
     }
 }
 
+enum KimiModelPreference: String, Codable, Sendable, CaseIterable {
+    case k3Recommended = "k3-256k"
+    case k3LongContext = "k3"
+    case k2Compatibility = "kimi-for-coding"
+
+    var modelID: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .k3Recommended:
+            return "Kimi K3 · 256K（推荐）"
+        case .k3LongContext:
+            return "Kimi K3 · 1M"
+        case .k2Compatibility:
+            return "Kimi K2.7 Code（兼容）"
+        }
+    }
+}
+
 struct AIProviderConfiguration: Codable, Sendable, Equatable {
     var selectedProvider: AIProviderKind
+    var kimiModel: KimiModelPreference
     var openAIBaseURL: String
     var openAIModelID: String
 
     init(
         selectedProvider: AIProviderKind = .kimi,
+        kimiModel: KimiModelPreference = .k3Recommended,
         openAIBaseURL: String = "https://api.openai.com/v1",
         openAIModelID: String = ""
     ) {
         self.selectedProvider = selectedProvider
+        self.kimiModel = kimiModel
         self.openAIBaseURL = openAIBaseURL
         self.openAIModelID = openAIModelID
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        selectedProvider = try container.decodeIfPresent(
+            AIProviderKind.self,
+            forKey: .selectedProvider
+        ) ?? .kimi
+        kimiModel = try container.decodeIfPresent(
+            KimiModelPreference.self,
+            forKey: .kimiModel
+        ) ?? .k3Recommended
+        openAIBaseURL = try container.decodeIfPresent(
+            String.self,
+            forKey: .openAIBaseURL
+        ) ?? "https://api.openai.com/v1"
+        openAIModelID = try container.decodeIfPresent(
+            String.self,
+            forKey: .openAIModelID
+        ) ?? ""
     }
 
     var validatedOpenAIBaseURL: URL? {
@@ -121,9 +163,15 @@ struct AIProviderDescriptor: Sendable, Equatable {
 struct AITextGenerationRequest: Sendable, Equatable {
     var system: String
     var input: String
-    var maxTokens: Int
+    /// nil 表示由当前 Provider 选择安全默认值，避免 K3 的 thinking 预算
+    /// 被套用到输出上限更小的 OpenAI-compatible 模型。
+    var maxTokens: Int?
 
-    init(system: String, input: String, maxTokens: Int = 16_384) {
+    init(
+        system: String,
+        input: String,
+        maxTokens: Int? = nil
+    ) {
         self.system = system
         self.input = input
         self.maxTokens = maxTokens
@@ -150,7 +198,8 @@ struct KimiTextGenerationService: AITextGenerationServing {
     func generate(_ request: AITextGenerationRequest) async throws -> AITextGenerationResponse {
         let text = try await transport.rawAnalysisText(
             system: request.system,
-            inputJSON: request.input
+            inputJSON: request.input,
+            maxTokens: request.maxTokens
         )
         return AITextGenerationResponse(
             text: text,
@@ -202,14 +251,16 @@ actor AIProviderRegistry: AITextGenerationServing {
         case .kimi:
             let text = try await kimiTransport.rawAnalysisText(
                 system: request.system,
-                inputJSON: request.input
+                inputJSON: request.input,
+                modelID: configuration.kimiModel.modelID,
+                maxTokens: request.maxTokens
             )
             return AITextGenerationResponse(
                 text: text,
                 provider: AIProviderDescriptor(
                     id: AIProviderKind.kimi.rawValue,
                     displayName: AIProviderKind.kimi.displayName,
-                    modelID: CloudModelConfig.analysisModelID
+                    modelID: configuration.kimiModel.modelID
                 )
             )
         case .openAICompatible:
@@ -222,11 +273,13 @@ actor AIProviderRegistry: AITextGenerationServing {
         let configuration = configurationStore.load()
         switch configuration.selectedProvider {
         case .kimi:
-            _ = try await kimiTransport.testConnection()
+            _ = try await kimiTransport.testConnection(
+                modelID: configuration.kimiModel.modelID
+            )
             return AIProviderDescriptor(
                 id: AIProviderKind.kimi.rawValue,
                 displayName: AIProviderKind.kimi.displayName,
-                modelID: CloudModelConfig.analysisModelID
+                modelID: configuration.kimiModel.modelID
             )
         case .openAICompatible:
             return try await openAIService(configuration: configuration)
@@ -241,7 +294,13 @@ actor AIProviderRegistry: AITextGenerationServing {
               !configuration.normalizedOpenAIModelID.isEmpty else {
             throw AIProviderConfigurationError.invalidOpenAIConfiguration
         }
-        guard let apiKey = try openAIKeyStore.readKey(), !apiKey.isEmpty else {
+        let apiKey: String?
+        do {
+            apiKey = try openAIKeyStore.readKey()
+        } catch KeychainError.interactionNotAllowed {
+            throw AnalysisAPIError.credentialAccessRequired
+        }
+        guard let apiKey, !apiKey.isEmpty else {
             throw AnalysisAPIError.missingAPIKey
         }
         return OpenAICompatibleTextGenerationService(
@@ -293,7 +352,7 @@ struct OpenAICompatibleTextGenerationService: Sendable {
         let text = try await perform(
             system: request.system,
             input: request.input,
-            maxTokens: request.maxTokens
+            maxTokens: request.maxTokens ?? 16_384
         )
         return AITextGenerationResponse(
             text: text,

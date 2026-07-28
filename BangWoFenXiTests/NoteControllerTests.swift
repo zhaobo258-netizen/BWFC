@@ -166,6 +166,12 @@ final class NoteControllerTests {
         shouldFail = false
         #expect(controller.saveNow() == true)
         #expect(ProjectWorkspaceView.canNavigateHome(afterNoteSave: true) == true)
+        #expect(
+            ProjectWorkspaceView.canNavigateHome(
+                afterNoteSave: true,
+                afterCoCreateDraftSave: false
+            ) == false
+        )
         #expect(try store.loadProjects().first?.note.markdown == "必须落盘才能走的内容")
     }
 }

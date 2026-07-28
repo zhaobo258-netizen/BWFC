@@ -3,6 +3,7 @@ import Foundation
 
 enum FinalReportItemCategory: String, Codable, Sendable, CaseIterable {
     case topic
+    case chapter
     case fact
     case decision
     case actionItem
@@ -14,6 +15,7 @@ enum FinalReportItemCategory: String, Codable, Sendable, CaseIterable {
     var displayName: String {
         switch self {
         case .topic: return "核心议题"
+        case .chapter: return "章节概要"
         case .fact: return "关键事实"
         case .decision: return "决定与结论"
         case .actionItem: return "行动项"
@@ -70,6 +72,7 @@ struct FinalReportSnapshot: Identifiable, Codable, Sendable {
     let inputFingerprint: String
     let headline: String
     let overview: String
+    let collaborationSummary: String?
     let items: [FinalReportItem]
     var markdownHash: String?
 
@@ -84,6 +87,7 @@ struct FinalReportSnapshot: Identifiable, Codable, Sendable {
         inputFingerprint: String,
         headline: String,
         overview: String,
+        collaborationSummary: String? = nil,
         items: [FinalReportItem],
         markdownHash: String? = nil
     ) {
@@ -97,6 +101,7 @@ struct FinalReportSnapshot: Identifiable, Codable, Sendable {
         self.inputFingerprint = inputFingerprint
         self.headline = headline
         self.overview = overview
+        self.collaborationSummary = collaborationSummary
         self.items = items
         self.markdownHash = markdownHash
     }
@@ -153,6 +158,22 @@ enum FinalReportFingerprint {
                     $0.text
                 ].joined(separator: "\u{1F}")
             })
+        lines.append(
+            project.noteAIContextEnabled
+                ? "legacy_note_enabled"
+                : "legacy_note_disabled"
+        )
+        if project.noteAIContextEnabled {
+            lines.append("legacy_note\u{1F}\(project.note.markdown)")
+        }
+        lines.append(contentsOf: project.aiChatMessages.map { message in
+            [
+                message.id.uuidString,
+                message.role.rawValue,
+                message.text,
+                message.attachments.map(\.fileName).joined(separator: "\u{1D}")
+            ].joined(separator: "\u{1F}")
+        })
         return SHA256.hash(data: Data(lines.joined(separator: "\u{1E}").utf8))
             .map { String(format: "%02x", $0) }
             .joined()

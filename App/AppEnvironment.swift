@@ -10,6 +10,7 @@ enum ProjectFieldOwnership: Sendable, Equatable {
     case analysis
     case finalReport
     case knowledgeGarden
+    case aiContext
     case importPipeline
 }
 
@@ -44,6 +45,9 @@ enum ProjectPersistence {
         "analysisSnapshots": .runtime,
         "finalReportSnapshots": .runtime,
         "knowledgeSeeds": .workspace,
+        "aiChatMessages": .workspace,
+        "aiChatDraft": .workspace,
+        "noteAIContextEnabled": .workspace,
         "legacyMetadata": .runtime,
         "note": .workspace,
         "processingJobs": .runtime,
@@ -93,6 +97,10 @@ enum ProjectPersistence {
             stored.lastActivityAt = incoming.lastActivityAt
         case .knowledgeGarden:
             stored.knowledgeSeeds = incoming.knowledgeSeeds
+        case .aiContext:
+            stored.aiChatMessages = incoming.aiChatMessages
+            stored.aiChatDraft = incoming.aiChatDraft
+            stored.noteAIContextEnabled = incoming.noteAIContextEnabled
         case .importPipeline:
             stored.status = incoming.status
             stored.processingJobs = incoming.processingJobs
@@ -187,6 +195,8 @@ final class AppEnvironment {
     let conversationAnalysis: any ConversationAnalysisServicing
     /// “开花”中的概念解释、跨领域连接与检索词生成
     let knowledgeExpansion: any KnowledgeExpansionServicing
+    /// 项目级背景补充、主题纠正与追问
+    let projectAIChat: any ProjectAIChatServing
     /// 完整总结生成器（证据账本 → 独立报告）
     let finalReportGenerator: any FinalReportGenerating
     /// 导出（阶段 5 实现：生成 Markdown/JSON 内容，保存位置由用户选择）
@@ -310,6 +320,7 @@ final class AppEnvironment {
         negotiationAnalysis: (any NegotiationAnalysisServicing)? = nil,
         conversationAnalysis: (any ConversationAnalysisServicing)? = nil,
         knowledgeExpansion: (any KnowledgeExpansionServicing)? = nil,
+        projectAIChat: (any ProjectAIChatServing)? = nil,
         finalReportGenerator: (any FinalReportGenerating)? = nil,
         kimiCredentials: (any KimiCredentialProviding)? = nil,
         exporter: (any MeetingExportServicing)? = nil,
@@ -361,6 +372,8 @@ final class AppEnvironment {
             ?? KimiConversationAnalysisService(generationService: providerRegistry)
         self.knowledgeExpansion = knowledgeExpansion
             ?? KimiKnowledgeExpansionService(generationService: providerRegistry)
+        self.projectAIChat = projectAIChat
+            ?? ProjectAIChatAgent(generationService: providerRegistry)
         self.finalReportGenerator = finalReportGenerator
             ?? ProjectAIOrchestrator(
                 finalReportAgent: FinalReportAgent(
@@ -636,9 +649,8 @@ final class AppEnvironment {
     }
 
     /// 旧版统一 Keychain 条目迁移（account=openai → 分析 kimi 条目）。
-    /// 迁移需要解密旧条目：ad-hoc 重签名后 Keychain ACL 可能不再信任新签名，
-    /// 解密会触发 SecurityAgent 授权交互——绝不能在启动主线程同步执行，
-    /// 否则首帧渲染前即被阻塞（与 hasStoredTokens/contains 修复同一类问题）。
+    /// 迁移使用禁止交互的 Keychain 读取；ACL 不匹配时立即跳过，不弹密码框。
+    /// 仍放在 utility task，避免启动首帧等待安全存储 I/O。
     private static func scheduleLegacyKeyMigration(refreshing environment: AppEnvironment) {
         Task.detached(priority: .utility) {
             CloudAPIKeyStore.migrateLegacyKeyIfNeeded()

@@ -143,6 +143,7 @@ final class MeetingRecordingService {
             }
         }
         capture.stopCapture()
+        meeting.endedAt = Date()
         try meeting.transition(to: .finalizing)
     }
 

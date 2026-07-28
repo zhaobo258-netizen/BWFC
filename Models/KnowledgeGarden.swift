@@ -88,6 +88,28 @@ struct KnowledgeConnection: Identifiable, Codable, Sendable, Hashable {
     }
 }
 
+struct KnowledgeSourceSynthesis: Codable, Sendable, Hashable {
+    var summary: String
+    var keyPoints: [String]
+    var discussionRelevance: String
+    var sourceIds: [String]
+    var generatedAt: Date
+
+    init(
+        summary: String,
+        keyPoints: [String],
+        discussionRelevance: String,
+        sourceIds: [String],
+        generatedAt: Date = Date()
+    ) {
+        self.summary = summary
+        self.keyPoints = keyPoints
+        self.discussionRelevance = discussionRelevance
+        self.sourceIds = sourceIds
+        self.generatedAt = generatedAt
+    }
+}
+
 struct KnowledgeSeed: Identifiable, Codable, Sendable, Hashable {
     var id: UUID
     var seedText: String
@@ -95,6 +117,7 @@ struct KnowledgeSeed: Identifiable, Codable, Sendable, Hashable {
     var evidenceSegmentIds: [UUID]
     var branches: [KnowledgeBranch]
     var connections: [KnowledgeConnection]
+    var sourceSynthesis: KnowledgeSourceSynthesis?
     var searchQueries: [String]
     var isAddedToProject: Bool
     var createdAt: Date
@@ -107,6 +130,7 @@ struct KnowledgeSeed: Identifiable, Codable, Sendable, Hashable {
         evidenceSegmentIds: [UUID],
         branches: [KnowledgeBranch] = [],
         connections: [KnowledgeConnection] = [],
+        sourceSynthesis: KnowledgeSourceSynthesis? = nil,
         searchQueries: [String] = [],
         isAddedToProject: Bool = false,
         createdAt: Date = Date(),
@@ -118,6 +142,7 @@ struct KnowledgeSeed: Identifiable, Codable, Sendable, Hashable {
         self.evidenceSegmentIds = evidenceSegmentIds
         self.branches = branches
         self.connections = connections
+        self.sourceSynthesis = sourceSynthesis
         self.searchQueries = searchQueries
         self.isAddedToProject = isAddedToProject
         self.createdAt = createdAt

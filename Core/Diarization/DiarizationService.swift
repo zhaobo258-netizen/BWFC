@@ -41,6 +41,8 @@ enum DiarizationAPIError: Error, Equatable {
     case invalidResponse
     /// 未配置 API Key
     case missingAPIKey
+    /// 当前 App 身份无法静默读取旧 Keychain 凭证
+    case credentialAccessRequired
 }
 
 extension DiarizationAPIError: LocalizedError {
@@ -53,6 +55,8 @@ extension DiarizationAPIError: LocalizedError {
         case .network: return "网络连接失败，将自动退避重试"
         case .invalidResponse: return "云端响应无法解析"
         case .missingAPIKey: return "未配置 API Key"
+        case .credentialAccessRequired:
+            return "当前 App 无法读取旧凭证，请前往设置重新保存 API Key"
         }
     }
 }
@@ -94,7 +98,13 @@ struct OpenAIDiarizationService: DiarizationServicing {
         at chunkURL: URL,
         knownSpeakers: [KnownSpeakerReference]
     ) async throws -> DiarizationChunkResult {
-        guard let apiKey = try apiKeyStore.readKey(), !apiKey.isEmpty else {
+        let apiKey: String?
+        do {
+            apiKey = try apiKeyStore.readKey()
+        } catch KeychainError.interactionNotAllowed {
+            throw DiarizationAPIError.credentialAccessRequired
+        }
+        guard let apiKey, !apiKey.isEmpty else {
             throw DiarizationAPIError.missingAPIKey
         }
 
@@ -131,7 +141,13 @@ struct OpenAIDiarizationService: DiarizationServicing {
 
     /// 连接测试：只返回可用/不可用（实施计划 5.1）
     func testConnection() async throws -> Bool {
-        guard let apiKey = try apiKeyStore.readKey(), !apiKey.isEmpty else {
+        let apiKey: String?
+        do {
+            apiKey = try apiKeyStore.readKey()
+        } catch KeychainError.interactionNotAllowed {
+            throw DiarizationAPIError.credentialAccessRequired
+        }
+        guard let apiKey, !apiKey.isEmpty else {
             throw DiarizationAPIError.missingAPIKey
         }
         var request = URLRequest(url: baseURL.appending(path: "/models"))

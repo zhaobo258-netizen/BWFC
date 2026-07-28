@@ -140,6 +140,32 @@ struct TranscriptCorrectorTests {
         #expect(s.text == "经销商找经销商")
     }
 
+    @Test("AI 纠错必须引用当前逐字稿中真实命中的片段")
+    func verifiedMatch() {
+        let hit = segment("我选幻影身机")
+        let unrelated = segment("另一段话")
+        let provisional = segment("幻影身机", state: .provisional)
+
+        #expect(TranscriptCorrector.hasVerifiedMatch(
+            wrong: "幻影身机",
+            right: "旷野之息",
+            evidenceSegmentIDs: [hit.id],
+            segments: [hit, unrelated, provisional]
+        ))
+        #expect(!TranscriptCorrector.hasVerifiedMatch(
+            wrong: "幻影身机",
+            right: "旷野之息",
+            evidenceSegmentIDs: [unrelated.id],
+            segments: [hit, unrelated, provisional]
+        ))
+        #expect(!TranscriptCorrector.hasVerifiedMatch(
+            wrong: "幻影身机",
+            right: "旷野之息",
+            evidenceSegmentIDs: [provisional.id],
+            segments: [hit, unrelated, provisional]
+        ))
+    }
+
     @Test("自动纠错：按规则集顺序替换")
     func autoCorrect() {
         let rules = [

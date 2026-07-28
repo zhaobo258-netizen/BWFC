@@ -137,19 +137,20 @@ struct SettingsView: View {
             Form {
                 activeAIProviderSection
                 if aiConfiguration.selectedProvider == .kimi {
+                    kimiModelSection
                     kimiAccountSection
                     keySection(
                         provider: .analysis,
-                        title: "静态分析 Key（后备）",
+                        title: "Kimi API Key（账号登录的备用方式）",
                         input: $analysisKeyInput,
-                        footnote: "未登录 Kimi 账号时才使用此 Key。"
+                        footnote: "它只用于实时分析、完整总结、项目对话和开花；不是“分析人”的身份，也不用于说话人识别。已登录 Kimi 账号时不会使用此备用 Key。"
                     )
                 } else {
                     openAICompatibleSection
                 }
                 Section("提示词") {
                     LabeledContent("当前版本", value: PromptRegistry.version)
-                    Text("实时分析、完整总结和开花使用统一安全规则。普通设置不开放原始提示词编辑。")
+                    Text("实时分析、完整总结、项目对话和开花使用统一安全规则。普通设置不开放原始提示词编辑。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -172,13 +173,13 @@ struct SettingsView: View {
             Form {
                 keySection(
                     provider: .diarization,
-                    title: "分人 Key（OpenAI 兼容）",
+                    title: "高精度转写与说话人 API Key（OpenAI 兼容）",
                     input: $diarizationKeyInput,
-                    footnote: "未配置时说话人显示为待识别，可手动标注；本地录音与转写不受影响。"
+                    footnote: "Kimi 只负责文字分析，不能直接识别录音。未配置时使用本地 Apple Speech；配置后新录音会把音频分片发送到兼容服务，用高精度结果校正本地文稿并识别说话人。"
                 )
                 Section("当前能力") {
                     LabeledContent(
-                        "说话人识别",
+                        "高精度转写与说话人",
                         value: "OpenAI 兼容 · \(CloudModelConfig.diarizationModelID)"
                     )
                     Text("专业词条在下一次录音或导入时进入 Apple Speech 上下文；录音中不会重启转写。")
@@ -213,7 +214,7 @@ struct SettingsView: View {
             }
             LabeledContent(
                 "生效范围",
-                value: "实时分析 · 完整总结 · 开花"
+                value: "实时分析 · 完整总结 · 项目对话 · 开花"
             )
             Text("修改从下一次 AI 请求开始生效；正在执行的请求不会被中断或切换模型。")
                 .font(.footnote)
@@ -224,13 +225,42 @@ struct SettingsView: View {
         }
     }
 
+    private var kimiModelSection: some View {
+        Section("Kimi 模型") {
+            Picker(
+                "优先模型",
+                selection: $aiConfiguration.kimiModel
+            ) {
+                ForEach(KimiModelPreference.allCases, id: \.self) { model in
+                    Text(model.displayName).tag(model)
+                }
+            }
+            .onChange(of: aiConfiguration.kimiModel) { _, _ in
+                _ = saveAIConfiguration(saveKey: false)
+            }
+            LabeledContent(
+                "当前 Model ID",
+                value: aiConfiguration.kimiModel.modelID
+            )
+            Text("默认使用 Kimi K3 256K；它与 K3 同属旗舰模型，官方建议日常任务优先使用且额度消耗更低。K3 需要相应会员权限，连接测试会如实提示，不会静默切换到其他模型。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+
     private var openAICompatibleSection: some View {
-        Section("OpenAI 兼容连接") {
+        let hasSavedKey = environment.openAICompatibleKeyStore.hasConfiguredKey
+        return Section("OpenAI 兼容连接") {
             TextField("Base URL，例如 https://api.openai.com/v1", text: $aiConfiguration.openAIBaseURL)
                 .textFieldStyle(.roundedBorder)
             TextField("Model ID", text: $aiConfiguration.openAIModelID)
                 .textFieldStyle(.roundedBorder)
-            SecureField("API Key（留空表示保留已保存的 Key）", text: $openAIKeyInput)
+            SecureField(
+                hasSavedKey
+                    ? "Key 已安全保存；粘贴新 Key 可替换"
+                    : "粘贴 API Key",
+                text: $openAIKeyInput
+            )
                 .textFieldStyle(.roundedBorder)
             HStack {
                 Button("保存") {
@@ -246,8 +276,16 @@ struct SettingsView: View {
                 Spacer()
                 configurationBadge(
                     configured: aiConfiguration.isOpenAIConfigurationValid
-                        && environment.openAICompatibleKeyStore.hasConfiguredKey
+                        && hasSavedKey
                 )
+            }
+            if hasSavedKey {
+                Label(
+                    "Key 已保存在本机 Keychain，重开 App 无需再次输入；为安全起见，此处不会回显原 Key。",
+                    systemImage: "checkmark.shield"
+                )
+                .font(.footnote)
+                .foregroundStyle(.secondary)
             }
             Text("仅允许 HTTPS；本机服务可使用 localhost。连接测试不发送项目、逐字稿或笔记。")
                 .font(.footnote)
@@ -262,7 +300,7 @@ struct SettingsView: View {
                 value: environment.obsidianVaultURL == nil ? "未连接" : "已连接"
             )
             LabeledContent("互联网", value: "已启用 · 中文维基百科")
-            Text("外部 MCP 只接收最长 24 字的知识检索词，不接收完整逐字稿、录音、笔记或整个 Vault。")
+            Text("外部 MCP 只接收最长 24 字的知识检索词，不接收完整逐字稿、录音、笔记正文或整个 Vault。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -529,6 +567,7 @@ struct SettingsView: View {
     private var privacySection: some View {
         Section("隐私说明") {
             Text("录音前请确认参与者已知晓并同意。说话人识别会按需发送音频分片；AI 分析会发送转写文本。")
+            Text("在项目中开启“允许上传笔记给 AI”后，项目对话和开花会把请求发起时的最新笔记交给当前分析模型；外部知识源只接收短检索词，完整总结仍不读取笔记。")
             Text("登录凭证、模型 Key 和每个 MCP Token 分别保存在本机 Keychain，不写入项目、日志或 Markdown。")
             Text("MCP 只能调用已经验证的只读知识检索工具。")
         }
@@ -934,13 +973,19 @@ struct SettingsView: View {
         input: Binding<String>,
         footnote: String
     ) -> some View {
-        Section(provider.displayName) {
+        let hasSavedKey = environment.isConfigured(provider)
+        return Section(provider.displayName) {
             HStack {
                 Text(title)
                 Spacer()
-                configurationBadge(configured: environment.isConfigured(provider))
+                configurationBadge(configured: hasSavedKey)
             }
-            SecureField("粘贴 API Key（不会明文保存）", text: input)
+            SecureField(
+                hasSavedKey
+                    ? "Key 已安全保存；粘贴新 Key 可替换"
+                    : "粘贴 API Key（不会明文保存）",
+                text: input
+            )
                 .textFieldStyle(.roundedBorder)
             HStack {
                 Button("保存到 Keychain") {
@@ -950,12 +995,20 @@ struct SettingsView: View {
                 Button("删除已保存的 Key") {
                     deleteKey(provider: provider)
                 }
-                .disabled(!environment.isConfigured(provider))
+                .disabled(!hasSavedKey)
                 Spacer()
                 Button(testingProvider == provider ? "测试中…" : "连接测试") {
                     runConnectionTest(provider: provider)
                 }
                 .disabled(testingProvider != nil || !canTestConnection(provider))
+            }
+            if hasSavedKey {
+                Label(
+                    "已保存在本机 Keychain，重开 App 无需再次输入；为安全起见，此处不会回显原 Key。",
+                    systemImage: "checkmark.shield"
+                )
+                .font(.footnote)
+                .foregroundStyle(.secondary)
             }
             if let result = testResults[provider] {
                 statusText(result.text)

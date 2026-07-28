@@ -66,6 +66,7 @@ final class KnowledgeGardenController {
 
     private let expansionService: any KnowledgeExpansionServicing
     private let providerFactory: () -> [any KnowledgeProvider]
+    private let automaticallyBloomNewSeeds: Bool
     private weak var project: Project?
 
     private(set) var seeds: [KnowledgeSeed] = []
@@ -74,14 +75,21 @@ final class KnowledgeGardenController {
     private(set) var providerMessages: [String: String] = [:]
     private(set) var providerDisplayNames: [String: String] = [:]
     private(set) var expansionMessage: String?
+    private(set) var sourceSynthesisMessage: String?
     var onUpdated: (() -> Void)?
+    var noteContextProvider: () -> String? = { nil }
+    private var automaticBloomTask: Task<Void, Never>?
+    private var pendingAutomaticBloomIDs: [UUID] = []
+    private var automaticallyAttemptedSeedIDs = Set<UUID>()
 
     init(
         expansionService: any KnowledgeExpansionServicing,
-        providerFactory: @escaping () -> [any KnowledgeProvider]
+        providerFactory: @escaping () -> [any KnowledgeProvider],
+        automaticallyBloomNewSeeds: Bool = false
     ) {
         self.expansionService = expansionService
         self.providerFactory = providerFactory
+        self.automaticallyBloomNewSeeds = automaticallyBloomNewSeeds
     }
 
     var selectedSeed: KnowledgeSeed? {
@@ -90,6 +98,12 @@ final class KnowledgeGardenController {
     }
 
     func attach(to project: Project) {
+        automaticBloomTask?.cancel()
+        automaticBloomTask = nil
+        pendingAutomaticBloomIDs = []
+        automaticallyAttemptedSeedIDs = Set(project.knowledgeSeeds.compactMap {
+            Self.needsBloom($0) ? nil : $0.id
+        })
         self.project = project
         refreshCandidates()
     }
@@ -119,6 +133,7 @@ final class KnowledgeGardenController {
                 let disposable = !seed.isAddedToProject
                     && seed.branches.isEmpty
                     && seed.connections.isEmpty
+                    && seed.sourceSynthesis == nil
                     && seed.id != protectedID
                 if disposable {
                     overflow -= 1
@@ -135,6 +150,12 @@ final class KnowledgeGardenController {
         if merged.map(\.id) != previousIDs {
             onUpdated?()
         }
+        let previousIDSet = Set(previousIDs)
+        scheduleAutomaticBloom(
+            preferredIDs: merged.compactMap {
+                previousIDSet.contains($0.id) ? nil : $0.id
+            }
+        )
     }
 
     func selectSeed(_ id: UUID) {
@@ -145,27 +166,37 @@ final class KnowledgeGardenController {
         providerMessages = [:]
         providerDisplayNames = [:]
         expansionMessage = nil
+        sourceSynthesisMessage = nil
     }
 
     func bloomIfNeeded() async {
         guard let seed = selectedSeed,
-              seed.branches.isEmpty && seed.connections.isEmpty else {
+              Self.needsBloom(seed) else {
             return
         }
         await bloomSelected()
     }
 
     func bloomSelected() async {
+        guard let selectedSeedID else {
+            return
+        }
+        await bloom(seedID: selectedSeedID)
+    }
+
+    private func bloom(seedID: UUID) async {
         guard state != .expanding,
               let project,
-              let selectedSeedID,
-              let seed = seeds.first(where: { $0.id == selectedSeedID }) else {
+              let seed = seeds.first(where: { $0.id == seedID }) else {
             return
         }
         state = .expanding
-        providerMessages = [:]
-        providerDisplayNames = [:]
-        expansionMessage = nil
+        if seedID == selectedSeedID {
+            providerMessages = [:]
+            providerDisplayNames = [:]
+            expansionMessage = nil
+            sourceSynthesisMessage = nil
+        }
 
         let providers = providerFactory()
         let output = await KnowledgeBloomAgent(
@@ -175,26 +206,32 @@ final class KnowledgeGardenController {
             whyItMatters: seed.whyItMatters,
             evidence: Self.evidence(for: seed, in: project),
             scenario: project.scenario,
+            userContext: ProjectAIUserContext.statements(
+                from: project.aiChatMessages
+            ),
+            noteMarkdown: project.noteAIContextEnabled
+                ? noteContextProvider()
+                : nil,
             providers: providers
         )
         apply(
             outcomes: output.initialOutcomes,
-            to: selectedSeedID,
+            to: seedID,
             replacing: true
         )
 
         switch output.expansion {
         case .success(let result):
-            updateSeed(id: selectedSeedID) { stored in
+            updateSeed(id: seedID) { stored in
                 stored.branches = result.branches
                 stored.searchQueries = result.searchQueries
                 stored.updatedAt = Date()
             }
-            if self.selectedSeedID == selectedSeedID {
+            if self.selectedSeedID == seedID {
                 expansionMessage = result.branches.isEmpty ? "AI 暂未生成有效联想" : nil
             }
         case .failure(let failure):
-            if self.selectedSeedID == selectedSeedID {
+            if self.selectedSeedID == seedID {
                 expansionMessage = Self.expansionFailureMessage(failure)
             }
         }
@@ -202,11 +239,47 @@ final class KnowledgeGardenController {
         if !output.refinedOutcomes.isEmpty {
             apply(
                 outcomes: output.refinedOutcomes,
-                to: selectedSeedID,
+                to: seedID,
                 replacing: false
             )
         }
+        if let synthesis = output.sourceSynthesis {
+            updateSeed(id: seedID) {
+                $0.sourceSynthesis = synthesis
+                $0.updatedAt = Date()
+            }
+        } else if output.sourceSynthesisFailure != nil,
+                  selectedSeedID == seedID {
+            sourceSynthesisMessage = "已找到来源，但 AI 速览暂时生成失败；原始资料仍可查看"
+        }
         state = .finished
+    }
+
+    private func scheduleAutomaticBloom(preferredIDs: [UUID]) {
+        guard automaticallyBloomNewSeeds else { return }
+        let orderedIDs = preferredIDs + seeds.map(\.id)
+        guard let candidateID = orderedIDs.first(where: { id in
+            !automaticallyAttemptedSeedIDs.contains(id)
+                && seeds.first(where: { $0.id == id }).map(Self.needsBloom) == true
+        }) else {
+            return
+        }
+        automaticallyAttemptedSeedIDs.insert(candidateID)
+        if !pendingAutomaticBloomIDs.contains(candidateID) {
+            pendingAutomaticBloomIDs.append(candidateID)
+        }
+        guard automaticBloomTask == nil else { return }
+        automaticBloomTask = Task { [weak self] in
+            await self?.drainAutomaticBloomQueue()
+        }
+    }
+
+    private func drainAutomaticBloomQueue() async {
+        while !Task.isCancelled, !pendingAutomaticBloomIDs.isEmpty {
+            let seedID = pendingAutomaticBloomIDs.removeFirst()
+            await bloom(seedID: seedID)
+        }
+        automaticBloomTask = nil
     }
 
     func setAddedToProject(_ added: Bool) {
@@ -225,6 +298,9 @@ final class KnowledgeGardenController {
         let incoming = outcomes.flatMap(\.connections)
         updateSeed(id: seedID) { seed in
             var merged = replacing ? [] : seed.connections
+            if replacing {
+                seed.sourceSynthesis = nil
+            }
             var seen = Set(merged.map { "\($0.stableProviderID)|\($0.sourceId)" })
             for connection in incoming {
                 let key = "\(connection.stableProviderID)|\(connection.sourceId)"
@@ -298,6 +374,7 @@ final class KnowledgeGardenController {
             .knowledgeSeed, .concept, .topic, .fact, .possibleConcern,
             .openQuestion, .factCheck
         ]
+        let existingSegmentIDs = Set(project.segments.map(\.id))
         var candidates: [KnowledgeSeed] = []
         var seen = Set<String>()
         if let snapshot {
@@ -305,7 +382,12 @@ final class KnowledgeGardenController {
                 for item in snapshot.items where item.category == category {
                     let text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
                     let key = normalized(text)
-                    guard text.count >= 4, seen.insert(key).inserted else { continue }
+                    guard !item.evidenceSegmentIds.isEmpty,
+                          item.evidenceSegmentIds.allSatisfy(existingSegmentIDs.contains),
+                          text.count >= 4,
+                          seen.insert(key).inserted else {
+                        continue
+                    }
                     candidates.append(KnowledgeSeed(
                         seedText: text,
                         whyItMatters: "来自“\(category.displayName)”的讨论线索",
@@ -356,6 +438,13 @@ final class KnowledgeGardenController {
         normalized(seed.seedText) + "|" + seed.evidenceSegmentIds.map(\.uuidString).joined(separator: ",")
     }
 
+    private static func needsBloom(_ seed: KnowledgeSeed) -> Bool {
+        if seed.branches.isEmpty && seed.connections.isEmpty {
+            return true
+        }
+        return !seed.connections.isEmpty && seed.sourceSynthesis == nil
+    }
+
     private static func normalized(_ text: String) -> String {
         text.lowercased()
             .replacingOccurrences(of: #"\s+"#, with: "", options: .regularExpression)
@@ -367,6 +456,8 @@ final class KnowledgeGardenController {
         if case .api(let apiError) = failure {
             switch apiError {
             case .missingAPIKey: return "AI 联想未启用；连接分析模型后可生成概念与跨领域连接"
+            case .credentialAccessRequired:
+                return "App 更新后需要重新连接 AI；知识来源检索仍可使用"
             case .unauthorized: return "AI 凭证已失效；知识来源检索仍可使用"
             case .timeout: return "AI 联想超时；知识来源检索仍可使用"
             default: return "AI 联想暂不可用；知识来源检索仍可使用"

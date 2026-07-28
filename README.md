@@ -28,6 +28,9 @@
   资源状态三道检查，不可用则阻止开始并显示真实原因（不静默降级）。
 - 采集 tap 缓冲同时写录音文件与 SpeechAnalyzer（`onBuffer` 分发，
   `bestAvailableAudioFormat` + AVAudioConverter 按需转换）。
+- 录音条实时显示输入电平；最近声音持续偏小时明确提醒靠近麦克风或提高播放音量，
+  避免在低质量音频上继续积累错误。结束录音时会等待 SpeechAnalyzer 的尾部最终结果，
+  不会因提前取消结果收集而丢掉最后一句。
 - 上下文词汇：glossary + 参会人姓名/角色经 `AnalysisContext.contextualStrings`
   送入（仅改善识别，不改写原意）。
 - 片段合并：`TranscriptReconciler` 纯逻辑——临时片段同 ID 就地更新；最终结果按
@@ -42,10 +45,10 @@
 
 ```bash
 swift build                    # 编译（0 警告基线）
-Scripts/make_app.sh            # Debug .app（ad-hoc 签名 + Sandbox/麦克风/网络 entitlements）
+Scripts/make_app.sh            # Debug .app（稳定本机签名 + Sandbox/麦克风/网络 entitlements）
 Scripts/make_app.sh release    # Release .app
 open build/BangWoFenXi.app     # 启动
-Scripts/run_tests.sh           # 全部 187 个自动化用例
+Scripts/run_tests.sh           # 全部 482 个自动化用例
 Scripts/soak_test.sh           # 稳定性缩短版（180s/4x）
 Scripts/soak_test.sh 3600 1    # 60 分钟完整稳定性（人工验收）
 ```
@@ -129,15 +132,30 @@ swift test                  # 可完成构建；本机执行阶段静默失效�
   删除后验证会议专属目录与数据库记录均不存在；导出文件存于用户自选位置，
   应用目录内无导出缓存需清理。
 
-## 云端分析 provider 切换（Kimi）
+## 当前 AI Provider
 
-- 谈判文字分析改用本机 Kimi 网关（Anthropic 风格 messages 接口）：
-  `POST https://agent-gw.kimi.com/coding/v1/messages`，`x-api-key` + `anthropic-version` 头，
-  模型 `kimi-for-coding`（集中配置于 CloudModelConfig）。
+- 实时分析、完整总结、项目对话和开花共用当前分析模型：Kimi，或一个用户配置的
+  OpenAI-compatible Chat Completions 模型；设置变化从下一次请求生效。
+- Kimi 使用 `POST https://api.kimi.com/coding/v1/messages`（Anthropic messages）；
+  默认优先 `k3-256k`，可选 `k3` 和 `kimi-for-coding`。K3 保持 thinking，
+  权限不足时如实报错，不静默切换模型。
 - 无 Structured Outputs 强制能力：系统提示词约束「只输出 JSON」+ 本地
   AnalysisSchema 严格解码与证据过滤兜底；不合规按 invalidResponse 处理并保留上一版。
 - 响应 content 可能含 thinking/text 块：只拼接 text 块；```json 围栏解析前剥离。
-- 说话人识别模块保持 OpenAI 兼容形态不变。
-- 设置页：「API Key（Kimi）」+ 真实连接测试（最小 messages 请求，可用/不可用与脱敏错误）。
-- 真实联调已通过（探针在 /tmp，不进仓库）：最小分析输入 → HTTP 200 →
-  合法分析 JSON（5 insights + 3 topics，枚举与证据引用全部有效）。
+- 高精度转写与说话人识别模块保持 OpenAI Audio Transcriptions 兼容形态；
+  未配置时明确显示当前仅使用本地 Apple Speech。Kimi 只处理文字，不能替代音频识别。
+- Kimi 凭证优先使用账号登录；“Kimi API Key”是未登录时的备用认证，不是“分析人”
+  或说话人身份。说话人识别使用独立 Key。
+- 用户笔记默认不上传；按项目开启授权后，只在项目对话、开花或完整总结请求发起时
+  读取当时最新文本，不逐键上传。外部 MCP 不接收笔记。
+
+## 当前工作台补充能力
+
+- 录音中的笔记使用稳定的原生文本编辑器；界面高频刷新时不回写中文输入法的
+  marked text，笔记仍按原有防抖策略自动保存。
+- 完整总结通读全部最终/人工修订逐字稿，分析账本只作辅助；全量分析 JSON 失败时仍可
+  从完整逐字稿生成。报告包含完整概述、核心议题、带时间戳章节概要、事实、结论、
+  行动项、分歧风险、未决问题与关键原话；用户主动发送的共创内容和获授权的旧笔记
+  单独整理为“我的思考与 AI 共创”，不会混写成录音事实。
+- 开花会自动处理新出现的高优先知识种子；检索 Obsidian、互联网和只读 MCP 后，
+  再由当前分析模型生成“来源速览、关键知识点、与本场讨论的关系”，并保留真实来源引用。

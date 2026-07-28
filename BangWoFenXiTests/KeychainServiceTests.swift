@@ -1,4 +1,6 @@
 import Foundation
+import LocalAuthentication
+import Security
 import Testing
 @testable import BangWoFenXi
 
@@ -17,7 +19,13 @@ final class KeychainServiceTests {
 
     deinit {
         // 清理测试条目
-        for account in ["test-account", "test-account-2", "never-saved", "test-cloud-key"] {
+        for account in [
+            "test-account",
+            "test-account-2",
+            "never-saved",
+            "test-cloud-key",
+            "cache-account"
+        ] {
             try? sut.delete(account: account)
         }
     }
@@ -65,6 +73,44 @@ final class KeychainServiceTests {
     @Test("读取不存在条目返回空")
     func readNonexistentReturnsNil() throws {
         #expect(try sut.read(account: "never-saved") == nil)
+    }
+
+    @Test("自动读取禁止弹出系统鉴权界面")
+    func automaticReadDisablesAuthenticationUI() {
+        let query = sut.readQuery(account: "test-account")
+        #expect(
+            (query[kSecUseAuthenticationContext as String] as? LAContext)?
+                .interactionNotAllowed == true
+        )
+    }
+
+    @Test("首次成功读取后同一进程复用内存凭证")
+    func successfulReadUsesProcessCache() throws {
+        let account = "cache-account"
+        let value = "process-cache-test-value"
+        let addQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrAccount as String: account,
+            kSecValueData as String: Data(value.utf8),
+            kSecAttrAccessible as String:
+                kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        ]
+        #expect(SecItemAdd(addQuery as CFDictionary, nil) == errSecSuccess)
+        #expect(try sut.read(account: account) == value)
+
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrAccount as String: account
+        ]
+        #expect(
+            SecItemDelete(deleteQuery as CFDictionary) == errSecSuccess
+        )
+        #expect(try sut.read(account: account) == value)
+
+        try sut.delete(account: account)
+        #expect(try sut.read(account: account) == nil)
     }
 
     /// CloudAPIKeyStore 封装：保存 / 状态 / 删除（同样使用测试专用 service）

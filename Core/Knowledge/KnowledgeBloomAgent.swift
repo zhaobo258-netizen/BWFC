@@ -5,7 +5,7 @@ enum KnowledgeBloomExpansionOutcome: Sendable {
     case failure(KnowledgeBloomFailure)
 }
 
-enum KnowledgeBloomFailure: Sendable {
+enum KnowledgeBloomFailure: Error, Sendable {
     case api(AnalysisAPIError)
     case unavailable
 }
@@ -14,6 +14,8 @@ struct KnowledgeBloomAgentOutput: Sendable {
     var expansion: KnowledgeBloomExpansionOutcome
     var initialOutcomes: [KnowledgeProviderSearchOutcome]
     var refinedOutcomes: [KnowledgeProviderSearchOutcome]
+    var sourceSynthesis: KnowledgeSourceSynthesis?
+    var sourceSynthesisFailure: KnowledgeBloomFailure?
 }
 
 struct KnowledgeBloomAgent: Sendable {
@@ -28,13 +30,17 @@ struct KnowledgeBloomAgent: Sendable {
         whyItMatters: String,
         evidence: [KnowledgeEvidenceInput],
         scenario: ProjectScenario?,
+        userContext: [String],
+        noteMarkdown: String?,
         providers: [any KnowledgeProvider]
     ) async -> KnowledgeBloomAgentOutput {
         async let expansionAttempt = expansion(
             seedText: seedText,
             whyItMatters: whyItMatters,
             evidence: evidence,
-            scenario: scenario
+            scenario: scenario,
+            userContext: userContext,
+            noteMarkdown: noteMarkdown
         )
         async let initialSearch = KnowledgeProviderSearch.search(
             providers: providers,
@@ -54,10 +60,20 @@ struct KnowledgeBloomAgent: Sendable {
                 limit: 4
             )
         }
+        let sources = Self.sourceInputs(
+            from: initialOutcomes + refinedOutcomes
+        )
+        let synthesisResult = await sourceSynthesis(
+            seedText: seedText,
+            whyItMatters: whyItMatters,
+            sources: sources
+        )
         return KnowledgeBloomAgentOutput(
             expansion: expansion,
             initialOutcomes: initialOutcomes,
-            refinedOutcomes: refinedOutcomes
+            refinedOutcomes: refinedOutcomes,
+            sourceSynthesis: synthesisResult.value,
+            sourceSynthesisFailure: synthesisResult.failure
         )
     }
 
@@ -65,14 +81,18 @@ struct KnowledgeBloomAgent: Sendable {
         seedText: String,
         whyItMatters: String,
         evidence: [KnowledgeEvidenceInput],
-        scenario: ProjectScenario?
+        scenario: ProjectScenario?,
+        userContext: [String],
+        noteMarkdown: String?
     ) async -> KnowledgeBloomExpansionOutcome {
         do {
             return .success(try await expansionService.expand(
                 seedText: seedText,
                 whyItMatters: whyItMatters,
                 evidence: evidence,
-                scenario: scenario
+                scenario: scenario,
+                userContext: userContext,
+                noteMarkdown: noteMarkdown
             ))
         } catch let error as AnalysisAPIError {
             return .failure(.api(error))
@@ -84,5 +104,47 @@ struct KnowledgeBloomAgent: Sendable {
     private static func normalized(_ text: String) -> String {
         text.lowercased()
             .replacingOccurrences(of: #"\s+"#, with: "", options: .regularExpression)
+    }
+
+    private func sourceSynthesis(
+        seedText: String,
+        whyItMatters: String,
+        sources: [KnowledgeSourceInput]
+    ) async -> (value: KnowledgeSourceSynthesis?, failure: KnowledgeBloomFailure?) {
+        guard !sources.isEmpty else { return (nil, nil) }
+        do {
+            return (
+                try await expansionService.synthesizeSources(
+                    seedText: seedText,
+                    whyItMatters: whyItMatters,
+                    sources: sources
+                ),
+                nil
+            )
+        } catch let error as AnalysisAPIError {
+            return (nil, .api(error))
+        } catch {
+            return (nil, .unavailable)
+        }
+    }
+
+    private static func sourceInputs(
+        from outcomes: [KnowledgeProviderSearchOutcome]
+    ) -> [KnowledgeSourceInput] {
+        var seen = Set<String>()
+        return outcomes
+            .flatMap(\.connections)
+            .compactMap { connection -> KnowledgeSourceInput? in
+                let id = "\(connection.stableProviderID)|\(connection.sourceId)"
+                guard seen.insert(id).inserted else { return nil }
+                return KnowledgeSourceInput(
+                    id: id,
+                    providerName: connection.providerName,
+                    title: String(connection.title.prefix(300)),
+                    excerpt: String(connection.excerpt.prefix(1_200))
+                )
+            }
+            .prefix(8)
+            .map { $0 }
     }
 }

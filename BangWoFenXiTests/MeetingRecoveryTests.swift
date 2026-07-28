@@ -53,7 +53,21 @@ struct MeetingRecoveryTests {
         #expect(meeting.status == .completed)
     }
 
-    @Test("正常状态不允许恢复操作", arguments: [MeetingStatus.draft, .ready, .completed])
+    @Test("重复标记已结束保持幂等")
+    func repeatedRecoveryIsIdempotent() throws {
+        let meeting = Meeting(title: "恢复测试")
+        try meeting.transition(to: .ready)
+        try meeting.transition(to: .recording)
+
+        try MeetingRecovery.markCompletedAfterAbnormalExit(meeting)
+        let endedAt = meeting.endedAt
+        try MeetingRecovery.markCompletedAfterAbnormalExit(meeting)
+
+        #expect(meeting.status == .completed)
+        #expect(meeting.endedAt == endedAt)
+    }
+
+    @Test("正常状态不允许恢复操作", arguments: [MeetingStatus.draft, .ready])
     func recoverRejectsNormalStatus(status: MeetingStatus) {
         let meeting = Meeting(title: "正常会议", status: status)
         #expect(throws: MeetingRecoveryError.self) {

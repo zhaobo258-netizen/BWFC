@@ -19,7 +19,9 @@ enum MeetingRecovery {
             try meeting.transition(to: .completed)
         case .finalizing:
             try meeting.transition(to: .completed)
-        case .draft, .ready, .completed:
+        case .completed:
+            return
+        case .draft, .ready:
             throw MeetingRecoveryError.notAnAbnormalMeeting(meeting.status)
         }
     }
@@ -29,4 +31,13 @@ enum MeetingRecovery {
 enum MeetingRecoveryError: Error, Equatable {
     /// 该会议并非未正常结束状态
     case notAnAbnormalMeeting(MeetingStatus)
+}
+
+extension MeetingRecoveryError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .notAnAbnormalMeeting(let status):
+            return "当前项目状态为“\(status.displayName)”，无需执行异常恢复。"
+        }
+    }
 }

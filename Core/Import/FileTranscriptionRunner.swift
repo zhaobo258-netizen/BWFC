@@ -45,27 +45,48 @@ struct FileTranscriptionRunner: Sendable {
         }
 
         do {
-            let format = file.processingFormat
-            var framesRead: AVAudioFramePosition = 0
-            while framesRead < totalFrames {
+            try await withTaskCancellationHandler {
+                let format = file.processingFormat
+                var framesRead: AVAudioFramePosition = 0
+                while framesRead < totalFrames {
+                    try Task.checkCancellation()
+                    guard let buffer = AVAudioPCMBuffer(
+                        pcmFormat: format,
+                        frameCapacity: Self.chunkFrameCount
+                    ) else {
+                        throw AudioImportError.extractionFailed
+                    }
+                    // AVAudioFile.read 可能短读（血泪教训 #5）：循环读满或到文件尾
+                    while buffer.frameLength < buffer.frameCapacity,
+                          framesRead < totalFrames {
+                        let before = buffer.frameLength
+                        try file.read(
+                            into: buffer,
+                            frameCount: buffer.frameCapacity - buffer.frameLength
+                        )
+                        let readNow = buffer.frameLength - before
+                        if readNow == 0 { break } // 文件尾
+                        framesRead += AVAudioFramePosition(readNow)
+                    }
+                    if buffer.frameLength == 0 { break }
+                    await service.feed(buffer)
+                    onProgress(
+                        min(Double(framesRead) / Double(totalFrames), 1.0)
+                    )
+                }
+                await service.finishSession()
+                _ = await collectTask.value
                 try Task.checkCancellation()
-                guard let buffer = AVAudioPCMBuffer(pcmFormat: format,
-                                                    frameCapacity: Self.chunkFrameCount) else {
-                    throw AudioImportError.extractionFailed
+            } onCancel: {
+                collectTask.cancel()
+                Task {
+                    await service.cancelSession()
                 }
-                // AVAudioFile.read 可能短读（血泪教训 #5）：循环读满或到文件尾
-                while buffer.frameLength < buffer.frameCapacity, framesRead < totalFrames {
-                    let before = buffer.frameLength
-                    try file.read(into: buffer, frameCount: buffer.frameCapacity - buffer.frameLength)
-                    let readNow = buffer.frameLength - before
-                    if readNow == 0 { break } // 文件尾
-                    framesRead += AVAudioFramePosition(readNow)
-                }
-                if buffer.frameLength == 0 { break }
-                await service.feed(buffer)
-                onProgress(min(Double(framesRead) / Double(totalFrames), 1.0))
             }
-            await service.finishSession()
+        } catch is CancellationError {
+            collectTask.cancel()
+            _ = await collectTask.value
+            throw CancellationError()
         } catch {
             await service.cancelSession()
             collectTask.cancel()
@@ -73,14 +94,6 @@ struct FileTranscriptionRunner: Sendable {
             throw error
         }
 
-        // 等待结果流收尾（取消响应：外层任务被取消时同步取消收集任务，
-        // AsyncStream 的 for-await 对消费任务取消是响应的，不会悬挂）
-        await withTaskCancellationHandler {
-            _ = await collectTask.value
-        } onCancel: {
-            collectTask.cancel()
-        }
-        try Task.checkCancellation()
         onProgress(1.0)
 
         // 导入无暂停区间：音频时间即项目时间轴；reconciler 与实时链路同一去重口径

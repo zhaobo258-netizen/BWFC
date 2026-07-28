@@ -1,10 +1,13 @@
 import Foundation
+import LocalAuthentication
 import Security
 
 /// Keychain 错误
 enum KeychainError: Error, Equatable {
     /// Security 框架返回的非预期状态码
     case unexpectedStatus(OSStatus)
+    /// 当前 App 身份无权静默读取；自动任务不得唤起系统密码框
+    case interactionNotAllowed
     /// 读出的数据无法解码为 UTF-8 字符串
     case dataCorrupted
 }
@@ -14,9 +17,41 @@ extension KeychainError: LocalizedError {
         switch self {
         case .unexpectedStatus(let status):
             return "Keychain 操作失败（状态码 \(status)）"
+        case .interactionNotAllowed:
+            return "AI 凭证需要重新连接；请前往设置登录或重新保存 API Key"
         case .dataCorrupted:
             return "Keychain 数据损坏"
         }
+    }
+}
+
+private final class KeychainValueCache: @unchecked Sendable {
+    static let shared = KeychainValueCache()
+
+    private struct Key: Hashable {
+        var service: String
+        var account: String
+    }
+
+    private let lock = NSLock()
+    private var values: [Key: String] = [:]
+
+    func value(service: String, account: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return values[Key(service: service, account: account)]
+    }
+
+    func store(_ value: String, service: String, account: String) {
+        lock.lock()
+        values[Key(service: service, account: account)] = value
+        lock.unlock()
+    }
+
+    func remove(service: String, account: String) {
+        lock.lock()
+        values.removeValue(forKey: Key(service: service, account: account))
+        lock.unlock()
     }
 }
 
@@ -44,6 +79,11 @@ struct KeychainService: Sendable {
         let attributesToUpdate: [String: Any] = [kSecValueData as String: data]
         let updateStatus = SecItemUpdate(baseQuery as CFDictionary, attributesToUpdate as CFDictionary)
         if updateStatus == errSecSuccess {
+            KeychainValueCache.shared.store(
+                value,
+                service: service,
+                account: account
+            )
             return
         }
         guard updateStatus == errSecItemNotFound else {
@@ -57,21 +97,30 @@ struct KeychainService: Sendable {
         guard addStatus == errSecSuccess else {
             throw KeychainError.unexpectedStatus(addStatus)
         }
+        KeychainValueCache.shared.store(
+            value,
+            service: service,
+            account: account
+        )
     }
 
-    /// 读取；不存在时返回 nil
+    /// 自动读取一律禁止 SecurityAgent 弹出系统密码框；需要交互时立即失败，
+    /// 由业务层在设置页提供重新连接入口，录音与本地转写继续运行。
     func read(account: String) throws -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
+        if let cached = KeychainValueCache.shared.value(
+            service: service,
+            account: account
+        ) {
+            return cached
+        }
+        let query = readQuery(account: account)
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         if status == errSecItemNotFound {
             return nil
+        }
+        if status == errSecInteractionNotAllowed || status == errSecAuthFailed {
+            throw KeychainError.interactionNotAllowed
         }
         guard status == errSecSuccess else {
             throw KeychainError.unexpectedStatus(status)
@@ -79,16 +128,36 @@ struct KeychainService: Sendable {
         guard let data = result as? Data, let value = String(data: data, encoding: .utf8) else {
             throw KeychainError.dataCorrupted
         }
+        KeychainValueCache.shared.store(
+            value,
+            service: service,
+            account: account
+        )
         return value
     }
 
-    func contains(account: String) -> Bool {
-        let query: [String: Any] = [
+    func readQuery(account: String) -> [String: Any] {
+        let authenticationContext = LAContext()
+        authenticationContext.interactionNotAllowed = true
+        return [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecMatchLimit as String: kSecMatchLimitOne
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecUseAuthenticationContext as String: authenticationContext
         ]
+    }
+
+    func contains(account: String) -> Bool {
+        if KeychainValueCache.shared.value(
+            service: service,
+            account: account
+        ) != nil {
+            return true
+        }
+        var query = readQuery(account: account)
+        query.removeValue(forKey: kSecReturnData as String)
         return SecItemCopyMatching(query as CFDictionary, nil) == errSecSuccess
     }
 
@@ -103,6 +172,10 @@ struct KeychainService: Sendable {
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw KeychainError.unexpectedStatus(status)
         }
+        KeychainValueCache.shared.remove(
+            service: service,
+            account: account
+        )
     }
 }
 
@@ -137,7 +210,10 @@ enum CloudProvider: String, Sendable, CaseIterable {
 /// service/account 可注入，便于测试隔离；按 provider 分条目存取，互不外借。
 struct CloudAPIKeyStore: Sendable {
     /// 生产环境使用的 Keychain service 名
-    static let defaultService = "com.zhaobo.BangWoFenXi.cloud-api-key"
+    /// v2 由稳定签名版本创建；旧 ad-hoc 条目原样保留，避免访问旧 ACL 时弹窗。
+    static let defaultService = "com.zhaobo.BangWoFenXi.credentials.v2"
+    static let legacyAdHocService =
+        "com.zhaobo.BangWoFenXi.cloud-api-key"
 
     private let keychain: KeychainService
     private let account: String

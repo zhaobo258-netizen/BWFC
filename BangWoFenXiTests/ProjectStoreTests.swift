@@ -348,6 +348,9 @@ final class ProjectStoreTests {
         #expect(project.legacySnapshots.isEmpty)
         #expect(project.finalReportSnapshots.isEmpty)
         #expect(project.knowledgeSeeds.isEmpty)
+        #expect(project.aiChatMessages.isEmpty)
+        #expect(project.aiChatDraft.isEmpty)
+        #expect(!project.noteAIContextEnabled)
         // 补强前生成的 Project JSON 无 legacyMetadata 键：解码为 nil，不报错
         #expect(project.legacyMetadata == nil)
         #expect(project.note.markdown == "")
@@ -527,7 +530,11 @@ final class ProjectStoreTests {
         let workspace = Project(
             id: id,
             title: "打开中的工作台",
-            sourceType: .importedAudio
+            sourceType: .importedAudio,
+            aiChatMessages: [
+                ProjectAIChatMessage(role: .user, text: "工作台里的背景")
+            ],
+            noteAIContextEnabled: true
         )
         let fresh = Project(
             id: id,
@@ -555,7 +562,11 @@ final class ProjectStoreTests {
                     whyItMatters: "测试刷新",
                     evidenceSegmentIds: [UUID()]
                 )
-            ]
+            ],
+            aiChatMessages: [
+                ProjectAIChatMessage(role: .assistant, text: "后台旧副本")
+            ],
+            noteAIContextEnabled: false
         )
 
         ProjectWorkspaceView.applyImportedStorageRefresh(from: fresh, to: workspace)
@@ -564,5 +575,7 @@ final class ProjectStoreTests {
         #expect(workspace.scenarioWasUserSelected == false)
         #expect(workspace.finalReportSnapshots.count == 1)
         #expect(workspace.knowledgeSeeds.count == 1)
+        #expect(workspace.aiChatMessages.first?.text == "工作台里的背景")
+        #expect(workspace.noteAIContextEnabled)
     }
 }

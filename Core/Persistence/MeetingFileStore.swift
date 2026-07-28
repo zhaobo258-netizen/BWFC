@@ -196,6 +196,20 @@ enum AppStorageLocation {
                 guard try containsValidProjectStore(destination, fileManager: fileManager) else {
                     throw AppStorageLocationError.destinationNotEmpty
                 }
+                let sourceContents = try meaningfulContents(
+                    of: source,
+                    fileManager: fileManager
+                )
+                let destinationMatchesSource = sourceContents.isEmpty
+                    ? true
+                    : try directoryContentsMatch(
+                            source,
+                            destination,
+                            fileManager: fileManager
+                        )
+                guard destinationMatchesSource else {
+                    throw AppStorageLocationError.destinationNotEmpty
+                }
                 return
             }
         }
@@ -306,6 +320,30 @@ enum AppStorageLocation {
             inventory[relativePath] = Int64(values.fileSize ?? 0)
         }
         return inventory
+    }
+
+    private static func directoryContentsMatch(
+        _ source: URL,
+        _ destination: URL,
+        fileManager: FileManager
+    ) throws -> Bool {
+        let sourceInventory = try fileInventory(
+            at: source,
+            fileManager: fileManager
+        ).filter { URL(fileURLWithPath: $0.key).lastPathComponent != ".DS_Store" }
+        let destinationInventory = try fileInventory(
+            at: destination,
+            fileManager: fileManager
+        ).filter { URL(fileURLWithPath: $0.key).lastPathComponent != ".DS_Store" }
+        guard sourceInventory == destinationInventory else {
+            return false
+        }
+        return sourceInventory.keys.allSatisfy { relativePath in
+            fileManager.contentsEqual(
+                atPath: source.appending(path: relativePath).path,
+                andPath: destination.appending(path: relativePath).path
+            )
+        }
     }
 }
 

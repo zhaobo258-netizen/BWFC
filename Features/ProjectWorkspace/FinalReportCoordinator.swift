@@ -23,6 +23,7 @@ final class FinalReportCoordinator {
     private let knownTermsProvider: () -> [String]
 
     private var tasks: [UUID: Task<Void, Never>] = [:]
+    private var refreshRequestedWhileRunning: Set<UUID> = []
     private(set) var states: [UUID: State] = [:]
     private(set) var revision = 0
     private(set) var latestCompletion: Completion?
@@ -51,13 +52,24 @@ final class FinalReportCoordinator {
         states[projectID] ?? .idle
     }
 
-    func start(projectID: UUID) {
-        guard tasks[projectID] == nil else { return }
+    func start(
+        projectID: UUID,
+        refreshIfRunning: Bool = false
+    ) {
+        guard tasks[projectID] == nil else {
+            if refreshIfRunning {
+                refreshRequestedWhileRunning.insert(projectID)
+            }
+            return
+        }
         latestCompletion = nil
         states[projectID] = .generating
         let task = Task { [weak self] in
             await self?.run(projectID: projectID)
             self?.tasks[projectID] = nil
+            if self?.refreshRequestedWhileRunning.remove(projectID) != nil {
+                self?.start(projectID: projectID)
+            }
         }
         tasks[projectID] = task
     }
@@ -80,31 +92,42 @@ final class FinalReportCoordinator {
             states[projectID] = .idle
             return
         }
-        if let failure = analysisController.lastFailureKind {
-            fail(
-                project: project,
-                projectID: projectID,
-                message: "全量分析失败（\(failure)），可重试"
+        let snapshot: ConversationAnalysisSnapshot
+        if analysisController.lastFailureKind == nil,
+           let generatedSnapshot = analysisController.currentSnapshot {
+            do {
+                try persistProject(project, .analysis)
+            } catch {
+                fail(
+                    project: project,
+                    projectID: projectID,
+                    message: "全量分析保存失败，可重试"
+                )
+                return
+            }
+            snapshot = generatedSnapshot
+        } else if let latestSnapshot = project.analysisSnapshots.max(by: {
+            $0.version < $1.version
+        }) {
+            snapshot = latestSnapshot
+            AppLog.logWarning(
+                AppLog.analysis,
+                LogSanitizer.formatEvent(
+                    "final_report_using_existing_analysis_after_refresh_failure"
+                )
             )
-            return
-        }
-        do {
-            try persistProject(project, .analysis)
-        } catch {
-            fail(
-                project: project,
-                projectID: projectID,
-                message: "全量分析保存失败，可重试"
+        } else {
+            snapshot = ConversationAnalysisSnapshot(
+                version: 0,
+                analyzedThroughMs: project.segments.map(\.endMs).max() ?? 0,
+                items: []
             )
-            return
-        }
-        guard let snapshot = analysisController.currentSnapshot else {
-            fail(
-                project: project,
-                projectID: projectID,
-                message: "没有可用于完整总结的分析证据"
+            AppLog.logWarning(
+                AppLog.analysis,
+                LogSanitizer.formatEvent(
+                    "final_report_using_full_transcript_without_analysis"
+                )
             )
-            return
         }
 
         let previousReports = project.finalReportSnapshots
@@ -216,7 +239,10 @@ final class FinalReportCoordinator {
         if let apiError = error as? AnalysisAPIError {
             switch apiError {
             case .missingAPIKey: return "AI 模型未连接，请前往设置"
-            case .unauthorized: return "AI 凭证无效，请前往设置重新连接"
+            case .credentialAccessRequired:
+                return "App 更新后需要重新连接 AI，请前往设置"
+            case .unauthorized:
+                return "AI 凭证无效或模型未开通，请前往设置检查连接与模型"
             case .timeout: return "完整总结生成超时，可重试"
             default: return "完整总结暂时生成失败，可重试"
             }

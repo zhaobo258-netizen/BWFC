@@ -163,11 +163,13 @@ final class LocalTranscriptionController {
 
     /// 结束转写：丢弃尾部临时片段（最终片段已即时入库）
     func finish() async {
-        collectTask?.cancel()
-        collectTask = nil
         pendingFlushTask?.cancel()
         pendingFlushTask = nil
         await service.finishSession()
+        if let collectTask {
+            await collectTask.value
+        }
+        collectTask = nil
         reconciler.dropProvisional()
         publishSegments()
         runState = .idle

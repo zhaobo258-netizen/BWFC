@@ -39,6 +39,7 @@ struct AIProviderConfigurationTests {
         let store = AIProviderConfigurationStore(defaults: defaults)
         let configured = AIProviderConfiguration(
             selectedProvider: .openAICompatible,
+            kimiModel: .k3LongContext,
             openAIBaseURL: "https://example.com/v1",
             openAIModelID: "model-a"
         )
@@ -48,7 +49,89 @@ struct AIProviderConfigurationTests {
         try store.selectKimiAndClearCustomConfiguration()
         let fallback = store.load()
         #expect(fallback.selectedProvider == .kimi)
+        #expect(fallback.kimiModel == .k3Recommended)
         #expect(fallback.openAIModelID.isEmpty)
+
+        let legacyData = try JSONSerialization.data(withJSONObject: [
+            "selectedProvider": "kimi",
+            "openAIBaseURL": "https://api.openai.com/v1",
+            "openAIModelID": ""
+        ])
+        let legacy = try JSONDecoder().decode(
+            AIProviderConfiguration.self,
+            from: legacyData
+        )
+        #expect(legacy.kimiModel == .k3Recommended)
+    }
+
+    @Test("Kimi 默认优先 K3 256K，设置模型从下一次请求生效且不关闭思考")
+    func kimiK3Preference() async throws {
+        let suiteName = "bwfx-ai-kimi-model-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = AIProviderConfigurationStore(defaults: defaults)
+        try store.save(AIProviderConfiguration(
+            selectedProvider: .kimi,
+            kimiModel: .k3LongContext
+        ))
+
+        let serviceName = "com.zhaobo.BangWoFenXi.tests.k3.\(UUID().uuidString)"
+        let kimiKey = CloudAPIKeyStore.store(
+            for: .analysis,
+            service: serviceName
+        )
+        defer { try? kimiKey.deleteKey() }
+        try kimiKey.saveKey("kimi-k3-test-key")
+
+        AIProviderMockURLProtocol.storage.reset()
+        AIProviderMockURLProtocol.storage.requestHandler = { request in
+            let response = Data("""
+            {
+              "content": [{"type": "text", "text": "{\\"ok\\":true}"}],
+              "stop_reason": "end_turn"
+            }
+            """.utf8)
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!,
+                response
+            )
+        }
+        let transport = KimiAnalysisService(
+            session: AIProviderMockURLProtocol.makeSession(),
+            apiKeyStore: kimiKey
+        )
+        let custom = CloudAPIKeyStore(
+            service: serviceName,
+            account: AIProviderConfigurationStore.openAIKeychainAccount
+        )
+        let registry = AIProviderRegistry(
+            configurationStore: store,
+            openAIKeyStore: custom,
+            kimiTransport: transport
+        )
+        let response = try await registry.generate(
+            AITextGenerationRequest(
+                system: "system",
+                input: "{}",
+                maxTokens: 8_192
+            )
+        )
+        #expect(response.provider.modelID == "k3")
+        let request = try #require(
+            AIProviderMockURLProtocol.storage.capturedRequests.first
+        )
+        let data = try #require(mockRequestBodyData(of: request))
+        let body = try #require(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        #expect(body["model"] as? String == "k3")
+        #expect(body["max_tokens"] as? Int == 8_192)
+        #expect(body["thinking"] == nil)
     }
 
     @Test("每次请求读取一次配置快照，修改只影响下一次请求")
@@ -80,6 +163,10 @@ struct AIProviderConfigurationTests {
                 try JSONSerialization.jsonObject(with: body) as? [String: Any]
             )
             let model = try #require(object["model"] as? String)
+            #expect(
+                object["max_tokens"] as? Int == 16_384,
+                "OpenAI-compatible 保持原有安全默认值，不继承 K3 thinking 预算"
+            )
             let response = try JSONSerialization.data(withJSONObject: [
                 "choices": [["message": ["content": "reply-\(model)"]]]
             ])

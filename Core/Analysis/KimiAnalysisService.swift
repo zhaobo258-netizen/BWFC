@@ -43,16 +43,20 @@ struct KimiAnalysisService: NegotiationAnalysisServicing {
 
     /// 通用传输入口（V1 谈判分析与 V2 通用分析共用同一 HTTP/解析/日志路径）：
     /// 发送 system + user 消息，返回模型的 text 块拼接文本。
-    func rawAnalysisText(system: String, inputJSON: String) async throws -> String {
+    func rawAnalysisText(
+        system: String,
+        inputJSON: String,
+        modelID: String? = nil,
+        maxTokens: Int? = nil
+    ) async throws -> String {
         // 取当前可用凭证（OAuth 临期自动刷新；未配置抛 missingAPIKey，不发请求）
         let apiKey = try await credentials.validCredential()
+        let activeModelID = modelID ?? self.modelID
+        let activeMaxTokens = maxTokens ?? self.maxTokens
 
         let body: [String: Any] = [
-            "model": modelID,
-            "max_tokens": maxTokens,
-            // 关闭思考：实测网关支持，消除 thinking 预算挤占 text 导致的 JSON 截断，
-            // 且响应更快（探针验证 1.25s vs 2.47s）
-            "thinking": ["type": "disabled"],
+            "model": activeModelID,
+            "max_tokens": activeMaxTokens,
             "system": system,
             "messages": [
                 ["role": "user", "content": inputJSON]
@@ -82,6 +86,10 @@ struct KimiAnalysisService: NegotiationAnalysisServicing {
     /// 连接测试（实施计划 5.1：只返回可用/不可用与脱敏错误）。
     /// 发起一次最小 messages 请求；非 2xx 按统一分类抛出。
     func testConnection() async throws -> Bool {
+        try await testConnection(modelID: modelID)
+    }
+
+    func testConnection(modelID: String) async throws -> Bool {
         let apiKey = try await credentials.validCredential()
         let body: [String: Any] = [
             "model": modelID,
