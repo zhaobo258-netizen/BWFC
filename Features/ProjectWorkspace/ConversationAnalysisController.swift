@@ -187,9 +187,9 @@ final class ConversationAnalysisController {
             lastErrorDescription = error.localizedDescription
             lastFailureKind = Self.failureKind(of: error)
             if error == .unauthorized {
-                state = .suspended(reason: "分析 Key 无效（401）。请在设置中检查「分析（Kimi）Key」。")
+                state = .suspended(reason: "当前分析模型凭证无效（401）。请在设置中重新连接。")
             } else if error == .missingAPIKey {
-                state = .suspended(reason: "分析 Key 未配置。在设置中填写后即可启用 AI 分析。")
+                state = .suspended(reason: "AI 未连接。在设置中连接分析模型后即可启用。")
             }
             AppLog.logError(AppLog.analysis, LogSanitizer.formatEvent(
                 "conversation_analysis_failed",

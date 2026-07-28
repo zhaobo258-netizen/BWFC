@@ -1,7 +1,7 @@
 import Foundation
 
 /// 分析接口错误（分类驱动调度行为，实施计划 11.2）
-enum AnalysisAPIError: Error, Equatable {
+enum AnalysisAPIError: Error, Equatable, Sendable {
     /// 401：API Key 无效 → 云端分析暂停，修复后可重试
     case unauthorized
     /// 429：限流 → 失败退避

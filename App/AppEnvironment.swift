@@ -8,6 +8,7 @@ enum ProjectFieldOwnership: Sendable, Equatable {
     case speakers
     case manualSegments
     case analysis
+    case finalReport
     case knowledgeGarden
     case importPipeline
 }
@@ -41,6 +42,7 @@ enum ProjectPersistence {
         "segments": .shared,
         "legacySnapshots": .runtime,
         "analysisSnapshots": .runtime,
+        "finalReportSnapshots": .runtime,
         "knowledgeSeeds": .workspace,
         "legacyMetadata": .runtime,
         "note": .workspace,
@@ -72,9 +74,8 @@ enum ProjectPersistence {
             stored.title = incoming.title
             stored.lastActivityAt = incoming.lastActivityAt
         case .userScenario:
-            guard incoming.scenarioWasUserSelected else { return }
             stored.scenario = incoming.scenario
-            stored.scenarioWasUserSelected = true
+            stored.scenarioWasUserSelected = incoming.scenarioWasUserSelected
         case .speakers:
             stored.speakers = incoming.speakers
         case .manualSegments:
@@ -86,6 +87,10 @@ enum ProjectPersistence {
                 stored.scenario = incoming.scenario
                 stored.scenarioWasUserSelected = incoming.scenarioWasUserSelected
             }
+        case .finalReport:
+            stored.finalReportSnapshots = incoming.finalReportSnapshots
+            stored.processingJobs = incoming.processingJobs
+            stored.lastActivityAt = incoming.lastActivityAt
         case .knowledgeGarden:
             stored.knowledgeSeeds = incoming.knowledgeSeeds
         case .importPipeline:
@@ -94,6 +99,7 @@ enum ProjectPersistence {
             mergePipelineSegments(incoming.segments, into: stored)
             stored.legacySnapshots = incoming.legacySnapshots
             stored.analysisSnapshots = incoming.analysisSnapshots
+            stored.finalReportSnapshots = incoming.finalReportSnapshots
             if !stored.scenarioWasUserSelected {
                 stored.scenario = incoming.scenario
             }
@@ -181,6 +187,8 @@ final class AppEnvironment {
     let conversationAnalysis: any ConversationAnalysisServicing
     /// “开花”中的概念解释、跨领域连接与检索词生成
     let knowledgeExpansion: any KnowledgeExpansionServicing
+    /// 完整总结生成器（证据账本 → 独立报告）
+    let finalReportGenerator: any FinalReportGenerating
     /// 导出（阶段 5 实现：生成 Markdown/JSON 内容，保存位置由用户选择）
     let exporter: any MeetingExportServicing
     /// 音视频导入（阶段 C 实现：检查 + 音轨提取）
@@ -196,6 +204,7 @@ final class AppEnvironment {
             importService: audioImport,
             makeTranscriptionService: makeImportTranscriptionService,
             analysisService: conversationAnalysis,
+            finalReportGenerator: finalReportGenerator,
             fileStore: fileStore,
             isAnalysisConfigured: { [weak self] in self?.isAnalysisConfigured ?? false },
             loadProject: { [weak self] id in
@@ -211,24 +220,74 @@ final class AppEnvironment {
         return controller
     }
 
+    private var _finalReportCoordinator: FinalReportCoordinator?
+    var finalReportCoordinator: FinalReportCoordinator {
+        if let existing = _finalReportCoordinator { return existing }
+        let coordinator = FinalReportCoordinator(
+            analysisService: conversationAnalysis,
+            finalReportGenerator: finalReportGenerator,
+            fileWriter: FinalReportFileWriter(fileStore: fileStore),
+            loadProject: { [weak self] id in
+                try self?.allProjects().first(where: { $0.id == id })
+            },
+            persistProject: { [weak self] project, fields in
+                try self?.persist(project, fields: fields)
+            },
+            knownTermsProvider: { [weak self] in self?.lexiconTerms ?? [] }
+        )
+        _finalReportCoordinator = coordinator
+        return coordinator
+    }
+
     /// 全局专业词库与纠错规则（App 级；转写上下文 + 分析已知名词 + 自动纠错）
     let lexiconStore: LexiconStore
     private(set) var lexiconTerms: [String] = []
     private(set) var correctionRules: [CorrectionRule] = []
+    private(set) var lexiconRevision = 0
 
     /// 各 provider 的 Keychain 存储（Key 分家，互不外借）
     private let keyStores: [CloudProvider: CloudAPIKeyStore]
+    private let keychainServiceName: String
     /// Kimi 账号 OAuth 凭证存储（设备码登录；与静态分析 Key 独立条目）
     let kimiOAuthTokenStore: KimiOAuthTokenStore
+    let aiProviderConfigurationStore: AIProviderConfigurationStore
+    let openAICompatibleKeyStore: CloudAPIKeyStore
+    let aiProviderRegistry: AIProviderRegistry
     /// 外部知识 MCP 的非敏感连接配置与独立 Keychain Token
     let externalMCPConfigurationStore: ExternalMCPConfigurationStore
-    let externalMCPTokenStore: CloudAPIKeyStore
-    /// 分析（Kimi）是否已配置（账号已登录或静态 Key 已保存）
-    private(set) var isAnalysisConfigured: Bool
+    private(set) var cloudConfigurationRevision = 0
     /// Kimi OAuth 凭证条目是否存在；启动状态检查不解密凭证，避免阻塞主线程。
     private(set) var isKimiAccountConnected: Bool
     /// 分人（OpenAI 兼容）Key 是否已配置
     private(set) var isDiarizationConfigured: Bool
+
+    var externalMCPTokenStore: CloudAPIKeyStore {
+        CloudAPIKeyStore(
+            service: keychainServiceName,
+            account: ExternalMCPConfigurationStore.legacyTokenAccount
+        )
+    }
+
+    func externalMCPTokenStore(
+        for configuration: ExternalMCPConfiguration
+    ) -> CloudAPIKeyStore {
+        CloudAPIKeyStore(
+            service: keychainServiceName,
+            account: configuration.credentialAccount
+        )
+    }
+
+    var isAnalysisConfigured: Bool {
+        _ = cloudConfigurationRevision
+        switch aiProviderConfigurationStore.load().selectedProvider {
+        case .kimi:
+            return isConfigured(.analysis) || isKimiAccountConnected
+        case .openAICompatible:
+            let configuration = aiProviderConfigurationStore.load()
+            return configuration.isOpenAIConfigurationValid
+                && openAICompatibleKeyStore.hasConfiguredKey
+        }
+    }
 
     /// 兼容旧调用：任一云端能力已配置
     var isCloudConfigured: Bool {
@@ -251,11 +310,14 @@ final class AppEnvironment {
         negotiationAnalysis: (any NegotiationAnalysisServicing)? = nil,
         conversationAnalysis: (any ConversationAnalysisServicing)? = nil,
         knowledgeExpansion: (any KnowledgeExpansionServicing)? = nil,
+        finalReportGenerator: (any FinalReportGenerating)? = nil,
         kimiCredentials: (any KimiCredentialProviding)? = nil,
         exporter: (any MeetingExportServicing)? = nil,
         audioImport: (any AudioImportServicing)? = nil,
         makeImportTranscriptionService: (() -> any LocalTranscriptionServicing)? = nil,
         keychainServiceName: String = CloudAPIKeyStore.defaultService,
+        aiProviderConfigurationStore: AIProviderConfigurationStore? = nil,
+        externalMCPConfigurationStore: ExternalMCPConfigurationStore? = nil,
         isPersistentStorageUnavailable: Bool = false
     ) {
         var stores: [CloudProvider: CloudAPIKeyStore] = [:]
@@ -273,6 +335,17 @@ final class AppEnvironment {
             apiKeyStore: analysisKeyStore,
             credentials: sharedCredentials
         )
+        let aiConfigurationStore = aiProviderConfigurationStore
+            ?? AIProviderConfigurationStore()
+        let openAIKeyStore = CloudAPIKeyStore(
+            service: keychainServiceName,
+            account: AIProviderConfigurationStore.openAIKeychainAccount
+        )
+        let providerRegistry = AIProviderRegistry(
+            configurationStore: aiConfigurationStore,
+            openAIKeyStore: openAIKeyStore,
+            kimiTransport: sharedTransport
+        )
 
         self.meetingStore = meetingStore
         self.fileStore = fileStore
@@ -285,9 +358,15 @@ final class AppEnvironment {
         self.diarization = diarization
         self.negotiationAnalysis = negotiationAnalysis ?? sharedTransport
         self.conversationAnalysis = conversationAnalysis
-            ?? KimiConversationAnalysisService(transport: sharedTransport)
+            ?? KimiConversationAnalysisService(generationService: providerRegistry)
         self.knowledgeExpansion = knowledgeExpansion
-            ?? KimiKnowledgeExpansionService(transport: sharedTransport)
+            ?? KimiKnowledgeExpansionService(generationService: providerRegistry)
+        self.finalReportGenerator = finalReportGenerator
+            ?? ProjectAIOrchestrator(
+                finalReportAgent: FinalReportAgent(
+                    generationService: providerRegistry
+                )
+            )
         self.exporter = exporter ?? LocalMeetingExportService(meetingStore: meetingStore)
         self.audioImport = audioImport ?? AVFoundationAudioImportService(fileStore: fileStore)
         self.makeImportTranscriptionService = makeImportTranscriptionService ?? { AppleSpeechTranscriptionService() }
@@ -299,16 +378,15 @@ final class AppEnvironment {
         self.correctionRules = loaded.corrections
 
         self.keyStores = stores
+        self.keychainServiceName = keychainServiceName
         self.kimiOAuthTokenStore = oauthStore
-        self.externalMCPConfigurationStore = ExternalMCPConfigurationStore()
-        self.externalMCPTokenStore = CloudAPIKeyStore(
-            service: keychainServiceName,
-            account: ExternalMCPConfigurationStore.tokenAccount
-        )
+        self.aiProviderConfigurationStore = aiConfigurationStore
+        self.openAICompatibleKeyStore = openAIKeyStore
+        self.aiProviderRegistry = providerRegistry
+        self.externalMCPConfigurationStore = externalMCPConfigurationStore
+            ?? ExternalMCPConfigurationStore()
         let hasStoredOAuthTokens = oauthStore.hasStoredTokens
         self.isKimiAccountConnected = hasStoredOAuthTokens
-        self.isAnalysisConfigured = (stores[.analysis]?.hasConfiguredKey ?? false)
-            || hasStoredOAuthTokens
         self.isDiarizationConfigured = stores[.diarization]?.hasConfiguredKey ?? false
     }
 
@@ -322,6 +400,7 @@ final class AppEnvironment {
         let added = merged.count - lexiconTerms.count
         try lexiconStore.save(terms: merged, corrections: correctionRules)
         lexiconTerms = merged
+        lexiconRevision += 1
         return added
     }
 
@@ -329,6 +408,37 @@ final class AppEnvironment {
     func clearLexicon() throws {
         try lexiconStore.save(terms: [], corrections: correctionRules)
         lexiconTerms = []
+        lexiconRevision += 1
+    }
+
+    func addLexiconTerm(_ rawValue: String) throws {
+        guard let term = LexiconStore.parse(rawValue).first else { return }
+        let merged = LexiconStore.merge(lexiconTerms, adding: [term])
+        guard merged != lexiconTerms else { return }
+        try lexiconStore.save(terms: merged, corrections: correctionRules)
+        lexiconTerms = merged
+        lexiconRevision += 1
+    }
+
+    func updateLexiconTerm(_ existing: String, to rawValue: String) throws {
+        guard let replacement = LexiconStore.parse(rawValue).first,
+              let index = lexiconTerms.firstIndex(of: existing) else {
+            return
+        }
+        var updated = lexiconTerms
+        updated[index] = replacement
+        updated = LexiconStore.merge([], adding: updated)
+        try lexiconStore.save(terms: updated, corrections: correctionRules)
+        lexiconTerms = updated
+        lexiconRevision += 1
+    }
+
+    func removeLexiconTerm(_ term: String) throws {
+        let updated = lexiconTerms.filter { $0 != term }
+        guard updated != lexiconTerms else { return }
+        try lexiconStore.save(terms: updated, corrections: correctionRules)
+        lexiconTerms = updated
+        lexiconRevision += 1
     }
 
     /// 记录纠错规则（同错词后写覆盖）；正词自动进入词库供后续识别
@@ -340,6 +450,7 @@ final class AppEnvironment {
         try lexiconStore.save(terms: terms, corrections: rules)
         correctionRules = rules
         lexiconTerms = terms
+        lexiconRevision += 1
     }
 
     /// 删除纠错规则
@@ -347,6 +458,27 @@ final class AppEnvironment {
         let rules = correctionRules.filter { $0.id != rule.id }
         try lexiconStore.save(terms: lexiconTerms, corrections: rules)
         correctionRules = rules
+        lexiconRevision += 1
+    }
+
+    func updateCorrectionRule(
+        _ rule: CorrectionRule,
+        wrong: String,
+        right: String
+    ) throws {
+        guard TranscriptCorrector.isValidRule(wrong: wrong, right: right) else {
+            return
+        }
+        var rules = correctionRules.filter { $0.id != rule.id }
+        rules = TranscriptCorrector.mergeRule(
+            CorrectionRule(wrong: wrong, right: right),
+            into: rules
+        )
+        let terms = LexiconStore.merge(lexiconTerms, adding: [right])
+        try lexiconStore.save(terms: terms, corrections: rules)
+        correctionRules = rules
+        lexiconTerms = terms
+        lexiconRevision += 1
     }
 
     /// 指定 provider 的 Keychain 存储（视图层读写 Key 的唯一入口）
@@ -365,8 +497,8 @@ final class AppEnvironment {
     /// API Key / 登录状态变更后刷新各 provider 配置状态
     func refreshCloudConfiguration() {
         isKimiAccountConnected = kimiOAuthTokenStore.hasStoredTokens
-        isAnalysisConfigured = isConfigured(.analysis) || isKimiAccountConnected
         isDiarizationConfigured = isConfigured(.diarization)
+        cloudConfigurationRevision += 1
     }
 
     /// Obsidian 检索索引跨多次“开花”复用（actor 内含 5 分钟缓存；
@@ -384,14 +516,28 @@ final class AppEnvironment {
             providers.append(obsidian)
         }
         providers.append(InternetKnowledgeProvider())
-        if let configuration = externalMCPConfigurationStore.load(),
-           configuration.validatedURL != nil {
+        for configuration in externalMCPConfigurationStore.loadAll()
+        where configuration.isEnabled
+            && configuration.isReadOnlyToolVerified
+            && configuration.validatedURL != nil {
             providers.append(ExternalMCPKnowledgeProvider(
                 configuration: configuration,
-                tokenStore: externalMCPTokenStore
+                tokenStore: externalMCPTokenStore(for: configuration)
             ))
         }
         return providers
+    }
+
+    var isStorageChangeBlocked: Bool {
+        if importProcessing.activeProjectID != nil { return true }
+        if _finalReportCoordinator?.hasActiveTasks == true { return true }
+        let projects = (try? allProjects()) ?? []
+        return projects.contains {
+            $0.sourceType == .liveRecording
+                && ($0.status == .recording
+                    || $0.status == .paused
+                    || $0.status == .processing)
+        }
     }
 
     // MARK: - 会议持久化便捷入口（集中 store 读写，避免散落各视图）

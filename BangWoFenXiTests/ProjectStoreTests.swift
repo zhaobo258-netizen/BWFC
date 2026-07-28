@@ -346,6 +346,7 @@ final class ProjectStoreTests {
         #expect(project.speakers.isEmpty)
         #expect(project.segments.isEmpty)
         #expect(project.legacySnapshots.isEmpty)
+        #expect(project.finalReportSnapshots.isEmpty)
         #expect(project.knowledgeSeeds.isEmpty)
         // 补强前生成的 Project JSON 无 legacyMetadata 键：解码为 nil，不报错
         #expect(project.legacyMetadata == nil)
@@ -492,6 +493,33 @@ final class ProjectStoreTests {
         #expect(merged.segments.first?.isStarred == true)
     }
 
+    @Test("用户可从人工场景切回自动判断")
+    func userScenarioCanReturnToAutomatic() {
+        let id = UUID()
+        let stored = Project(
+            id: id,
+            title: "场景",
+            sourceType: .liveRecording,
+            scenario: .clientVisit,
+            scenarioWasUserSelected: true
+        )
+        let incoming = Project(
+            id: id,
+            title: "场景",
+            sourceType: .liveRecording,
+            scenario: nil,
+            scenarioWasUserSelected: false
+        )
+        var projects = [stored]
+        ProjectPersistence.upsert(
+            incoming,
+            into: &projects,
+            fields: .userScenario
+        )
+        #expect(projects[0].scenario == nil)
+        #expect(!projects[0].scenarioWasUserSelected)
+    }
+
     @Test("导入项目刷新清单包含后台场景建议与选择来源")
     @MainActor
     func importedRefreshIncludesScenarioSuggestion() {
@@ -508,6 +536,19 @@ final class ProjectStoreTests {
             scenario: .journalistInterview,
             scenarioWasUserSelected: false,
             status: .ready,
+            finalReportSnapshots: [
+                FinalReportSnapshot(
+                    version: 1,
+                    providerID: "p",
+                    providerName: "P",
+                    modelID: "m",
+                    promptVersion: "v",
+                    inputFingerprint: "f",
+                    headline: "完整总结",
+                    overview: "后台完整总结",
+                    items: []
+                )
+            ],
             knowledgeSeeds: [
                 KnowledgeSeed(
                     seedText: "后台生成的知识种子",
@@ -521,6 +562,7 @@ final class ProjectStoreTests {
 
         #expect(workspace.scenario == .journalistInterview)
         #expect(workspace.scenarioWasUserSelected == false)
+        #expect(workspace.finalReportSnapshots.count == 1)
         #expect(workspace.knowledgeSeeds.count == 1)
     }
 }

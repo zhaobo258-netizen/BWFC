@@ -162,15 +162,17 @@ struct KnowledgeGardenView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            ForEach(KnowledgeProviderKind.allCases, id: \.self) { provider in
-                let connections = seed.connections.filter { $0.provider == provider }
-                if !connections.isEmpty || controller.providerMessages[provider] != nil {
+            ForEach(controller.providerIDs(for: seed), id: \.self) { providerID in
+                let connections = seed.connections.filter {
+                    $0.stableProviderID == providerID
+                }
+                if !connections.isEmpty || controller.providerMessages[providerID] != nil {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text(connections.first?.providerName ?? provider.displayName)
+                        Text(controller.providerDisplayName(for: providerID, in: seed))
                             .font(.caption)
                             .fontWeight(.semibold)
                             .foregroundStyle(.secondary)
-                        if let message = controller.providerMessages[provider] {
+                        if let message = controller.providerMessages[providerID] {
                             sourceStatus(message)
                         }
                         ForEach(connections) { connection in
@@ -204,7 +206,7 @@ struct KnowledgeGardenView: View {
                     open(connection)
                 }
                 .controlSize(.small)
-                .disabled(connection.sourceLocation.isEmpty)
+                .disabled(openableURL(for: connection) == nil)
             }
             if !connection.excerpt.isEmpty {
                 Text(connection.excerpt)
@@ -246,14 +248,21 @@ struct KnowledgeGardenView: View {
     }
 
     private func open(_ connection: KnowledgeConnection) {
-        let url: URL?
-        if connection.provider == .obsidian {
-            url = URL(fileURLWithPath: connection.sourceLocation)
-        } else {
-            url = URL(string: connection.sourceLocation)
-        }
-        if let url {
+        if let url = openableURL(for: connection) {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    private func openableURL(for connection: KnowledgeConnection) -> URL? {
+        if connection.provider == .obsidian {
+            guard !connection.sourceLocation.isEmpty else { return nil }
+            return URL(fileURLWithPath: connection.sourceLocation)
+        }
+        guard let url = URL(string: connection.sourceLocation),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "https" || scheme == "http" else {
+            return nil
+        }
+        return url
     }
 }

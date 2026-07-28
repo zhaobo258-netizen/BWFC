@@ -9,18 +9,24 @@ protocol ConversationAnalysisServicing: Sendable {
 /// Kimi 网关实现：与 V1 谈判分析共用同一传输层（KimiAnalysisService.rawAnalysisText），
 /// 只是系统指令换成语义分析师 + V2 JSON 合同，解码为 V2 DTO。
 struct KimiConversationAnalysisService: ConversationAnalysisServicing {
-    private let transport: KimiAnalysisService
+    private let generationService: any AITextGenerationServing
 
     init(transport: KimiAnalysisService = KimiAnalysisService()) {
-        self.transport = transport
+        self.generationService = KimiTextGenerationService(transport: transport)
+    }
+
+    init(generationService: any AITextGenerationServing) {
+        self.generationService = generationService
     }
 
     func analyze(instructions: String, inputJSON: String) async throws -> ConversationAnalysisOutputDTO {
-        let text = try await transport.rawAnalysisText(
-            system: instructions + "\n\n" + ConversationAnalysisPrompt.jsonOutputSuffix,
-            inputJSON: inputJSON
+        let response = try await generationService.generate(
+            AITextGenerationRequest(
+                system: instructions + "\n\n" + ConversationAnalysisPrompt.jsonOutputSuffix,
+                input: inputJSON
+            )
         )
-        let trimmed = KimiAnalysisService.strippedJSONText(text)
+        let trimmed = KimiAnalysisService.strippedJSONText(response.text)
         guard let data = trimmed.data(using: .utf8),
               let dto = try? JSONDecoder().decode(ConversationAnalysisOutputDTO.self, from: data) else {
             let closed = trimmed.hasSuffix("}") || trimmed.hasSuffix("]")

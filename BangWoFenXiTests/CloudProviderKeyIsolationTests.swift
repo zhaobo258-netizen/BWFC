@@ -123,10 +123,16 @@ final class CloudProviderKeyIsolationTests {
     @Test("AppEnvironment：分 provider 配置状态与 keyStore 入口")
     @MainActor
     func environmentPerProviderState() throws {
+        let suiteName = "bwfx-key-isolation-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
         let env = AppEnvironment(
             meetingStore: InMemoryMeetingStore(),
             fileStore: MeetingFileStore(baseDirectory: FileManager.default.temporaryDirectory),
-            keychainServiceName: serviceName
+            keychainServiceName: serviceName,
+            aiProviderConfigurationStore: AIProviderConfigurationStore(
+                defaults: defaults
+            )
         )
         #expect(!env.isAnalysisConfigured)
         #expect(!env.isDiarizationConfigured)

@@ -15,7 +15,7 @@ struct BangWoFenXiApp: App {
             RootView {
                 router.showProjectHome()
                 environment = AppEnvironment.live()
-                }
+            }
                 .environment(environment)
                 .environment(router)
                 .frame(minWidth: 960, minHeight: 640)
@@ -33,6 +33,7 @@ struct RootView: View {
 
     /// 启动时发现的未正常结束会议（实施计划 11.1 恢复提示）
     @State private var abnormalMeetings: [Meeting] = []
+    @State private var finalReportNotification: FinalReportCoordinator.Completion?
 
     var body: some View {
         Group {
@@ -42,8 +43,6 @@ struct RootView: View {
             case .projectWorkspace(let id, let autoStart):
                 ProjectWorkspaceView(projectID: id, autoStart: autoStart)
                     .id(id)
-            case .settings:
-                SettingsView(onStorageLocationChanged: onStorageLocationChanged)
             case .meetingList:
                 MeetingListView()
             case .meetingSetup(let id):
@@ -53,6 +52,20 @@ struct RootView: View {
             case .meetingReview(let id):
                 MeetingReviewView(meetingID: id)
             }
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { router.isSettingsPresented },
+                set: { if !$0 { router.closeSettings() } }
+            )
+        ) {
+            SettingsView(onStorageLocationChanged: {
+                router.closeSettings()
+                onStorageLocationChanged()
+            })
+            .environment(environment)
+            .environment(router)
+            .frame(minWidth: 780, minHeight: 620)
         }
         .task {
             // 首次启动：申请麦克风权限（实施计划 5.1）。
@@ -69,6 +82,44 @@ struct RootView: View {
                 handleRecovery(meeting: meeting, action: action)
             }
             .interactiveDismissDisabled()
+        }
+        .onChange(of: environment.finalReportCoordinator.revision) { _, _ in
+            finalReportNotification = environment.finalReportCoordinator.latestCompletion
+        }
+        .onChange(
+            of: environment.importProcessing.finalReportNotificationRevision
+        ) { _, _ in
+            finalReportNotification = environment.importProcessing
+                .latestFinalReportCompletion
+        }
+        .overlay(alignment: .top) {
+            if let completion = finalReportNotification {
+                HStack(spacing: 10) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text("完整总结已生成（第 \(completion.version) 版）")
+                        .font(.callout)
+                    Spacer()
+                    Button("查看") {
+                        router.showProjectFinalReport(completion.projectID)
+                        finalReportNotification = nil
+                    }
+                    Button {
+                        finalReportNotification = nil
+                    } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("关闭完整总结提示")
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                .shadow(color: .black.opacity(0.16), radius: 10, y: 4)
+                .padding(.top, 10)
+                .padding(.horizontal, 18)
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
         }
     }
 

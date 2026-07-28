@@ -2,6 +2,7 @@ import Foundation
 
 struct InternetKnowledgeProvider: KnowledgeProvider {
     let kind: KnowledgeProviderKind = .internet
+    let providerID = "internet:wikipedia-zh"
     let displayName = "互联网"
 
     private let session: URLSession
@@ -62,6 +63,7 @@ struct InternetKnowledgeProvider: KnowledgeProvider {
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 return KnowledgeConnection(
                     provider: .internet,
+                    providerId: providerID,
                     providerName: "互联网 · 维基百科",
                     sourceId: String(page.pageID),
                     title: page.title,

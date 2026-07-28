@@ -97,20 +97,22 @@ final class FileTranscriptionRunnerTests {
         let mock = MockLocalTranscriptionService()
         mock.finishEndsStream = false // 模拟服务收尾迟迟不结束流
         let url = try makeAudioFile(seconds: 0.2)
+        let outcome = CancellationOutcome()
         let task = Task {
-            try await FileTranscriptionRunner(service: mock).run(audioURL: url)
+            do {
+                _ = try await FileTranscriptionRunner(service: mock).run(audioURL: url)
+                outcome.set(.completed)
+            } catch is CancellationError {
+                outcome.set(.cancelled)
+            } catch {
+                outcome.set(.other(String(describing: type(of: error))))
+            }
         }
         // 等喂入完成进入等待流阶段后取消
         try await Task.sleep(for: .milliseconds(200))
         task.cancel()
-        do {
-            _ = try await task.value
-            Issue.record("取消后不应正常返回")
-        } catch is CancellationError {
-            // 预期
-        } catch {
-            Issue.record("应抛出 CancellationError，实际 \(type(of: error))")
-        }
+        await task.value
+        #expect(outcome.value == .cancelled, "取消后应如实抛出 CancellationError")
     }
 
     private final class ProgressRecorder: @unchecked Sendable {
@@ -118,5 +120,19 @@ final class FileTranscriptionRunnerTests {
         private var storage: [Double] = []
         var values: [Double] { lock.withLock { storage } }
         func append(_ value: Double) { lock.withLock { storage.append(value) } }
+    }
+
+    private final class CancellationOutcome: @unchecked Sendable {
+        enum Value: Equatable {
+            case pending
+            case completed
+            case cancelled
+            case other(String)
+        }
+
+        private let lock = NSLock()
+        private var storage: Value = .pending
+        var value: Value { lock.withLock { storage } }
+        func set(_ value: Value) { lock.withLock { storage = value } }
     }
 }

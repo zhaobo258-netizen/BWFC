@@ -3,7 +3,7 @@ import Testing
 @testable import BangWoFenXi
 
 /// OAuth 网络客户端专用 Mock 协议存储（与其他套件隔离）
-final class OAuthMockURLProtocol: MockURLProtocolBase {
+final class OAuthMockURLProtocol: MockURLProtocolBase, @unchecked Sendable {
     static let storage = MockURLProtocolStorage()
     override class var sharedStorage: MockURLProtocolStorage { storage }
 }
@@ -350,13 +350,19 @@ final class KimiOAuthTests {
             .appending(path: "bwfx-kimi-env-\(UUID().uuidString)", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
+        let suiteName = "bwfx-kimi-env-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let credentials = CountingFailingKimiCredentials()
         let environment = AppEnvironment(
             meetingStore: InMemoryMeetingStore(),
             fileStore: MeetingFileStore(baseDirectory: directory),
             kimiCredentials: credentials,
-            keychainServiceName: keychainServiceName
+            keychainServiceName: keychainServiceName,
+            aiProviderConfigurationStore: AIProviderConfigurationStore(
+                defaults: defaults
+            )
         )
 
         await #expect(throws: AnalysisAPIError.network) {

@@ -21,6 +21,18 @@ struct ImportPlannerTests {
         #expect(jobs.map(\.kind) == [.audioExtraction, .transcription, .analysis])
     }
 
+    @Test("分析模型可用且启用完整总结：完整总结排在分析之后")
+    func planWithFinalReport() {
+        let jobs = ImportPlanner.planJobs(
+            analysisConfigured: true,
+            finalReportConfigured: true
+        )
+        #expect(
+            jobs.map(\.kind)
+                == [.audioExtraction, .transcription, .analysis, .finalReport]
+        )
+    }
+
     // MARK: - 续跑
 
     @Test("续跑：running（崩溃遗留）与 failedRetryable 回 pending，completed 不动")
@@ -47,6 +59,27 @@ struct ImportPlannerTests {
         #expect(jobs.filter { $0.kind == .analysis }.count == 1)
         let again = ImportPlanner.jobsForResume(jobs, analysisConfigured: true)
         #expect(again.filter { $0.kind == .analysis }.count == 1)
+    }
+
+    @Test("续跑补建完整总结且不重复")
+    func resumeAddsFinalReportOnce() {
+        let existing = [
+            ProcessingJob(kind: .audioExtraction, status: .completed),
+            ProcessingJob(kind: .transcription, status: .completed),
+            ProcessingJob(kind: .analysis, status: .completed)
+        ]
+        let jobs = ImportPlanner.jobsForResume(
+            existing,
+            analysisConfigured: true,
+            finalReportConfigured: true
+        )
+        #expect(jobs.filter { $0.kind == .finalReport }.count == 1)
+        let again = ImportPlanner.jobsForResume(
+            jobs,
+            analysisConfigured: true,
+            finalReportConfigured: true
+        )
+        #expect(again.filter { $0.kind == .finalReport }.count == 1)
     }
 
     @Test("续跑：failedFinal 保持不动，不复活")

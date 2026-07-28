@@ -106,10 +106,14 @@ enum KnowledgeExpansionPrompt {
 }
 
 struct KimiKnowledgeExpansionService: KnowledgeExpansionServicing {
-    private let transport: KimiAnalysisService
+    private let generationService: any AITextGenerationServing
 
     init(transport: KimiAnalysisService = KimiAnalysisService()) {
-        self.transport = transport
+        self.generationService = KimiTextGenerationService(transport: transport)
+    }
+
+    init(generationService: any AITextGenerationServing) {
+        self.generationService = generationService
     }
 
     func expand(
@@ -124,11 +128,14 @@ struct KimiKnowledgeExpansionService: KnowledgeExpansionServicing {
             evidence: evidence,
             scenario: scenario
         )
-        let text = try await transport.rawAnalysisText(
-            system: KnowledgeExpansionPrompt.system + "\n\n" + KnowledgeExpansionPrompt.jsonOutputSuffix,
-            inputJSON: input
+        let response = try await generationService.generate(
+            AITextGenerationRequest(
+                system: PromptRegistry.knowledgeBloomSystem() + "\n\n"
+                    + KnowledgeExpansionPrompt.jsonOutputSuffix,
+                input: input
+            )
         )
-        let trimmed = KimiAnalysisService.strippedJSONText(text)
+        let trimmed = KimiAnalysisService.strippedJSONText(response.text)
         guard let data = trimmed.data(using: .utf8),
               let dto = try? JSONDecoder().decode(KnowledgeExpansionOutputDTO.self, from: data) else {
             throw AnalysisAPIError.invalidResponse
@@ -153,7 +160,7 @@ struct KimiKnowledgeExpansionService: KnowledgeExpansionServicing {
         var seen = Set<String>()
         let queries = dto.searchQueries.compactMap { raw -> String? in
             let query = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !query.isEmpty, query.count <= 48, seen.insert(query).inserted else {
+            guard !query.isEmpty, query.count <= 24, seen.insert(query).inserted else {
                 return nil
             }
             return query

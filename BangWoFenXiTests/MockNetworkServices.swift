@@ -51,31 +51,31 @@ class MockURLProtocolBase: URLProtocol, @unchecked Sendable {
 }
 
 /// 阶段 3 云端识别接口测试专用
-final class DiarizationMockURLProtocol: MockURLProtocolBase {
+final class DiarizationMockURLProtocol: MockURLProtocolBase, @unchecked Sendable {
     static let storage = MockURLProtocolStorage()
     override class var sharedStorage: MockURLProtocolStorage { storage }
 }
 
 /// 阶段 4 谈判分析接口测试专用
-final class AnalysisMockURLProtocol: MockURLProtocolBase {
+final class AnalysisMockURLProtocol: MockURLProtocolBase, @unchecked Sendable {
     static let storage = MockURLProtocolStorage()
     override class var sharedStorage: MockURLProtocolStorage { storage }
 }
 
 /// Kimi 网关分析接口测试专用
-final class KimiMockURLProtocol: MockURLProtocolBase {
+final class KimiMockURLProtocol: MockURLProtocolBase, @unchecked Sendable {
     static let storage = MockURLProtocolStorage()
     override class var sharedStorage: MockURLProtocolStorage { storage }
 }
 
 /// Key 分家隔离测试专用（分人侧）
-final class IsolationDiarizationMockURLProtocol: MockURLProtocolBase {
+final class IsolationDiarizationMockURLProtocol: MockURLProtocolBase, @unchecked Sendable {
     static let storage = MockURLProtocolStorage()
     override class var sharedStorage: MockURLProtocolStorage { storage }
 }
 
 /// Key 分家隔离测试专用（分析侧）
-final class IsolationKimiMockURLProtocol: MockURLProtocolBase {
+final class IsolationKimiMockURLProtocol: MockURLProtocolBase, @unchecked Sendable {
     static let storage = MockURLProtocolStorage()
     override class var sharedStorage: MockURLProtocolStorage { storage }
 }

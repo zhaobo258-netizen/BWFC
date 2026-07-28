@@ -2,6 +2,7 @@ import Foundation
 
 struct KnowledgeProviderSearchOutcome: Sendable {
     var kind: KnowledgeProviderKind
+    var providerID: String
     var displayName: String
     var connections: [KnowledgeConnection]
     var errorMessage: String?
@@ -13,19 +14,31 @@ enum KnowledgeProviderSearch {
         query: String,
         limit: Int = 5
     ) async -> [KnowledgeProviderSearchOutcome] {
-        await withTaskGroup(of: KnowledgeProviderSearchOutcome.self) { group in
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedQuery.isEmpty else { return [] }
+        return await withTaskGroup(of: KnowledgeProviderSearchOutcome.self) { group in
             for provider in providers {
                 group.addTask {
                     do {
+                        let connections = try await provider.search(
+                            normalizedQuery,
+                            limit: limit
+                        ).map { connection in
+                            var connection = connection
+                            connection.providerId = provider.providerID
+                            return connection
+                        }
                         return KnowledgeProviderSearchOutcome(
                             kind: provider.kind,
+                            providerID: provider.providerID,
                             displayName: provider.displayName,
-                            connections: try await provider.search(query, limit: limit),
+                            connections: connections,
                             errorMessage: nil
                         )
                     } catch {
                         return KnowledgeProviderSearchOutcome(
                             kind: provider.kind,
+                            providerID: provider.providerID,
                             displayName: provider.displayName,
                             connections: [],
                             errorMessage: error.localizedDescription
@@ -58,7 +71,8 @@ final class KnowledgeGardenController {
     private(set) var seeds: [KnowledgeSeed] = []
     private(set) var selectedSeedID: UUID?
     private(set) var state: State = .idle
-    private(set) var providerMessages: [KnowledgeProviderKind: String] = [:]
+    private(set) var providerMessages: [String: String] = [:]
+    private(set) var providerDisplayNames: [String: String] = [:]
     private(set) var expansionMessage: String?
     var onUpdated: (() -> Void)?
 
@@ -129,6 +143,7 @@ final class KnowledgeGardenController {
         selectedSeedID = id
         // 状态消息属于上一个种子的开花过程，切换后清空，避免张冠李戴
         providerMessages = [:]
+        providerDisplayNames = [:]
         expansionMessage = nil
     }
 
@@ -149,59 +164,47 @@ final class KnowledgeGardenController {
         }
         state = .expanding
         providerMessages = [:]
+        providerDisplayNames = [:]
         expansionMessage = nil
 
-        let evidence = Self.evidence(for: seed, in: project)
-        let scenario = project.scenario
-        let expansionService = self.expansionService
-        async let expansionAttempt: Result<KnowledgeExpansionResult, Error> = {
-            do {
-                return .success(try await expansionService.expand(
-                    seedText: seed.seedText,
-                    whyItMatters: seed.whyItMatters,
-                    evidence: evidence,
-                    scenario: scenario
-                ))
-            } catch {
-                return .failure(error)
-            }
-        }()
-
         let providers = providerFactory()
-        let initialOutcomes = await KnowledgeProviderSearch.search(
-            providers: providers,
-            query: seed.seedText
+        let output = await KnowledgeBloomAgent(
+            expansionService: expansionService
+        ).bloom(
+            seedText: seed.seedText,
+            whyItMatters: seed.whyItMatters,
+            evidence: Self.evidence(for: seed, in: project),
+            scenario: project.scenario,
+            providers: providers
         )
-        apply(outcomes: initialOutcomes, to: selectedSeedID, replacing: true)
+        apply(
+            outcomes: output.initialOutcomes,
+            to: selectedSeedID,
+            replacing: true
+        )
 
-        let expansion = await expansionAttempt
-        var refinedQuery: String?
-        switch expansion {
+        switch output.expansion {
         case .success(let result):
             updateSeed(id: selectedSeedID) { stored in
                 stored.branches = result.branches
                 stored.searchQueries = result.searchQueries
                 stored.updatedAt = Date()
             }
-            refinedQuery = result.searchQueries.first(where: {
-                Self.normalized($0) != Self.normalized(seed.seedText)
-            })
             if self.selectedSeedID == selectedSeedID {
                 expansionMessage = result.branches.isEmpty ? "AI 暂未生成有效联想" : nil
             }
-        case .failure(let error):
+        case .failure(let failure):
             if self.selectedSeedID == selectedSeedID {
-                expansionMessage = Self.expansionFailureMessage(error)
+                expansionMessage = Self.expansionFailureMessage(failure)
             }
         }
 
-        if let refinedQuery {
-            let refinedOutcomes = await KnowledgeProviderSearch.search(
-                providers: providers,
-                query: refinedQuery,
-                limit: 4
+        if !output.refinedOutcomes.isEmpty {
+            apply(
+                outcomes: output.refinedOutcomes,
+                to: selectedSeedID,
+                replacing: false
             )
-            apply(outcomes: refinedOutcomes, to: selectedSeedID, replacing: false)
         }
         state = .finished
     }
@@ -222,9 +225,9 @@ final class KnowledgeGardenController {
         let incoming = outcomes.flatMap(\.connections)
         updateSeed(id: seedID) { seed in
             var merged = replacing ? [] : seed.connections
-            var seen = Set(merged.map { "\($0.provider.rawValue)|\($0.sourceId)" })
+            var seen = Set(merged.map { "\($0.stableProviderID)|\($0.sourceId)" })
             for connection in incoming {
-                let key = "\(connection.provider.rawValue)|\(connection.sourceId)"
+                let key = "\(connection.stableProviderID)|\(connection.sourceId)"
                 if seen.insert(key).inserted {
                     merged.append(connection)
                 }
@@ -242,14 +245,41 @@ final class KnowledgeGardenController {
         guard seedID == selectedSeedID else { return }
         let mergedConnections = seeds.first(where: { $0.id == seedID })?.connections ?? []
         for outcome in outcomes {
+            providerDisplayNames[outcome.providerID] = outcome.displayName
             if let errorMessage = outcome.errorMessage {
-                providerMessages[outcome.kind] = "\(outcome.displayName)：\(errorMessage)"
-            } else if mergedConnections.contains(where: { $0.provider == outcome.kind }) {
-                providerMessages[outcome.kind] = nil
+                providerMessages[outcome.providerID] = "\(outcome.displayName)：\(errorMessage)"
+            } else if mergedConnections.contains(where: {
+                $0.stableProviderID == outcome.providerID
+            }) {
+                providerMessages[outcome.providerID] = nil
             } else {
-                providerMessages[outcome.kind] = "\(outcome.displayName)：没有找到相关内容"
+                providerMessages[outcome.providerID] = "\(outcome.displayName)：没有找到相关内容"
             }
         }
+    }
+
+    func providerIDs(for seed: KnowledgeSeed) -> [String] {
+        let ids = Set(seed.connections.map(\.stableProviderID))
+            .union(providerMessages.keys)
+        return ids.sorted { lhs, rhs in
+            let leftRank = Self.providerRank(lhs)
+            let rightRank = Self.providerRank(rhs)
+            if leftRank != rightRank { return leftRank < rightRank }
+            return (providerDisplayNames[lhs] ?? lhs)
+                .localizedStandardCompare(providerDisplayNames[rhs] ?? rhs) == .orderedAscending
+        }
+    }
+
+    func providerDisplayName(for id: String, in seed: KnowledgeSeed) -> String {
+        providerDisplayNames[id]
+            ?? seed.connections.first(where: { $0.stableProviderID == id })?.providerName
+            ?? id
+    }
+
+    private static func providerRank(_ id: String) -> Int {
+        if id == "obsidian" { return 0 }
+        if id.hasPrefix("internet") { return 1 }
+        return 2
     }
 
     private func updateSeed(id: UUID, change: (inout KnowledgeSeed) -> Void) {
@@ -331,11 +361,13 @@ final class KnowledgeGardenController {
             .replacingOccurrences(of: #"\s+"#, with: "", options: .regularExpression)
     }
 
-    private static func expansionFailureMessage(_ error: Error) -> String {
-        if let apiError = error as? AnalysisAPIError {
+    private static func expansionFailureMessage(
+        _ failure: KnowledgeBloomFailure
+    ) -> String {
+        if case .api(let apiError) = failure {
             switch apiError {
-            case .missingAPIKey: return "AI 联想未启用；登录 Kimi 后可生成概念与跨领域连接"
-            case .unauthorized: return "Kimi 登录已失效；知识来源检索仍可使用"
+            case .missingAPIKey: return "AI 联想未启用；连接分析模型后可生成概念与跨领域连接"
+            case .unauthorized: return "AI 凭证已失效；知识来源检索仍可使用"
             case .timeout: return "AI 联想超时；知识来源检索仍可使用"
             default: return "AI 联想暂不可用；知识来源检索仍可使用"
             }

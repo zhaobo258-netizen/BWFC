@@ -50,6 +50,7 @@ enum KnowledgeProviderKind: String, Codable, Sendable, CaseIterable {
 struct KnowledgeConnection: Identifiable, Codable, Sendable, Hashable {
     var id: UUID
     var provider: KnowledgeProviderKind
+    var providerId: String?
     var providerName: String
     var sourceId: String
     var title: String
@@ -61,6 +62,7 @@ struct KnowledgeConnection: Identifiable, Codable, Sendable, Hashable {
     init(
         id: UUID = UUID(),
         provider: KnowledgeProviderKind,
+        providerId: String? = nil,
         providerName: String? = nil,
         sourceId: String,
         title: String,
@@ -71,6 +73,7 @@ struct KnowledgeConnection: Identifiable, Codable, Sendable, Hashable {
     ) {
         self.id = id
         self.provider = provider
+        self.providerId = providerId
         self.providerName = providerName ?? provider.displayName
         self.sourceId = sourceId
         self.title = title
@@ -78,6 +81,10 @@ struct KnowledgeConnection: Identifiable, Codable, Sendable, Hashable {
         self.sourceLocation = sourceLocation
         self.relevance = relevance
         self.retrievedAt = retrievedAt
+    }
+
+    var stableProviderID: String {
+        providerId ?? provider.rawValue
     }
 }
 

@@ -1,14 +1,33 @@
 import Foundation
 
-struct ExternalMCPConfiguration: Codable, Sendable, Equatable {
+struct ExternalMCPConfiguration: Identifiable, Codable, Sendable, Equatable {
+    static let credentialAccountPrefix = "knowledge-mcp."
+
+    var id: UUID
     var displayName: String
     var endpoint: String
     var toolName: String
+    var isEnabled: Bool
+    var credentialAccount: String
+    var verifiedReadOnlyToolName: String?
 
-    init(displayName: String = "得到大脑", endpoint: String = "", toolName: String = "") {
+    init(
+        id: UUID = UUID(),
+        displayName: String = "得到大脑",
+        endpoint: String = "",
+        toolName: String = "",
+        isEnabled: Bool = true,
+        credentialAccount: String? = nil,
+        verifiedReadOnlyToolName: String? = nil
+    ) {
+        self.id = id
         self.displayName = displayName
         self.endpoint = endpoint
         self.toolName = toolName
+        self.isEnabled = isEnabled
+        self.credentialAccount = credentialAccount
+            ?? Self.credentialAccountPrefix + id.uuidString
+        self.verifiedReadOnlyToolName = verifiedReadOnlyToolName
     }
 
     var validatedURL: URL? {
@@ -33,11 +52,18 @@ struct ExternalMCPConfiguration: Codable, Sendable, Equatable {
         let value = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? "外部 MCP" : value
     }
+
+    var isReadOnlyToolVerified: Bool {
+        let selected = toolName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !selected.isEmpty && verifiedReadOnlyToolName == selected
+    }
 }
 
 struct ExternalMCPConfigurationStore: @unchecked Sendable {
-    static let defaultsKey = "bwfx.knowledge.externalMCP"
-    static let tokenAccount = "knowledge-mcp"
+    static let legacyDefaultsKey = "bwfx.knowledge.externalMCP"
+    static let defaultsKey = "bwfx.knowledge.externalMCP.v2"
+    static let legacyTokenAccount = "knowledge-mcp"
+    static let tokenAccount = legacyTokenAccount
 
     private let defaults: UserDefaults
 
@@ -45,20 +71,79 @@ struct ExternalMCPConfigurationStore: @unchecked Sendable {
         self.defaults = defaults
     }
 
+    func loadAll() -> [ExternalMCPConfiguration] {
+        if let data = defaults.data(forKey: Self.defaultsKey),
+           let configurations = try? JSONDecoder().decode(
+               [ExternalMCPConfiguration].self,
+               from: data
+           ) {
+            return configurations
+        }
+        guard let data = defaults.data(forKey: Self.legacyDefaultsKey),
+              let legacy = try? JSONDecoder().decode(
+                  LegacyExternalMCPConfiguration.self,
+                  from: data
+              ) else {
+            return []
+        }
+        let migrated = ExternalMCPConfiguration(
+            displayName: legacy.displayName,
+            endpoint: legacy.endpoint,
+            toolName: legacy.toolName,
+            isEnabled: true,
+            credentialAccount: Self.legacyTokenAccount,
+            verifiedReadOnlyToolName: legacy.toolName
+        )
+        if let encoded = try? JSONEncoder().encode([migrated]) {
+            defaults.set(encoded, forKey: Self.defaultsKey)
+            defaults.removeObject(forKey: Self.legacyDefaultsKey)
+        }
+        return [migrated]
+    }
+
     func load() -> ExternalMCPConfiguration? {
-        guard let data = defaults.data(forKey: Self.defaultsKey) else { return nil }
-        return try? JSONDecoder().decode(ExternalMCPConfiguration.self, from: data)
+        loadAll().first
     }
 
     func save(_ configuration: ExternalMCPConfiguration) throws {
-        guard configuration.validatedURL != nil else {
+        var configurations = loadAll()
+        if let index = configurations.firstIndex(where: { $0.id == configuration.id }) {
+            configurations[index] = configuration
+        } else {
+            configurations.append(configuration)
+        }
+        try saveAll(configurations)
+    }
+
+    func saveAll(_ configurations: [ExternalMCPConfiguration]) throws {
+        guard Set(configurations.map(\.id)).count == configurations.count,
+              configurations.allSatisfy({ $0.validatedURL != nil }) else {
             throw KnowledgeProviderError.invalidConfiguration
         }
-        defaults.set(try JSONEncoder().encode(configuration), forKey: Self.defaultsKey)
+        defaults.set(
+            try JSONEncoder().encode(configurations),
+            forKey: Self.defaultsKey
+        )
+    }
+
+    func remove(id: UUID) {
+        let remaining = loadAll().filter { $0.id != id }
+        if remaining.isEmpty {
+            defaults.removeObject(forKey: Self.defaultsKey)
+        } else if let encoded = try? JSONEncoder().encode(remaining) {
+            defaults.set(encoded, forKey: Self.defaultsKey)
+        }
     }
 
     func clear() {
         defaults.removeObject(forKey: Self.defaultsKey)
+        defaults.removeObject(forKey: Self.legacyDefaultsKey)
+    }
+
+    private struct LegacyExternalMCPConfiguration: Codable {
+        var displayName: String
+        var endpoint: String
+        var toolName: String
     }
 }
 
@@ -79,10 +164,12 @@ private final class MCPNoRedirectDelegate: NSObject, URLSessionTaskDelegate {
 
 actor ExternalMCPKnowledgeProvider: KnowledgeProvider {
     nonisolated let kind: KnowledgeProviderKind = .externalMCP
+    nonisolated let providerID: String
     nonisolated let displayName: String
 
     private let configuration: ExternalMCPConfiguration
-    private let tokenStore: CloudAPIKeyStore
+    private let tokenSnapshot: String?
+    private let tokenReadFailed: Bool
     private let session: URLSession
     private var cachedDiscovery: Discovery?
 
@@ -92,8 +179,15 @@ actor ExternalMCPKnowledgeProvider: KnowledgeProvider {
         session: URLSession? = nil
     ) {
         self.configuration = configuration
+        self.providerID = "mcp:\(configuration.id.uuidString)"
         self.displayName = configuration.normalizedDisplayName
-        self.tokenStore = tokenStore
+        do {
+            self.tokenSnapshot = try tokenStore.readKey()
+            self.tokenReadFailed = false
+        } catch {
+            self.tokenSnapshot = nil
+            self.tokenReadFailed = true
+        }
         self.session = session ?? URLSession(
             configuration: .ephemeral,
             delegate: MCPNoRedirectDelegate(),
@@ -116,8 +210,15 @@ actor ExternalMCPKnowledgeProvider: KnowledgeProvider {
         }
     }
 
+    func discoverReadOnlyToolNames() async throws -> [String] {
+        let listed = try await listTools()
+        return listed.tools.filter(\.looksLikeSearch).map(\.name)
+    }
+
     func search(_ query: String, limit: Int = 5) async throws -> [KnowledgeConnection] {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = String(
+            query.trimmingCharacters(in: .whitespacesAndNewlines).prefix(24)
+        )
         guard !trimmed.isEmpty else { return [] }
         let discovery = try await discover(force: false)
         var arguments: [String: Any] = [
@@ -142,6 +243,7 @@ actor ExternalMCPKnowledgeProvider: KnowledgeProvider {
         }
         return Self.connections(
             from: result,
+            providerID: providerID,
             providerName: displayName,
             endpoint: configuration.endpoint,
             limit: limit
@@ -155,6 +257,31 @@ actor ExternalMCPKnowledgeProvider: KnowledgeProvider {
         guard configuration.validatedURL != nil else {
             throw KnowledgeProviderError.invalidConfiguration
         }
+        let listed = try await listTools()
+        let parsed = listed.tools.filter(\.looksLikeSearch)
+        let configuredName = configuration.toolName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let selected: Tool?
+        if configuredName.isEmpty {
+            guard parsed.count <= 1 else {
+                throw KnowledgeProviderError.multipleSearchTools(parsed.map(\.name))
+            }
+            selected = parsed.first
+        } else {
+            selected = parsed.first { $0.name == configuredName }
+        }
+        guard let selected else {
+            throw KnowledgeProviderError.noSearchTool
+        }
+        let discovery = Discovery(
+            sessionID: listed.sessionID,
+            tool: selected,
+            discoveredAt: Date()
+        )
+        cachedDiscovery = discovery
+        return discovery
+    }
+
+    private func listTools() async throws -> ToolListing {
         let initialized = try await post(
             method: "initialize",
             params: [
@@ -187,24 +314,10 @@ actor ExternalMCPKnowledgeProvider: KnowledgeProvider {
               let rawTools = tools["tools"] as? [[String: Any]] else {
             throw KnowledgeProviderError.invalidResponse
         }
-        let parsed = rawTools.compactMap(Self.parseTool)
-        let configuredName = configuration.toolName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let selected: Tool?
-        if configuredName.isEmpty {
-            selected = parsed.first(where: \.looksLikeSearch) ?? parsed.first
-        } else {
-            selected = parsed.first { $0.name == configuredName }
-        }
-        guard let selected else {
-            throw KnowledgeProviderError.noSearchTool
-        }
-        let discovery = Discovery(
+        return ToolListing(
             sessionID: initialized.sessionID,
-            tool: selected,
-            discoveredAt: Date()
+            tools: rawTools.compactMap(Self.parseTool)
         )
-        cachedDiscovery = discovery
-        return discovery
     }
 
     private func post(
@@ -232,7 +345,10 @@ actor ExternalMCPKnowledgeProvider: KnowledgeProvider {
         if let sessionID {
             request.setValue(sessionID, forHTTPHeaderField: "Mcp-Session-Id")
         }
-        if let token = try tokenStore.readKey(), !token.isEmpty {
+        guard !tokenReadFailed else {
+            throw KnowledgeProviderError.unavailable
+        }
+        if let token = tokenSnapshot, !token.isEmpty {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: message)
@@ -290,22 +406,40 @@ actor ExternalMCPKnowledgeProvider: KnowledgeProvider {
         let properties = schema?["properties"] as? [String: Any] ?? [:]
         let queryNames = ["query", "q", "search", "keyword", "keywords", "text"]
         let limitNames = ["limit", "top_k", "max_results"]
-        let queryArgument = queryNames.first(where: { properties[$0] != nil }) ?? "query"
+        guard let queryArgument = queryNames.first(where: { name in
+            guard let property = properties[name] as? [String: Any] else {
+                return false
+            }
+            return (property["type"] as? String)?.lowercased() == "string"
+        }) else {
+            return Tool(
+                name: name,
+                queryArgument: "query",
+                limitArgument: nil,
+                looksLikeSearch: false
+            )
+        }
         let limitArgument = limitNames.first(where: { properties[$0] != nil })
         let searchText = (name + " " + description).lowercased()
-        let looksLikeSearch = [
-            "search", "query", "find", "knowledge", "note", "检索", "搜索", "知识", "笔记"
+        let hasReadIntent = [
+            "search", "query", "find", "retrieve", "read", "lookup", "fetch",
+            "检索", "搜索", "查询", "读取", "查找", "获取"
+        ].contains { searchText.contains($0) }
+        let hasWriteIntent = [
+            "create", "update", "delete", "write", "send", "execute", "upload",
+            "创建", "更新", "删除", "写入", "发送", "执行", "上传"
         ].contains { searchText.contains($0) }
         return Tool(
             name: name,
             queryArgument: queryArgument,
             limitArgument: limitArgument,
-            looksLikeSearch: looksLikeSearch
+            looksLikeSearch: hasReadIntent && !hasWriteIntent
         )
     }
 
     static func connections(
         from result: [String: Any],
+        providerID: String = KnowledgeProviderKind.externalMCP.rawValue,
         providerName: String,
         endpoint: String,
         limit: Int
@@ -350,6 +484,7 @@ actor ExternalMCPKnowledgeProvider: KnowledgeProvider {
             let relevance = firstNumber(in: item, keys: ["relevance", "score", "similarity"])
             return KnowledgeConnection(
                 provider: .externalMCP,
+                providerId: providerID,
                 providerName: providerName,
                 sourceId: sourceId,
                 title: title,
@@ -409,6 +544,11 @@ actor ExternalMCPKnowledgeProvider: KnowledgeProvider {
         var sessionID: String?
         var tool: Tool
         var discoveredAt: Date
+    }
+
+    private struct ToolListing: Sendable {
+        var sessionID: String?
+        var tools: [Tool]
     }
 
     private struct Tool: Sendable {

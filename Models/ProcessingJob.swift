@@ -6,6 +6,7 @@ enum ProcessingJobKind: String, Codable, Sendable, CaseIterable {
     case transcription      // 转写
     case diarization        // 分人
     case analysis           // 分析
+    case finalReport        // 完整总结
     case knowledgeExpansion // 知识扩展
     case obsidianArchive    // Obsidian 归档
 }

@@ -109,7 +109,8 @@ enum ConversationAnalysisPrompt {
 
     /// 组装完整系统指令
     static func text(scenario: ProjectScenario?, knownTerms: [String] = []) -> String {
-        persona + "\n\n" + rules + "\n\n" + scenarioRules(for: scenario)
+        PromptRegistry.sharedGuardrails + "\n\n" + persona + "\n\n" + rules
+            + "\n\n" + scenarioRules(for: scenario)
             + knownTermsSection(knownTerms)
     }
 

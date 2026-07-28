@@ -19,6 +19,9 @@ private struct MockKnowledgeProvider: KnowledgeProvider {
     var kind: KnowledgeProviderKind
     var displayName: String
     var shouldFail = false
+    var providerID: String {
+        "mock:\(kind.rawValue):\(displayName)"
+    }
 
     func healthCheck() async -> KnowledgeProviderHealth {
         KnowledgeProviderHealth(isAvailable: !shouldFail, message: shouldFail ? "不可用" : "正常")
@@ -200,7 +203,10 @@ struct KnowledgeGardenTests {
         #expect(bloomed.branches.count == 1)
         #expect(bloomed.connections.count == 2)
         #expect(Set(bloomed.connections.map(\.provider)) == [.obsidian, .internet])
-        #expect(controller.providerMessages[.externalMCP]?.contains("不可用") == true)
+        #expect(
+            controller.providerMessages["mock:externalMCP:得到大脑"]?
+                .contains("不可用") == true
+        )
         #expect(controller.state == .finished)
     }
 
@@ -267,6 +273,10 @@ struct KnowledgeGardenTests {
     func externalMCPFlow() async throws {
         KnowledgeMCPMockURLProtocol.storage.reset()
         KnowledgeMCPMockURLProtocol.storage.requestHandler = { request in
+            #expect(
+                request.value(forHTTPHeaderField: "Authorization")
+                    == "Bearer token-at-start"
+            )
             let body = try #require(mockRequestBodyData(of: request))
             let object = try #require(
                 try JSONSerialization.jsonObject(with: body) as? [String: Any]
@@ -293,6 +303,36 @@ struct KnowledgeGardenTests {
                     "result": [
                         "tools": [
                             [
+                                "name": "delete_note",
+                                "description": "删除一条笔记",
+                                "inputSchema": [
+                                    "type": "object",
+                                    "properties": [
+                                        "query": ["type": "string"]
+                                    ]
+                                ]
+                            ],
+                            [
+                                "name": "read_object",
+                                "description": "读取知识对象",
+                                "inputSchema": [
+                                    "type": "object",
+                                    "properties": [
+                                        "query": ["type": "object"]
+                                    ]
+                                ]
+                            ],
+                            [
+                                "name": "note_manager",
+                                "description": "管理笔记",
+                                "inputSchema": [
+                                    "type": "object",
+                                    "properties": [
+                                        "query": ["type": "string"]
+                                    ]
+                                ]
+                            ],
+                            [
                                 "name": "search_notes",
                                 "description": "搜索知识和笔记",
                                 "inputSchema": [
@@ -307,6 +347,18 @@ struct KnowledgeGardenTests {
                     ]
                 ]
             case "tools/call":
+                let params = try #require(object["params"] as? [String: Any])
+                #expect(params["name"] as? String == "search_notes")
+                let arguments = try #require(params["arguments"] as? [String: Any])
+                let query = try #require(arguments["query"] as? String)
+                #expect(query.count == 24)
+                #expect(
+                    query
+                        == String(
+                            "这是一整段不应该发送给 MCP 的完整逐字稿内容，长度明显超过二十四个字符。"
+                                .prefix(24)
+                        )
+                )
                 responseObject = [
                     "jsonrpc": "2.0",
                     "id": 3,
@@ -345,6 +397,7 @@ struct KnowledgeGardenTests {
             account: ExternalMCPConfigurationStore.tokenAccount
         )
         defer { try? tokenStore.deleteKey() }
+        try tokenStore.saveKey("token-at-start")
         let provider = ExternalMCPKnowledgeProvider(
             configuration: ExternalMCPConfiguration(
                 displayName: "得到大脑",
@@ -353,7 +406,11 @@ struct KnowledgeGardenTests {
             tokenStore: tokenStore,
             session: KnowledgeMCPMockURLProtocol.makeSession()
         )
-        let results = try await provider.search("库存口径", limit: 5)
+        try tokenStore.saveKey("token-after-start")
+        let results = try await provider.search(
+            "这是一整段不应该发送给 MCP 的完整逐字稿内容，长度明显超过二十四个字符。",
+            limit: 5
+        )
         #expect(results.count == 1)
         #expect(results.first?.providerName == "得到大脑")
         #expect(results.first?.sourceId == "note-1")
@@ -415,6 +472,7 @@ struct KnowledgeGardenTests {
         /// 初次查询返回结果、refined 查询返回空的 provider
         struct QueryAwareProvider: KnowledgeProvider {
             let kind: KnowledgeProviderKind = .internet
+            let providerID = "internet:test"
             let displayName = "互联网"
             let initialQuery: String
 
@@ -455,7 +513,11 @@ struct KnowledgeGardenTests {
                     searchQueries: ["完全不同的refined检索词"]
                 )
             ),
-            providerFactory: { [QueryAwareProvider(initialQuery: seedText)] }
+            providerFactory: {
+                [QueryAwareProvider(
+                    initialQuery: seedText
+                )]
+            }
         )
         refinedController.attach(to: project)
         let seed = try #require(refinedController.selectedSeed)
@@ -465,7 +527,7 @@ struct KnowledgeGardenTests {
         let bloomed = try #require(refinedController.selectedSeed)
         #expect(bloomed.connections.count == 1, "初次检索结果必须保留")
         #expect(
-            refinedController.providerMessages[.internet] == nil,
+            refinedController.providerMessages["internet:test"] == nil,
             "已有真实结果时不得显示「没有找到相关内容」"
         )
     }
@@ -537,5 +599,78 @@ struct KnowledgeGardenTests {
         #expect(ExternalMCPConfiguration(
             endpoint: "file:///tmp/mcp"
         ).validatedURL == nil)
+    }
+
+    @Test("旧单 MCP 自动迁移为启用连接并保留旧凭证账号")
+    func legacySingleMCPMigration() throws {
+        let suiteName = "bwfx-mcp-migration-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(
+            Data("""
+            {
+              "displayName": "得到大脑",
+              "endpoint": "https://example.com/mcp",
+              "toolName": "search_notes"
+            }
+            """.utf8),
+            forKey: ExternalMCPConfigurationStore.legacyDefaultsKey
+        )
+        let store = ExternalMCPConfigurationStore(defaults: defaults)
+        let migrated = try #require(store.loadAll().first)
+        #expect(migrated.isEnabled)
+        #expect(migrated.toolName == "search_notes")
+        #expect(migrated.isReadOnlyToolVerified)
+        #expect(
+            migrated.credentialAccount
+                == ExternalMCPConfigurationStore.legacyTokenAccount
+        )
+        #expect(
+            defaults.data(
+                forKey: ExternalMCPConfigurationStore.legacyDefaultsKey
+            ) == nil
+        )
+    }
+
+    @Test("多 MCP 配置和 Token 使用稳定 ID 独立保存")
+    func multipleMCPConnectionsAreIsolated() throws {
+        let suiteName = "bwfx-mcp-array-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = ExternalMCPConfigurationStore(defaults: defaults)
+        let first = ExternalMCPConfiguration(
+            displayName: "知识源一",
+            endpoint: "https://one.example.com/mcp",
+            toolName: "search_one",
+            verifiedReadOnlyToolName: "search_one"
+        )
+        let second = ExternalMCPConfiguration(
+            displayName: "知识源二",
+            endpoint: "https://two.example.com/mcp",
+            toolName: "search_two",
+            verifiedReadOnlyToolName: "search_two"
+        )
+        try store.saveAll([first, second])
+        #expect(store.loadAll().map(\.id) == [first.id, second.id])
+        #expect(first.credentialAccount != second.credentialAccount)
+
+        let serviceName = "com.zhaobo.BangWoFenXi.tests.mcp.\(UUID().uuidString)"
+        let firstToken = CloudAPIKeyStore(
+            service: serviceName,
+            account: first.credentialAccount
+        )
+        let secondToken = CloudAPIKeyStore(
+            service: serviceName,
+            account: second.credentialAccount
+        )
+        defer {
+            try? firstToken.deleteKey()
+            try? secondToken.deleteKey()
+        }
+        try firstToken.saveKey("token-one")
+        try secondToken.saveKey("token-two")
+        try firstToken.deleteKey()
+        #expect(!firstToken.hasConfiguredKey)
+        #expect(try secondToken.readKey() == "token-two")
     }
 }

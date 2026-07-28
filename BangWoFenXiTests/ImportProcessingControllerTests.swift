@@ -3,6 +3,49 @@ import AVFoundation
 import Testing
 @testable import BangWoFenXi
 
+@MainActor
+private final class ImportFinalReportGenerator:
+    FinalReportGenerating,
+    @unchecked Sendable
+{
+    var error: AnalysisAPIError?
+    private(set) var callCount = 0
+
+    func generate(
+        project: Project,
+        analysis: ConversationAnalysisSnapshot,
+        knownTerms: [String],
+        version: Int
+    ) async throws -> FinalReportSnapshot {
+        callCount += 1
+        if let error {
+            throw error
+        }
+        guard let segment = project.segments.first else {
+            throw AnalysisAPIError.invalidResponse
+        }
+        return FinalReportSnapshot(
+            version: version,
+            providerID: "import-mock",
+            providerName: "Import Mock",
+            modelID: "import-model",
+            promptVersion: PromptRegistry.version,
+            inputFingerprint: FinalReportFingerprint.make(for: project),
+            headline: "导入完整总结",
+            overview: "导入完成后自动生成。",
+            items: [
+                FinalReportItem(
+                    category: .fact,
+                    text: "导入文稿事实",
+                    epistemicStatus: .explicit,
+                    confidence: .high,
+                    evidenceSegmentIds: [segment.id]
+                )
+            ]
+        )
+    }
+}
+
 /// 导入处理控制器（阶段 C）：流水线编排、持久化、续跑、并发保护、字段级合并
 @MainActor
 @Suite("导入处理流水线", .serialized)
@@ -34,12 +77,15 @@ final class ImportProcessingControllerTests {
         try? FileManager.default.removeItem(at: tempDirectory)
     }
 
-    private func makeController() -> ImportProcessingController {
+    private func makeController(
+        finalReportGenerator: (any FinalReportGenerating)? = nil
+    ) -> ImportProcessingController {
         let factory = transcriptionMockFactory
         return ImportProcessingController(
             importService: importMock,
             makeTranscriptionService: { factory() },
             analysisService: analysisMock,
+            finalReportGenerator: finalReportGenerator,
             fileStore: fileStore,
             isAnalysisConfigured: { [self] in analysisConfigured },
             loadProject: { [store] id in
@@ -99,6 +145,52 @@ final class ImportProcessingControllerTests {
         #expect(project.processingJobs.allSatisfy { $0.status == .completed })
         #expect(project.analysisSnapshots.count == 1, "最终分析快照必须落库（阶段 D：V2 通用分析容器）")
         #expect(analysisMock.calls.count == 1)
+    }
+
+    @Test("导入完成后自动生成一次完整总结并写入 Markdown")
+    func importGeneratesFinalReportOnce() async throws {
+        analysisConfigured = true
+        let generator = ImportFinalReportGenerator()
+        let controller = makeController(finalReportGenerator: generator)
+        let projectID = try await controller.beginImport(
+            url: importMock.fakeSourceURL(named: "带完整总结.m4a")
+        )
+        await waitFor { !controller.isRunning }
+
+        let project = try #require(try storedProject(projectID))
+        #expect(
+            project.processingJobs.map(\.kind)
+                == [.audioExtraction, .transcription, .analysis, .finalReport]
+        )
+        #expect(project.processingJobs.allSatisfy { $0.status == .completed })
+        #expect(project.finalReportSnapshots.count == 1)
+        #expect(generator.callCount == 1)
+        #expect(controller.finalReportNotificationRevision == 1)
+        #expect(FileManager.default.fileExists(
+            atPath: fileStore.meetingDirectory(for: projectID)
+                .appending(path: "完整总结.md").path
+        ))
+    }
+
+    @Test("完整总结失败只产生可重试告警，录音文稿仍可用")
+    func finalReportFailureDoesNotLoseTranscript() async throws {
+        analysisConfigured = true
+        let generator = ImportFinalReportGenerator()
+        generator.error = .network
+        let controller = makeController(finalReportGenerator: generator)
+        let projectID = try await controller.beginImport(
+            url: importMock.fakeSourceURL(named: "总结失败.m4a")
+        )
+        await waitFor { !controller.isRunning }
+
+        let project = try #require(try storedProject(projectID))
+        #expect(project.status == .readyWithWarnings)
+        #expect(project.segments.count == 1)
+        #expect(project.finalReportSnapshots.isEmpty)
+        #expect(
+            project.processingJobs.first { $0.kind == .finalReport }?.status
+                == .failedRetryable
+        )
     }
 
     @Test("检查失败：明确错误抛出，不创建项目")

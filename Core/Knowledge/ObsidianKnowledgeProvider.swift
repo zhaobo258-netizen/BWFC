@@ -2,6 +2,7 @@ import Foundation
 
 actor ObsidianKnowledgeProvider: KnowledgeProvider {
     let kind: KnowledgeProviderKind = .obsidian
+    nonisolated let providerID = "obsidian"
     let displayName = "Obsidian"
 
     private let vaultURL: URL
@@ -49,6 +50,7 @@ actor ObsidianKnowledgeProvider: KnowledgeProvider {
         return scored.prefix(max(1, limit)).map { entry, score in
             KnowledgeConnection(
                 provider: .obsidian,
+                providerId: providerID,
                 sourceId: entry.relativePath,
                 title: entry.title,
                 excerpt: Self.excerpt(from: entry.searchableText, terms: terms),

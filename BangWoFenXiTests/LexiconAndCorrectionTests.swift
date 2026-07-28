@@ -54,6 +54,50 @@ struct LexiconStoreTests {
         #expect(loaded.corrections.isEmpty)
         try? FileManager.default.removeItem(at: dir)
     }
+
+    @Test("设置中心支持词条与纠错规则完整增删改")
+    @MainActor
+    func environmentCRUD() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "lexicon-environment-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let suiteName = "bwfx-lexicon-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let environment = AppEnvironment(
+            meetingStore: InMemoryMeetingStore(),
+            fileStore: MeetingFileStore(baseDirectory: directory),
+            keychainServiceName: "com.zhaobo.BangWoFenXi.tests.lexicon.\(UUID().uuidString)",
+            aiProviderConfigurationStore: AIProviderConfigurationStore(
+                defaults: defaults
+            ),
+            externalMCPConfigurationStore: ExternalMCPConfigurationStore(
+                defaults: defaults
+            )
+        )
+
+        try environment.addLexiconTerm("经销商")
+        try environment.addLexiconTerm("动销")
+        try environment.updateLexiconTerm("动销", to: "终端动销")
+        #expect(environment.lexiconTerms == ["经销商", "终端动销"])
+        try environment.removeLexiconTerm("经销商")
+        #expect(environment.lexiconTerms == ["终端动销"])
+
+        try environment.addCorrectionRule(wrong: "经消商", right: "经销商")
+        let rule = try #require(environment.correctionRules.first)
+        try environment.updateCorrectionRule(
+            rule,
+            wrong: "经消商",
+            right: "渠道经销商"
+        )
+        #expect(environment.correctionRules.first?.right == "渠道经销商")
+        let updatedRule = try #require(environment.correctionRules.first)
+        try environment.removeCorrectionRule(updatedRule)
+        #expect(environment.correctionRules.isEmpty)
+        try environment.clearLexicon()
+        #expect(environment.lexiconTerms.isEmpty)
+        #expect(environment.lexiconRevision >= 7)
+    }
 }
 
 /// 转写纠错引擎（全局替换 + 自动套用）
