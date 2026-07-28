@@ -110,7 +110,7 @@ struct ConversationAnalysisInputAssemblerTests {
 
     // MARK: - 系统指令（Prompt）
 
-    @Test("红线约束：四个场景的指令都完整包含 8 条规则与不可信数据声明")
+    @Test("红线约束：五个场景的指令都完整包含 8 条规则与不可信数据声明")
     func rulesPresentInAllScenarios() {
         for scenario in ProjectScenario.allCases {
             let text = ConversationAnalysisPrompt.text(scenario: scenario)
@@ -125,6 +125,15 @@ struct ConversationAnalysisInputAssemblerTests {
         let auto = ConversationAnalysisPrompt.text(scenario: nil)
         #expect(auto.contains(ConversationAnalysisPrompt.rules))
         #expect(auto.contains("detected_scenario"))
+    }
+
+    @Test("内部会议场景包含决定、责任人、未决问题与风险侧重")
+    func internalMeetingRules() {
+        let rules = ConversationAnalysisPrompt.scenarioRules(for: .internalMeeting)
+        #expect(rules.contains("decision"))
+        #expect(rules.contains("责任人"))
+        #expect(rules.contains("open_question"))
+        #expect(rules.contains("风险"))
     }
 
     @Test("场景增强只改变侧重：各场景引用的类别都在同一 Schema 白名单内")
@@ -155,6 +164,10 @@ struct ConversationAnalysisInputAssemblerTests {
         for category in AnalysisItemCategory.allCases {
             #expect(suffix.contains(ConversationAnalysisTaxonomy.wireName(for: category)),
                     "输出约束缺少类别 \(category)")
+        }
+        for scenario in ProjectScenario.allCases {
+            #expect(suffix.contains(ConversationAnalysisTaxonomy.wireName(for: scenario)),
+                    "输出约束缺少场景 \(scenario)")
         }
         #expect(suffix.contains("explicit / inference"))
         #expect(suffix.contains("low / medium / high"))

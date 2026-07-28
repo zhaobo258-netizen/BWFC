@@ -14,6 +14,7 @@ struct ProjectHomeView: View {
     @State private var showConsent = false
     @State private var importErrorMessage: String?
     @State private var isDropTargeted = false
+    @State private var selectedRecordingScenario: ProjectScenario?
     /// 首次录音知情确认只做一次（03 §6.1）
     @AppStorage("bwfx.recordingConsentConfirmed") private var consentConfirmed = false
 
@@ -24,6 +25,7 @@ struct ProjectHomeView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     actionArea
+                    recordingScenarioSection
                     if let loadError {
                         Label("项目读取失败：\(loadError)", systemImage: "exclamationmark.triangle")
                             .font(.callout)
@@ -39,7 +41,10 @@ struct ProjectHomeView: View {
         }
         .background(BWTheme.paper)
         .navigationTitle("帮我分析")
-        .onAppear(perform: reload)
+        .onAppear {
+            selectedRecordingScenario = nil
+            reload()
+        }
         .confirmationDialog("开始录音前请确认", isPresented: $showConsent, titleVisibility: .visible) {
             Button("已告知，开始录音") {
                 consentConfirmed = true
@@ -159,6 +164,75 @@ struct ProjectHomeView: View {
         .padding(.bottom, 6)
     }
 
+    // MARK: - 录音场景
+
+    private var recordingScenarioSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("录音场景（可选）")
+                    .font(.headline)
+                Spacer()
+                Text("仅用于现场录音")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+
+            HStack(spacing: 8) {
+                recordingScenarioButton(nil)
+                ForEach(ProjectHomeSupport.recordingScenarioOrder, id: \.self) { scenario in
+                    recordingScenarioButton(scenario)
+                }
+            }
+
+            Text("默认由 AI 根据内容判断，也可以提前指定；进入工作台后仍可随时修改。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(14)
+        .background(BWTheme.card, in: RoundedRectangle(cornerRadius: 14))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .strokeBorder(BWTheme.cardStroke, lineWidth: 1)
+        )
+    }
+
+    private func recordingScenarioButton(_ scenario: ProjectScenario?) -> some View {
+        let isSelected = selectedRecordingScenario == scenario
+        let label = scenario?.displayName ?? "自动判断"
+        return Button {
+            selectedRecordingScenario = scenario
+        } label: {
+            HStack(spacing: 5) {
+                if isSelected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.caption)
+                }
+                Text(label)
+                    .font(.callout)
+                    .fontWeight(isSelected ? .semibold : .regular)
+            }
+            .foregroundStyle(isSelected ? BWTheme.accent : .secondary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(
+                isSelected ? BWTheme.accent.opacity(0.13) : Color.clear,
+                in: Capsule()
+            )
+            .overlay(
+                Capsule()
+                    .strokeBorder(
+                        isSelected ? BWTheme.accent.opacity(0.75) : BWTheme.cardStroke,
+                        lineWidth: isSelected ? 1.5 : 1
+                    )
+            )
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("录音场景：\(label)")
+        .accessibilityValue(isSelected ? "已选择" : "未选择")
+        .help(isSelected ? "当前录音场景：\(label)" : "将录音场景设为\(label)")
+    }
+
     // MARK: - 异常项目提示（非阻塞）
 
     @ViewBuilder
@@ -251,14 +325,9 @@ struct ProjectHomeView: View {
     /// 开始录音：立即创建临时项目并直达工作台开录（两次交互内）
     private func startRecordingProject() {
         let now = Date()
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm"
-        let project = Project(
-            title: "未命名录音 · \(formatter.string(from: now))",
-            sourceType: .liveRecording,
-            status: .creating,
-            createdAt: now,
-            lastActivityAt: now
+        let project = ProjectHomeSupport.makeRecordingProject(
+            at: now,
+            scenario: selectedRecordingScenario
         )
         do {
             try environment.persist(project)

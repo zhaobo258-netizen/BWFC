@@ -44,10 +44,21 @@ struct ConversationAnalysisView: View {
 
                 let groups = groupedItems
                 if groups.isEmpty {
-                    Text(snapshot == nil ? "尚无足够信息" : "本页签暂无内容")
-                        .font(.callout)
-                        .foregroundStyle(.tertiary)
-                        .padding(.vertical, 20)
+                    VStack(spacing: 8) {
+                        Image(systemName: summaryTab ? "text.page" : "sparkles")
+                            .font(.title2)
+                            .foregroundStyle(BWTheme.accent.opacity(0.75))
+                        Text(snapshot == nil ? "尚无足够信息" : "本页签暂无内容")
+                            .font(.callout)
+                            .fontWeight(.medium)
+                        Text(snapshot == nil
+                             ? "对话继续后，AI 会在这里更新分析"
+                             : "当前证据没有形成可靠条目")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 28)
                 }
                 ForEach(groups, id: \.category) { group in
                     VStack(alignment: .leading, spacing: 6) {

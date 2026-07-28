@@ -12,12 +12,16 @@ struct BangWoFenXiApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView()
+            RootView {
+                router.showProjectHome()
+                environment = AppEnvironment.live()
+                }
                 .environment(environment)
                 .environment(router)
-                .frame(minWidth: 1280, minHeight: 800)
+                .frame(minWidth: 960, minHeight: 640)
         }
         .defaultSize(width: 1440, height: 900)
+        .windowResizability(.contentMinSize)
     }
 }
 
@@ -25,6 +29,7 @@ struct BangWoFenXiApp: App {
 struct RootView: View {
     @Environment(AppRouter.self) private var router
     @Environment(AppEnvironment.self) private var environment
+    let onStorageLocationChanged: () -> Void
 
     /// 启动时发现的未正常结束会议（实施计划 11.1 恢复提示）
     @State private var abnormalMeetings: [Meeting] = []
@@ -36,8 +41,9 @@ struct RootView: View {
                 ProjectHomeView()
             case .projectWorkspace(let id, let autoStart):
                 ProjectWorkspaceView(projectID: id, autoStart: autoStart)
+                    .id(id)
             case .settings:
-                SettingsView()
+                SettingsView(onStorageLocationChanged: onStorageLocationChanged)
             case .meetingList:
                 MeetingListView()
             case .meetingSetup(let id):

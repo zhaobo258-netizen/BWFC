@@ -82,6 +82,16 @@ struct KeychainService: Sendable {
         return value
     }
 
+    func contains(account: String) -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        return SecItemCopyMatching(query as CFDictionary, nil) == errSecSuccess
+    }
+
     /// 删除；条目不存在视为成功（幂等）
     func delete(account: String) throws {
         let query: [String: Any] = [
@@ -148,7 +158,7 @@ struct CloudAPIKeyStore: Sendable {
 
     /// 是否已配置 API Key
     var hasConfiguredKey: Bool {
-        (try? keychain.read(account: account)).map { !$0.isEmpty } ?? false
+        keychain.contains(account: account)
     }
 
     /// 保存 API Key

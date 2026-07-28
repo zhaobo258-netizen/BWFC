@@ -2,6 +2,31 @@ import Foundation
 
 /// 首页列表的纯逻辑（可单测）：排序与一行摘要。
 enum ProjectHomeSupport {
+    static let recordingScenarioOrder: [ProjectScenario] = [
+        .clientVisit,
+        .internalMeeting,
+        .journalistInterview,
+        .classLearning,
+        .freeform
+    ]
+
+    static func makeRecordingProject(
+        at date: Date,
+        scenario: ProjectScenario?
+    ) -> Project {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        return Project(
+            title: "未命名录音 · \(formatter.string(from: date))",
+            sourceType: .liveRecording,
+            scenario: scenario,
+            scenarioWasUserSelected: scenario != nil,
+            status: .creating,
+            createdAt: date,
+            lastActivityAt: date
+        )
+    }
+
     /// 最近项目按最近活动时间倒序
     static func sortedForDisplay(_ projects: [Project]) -> [Project] {
         projects.sorted { $0.lastActivityAt > $1.lastActivityAt }

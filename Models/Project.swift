@@ -10,16 +10,18 @@ enum ProjectSourceType: String, Codable, Sendable, CaseIterable {
 /// 项目场景（产品文档 03 号 §8.1）
 enum ProjectScenario: String, Codable, Sendable, CaseIterable {
     case clientVisit         // 客户拜访
-    case classLearning       // 课堂学习
-    case journalistInterview // 记者采访
+    case internalMeeting     // 内部会议
+    case classLearning       // 课堂培训
+    case journalistInterview // 访谈采访
     case freeform            // 自由记录
 
     /// 中文显示名
     var displayName: String {
         switch self {
         case .clientVisit: return "客户拜访"
-        case .classLearning: return "课堂学习"
-        case .journalistInterview: return "记者采访"
+        case .internalMeeting: return "内部会议"
+        case .classLearning: return "课堂培训"
+        case .journalistInterview: return "访谈采访"
         case .freeform: return "自由记录"
         }
     }
@@ -129,6 +131,8 @@ final class Project: Identifiable, Codable {
     var legacySnapshots: [AnalysisSnapshot] = []
     /// V2 通用分析快照（阶段 D，03 §8.4）：新分析的权威存储
     var analysisSnapshots: [ConversationAnalysisSnapshot] = []
+    /// 由分析条目继续延展的知识种子、联想分支与真实来源
+    var knowledgeSeeds: [KnowledgeSeed] = []
     /// 旧 Meeting 专属字段存档（谈判背景/目标/底线/词汇等）；迁移时必有值，新建 V2 项目为 nil
     var legacyMetadata: LegacyMeetingMetadata?
     /// 项目笔记
@@ -159,6 +163,7 @@ final class Project: Identifiable, Codable {
         segments: [TranscriptSegment] = [],
         legacySnapshots: [AnalysisSnapshot] = [],
         analysisSnapshots: [ConversationAnalysisSnapshot] = [],
+        knowledgeSeeds: [KnowledgeSeed] = [],
         legacyMetadata: LegacyMeetingMetadata? = nil,
         note: NoteDocument = NoteDocument(markdown: "", updatedAt: Date()),
         processingJobs: [ProcessingJob] = [],
@@ -184,6 +189,7 @@ final class Project: Identifiable, Codable {
         self.segments = segments
         self.legacySnapshots = legacySnapshots
         self.analysisSnapshots = analysisSnapshots
+        self.knowledgeSeeds = knowledgeSeeds
         self.legacyMetadata = legacyMetadata
         self.note = note
         self.processingJobs = processingJobs
@@ -214,6 +220,7 @@ final class Project: Identifiable, Codable {
         legacySnapshots = try container.decodeIfPresent([AnalysisSnapshot].self, forKey: .legacySnapshots) ?? []
         // 兼容阶段 D 之前的 Project JSON（无 analysisSnapshots 键）
         analysisSnapshots = try container.decodeIfPresent([ConversationAnalysisSnapshot].self, forKey: .analysisSnapshots) ?? []
+        knowledgeSeeds = try container.decodeIfPresent([KnowledgeSeed].self, forKey: .knowledgeSeeds) ?? []
         // 兼容补强前生成的 Project JSON（无 legacyMetadata 键）
         legacyMetadata = try container.decodeIfPresent(LegacyMeetingMetadata.self, forKey: .legacyMetadata)
         note = try container.decodeIfPresent(NoteDocument.self, forKey: .note) ?? NoteDocument(markdown: "", updatedAt: createdAt)

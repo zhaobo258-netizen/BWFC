@@ -44,6 +44,10 @@ struct KimiOAuthTokenStore: Sendable {
         ((try? read()) ?? nil) != nil
     }
 
+    var hasStoredTokens: Bool {
+        keychain.contains(account: Self.account)
+    }
+
     /// 读取凭证；不存在或数据损坏返回 nil（损坏视为未登录，不猜测修复）
     func read() throws -> KimiOAuthTokens? {
         guard let raw = try keychain.read(account: Self.account) else {

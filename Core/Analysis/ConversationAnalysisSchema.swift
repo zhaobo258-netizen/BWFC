@@ -34,6 +34,7 @@ enum ConversationAnalysisTaxonomy {
     static func wireName(for scenario: ProjectScenario) -> String {
         switch scenario {
         case .clientVisit: return "client_visit"
+        case .internalMeeting: return "internal_meeting"
         case .classLearning: return "class_learning"
         case .journalistInterview: return "journalist_interview"
         case .freeform: return "freeform"

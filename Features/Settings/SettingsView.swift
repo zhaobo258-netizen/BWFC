@@ -8,6 +8,7 @@ import AppKit
 struct SettingsView: View {
     @Environment(AppEnvironment.self) private var environment
     @Environment(AppRouter.self) private var router
+    let onStorageLocationChanged: () -> Void
 
     @State private var analysisKeyInput: String = ""
     @State private var diarizationKeyInput: String = ""
@@ -18,9 +19,19 @@ struct SettingsView: View {
     @State private var login: KimiLoginController?
     @State private var lexiconPaste: String = ""
     @State private var lexiconMessage: String?
+    @State private var storageMessage: String?
+    @State private var isMigratingStorage = false
+    @State private var mcpDisplayName = "得到大脑"
+    @State private var mcpEndpoint = ""
+    @State private var mcpToolName = ""
+    @State private var mcpTokenInput = ""
+    @State private var mcpMessage: String?
+    @State private var isTestingMCP = false
 
     var body: some View {
         Form {
+            storageSection
+            knowledgeSourceSection
             lexiconSection
             kimiAccountSection
             keySection(
@@ -64,6 +75,256 @@ struct SettingsView: View {
                 Button("返回") {
                     router.closeSettings()
                 }
+                .disabled(isMigratingStorage)
+            }
+        }
+        .onAppear {
+            loadExternalMCPSettings()
+        }
+    }
+
+    // MARK: - 开花知识来源
+
+    @ViewBuilder
+    private var knowledgeSourceSection: some View {
+        Section {
+            HStack {
+                Text("Obsidian")
+                Spacer()
+                Text(environment.obsidianVaultURL == nil ? "未连接" : "已连接")
+                    .font(.caption)
+                    .foregroundStyle(environment.obsidianVaultURL == nil ? Color.gray : Color.green)
+            }
+            HStack {
+                Text("互联网")
+                Spacer()
+                Text("已启用 · 中文维基百科")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+            }
+
+            Divider()
+
+            TextField("来源名称，例如：得到大脑", text: $mcpDisplayName)
+                .textFieldStyle(.roundedBorder)
+            TextField("Streamable HTTP MCP 地址，例如：https://example.com/mcp", text: $mcpEndpoint)
+                .textFieldStyle(.roundedBorder)
+            TextField("知识搜索工具名（留空时自动发现）", text: $mcpToolName)
+                .textFieldStyle(.roundedBorder)
+            SecureField("Bearer Token（可选，仅保存到 Keychain）", text: $mcpTokenInput)
+                .textFieldStyle(.roundedBorder)
+
+            HStack {
+                Button("保存 MCP") {
+                    saveExternalMCPSettings()
+                }
+                .disabled(mcpEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                Button(isTestingMCP ? "测试中…" : "保存并测试连接") {
+                    testExternalMCP()
+                }
+                .disabled(isTestingMCP
+                          || mcpEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                Button("删除连接") {
+                    deleteExternalMCPSettings()
+                }
+                .disabled(environment.externalMCPConfigurationStore.load() == nil
+                          && !environment.externalMCPTokenStore.hasConfiguredKey)
+                Spacer()
+            }
+
+            if let mcpMessage {
+                Text(mcpMessage)
+                    .font(.footnote)
+                    .foregroundStyle(
+                        mcpMessage.hasPrefix("已") || mcpMessage.hasPrefix("连接正常")
+                            ? .green : .orange
+                    )
+            }
+            Text("“开花”会自动检索 Obsidian 和互联网；配置外部 MCP 后会一并查询。MCP 只接收当前知识种子的短检索词，不发送整场录音、完整逐字稿或整个 Vault。远程地址必须使用 HTTPS，本机地址可使用 localhost。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        } header: {
+            Text("开花 · 知识来源")
+        }
+    }
+
+    private func loadExternalMCPSettings() {
+        guard let configuration = environment.externalMCPConfigurationStore.load() else {
+            return
+        }
+        mcpDisplayName = configuration.displayName
+        mcpEndpoint = configuration.endpoint
+        mcpToolName = configuration.toolName
+    }
+
+    @discardableResult
+    private func saveExternalMCPSettings() -> ExternalMCPConfiguration? {
+        let configuration = ExternalMCPConfiguration(
+            displayName: mcpDisplayName,
+            endpoint: mcpEndpoint,
+            toolName: mcpToolName
+        )
+        do {
+            try environment.externalMCPConfigurationStore.save(configuration)
+        } catch {
+            mcpMessage = "无法保存：请使用 HTTPS 地址，或本机 localhost 地址。"
+            return nil
+        }
+        let token = mcpTokenInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !token.isEmpty {
+            do {
+                try environment.externalMCPTokenStore.saveKey(token)
+                mcpTokenInput = ""
+            } catch {
+                // 地址已保存成功；Token 写入 Keychain 失败要如实区分，不能误报成地址问题
+                mcpMessage = "地址已保存，但 Token 写入 Keychain 失败，请重试。"
+                return nil
+            }
+        }
+        mcpMessage = "已保存外部 MCP。"
+        return configuration
+    }
+
+    private func testExternalMCP() {
+        guard let configuration = saveExternalMCPSettings() else { return }
+        isTestingMCP = true
+        mcpMessage = nil
+        let provider = ExternalMCPKnowledgeProvider(
+            configuration: configuration,
+            tokenStore: environment.externalMCPTokenStore
+        )
+        Task { @MainActor in
+            let health = await provider.healthCheck()
+            mcpMessage = health.isAvailable
+                ? "连接正常：\(health.message)"
+                : "连接失败：\(health.message)"
+            isTestingMCP = false
+        }
+    }
+
+    private func deleteExternalMCPSettings() {
+        environment.externalMCPConfigurationStore.clear()
+        do {
+            try environment.externalMCPTokenStore.deleteKey()
+            mcpEndpoint = ""
+            mcpToolName = ""
+            mcpTokenInput = ""
+            mcpDisplayName = "得到大脑"
+            mcpMessage = "已删除外部 MCP 连接。"
+        } catch {
+            mcpMessage = "删除失败：\(error.localizedDescription)"
+        }
+    }
+
+    // MARK: - Obsidian 存储
+
+    @ViewBuilder
+    private var storageSection: some View {
+        Section {
+            LabeledContent("当前目录") {
+                Text(displayedStoragePath)
+                    .font(.callout.monospaced())
+                    .textSelection(.enabled)
+            }
+
+            HStack {
+                Button(environment.obsidianVaultURL == nil
+                       ? "选择 Obsidian Vault…"
+                       : "重新选择 Obsidian Vault…") {
+                    chooseObsidianVault()
+                }
+                .disabled(isMigratingStorage || environment.importProcessing.activeProjectID != nil)
+
+                Button("在 Finder 中显示") {
+                    NSWorkspace.shared.activateFileViewerSelecting([environment.fileStore.baseDirectory])
+                }
+
+                if isMigratingStorage {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("正在复制并校验现有数据…")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let storageMessage {
+                Text(storageMessage)
+                    .font(.footnote)
+                    .foregroundStyle(storageMessage.hasPrefix("切换失败")
+                                     || storageMessage.hasPrefix("无法")
+                                     ? .orange : .green)
+            } else if let storageWarning = environment.storageWarning {
+                Text(storageWarning)
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+            }
+
+            Text("选择 Vault 根目录后，默认在其中建立“帮我分析”子文件夹。首次切换会复制并校验现有数据，旧目录保留，不直接删除。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        } header: {
+            Text("存储位置")
+        }
+    }
+
+    private var displayedStoragePath: String {
+        let path = environment.fileStore.baseDirectory.standardizedFileURL.path
+        let homePath = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
+        guard path == homePath || path.hasPrefix(homePath + "/") else {
+            return path
+        }
+        return "~" + String(path.dropFirst(homePath.count))
+    }
+
+    private func chooseObsidianVault() {
+        let panel = NSOpenPanel()
+        panel.title = "选择 Obsidian Vault"
+        panel.message = "应用将在所选 Vault 下建立“帮我分析”子文件夹。"
+        panel.prompt = "选择"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = environment.obsidianVaultURL
+            ?? AppStorageLocation.suggestedObsidianVault()
+        guard panel.runModal() == .OK, let vaultURL = panel.url else { return }
+
+        let didStartAccessing = vaultURL.startAccessingSecurityScopedResource()
+        let bookmarkData: Data
+        do {
+            bookmarkData = try AppStorageLocation.bookmarkData(for: vaultURL)
+        } catch {
+            if didStartAccessing {
+                vaultURL.stopAccessingSecurityScopedResource()
+            }
+            storageMessage = "无法保存文件夹授权：\(error.localizedDescription)"
+            return
+        }
+
+        let sourceDirectory = environment.fileStore.baseDirectory
+        isMigratingStorage = true
+        storageMessage = nil
+        Task { @MainActor in
+            defer {
+                if didStartAccessing {
+                    vaultURL.stopAccessingSecurityScopedResource()
+                }
+                isMigratingStorage = false
+            }
+            do {
+                _ = try await Task.detached(priority: .userInitiated) {
+                    try AppStorageLocation.prepareVault(
+                        vaultURL,
+                        migratingFrom: sourceDirectory
+                    )
+                }.value
+                AppStorageLocation.saveBookmarkData(bookmarkData)
+                storageMessage = "已切换到 Obsidian Vault。"
+                onStorageLocationChanged()
+            } catch {
+                storageMessage = "切换失败：\(error.localizedDescription)"
             }
         }
     }
@@ -170,7 +431,7 @@ struct SettingsView: View {
     }
 
     private var isKimiLoggedIn: Bool {
-        environment.kimiOAuthTokenStore.hasTokens
+        environment.isKimiAccountConnected
     }
 
     @ViewBuilder

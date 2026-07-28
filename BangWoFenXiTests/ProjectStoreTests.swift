@@ -346,6 +346,7 @@ final class ProjectStoreTests {
         #expect(project.speakers.isEmpty)
         #expect(project.segments.isEmpty)
         #expect(project.legacySnapshots.isEmpty)
+        #expect(project.knowledgeSeeds.isEmpty)
         // 补强前生成的 Project JSON 无 legacyMetadata 键：解码为 nil，不报错
         #expect(project.legacyMetadata == nil)
         #expect(project.note.markdown == "")
@@ -506,12 +507,20 @@ final class ProjectStoreTests {
             sourceType: .importedAudio,
             scenario: .journalistInterview,
             scenarioWasUserSelected: false,
-            status: .ready
+            status: .ready,
+            knowledgeSeeds: [
+                KnowledgeSeed(
+                    seedText: "后台生成的知识种子",
+                    whyItMatters: "测试刷新",
+                    evidenceSegmentIds: [UUID()]
+                )
+            ]
         )
 
         ProjectWorkspaceView.applyImportedStorageRefresh(from: fresh, to: workspace)
 
         #expect(workspace.scenario == .journalistInterview)
         #expect(workspace.scenarioWasUserSelected == false)
+        #expect(workspace.knowledgeSeeds.count == 1)
     }
 }

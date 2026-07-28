@@ -332,6 +332,27 @@ final class ConversationAnalysisControllerTests {
         #expect(mock.calls[0].inputJSON.contains(#""scenario":"class_learning""#))
     }
 
+    @Test("人工场景切回自动后重新采纳模型建议")
+    func resettingManualScenarioRestoresSuggestion() async throws {
+        project.scenario = .classLearning
+        project.scenarioWasUserSelected = true
+        project.scenario = nil
+        project.scenarioWasUserSelected = false
+
+        addThreeSegments()
+        let evidence = try #require(project.segments.first)
+        mock.resultQueue = [ConversationAnalysisOutputDTO(
+            headline: nil, detectedScenario: "internal_meeting", scenarioConfidence: "high",
+            items: [makeItem(text: "会议决定", evidence: evidence)]
+        )]
+        advance(10_100)
+        await controller.tick()
+
+        #expect(project.scenario == .internalMeeting)
+        #expect(!project.scenarioWasUserSelected)
+        #expect(mock.calls[0].inputJSON.contains(#""scenario":"auto""#))
+    }
+
     @Test("attach 恢复：重新进入项目时以最高版本快照为当前版")
     func attachRestoresLatestSnapshot() {
         let old = ConversationAnalysisSnapshot(version: 1, analyzedThroughMs: 10_000, items: [])

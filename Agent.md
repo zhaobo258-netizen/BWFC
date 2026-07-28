@@ -17,7 +17,7 @@
 ```bash
 cd /Users/zhaobo/系统软件开发/帮我分析-同声翻译/帮我分析
 swift build                 # 编译，要求 0 警告（Swift 6 严格并发）
-Scripts/run_tests.sh        # 全部测试（当前 380 例 56 套件，必须全绿；BWFX_IT_MEDIA=1 加真实媒体探针）
+Scripts/run_tests.sh        # 全部测试（当前 429 例 64 套件，必须全绿；BWFX_IT_MEDIA=1 加真实媒体探针）
 Scripts/make_app.sh         # 产出 build/BangWoFenXi.app（ad-hoc 签名 + entitlements）
 Scripts/soak_test.sh 3600 1 # 60 分钟录音稳定性（尚未完整跑过）
 ```

@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// 项目工作台（阶段 B，方案 3「知识花园」三栏骨架，03 文档 §6.3）：
 /// 左栏录音文稿 / 中栏 AI 工作区 / 右栏我的笔记。
@@ -8,6 +9,8 @@ import SwiftUI
 /// 技术状态（转写/分人/分析/Key/分片）收进「处理详情」弹层，不占据主工作区；
 /// 异常（麦克风断开、语言资源缺失、云端暂停）才出现非阻塞横幅。
 struct ProjectWorkspaceView: View {
+    static let projectSidebarWidth: CGFloat = 232
+
     @Environment(AppEnvironment.self) private var environment
     @Environment(AppRouter.self) private var router
 
@@ -21,6 +24,7 @@ struct ProjectWorkspaceView: View {
     @State private var transcription: LocalTranscriptionController?
     @State private var diarization: DiarizationController?
     @State private var analysis: ConversationAnalysisController?
+    @State private var knowledgeGarden: KnowledgeGardenController?
     @State private var noteController: NoteController?
     @State private var runtimePersistence: ProjectRuntimePersistenceController?
     @State private var operationError: String?
@@ -30,6 +34,10 @@ struct ProjectWorkspaceView: View {
     @State private var showBackConfirmation = false
     @State private var showSpeakerPanel = false
     @State private var newDeviceID: String?
+    @State private var sidebarProjects: [Project] = []
+    @AppStorage("bwfx.workspace.projectSidebarVisible") private var prefersProjectSidebarVisible = true
+    @State private var isProjectSidebarOverlayPresented = false
+    @State private var isNotesInspectorPresented = false
     /// 中栏页签：结构总结 / 分析卡片（阶段 D 换通用分析后扩展四页签）
     @State private var centerTab: CenterTab = .summary
     /// 本会话已在当前视图内实际开录（恢复横幅只在「打开时即异常」的旧会话上出现，
@@ -41,61 +49,20 @@ struct ProjectWorkspaceView: View {
     private enum CenterTab: String, CaseIterable {
         case summary = "实时总结"
         case insights = "动机与目的"
+        case bloom = "开花"
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if let project, let meeting {
-                topBar(project: project, meeting: meeting)
-                Divider()
-                if recorder?.writeFailureInterrupted == true {
-                    writeFailureBanner
-                } else if recorder?.deviceInterrupted == true {
-                    deviceInterruptedBanner(meeting: meeting)
-                }
-                if transcription?.availability?.assetState == .supportedNotInstalled
-                    || transcription?.assetDownloadProgress != nil {
-                    assetDownloadBanner
-                }
-                if case .suspended(let reason) = diarization?.cloudState {
-                    cloudSuspendedBanner(reason: reason)
-                }
-                if case .suspended(let reason) = analysis?.state {
-                    analysisSuspendedBanner(reason: reason)
-                }
-                if meeting.status.isAbnormalIfAppRelaunched, !isFinishing, !didStartSessionThisView,
-                   environment.importProcessing.activeProjectID != project.id {
-                    abnormalBanner(meeting: meeting)
-                }
-                if let operationError {
-                    errorBanner(text: operationError)
-                }
-                if project.sourceType != .liveRecording {
-                    importProgressSection(project: project)
-                }
-                ThreeColumnLayout {
-                    transcriptColumn(meeting: meeting)
-                        .background(BWTheme.columnBackground)
-                } center: {
-                    analysisColumn(meeting: meeting)
-                        .background(BWTheme.paper)
-                } right: {
-                    noteColumn
-                        .background(BWTheme.columnBackground)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                if meeting.status == .recording || meeting.status == .paused {
-                    Divider()
-                    bottomRecordBar(meeting: meeting)
-                }
-            } else {
-                Text("项目不存在或已被删除")
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
+        GeometryReader { geometry in
+            workspaceBody(
+                mode: WorkspaceLayoutMode.resolve(totalWidth: geometry.size.width)
+            )
         }
         .navigationTitle(project?.title ?? "项目")
-        .onAppear { loadProject() }
+        .onAppear {
+            loadProject()
+            reloadSidebarProjects()
+        }
         .onDisappear {
             noteController?.saveNow()
             runtimePersistence?.flush()
@@ -138,6 +105,327 @@ struct ProjectWorkspaceView: View {
         }
     }
 
+    @ViewBuilder
+    private func workspaceBody(mode: WorkspaceLayoutMode) -> some View {
+        if mode == .narrow {
+            workspaceBase(mode: mode)
+                .inspector(isPresented: $isNotesInspectorPresented) {
+                    noteColumn
+                        .background(BWTheme.columnBackground)
+                        .inspectorColumnWidth(min: 280, ideal: 320, max: 400)
+                }
+        } else {
+            workspaceBase(mode: mode)
+        }
+    }
+
+    private func workspaceBase(mode: WorkspaceLayoutMode) -> some View {
+        let showsPersistentSidebar = mode.showsPersistentSidebar(
+            preference: prefersProjectSidebarVisible
+        )
+        return HStack(spacing: 0) {
+            if showsPersistentSidebar {
+                projectSidebar(isOverlay: false)
+                    .frame(width: Self.projectSidebarWidth)
+                Divider()
+            }
+
+            VStack(spacing: 0) {
+                if let project, let meeting {
+                    topBar(project: project, meeting: meeting, mode: mode)
+                    Divider()
+                    if recorder?.writeFailureInterrupted == true {
+                        writeFailureBanner
+                    } else if recorder?.deviceInterrupted == true {
+                        deviceInterruptedBanner(meeting: meeting)
+                    }
+                    if transcription?.availability?.assetState == .supportedNotInstalled
+                        || transcription?.assetDownloadProgress != nil {
+                        assetDownloadBanner
+                    }
+                    if case .suspended(let reason) = diarization?.cloudState {
+                        cloudSuspendedBanner(reason: reason)
+                    }
+                    if case .suspended(let reason) = analysis?.state {
+                        analysisSuspendedBanner(reason: reason)
+                    }
+                    if meeting.status.isAbnormalIfAppRelaunched, !isFinishing, !didStartSessionThisView,
+                       environment.importProcessing.activeProjectID != project.id {
+                        abnormalBanner(meeting: meeting)
+                    }
+                    if let operationError {
+                        errorBanner(text: operationError)
+                    }
+                    if project.sourceType != .liveRecording {
+                        importProgressSection(project: project)
+                    }
+                    workspaceColumns(mode: mode, meeting: meeting)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    if meeting.status == .recording || meeting.status == .paused {
+                        Divider()
+                        bottomRecordBar(meeting: meeting)
+                    }
+                } else {
+                    Text("项目不存在或已被删除")
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+        }
+        .overlay(alignment: .leading) {
+            if mode != .wide, isProjectSidebarOverlayPresented {
+                ZStack(alignment: .leading) {
+                    Color.black.opacity(0.14)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            isProjectSidebarOverlayPresented = false
+                        }
+                    projectSidebar(isOverlay: true)
+                        .frame(width: Self.projectSidebarWidth)
+                        .background(BWTheme.columnBackground)
+                        .shadow(color: .black.opacity(0.24), radius: 16, x: 5)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .zIndex(10)
+            }
+        }
+        .onChange(of: mode) { _, newMode in
+            if newMode == .wide {
+                isProjectSidebarOverlayPresented = false
+            }
+            if newMode != .narrow {
+                isNotesInspectorPresented = false
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func workspaceColumns(mode: WorkspaceLayoutMode, meeting: Meeting) -> some View {
+        if mode == .narrow {
+            TwoColumnLayout {
+                transcriptColumn(meeting: meeting)
+                    .background(BWTheme.columnBackground)
+            } center: {
+                analysisColumn(meeting: meeting)
+                    .background(BWTheme.paper)
+            }
+        } else {
+            ThreeColumnLayout(
+                minimums: mode == .wide ? .wide : .compact
+            ) {
+                transcriptColumn(meeting: meeting)
+                    .background(BWTheme.columnBackground)
+            } center: {
+                analysisColumn(meeting: meeting)
+                    .background(BWTheme.paper)
+            } right: {
+                noteColumn
+                    .background(BWTheme.columnBackground)
+            }
+        }
+    }
+
+    // MARK: - 项目侧栏
+
+    private func projectSidebar(isOverlay: Bool) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                BWBrandMark(size: 24)
+                Text("项目")
+                    .font(.headline)
+                Spacer()
+                Button {
+                    if isOverlay {
+                        isProjectSidebarOverlayPresented = false
+                    } else {
+                        prefersProjectSidebarVisible = false
+                    }
+                } label: {
+                    Image(systemName: "sidebar.left")
+                }
+                .buttonStyle(.plain)
+                .help(isOverlay ? "关闭项目列表" : "收起项目侧栏")
+                .accessibilityLabel(isOverlay ? "关闭项目列表" : "收起项目侧栏")
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 13)
+
+            Divider()
+
+            Button {
+                if isOverlay {
+                    isProjectSidebarOverlayPresented = false
+                }
+                if let meeting, meeting.status == .recording || meeting.status == .paused {
+                    showBackConfirmation = true
+                } else {
+                    attemptNavigateHome()
+                }
+            } label: {
+                Label("全部项目", systemImage: "square.grid.2x2")
+                    .font(.callout)
+                    .fontWeight(.medium)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 9)
+                    .background(BWTheme.card, in: RoundedRectangle(cornerRadius: 8))
+            }
+            .buttonStyle(.plain)
+            .padding(10)
+
+            ScrollView {
+                LazyVStack(spacing: 3) {
+                    ForEach(ProjectHomeSupport.sortedForDisplay(sidebarProjects)) { item in
+                        Button {
+                            switchProject(to: item.id)
+                            if isOverlay {
+                                isProjectSidebarOverlayPresented = false
+                            }
+                        } label: {
+                            projectSidebarRow(item)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(item.id != projectID && isRecordingActive)
+                        .help(item.id != projectID && isRecordingActive
+                              ? "录音进行中，结束后才能切换项目"
+                              : item.title)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.bottom, 8)
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
+                Label(
+                    environment.obsidianVaultURL == nil ? "本机保存" : "Obsidian 保存",
+                    systemImage: environment.obsidianVaultURL == nil ? "internaldrive" : "square.stack.3d.up"
+                )
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                Text(Self.displayStoragePath(
+                    baseDirectory: environment.fileStore.baseDirectory
+                ))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+
+                Button {
+                    revealCurrentProjectInFinder()
+                } label: {
+                    Label("在 Finder 中显示", systemImage: "folder")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+            }
+            .padding(12)
+        }
+        .background(BWTheme.columnBackground)
+    }
+
+    private func projectSidebarRow(_ item: Project) -> some View {
+        let isSelected = item.id == projectID
+        return VStack(alignment: .leading, spacing: 5) {
+            Text(item.title)
+                .font(.callout)
+                .fontWeight(isSelected ? .semibold : .regular)
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(sidebarStatusColor(item.status))
+                    .frame(width: 6, height: 6)
+                Text(item.status.displayName)
+                Text("·")
+                Text(ProjectHomeSupport.sourceLabel(for: item.sourceType))
+                Spacer(minLength: 0)
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .background(
+            isSelected ? BWTheme.accent.opacity(0.13) : Color.clear,
+            in: RoundedRectangle(cornerRadius: 8)
+        )
+        .overlay(alignment: .leading) {
+            if isSelected {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(BWTheme.accent)
+                    .frame(width: 3)
+                    .padding(.vertical, 7)
+            }
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var isRecordingActive: Bool {
+        meeting?.status == .recording || meeting?.status == .paused
+    }
+
+    private func sidebarStatusColor(_ status: ProjectStatus) -> Color {
+        switch status {
+        case .recording, .failed: return .red
+        case .paused, .processing, .readyWithWarnings: return .orange
+        case .ready: return .green
+        case .creating: return .gray
+        }
+    }
+
+    private func reloadSidebarProjects() {
+        do {
+            sidebarProjects = try environment.allProjects()
+        } catch {
+            operationError = "项目列表读取失败（\(String(describing: type(of: error)))）"
+        }
+    }
+
+    private func switchProject(to id: UUID) {
+        guard id != projectID else { return }
+        guard !isRecordingActive else {
+            operationError = "录音进行中，请结束录音后再切换项目。"
+            return
+        }
+        let saved = noteController?.saveNow() ?? true
+        guard Self.canNavigateHome(afterNoteSave: saved) else {
+            operationError = "笔记尚未保存成功，已阻止切换项目。请在右栏检查错误并重试保存。"
+            return
+        }
+        runtimePersistence?.flush()
+        router.showProjectWorkspace(id, autoStart: false)
+    }
+
+    static func displayStoragePath(
+        baseDirectory: URL,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> String {
+        let path = baseDirectory.standardizedFileURL.path
+        let homePath = homeDirectory.standardizedFileURL.path
+        guard path == homePath || path.hasPrefix(homePath + "/") else {
+            return path
+        }
+        return "~" + String(path.dropFirst(homePath.count))
+    }
+
+    private func revealCurrentProjectInFinder() {
+        let projectDirectory = environment.fileStore.meetingDirectory(for: projectID)
+        let target = FileManager.default.fileExists(atPath: projectDirectory.path)
+            ? projectDirectory
+            : environment.fileStore.baseDirectory
+        guard FileManager.default.fileExists(atPath: target.path) else {
+            operationError = "本机保存目录尚未创建。"
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([target])
+    }
+
     // MARK: - 导航门禁
 
     /// 笔记保存门禁（Codex 审计补强）：保存失败不得离开工作台
@@ -157,8 +445,29 @@ struct ProjectWorkspaceView: View {
 
     // MARK: - 顶部栏（03 §6.3：只保留标题、录音状态、同步状态与少量全局动作）
 
-    private func topBar(project: Project, meeting: Meeting) -> some View {
-        HStack(spacing: 12) {
+    private func topBar(
+        project: Project,
+        meeting: Meeting,
+        mode: WorkspaceLayoutMode
+    ) -> some View {
+        let showsPersistentSidebar = mode.showsPersistentSidebar(
+            preference: prefersProjectSidebarVisible
+        )
+        return HStack(spacing: mode == .narrow ? 8 : 12) {
+            if !showsPersistentSidebar {
+                Button {
+                    if mode == .wide {
+                        prefersProjectSidebarVisible = true
+                    } else {
+                        isProjectSidebarOverlayPresented = true
+                    }
+                } label: {
+                    Image(systemName: "sidebar.left")
+                }
+                .help(mode == .wide ? "显示项目侧栏" : "打开项目列表")
+                .accessibilityLabel(mode == .wide ? "显示项目侧栏" : "打开项目列表")
+            }
+
             Button {
                 if meeting.status == .recording || meeting.status == .paused {
                     showBackConfirmation = true
@@ -166,19 +475,28 @@ struct ProjectWorkspaceView: View {
                     attemptNavigateHome()
                 }
             } label: {
-                Label("项目", systemImage: "chevron.left")
+                if mode == .narrow {
+                    Image(systemName: "chevron.left")
+                } else {
+                    Label("项目", systemImage: "chevron.left")
+                }
             }
+            .help("返回全部项目")
+            .accessibilityLabel("返回全部项目")
 
             // 项目标题：可单击修改
-            TitleField(title: Binding(
-                get: { project.title },
-                set: { newTitle in
-                    project.title = newTitle
-                    meeting.title = newTitle
-                    project.lastActivityAt = Date()
-                    persistProject(fields: .title)
-                }
-            ))
+            TitleField(
+                title: Binding(
+                    get: { project.title },
+                    set: { newTitle in
+                        project.title = newTitle
+                        meeting.title = newTitle
+                        project.lastActivityAt = Date()
+                        persistProject(fields: .title)
+                    }
+                ),
+                maximumWidth: mode == .narrow ? 180 : 320
+            )
 
             // 录音状态（录音中红点清晰可见）
             HStack(spacing: 6) {
@@ -213,13 +531,29 @@ struct ProjectWorkspaceView: View {
 
             Spacer()
 
+            if mode == .narrow {
+                Button {
+                    isNotesInspectorPresented.toggle()
+                } label: {
+                    Image(systemName: "note.text")
+                }
+                .help(isNotesInspectorPresented ? "关闭我的笔记" : "打开我的笔记")
+                .accessibilityLabel(isNotesInspectorPresented ? "关闭我的笔记" : "打开我的笔记")
+                .accessibilityValue(isNotesInspectorPresented ? "已打开" : "已关闭")
+            }
+
             // 说话人与声纹面板
             Button {
                 showSpeakerPanel = true
             } label: {
-                Label("说话人", systemImage: "person.2")
+                if mode == .narrow {
+                    Image(systemName: "person.2")
+                } else {
+                    Label("说话人", systemImage: "person.2")
+                }
             }
             .help("管理说话人与声纹样本")
+            .accessibilityLabel("管理说话人")
 
             // 技术状态收进处理详情弹层
             ProcessingDetailsButton(
@@ -240,7 +574,7 @@ struct ProjectWorkspaceView: View {
                 }
             )
         }
-        .padding(.horizontal, 16)
+        .padding(.horizontal, mode == .narrow ? 10 : 16)
         .padding(.vertical, 10)
         .background(.bar)
     }
@@ -248,6 +582,7 @@ struct ProjectWorkspaceView: View {
     /// 可单击编辑的项目标题
     private struct TitleField: View {
         @Binding var title: String
+        let maximumWidth: CGFloat
         @State private var draft: String = ""
         @State private var isEditing = false
 
@@ -259,7 +594,7 @@ struct ProjectWorkspaceView: View {
                     isEditing = false
                 })
                 .textFieldStyle(.roundedBorder)
-                .frame(maxWidth: 320)
+                .frame(maxWidth: maximumWidth)
             } else {
                 Button {
                     draft = title
@@ -268,6 +603,7 @@ struct ProjectWorkspaceView: View {
                     Text(title)
                         .font(.headline)
                         .lineLimit(1)
+                        .frame(maxWidth: maximumWidth, alignment: .leading)
                 }
                 .buttonStyle(.plain)
                 .help("单击修改项目标题")
@@ -326,7 +662,14 @@ struct ProjectWorkspaceView: View {
                     scenarioPicker(project: project)
                 }
                 Spacer()
-                if analysis?.state == .analyzing {
+                if centerTab == .bloom, knowledgeGarden?.state == .expanding {
+                    HStack(spacing: 4) {
+                        ProgressView().controlSize(.mini)
+                        Text("开花中")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                } else if analysis?.state == .analyzing {
                     HStack(spacing: 4) {
                         ProgressView().controlSize(.mini)
                         Text("分析中")
@@ -345,11 +688,13 @@ struct ProjectWorkspaceView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(maxWidth: 220)
+                .frame(maxWidth: 300)
                 .labelsHidden()
+                .tint(BWTheme.accent)
             }
             .padding(.horizontal, 16)
-            .padding(.vertical, 8)
+            .frame(minHeight: 44)
+            .background(.bar)
 
             // 旧谈判项目（仅有迁移快照、无 V2 快照）继续用旧渲染（03 §16D 兼容显示）
             let showLegacy = analysis?.currentSnapshot == nil
@@ -387,6 +732,18 @@ struct ProjectWorkspaceView: View {
                         onEvidenceTap: locateEvidence
                     )
                 }
+            case .bloom:
+                if let knowledgeGarden {
+                    KnowledgeGardenView(
+                        controller: knowledgeGarden,
+                        onEvidenceTap: locateEvidence
+                    )
+                } else {
+                    ContentUnavailableView(
+                        "开花功能正在准备",
+                        systemImage: "leaf"
+                    )
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -400,13 +757,25 @@ struct ProjectWorkspaceView: View {
     /// 场景选择器（03 §3.2：自动建议 + 用户随时修正；不阻塞任何流程）
     private func scenarioPicker(project: Project) -> some View {
         Menu {
-            ForEach(ProjectScenario.allCases, id: \.self) { scenario in
+            Button {
+                project.scenario = nil
+                project.scenarioWasUserSelected = false
+                persistProject(fields: .userScenario)
+            } label: {
+                if !project.scenarioWasUserSelected {
+                    Label("自动判断", systemImage: "checkmark")
+                } else {
+                    Text("自动判断")
+                }
+            }
+            Divider()
+            ForEach(ProjectHomeSupport.recordingScenarioOrder, id: \.self) { scenario in
                 Button {
                     project.scenario = scenario
                     project.scenarioWasUserSelected = true
                     persistProject(fields: .userScenario)
                 } label: {
-                    if project.scenario == scenario {
+                    if project.scenarioWasUserSelected, project.scenario == scenario {
                         Label(scenario.displayName, systemImage: "checkmark")
                     } else {
                         Text(scenario.displayName)
@@ -416,13 +785,25 @@ struct ProjectWorkspaceView: View {
         } label: {
             HStack(spacing: 3) {
                 Image(systemName: "tag")
-                Text(project.scenario?.displayName ?? "场景：自动")
+                if project.scenarioWasUserSelected, let scenario = project.scenario {
+                    Text(scenario.displayName)
+                } else if let suggested = project.scenario {
+                    Text("自动 · \(suggested.displayName)")
+                } else {
+                    Text("场景：自动")
+                }
             }
             .font(.caption)
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
         .help(project.scenarioWasUserSelected ? "场景（已手动选择）" : "场景（自动建议，可修正）")
+        .accessibilityLabel("项目场景")
+        .accessibilityValue(
+            project.scenarioWasUserSelected
+                ? (project.scenario?.displayName ?? "未设置")
+                : "自动判断"
+        )
     }
 
     private var noteColumn: some View {
@@ -437,6 +818,21 @@ struct ProjectWorkspaceView: View {
                 .scrollContentBackground(.hidden)
                 .padding(.horizontal, 12)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .overlay(alignment: .topLeading) {
+                    if noteController.markdown.isEmpty {
+                        HStack(spacing: 8) {
+                            Image(systemName: "square.and.pencil")
+                                .foregroundStyle(BWTheme.accent.opacity(0.7))
+                            Text("在这里记录判断、问题和待办")
+                                .font(.callout)
+                                .foregroundStyle(.tertiary)
+                        }
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 12)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                    }
+                }
 
                 Divider()
                 // 保存状态：成功显示时间；失败如实显示（不静默丢失）
@@ -480,7 +876,8 @@ struct ProjectWorkspaceView: View {
             Spacer()
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 10)
+        .frame(minHeight: 44)
+        .background(.bar)
     }
 
     // MARK: - 底部录音条（录音/暂停时始终可达：暂停 / 继续 / 标记 / 结束）
@@ -772,7 +1169,9 @@ struct ProjectWorkspaceView: View {
             meeting.snapshots = fresh.legacySnapshots
             // 分析快照刷新（导入流水线的最终分析在后台生成；V2 快照直接挂在 Project 上）
             analysis?.attach(to: project)
+            knowledgeGarden?.attach(to: project)
         }
+        reloadSidebarProjects()
     }
 
     static func applyImportedStorageRefresh(from fresh: Project, to project: Project) {
@@ -782,6 +1181,7 @@ struct ProjectWorkspaceView: View {
         project.endedAt = fresh.endedAt
         project.legacySnapshots = fresh.legacySnapshots
         project.analysisSnapshots = fresh.analysisSnapshots
+        project.knowledgeSeeds = fresh.knowledgeSeeds
         project.segments = fresh.segments
         project.scenario = fresh.scenario
         project.scenarioWasUserSelected = fresh.scenarioWasUserSelected
@@ -850,6 +1250,22 @@ struct ProjectWorkspaceView: View {
             keyStore: environment.keyStore(for: .diarization)
         )
 
+        let knowledgeController = KnowledgeGardenController(
+            expansionService: environment.knowledgeExpansion,
+            providerFactory: { [environment] in
+                environment.makeKnowledgeProviders()
+            }
+        )
+        knowledgeController.onUpdated = { [environment] in
+            do {
+                try environment.persist(project, fields: .knowledgeGarden)
+            } catch {
+                self.operationError = "知识开花保存失败（\(String(describing: type(of: error)))）"
+            }
+        }
+        knowledgeController.attach(to: project)
+        knowledgeGarden = knowledgeController
+
         let analysisController = ConversationAnalysisController(
             service: environment.conversationAnalysis,
             triggerConfig: project.sourceType == .liveRecording ? .liveRecording : AnalysisTrigger()
@@ -860,6 +1276,7 @@ struct ProjectWorkspaceView: View {
             // V2 快照直接写在 Project 上，无需运行时桥接
             do {
                 try environment.persist(project, fields: .analysis)
+                knowledgeController.refreshCandidates()
             } catch {
                 Task { @MainActor in self.operationError = "项目保存失败（\(String(describing: type(of: error)))）" }
             }
@@ -877,6 +1294,7 @@ struct ProjectWorkspaceView: View {
         if let runtimePersistence {
             if runtimePersistence.flush(force: true) {
                 operationError = nil
+                reloadSidebarProjects()
             }
             return
         }
@@ -887,6 +1305,7 @@ struct ProjectWorkspaceView: View {
                 : .manualSegments
             try environment.persist(project, fields: fields)
             operationError = nil
+            reloadSidebarProjects()
         } catch {
             operationError = "项目保存失败（\(String(describing: type(of: error)))）"
         }
@@ -896,6 +1315,7 @@ struct ProjectWorkspaceView: View {
         guard let project else { return }
         do {
             try environment.persist(project, fields: fields)
+            reloadSidebarProjects()
         } catch {
             operationError = "项目保存失败（\(String(describing: type(of: error)))）"
         }

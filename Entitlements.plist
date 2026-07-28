@@ -14,5 +14,8 @@
 	<!-- Powerbox：读写用户通过打开/保存面板或拖放明确选择的文件 -->
 	<key>com.apple.security.files.user-selected.read-write</key>
 	<true/>
+	<!-- 持久化用户选择的 Obsidian Vault 访问权限 -->
+	<key>com.apple.security.files.bookmarks.app-scope</key>
+	<true/>
 </dict>
 </plist>

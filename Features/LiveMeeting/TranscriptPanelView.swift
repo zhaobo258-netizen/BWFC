@@ -86,11 +86,19 @@ struct TranscriptPanelView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 6) {
                         if segments.isEmpty {
-                            Text("发言后将在此显示实时转写…")
-                                .font(.callout)
-                                .foregroundStyle(.tertiary)
-                                .frame(maxWidth: .infinity, alignment: .center)
-                                .padding(.top, 12)
+                            VStack(spacing: 8) {
+                                Image(systemName: "waveform")
+                                    .font(.title2)
+                                    .foregroundStyle(BWTheme.accent.opacity(0.75))
+                                Text("等待第一段发言")
+                                    .font(.callout)
+                                    .fontWeight(.medium)
+                                Text("开始说话后，实时转写会显示在这里")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .padding(.top, 28)
                         }
                         ForEach(rows) { row in
                             TranscriptRowView(row: row)

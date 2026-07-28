@@ -58,4 +58,37 @@ final class ProjectHomeSupportTests {
         #expect(ProjectHomeSupport.sourceLabel(for: .importedAudio) == "导入音频")
         #expect(ProjectHomeSupport.sourceLabel(for: .importedVideo) == "导入视频")
     }
+
+    @Test("录音场景按产品顺序展示")
+    func recordingScenarioOrder() {
+        #expect(ProjectHomeSupport.recordingScenarioOrder == [
+            .clientVisit,
+            .internalMeeting,
+            .journalistInterview,
+            .classLearning,
+            .freeform
+        ])
+    }
+
+    @Test("自动场景创建项目时不冒充人工选择")
+    func automaticRecordingProject() {
+        let date = Date(timeIntervalSince1970: 1_000)
+        let project = ProjectHomeSupport.makeRecordingProject(at: date, scenario: nil)
+        #expect(project.sourceType == .liveRecording)
+        #expect(project.scenario == nil)
+        #expect(!project.scenarioWasUserSelected)
+        #expect(project.status == .creating)
+        #expect(project.createdAt == date)
+        #expect(project.lastActivityAt == date)
+    }
+
+    @Test("人工场景创建项目时保存选择来源")
+    func manuallyClassifiedRecordingProject() {
+        let project = ProjectHomeSupport.makeRecordingProject(
+            at: Date(timeIntervalSince1970: 1_000),
+            scenario: .internalMeeting
+        )
+        #expect(project.scenario == .internalMeeting)
+        #expect(project.scenarioWasUserSelected)
+    }
 }

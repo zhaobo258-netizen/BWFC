@@ -143,15 +143,26 @@ struct ConversationAnalysisSchemaTests {
         #expect(snapshot.items[1].subjectSpeakerId == nil)
     }
 
-    // MARK: - 四场景同一 Schema
+    // MARK: - 五场景同一 Schema
 
-    @Test("四个场景 wire 名往返一致（同一 Schema，无场景私有字段）")
+    @Test("五个场景 wire 名往返一致（同一 Schema，无场景私有字段）")
     func scenarioWireRoundTrip() {
         for scenario in ProjectScenario.allCases {
             let wire = ConversationAnalysisTaxonomy.wireName(for: scenario)
             #expect(ConversationAnalysisTaxonomy.scenario(fromWire: wire) == scenario)
         }
+        #expect(ConversationAnalysisTaxonomy.wireName(for: .internalMeeting) == "internal_meeting")
         #expect(ConversationAnalysisTaxonomy.scenario(fromWire: "board_meeting") == nil)
+    }
+
+    @Test("五个场景 Codable 往返及中文显示名稳定")
+    func scenarioCodableAndDisplayNames() throws {
+        let expectedNames = ["客户拜访", "内部会议", "课堂培训", "访谈采访", "自由记录"]
+        #expect(ProjectScenario.allCases.map(\.displayName) == expectedNames)
+        for scenario in ProjectScenario.allCases {
+            let data = try JSONEncoder().encode(scenario)
+            #expect(try JSONDecoder().decode(ProjectScenario.self, from: data) == scenario)
+        }
     }
 
     @Test("全部类别 wire 名往返一致且互不重复")

@@ -58,6 +58,12 @@ enum ConversationAnalysisPrompt {
             行动项（action_item）；深挖客户的顾虑（possible_concern）、决策因素与未明说的目标\
             （possible_motive/expression_purpose）、立场变化（stance_change）。
             """
+        case .internalMeeting:
+            return """
+            本场对话是内部会议。侧重：议题与事实（topic/fact）、已经形成的决定（decision）、\
+            责任人与后续行动（action_item）、尚未解决的问题（open_question），以及明确出现的\
+            分歧、顾虑与风险（possible_concern/contradiction_evasion）。动机类条目仅在证据充分时输出。
+            """
         case .classLearning:
             return """
             本场对话是课堂/培训。侧重：章节结构（topic）、概念（concept）、例子（example）、\
@@ -66,12 +72,18 @@ enum ConversationAnalysisPrompt {
             """
         case .journalistInterview:
             return """
-            本场对话是记者采访。侧重：问答结构（topic）、可直接引用的关键原话（key_quote）、\
+            本场对话是访谈/采访。侧重：问答结构（topic）、可直接引用的关键原话（key_quote）、\
             受访者的明确立场（fact/explicit_need）、表达目的（expression_purpose）、\
             回避与矛盾（contradiction_evasion）、需要核实的事实（fact_check）、\
             下一轮追问线索（follow_up_question）。
             """
-        case .freeform, nil:
+        case .freeform:
+            return """
+            本场内容是自由记录。按通用视角整理：主题（topic）、事实（fact）、决定（decision）、\
+            行动项（action_item）、待确认问题（open_question），以及有明确证据支持的诉求与\
+            表达目的（explicit_need/expression_purpose）。不要强行套用会议、拜访或采访结构。
+            """
+        case nil:
             return """
             场景未指定。请先按内容判断最可能的场景（detected_scenario），\
             再按通用视角整理：主题（topic）、事实（fact）、决定（decision）、\
@@ -107,7 +119,7 @@ enum ConversationAnalysisPrompt {
     JSON 对象必须包含以下字段：
     - headline：字符串或 null，一句话总览（内容不足时为 null）；
     - detected_scenario：字符串或 null，只能是 client_visit / class_learning /
-      journalist_interview / freeform；
+      internal_meeting / journalist_interview / freeform；
     - scenario_confidence：字符串或 null，只能是 low / medium / high；
     - items：数组，元素含 category、text、subject_speaker_id（字符串或 null，
       只能用输入 speakers 中的代号）、epistemic_status、confidence、evidence_segment_ids。

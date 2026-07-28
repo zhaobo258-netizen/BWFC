@@ -136,3 +136,88 @@ final class ThreeColumnLayoutTests {
         #expect(abs(floored - Double(ThreeColumnMetrics.minLeft / (total - 2))) < 0.001)
     }
 }
+
+@Suite("工作台自适应布局")
+final class WorkspaceResponsiveLayoutTests {
+
+    @Test("窗口宽度在 960/1080/1182/1280/1440 选择固定布局模式")
+    func fixedBreakpoints() {
+        #expect(WorkspaceLayoutMode.resolve(totalWidth: 960) == .narrow)
+        #expect(WorkspaceLayoutMode.resolve(totalWidth: 1_079) == .narrow)
+        #expect(WorkspaceLayoutMode.resolve(totalWidth: 1_080) == .compact)
+        #expect(WorkspaceLayoutMode.resolve(totalWidth: 1_182) == .compact)
+        #expect(WorkspaceLayoutMode.resolve(totalWidth: 1_279) == .compact)
+        #expect(WorkspaceLayoutMode.resolve(totalWidth: 1_280) == .wide)
+        #expect(WorkspaceLayoutMode.resolve(totalWidth: 1_440) == .wide)
+    }
+
+    @Test("自动收起只影响紧凑与窄屏，不改写宽屏偏好语义")
+    func persistentSidebarOnlyOnWideScreens() {
+        #expect(!WorkspaceLayoutMode.narrow.showsPersistentSidebar(preference: true))
+        #expect(!WorkspaceLayoutMode.compact.showsPersistentSidebar(preference: true))
+        #expect(WorkspaceLayoutMode.wide.showsPersistentSidebar(preference: true))
+        #expect(!WorkspaceLayoutMode.wide.showsPersistentSidebar(preference: false))
+    }
+
+    @Test("1182 紧凑窗口三栏满足紧凑最小宽度")
+    func compactWindowKeepsThreeColumnsUsable() {
+        let widths = ThreeColumnMetrics.solve(
+            total: 1_182,
+            minimums: .compact,
+            leftFraction: 0.34,
+            rightFraction: 0.25
+        )
+        #expect(widths.left + widths.center + widths.right + 2 == 1_182)
+        #expect(widths.left >= ThreeColumnMetrics.Minimums.compact.left)
+        #expect(widths.center >= ThreeColumnMetrics.Minimums.compact.center)
+        #expect(widths.right >= ThreeColumnMetrics.Minimums.compact.right)
+    }
+
+    @Test("960 窄窗口双栏满足最小宽度并守住总宽")
+    func narrowWindowKeepsTwoColumnsUsable() {
+        let widths = TwoColumnMetrics.solve(total: 960, leftFraction: 0.34)
+        #expect(widths.left + widths.center + 2 == 960)
+        #expect(widths.left >= TwoColumnMetrics.minLeft)
+        #expect(widths.center >= TwoColumnMetrics.minCenter)
+        #expect(WorkspaceLayoutMode.narrow.usesNotesInspector)
+        #expect(!WorkspaceLayoutMode.compact.usesNotesInspector)
+    }
+}
+
+@Suite("项目侧栏")
+@MainActor
+final class ProjectSidebarTests {
+
+    @Test("1280 最小窗口展开侧栏后，文稿、分析、笔记仍满足最小宽度")
+    func minimumWindowKeepsWorkspaceUsable() {
+        let workspaceWidth = 1280 - ProjectWorkspaceView.projectSidebarWidth - 1
+        let widths = ThreeColumnMetrics.solve(
+            total: workspaceWidth,
+            leftFraction: 0.34,
+            rightFraction: 0.25
+        )
+
+        #expect(widths.left >= ThreeColumnMetrics.minLeft)
+        #expect(widths.center >= ThreeColumnMetrics.minCenter)
+        #expect(widths.right >= ThreeColumnMetrics.minRight)
+    }
+
+    @Test("本机保存路径用波浪号隐藏用户目录，外部路径保持原样")
+    func storagePathDisplay() {
+        let home = URL(fileURLWithPath: "/Users/example", isDirectory: true)
+        let appData = URL(
+            fileURLWithPath: "/Users/example/Library/Application Support/BangWoFenXi",
+            isDirectory: true
+        )
+        let external = URL(fileURLWithPath: "/Volumes/Archive/BangWoFenXi", isDirectory: true)
+
+        #expect(ProjectWorkspaceView.displayStoragePath(
+            baseDirectory: appData,
+            homeDirectory: home
+        ) == "~/Library/Application Support/BangWoFenXi")
+        #expect(ProjectWorkspaceView.displayStoragePath(
+            baseDirectory: external,
+            homeDirectory: home
+        ) == "/Volumes/Archive/BangWoFenXi")
+    }
+}

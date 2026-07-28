@@ -8,6 +8,7 @@ enum ProjectFieldOwnership: Sendable, Equatable {
     case speakers
     case manualSegments
     case analysis
+    case knowledgeGarden
     case importPipeline
 }
 
@@ -40,6 +41,7 @@ enum ProjectPersistence {
         "segments": .shared,
         "legacySnapshots": .runtime,
         "analysisSnapshots": .runtime,
+        "knowledgeSeeds": .workspace,
         "legacyMetadata": .runtime,
         "note": .workspace,
         "processingJobs": .runtime,
@@ -84,6 +86,8 @@ enum ProjectPersistence {
                 stored.scenario = incoming.scenario
                 stored.scenarioWasUserSelected = incoming.scenarioWasUserSelected
             }
+        case .knowledgeGarden:
+            stored.knowledgeSeeds = incoming.knowledgeSeeds
         case .importPipeline:
             stored.status = incoming.status
             stored.processingJobs = incoming.processingJobs
@@ -158,6 +162,12 @@ final class AppEnvironment {
     let projectStore: any ProjectStoring
     /// 会议文件存储（录音文件布局与相对路径）
     let fileStore: MeetingFileStore
+    /// 已授权的 Obsidian Vault；为 nil 时使用 App Sandbox 内的安全回退目录。
+    let obsidianVaultURL: URL?
+    /// Vault 失权等情况下向设置页展示的可恢复提示。
+    let storageWarning: String?
+    /// 持有安全作用域访问直至环境释放，避免运行中 Vault 权限提前失效。
+    private let securityScopedStorageAccess: SecurityScopedStorageAccess?
 
     /// 音频采集（阶段 1：AVAudioEngine 实现）
     let audioCapture: any AudioCaptureServicing
@@ -169,6 +179,8 @@ final class AppEnvironment {
     let negotiationAnalysis: any NegotiationAnalysisServicing
     /// V2 通用对话分析（阶段 D，语义分析师；工作台与导入流水线使用）
     let conversationAnalysis: any ConversationAnalysisServicing
+    /// “开花”中的概念解释、跨领域连接与检索词生成
+    let knowledgeExpansion: any KnowledgeExpansionServicing
     /// 导出（阶段 5 实现：生成 Markdown/JSON 内容，保存位置由用户选择）
     let exporter: any MeetingExportServicing
     /// 音视频导入（阶段 C 实现：检查 + 音轨提取）
@@ -208,8 +220,13 @@ final class AppEnvironment {
     private let keyStores: [CloudProvider: CloudAPIKeyStore]
     /// Kimi 账号 OAuth 凭证存储（设备码登录；与静态分析 Key 独立条目）
     let kimiOAuthTokenStore: KimiOAuthTokenStore
+    /// 外部知识 MCP 的非敏感连接配置与独立 Keychain Token
+    let externalMCPConfigurationStore: ExternalMCPConfigurationStore
+    let externalMCPTokenStore: CloudAPIKeyStore
     /// 分析（Kimi）是否已配置（账号已登录或静态 Key 已保存）
     private(set) var isAnalysisConfigured: Bool
+    /// Kimi OAuth 凭证条目是否存在；启动状态检查不解密凭证，避免阻塞主线程。
+    private(set) var isKimiAccountConnected: Bool
     /// 分人（OpenAI 兼容）Key 是否已配置
     private(set) var isDiarizationConfigured: Bool
 
@@ -225,11 +242,15 @@ final class AppEnvironment {
         meetingStore: any MeetingStoring,
         fileStore: MeetingFileStore,
         projectStore: (any ProjectStoring)? = nil,
+        obsidianVaultURL: URL? = nil,
+        storageWarning: String? = nil,
+        securityScopedStorageAccess: SecurityScopedStorageAccess? = nil,
         audioCapture: any AudioCaptureServicing = AVAudioCaptureService(),
         localTranscription: any LocalTranscriptionServicing = AppleSpeechTranscriptionService(),
         diarization: any DiarizationServicing = OpenAIDiarizationService(),
         negotiationAnalysis: (any NegotiationAnalysisServicing)? = nil,
         conversationAnalysis: (any ConversationAnalysisServicing)? = nil,
+        knowledgeExpansion: (any KnowledgeExpansionServicing)? = nil,
         kimiCredentials: (any KimiCredentialProviding)? = nil,
         exporter: (any MeetingExportServicing)? = nil,
         audioImport: (any AudioImportServicing)? = nil,
@@ -256,12 +277,17 @@ final class AppEnvironment {
         self.meetingStore = meetingStore
         self.fileStore = fileStore
         self.projectStore = projectStore ?? InMemoryProjectStore()
+        self.obsidianVaultURL = obsidianVaultURL
+        self.storageWarning = storageWarning
+        self.securityScopedStorageAccess = securityScopedStorageAccess
         self.audioCapture = audioCapture
         self.localTranscription = localTranscription
         self.diarization = diarization
         self.negotiationAnalysis = negotiationAnalysis ?? sharedTransport
         self.conversationAnalysis = conversationAnalysis
             ?? KimiConversationAnalysisService(transport: sharedTransport)
+        self.knowledgeExpansion = knowledgeExpansion
+            ?? KimiKnowledgeExpansionService(transport: sharedTransport)
         self.exporter = exporter ?? LocalMeetingExportService(meetingStore: meetingStore)
         self.audioImport = audioImport ?? AVFoundationAudioImportService(fileStore: fileStore)
         self.makeImportTranscriptionService = makeImportTranscriptionService ?? { AppleSpeechTranscriptionService() }
@@ -274,7 +300,15 @@ final class AppEnvironment {
 
         self.keyStores = stores
         self.kimiOAuthTokenStore = oauthStore
-        self.isAnalysisConfigured = (stores[.analysis]?.hasConfiguredKey ?? false) || oauthStore.hasTokens
+        self.externalMCPConfigurationStore = ExternalMCPConfigurationStore()
+        self.externalMCPTokenStore = CloudAPIKeyStore(
+            service: keychainServiceName,
+            account: ExternalMCPConfigurationStore.tokenAccount
+        )
+        let hasStoredOAuthTokens = oauthStore.hasStoredTokens
+        self.isKimiAccountConnected = hasStoredOAuthTokens
+        self.isAnalysisConfigured = (stores[.analysis]?.hasConfiguredKey ?? false)
+            || hasStoredOAuthTokens
         self.isDiarizationConfigured = stores[.diarization]?.hasConfiguredKey ?? false
     }
 
@@ -330,8 +364,34 @@ final class AppEnvironment {
 
     /// API Key / 登录状态变更后刷新各 provider 配置状态
     func refreshCloudConfiguration() {
-        isAnalysisConfigured = isConfigured(.analysis) || kimiOAuthTokenStore.hasTokens
+        isKimiAccountConnected = kimiOAuthTokenStore.hasStoredTokens
+        isAnalysisConfigured = isConfigured(.analysis) || isKimiAccountConnected
         isDiarizationConfigured = isConfigured(.diarization)
+    }
+
+    /// Obsidian 检索索引跨多次“开花”复用（actor 内含 5 分钟缓存；
+    /// 每次新建实例会让缓存失效，导致重复全量扫描 Vault）。
+    /// Vault URL 在环境生命周期内不变，重选 Vault 会重建整个 AppEnvironment，
+    /// 因此不存在旧 Vault 索引带入新 Vault 的问题。
+    private var cachedObsidianProvider: ObsidianKnowledgeProvider?
+
+    func makeKnowledgeProviders() -> [any KnowledgeProvider] {
+        var providers: [any KnowledgeProvider] = []
+        if let obsidianVaultURL {
+            let obsidian = cachedObsidianProvider
+                ?? ObsidianKnowledgeProvider(vaultURL: obsidianVaultURL)
+            cachedObsidianProvider = obsidian
+            providers.append(obsidian)
+        }
+        providers.append(InternetKnowledgeProvider())
+        if let configuration = externalMCPConfigurationStore.load(),
+           configuration.validatedURL != nil {
+            providers.append(ExternalMCPKnowledgeProvider(
+                configuration: configuration,
+                tokenStore: externalMCPTokenStore
+            ))
+        }
+        return providers
     }
 
     // MARK: - 会议持久化便捷入口（集中 store 读写，避免散落各视图）
@@ -382,22 +442,19 @@ final class AppEnvironment {
 
     /// 生产环境：默认 JSON 持久化 + 文件存储
     static func live() -> AppEnvironment {
-        // 旧版统一 Keychain 条目迁移（account=openai → 分析 kimi 条目）
-        CloudAPIKeyStore.migrateLegacyKeyIfNeeded()
         do {
-            let store = try JSONMeetingStore.makeDefault()
-            let projectStore = try JSONProjectStore.makeDefault()
-            let fileStore = try MeetingFileStore.makeDefault()
+            let storage = try AppStorageLocation.resolveDefault()
+            let directory = storage.baseDirectory
+            let store = try JSONMeetingStore(directory: directory)
+            let projectStore = try JSONProjectStore(directory: directory)
+            let fileStore = MeetingFileStore(baseDirectory: directory)
             // V1 → V2 一次性迁移：失败只脱敏记录，绝不抛出、绝不影响启动与旧数据
             var migrationSucceeded = true
-            if let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
-                let directory = base.appending(path: "BangWoFenXi", directoryHint: .isDirectory)
-                do {
-                    _ = try ProjectMigrationCoordinator(directory: directory).migrateIfNeeded()
-                } catch {
-                    migrationSucceeded = false
-                    AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent("project_migration_failed", error: String(describing: type(of: error))))
-                }
+            do {
+                _ = try ProjectMigrationCoordinator(directory: directory).migrateIfNeeded()
+            } catch {
+                migrationSucceeded = false
+                AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent("project_migration_failed", error: String(describing: type(of: error))))
             }
             // 录音资产缺失安全恢复（幂等；仅补写空路径且文件真实存在的项目，不动录音文件）
             if migrationSucceeded {
@@ -407,17 +464,41 @@ final class AppEnvironment {
                     AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent("project_asset_repair_failed", error: String(describing: type(of: error))))
                 }
             }
-            return AppEnvironment(meetingStore: store, fileStore: fileStore, projectStore: projectStore)
+            let environment = AppEnvironment(
+                meetingStore: store,
+                fileStore: fileStore,
+                projectStore: projectStore,
+                obsidianVaultURL: storage.obsidianVaultURL,
+                storageWarning: storage.warning,
+                securityScopedStorageAccess: storage.securityScopedAccess
+            )
+            scheduleLegacyKeyMigration(refreshing: environment)
+            return environment
         } catch {
             // 持久化初始化失败：降级为内存库，保证界面可用；
             // 仅记录脱敏错误，不含路径与正文
             AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent("storage_init_failed", error: String(describing: type(of: error))))
-            return AppEnvironment(
+            let environment = AppEnvironment(
                 meetingStore: InMemoryMeetingStore(),
                 fileStore: MeetingFileStore(baseDirectory: FileManager.default.temporaryDirectory),
                 projectStore: InMemoryProjectStore(),
                 isPersistentStorageUnavailable: true
             )
+            scheduleLegacyKeyMigration(refreshing: environment)
+            return environment
+        }
+    }
+
+    /// 旧版统一 Keychain 条目迁移（account=openai → 分析 kimi 条目）。
+    /// 迁移需要解密旧条目：ad-hoc 重签名后 Keychain ACL 可能不再信任新签名，
+    /// 解密会触发 SecurityAgent 授权交互——绝不能在启动主线程同步执行，
+    /// 否则首帧渲染前即被阻塞（与 hasStoredTokens/contains 修复同一类问题）。
+    private static func scheduleLegacyKeyMigration(refreshing environment: AppEnvironment) {
+        Task.detached(priority: .utility) {
+            CloudAPIKeyStore.migrateLegacyKeyIfNeeded()
+            await MainActor.run {
+                environment.refreshCloudConfiguration()
+            }
         }
     }
 }

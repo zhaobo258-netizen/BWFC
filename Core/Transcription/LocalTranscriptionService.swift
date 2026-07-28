@@ -411,15 +411,26 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
         let input = lock.withLock { inputContinuation }
         let analyzer = lock.withLock { self.analyzer }
         let collectTask = lock.withLock { collectorTask }
+        defer { cleanup() }
         input?.finish()
-        // 输入流结束后让分析器收尾，结果流随之结束
+        // 有限输入结束后等待剩余音频被消费并产出最终结果。
+        // finish(after: .positiveInfinity) 永远等不到对应时间点，会让导入转写永久悬挂。
         if let analyzer {
-            try? await analyzer.finish(after: CMTime.positiveInfinity)
+            do {
+                try await analyzer.finalizeAndFinishThroughEndOfInput()
+            } catch {
+                AppLog.logError(
+                    AppLog.transcription,
+                    LogSanitizer.formatEvent(
+                        "transcription_finish_failed",
+                        error: String(describing: type(of: error))
+                    )
+                )
+            }
         }
         if let collectTask {
             await collectTask.value
         }
-        cleanup()
     }
 
     func cancelSession() async {
