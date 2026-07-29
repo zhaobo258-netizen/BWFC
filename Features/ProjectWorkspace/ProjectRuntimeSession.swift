@@ -28,6 +28,19 @@ enum ProjectRuntimeSession {
         MeetingToProjectMigrator.projectStatus(for: status)
     }
 
+    // MARK: - 底部录音条可见性
+
+    /// 底部录音条只在「本次会话真的持有录音器」时出现。
+    ///
+    /// 崩溃遗留的项目状态仍是 recording/paused，但进程重启后 recorder 里没有 activeMeeting，
+    /// 此时露出录音条会让人按到暂停 —— 状态机必然抛 noActiveMeeting，且「继续」分支永远够不着。
+    /// 这类项目该走的是异常横幅的「标记为已结束」，不是录音条。
+    /// 修的是显示前提而不是放宽状态机守卫：守卫报错是对的，不能让真实的状态机错误被吞掉。
+    static func showsRecordBar(status: MeetingStatus, hasLiveRecorder: Bool) -> Bool {
+        guard hasLiveRecorder else { return false }
+        return status == .recording || status == .paused
+    }
+
     // MARK: - 时长口径
 
     /// 墙钟时长（毫秒），口径与迁移器一致：含暂停区间，不等于媒体真实时长。

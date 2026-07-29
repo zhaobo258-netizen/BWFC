@@ -51,6 +51,20 @@ final class ProjectRuntimeSessionTests {
         #expect(ProjectRuntimeSession.runtimeStatus(for: .failed) == .completed)
     }
 
+    @Test("底部录音条：仅在本次会话真的持有录音器时出现")
+    func recordBarRequiresLiveRecorder() {
+        #expect(ProjectRuntimeSession.showsRecordBar(status: .recording, hasLiveRecorder: true))
+        #expect(ProjectRuntimeSession.showsRecordBar(status: .paused, hasLiveRecorder: true))
+        // 崩溃遗留：状态仍是 recording/paused，但进程重启后没有 activeMeeting，
+        // 露出录音条只会让人按到必然抛错的暂停键
+        #expect(!ProjectRuntimeSession.showsRecordBar(status: .recording, hasLiveRecorder: false))
+        #expect(!ProjectRuntimeSession.showsRecordBar(status: .paused, hasLiveRecorder: false))
+        // 非录音态即使持有录音器也不显示
+        for status in [MeetingStatus.ready, .finalizing, .completed] {
+            #expect(!ProjectRuntimeSession.showsRecordBar(status: status, hasLiveRecorder: true))
+        }
+    }
+
     @Test("水合：参与者、legacy 字段与状态完整还原，片段深拷贝隔离")
     func rehydrateRestoresFields() throws {
         let project = makeProject(status: .ready)

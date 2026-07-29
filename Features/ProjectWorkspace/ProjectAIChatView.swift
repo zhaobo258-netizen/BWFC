@@ -14,10 +14,10 @@ struct ProjectAIChatView: View {
     @State private var isConfirmingClear = false
     @State private var isSelectingReferenceDocuments = false
     @State private var isLegacyNoteExpanded = false
+    @State private var isDropTargeted = false
 
-    private static let supportedReferenceDocumentTypes = [
-        "pdf", "md", "markdown", "txt", "rtf", "doc", "docx"
-    ].compactMap { UTType(filenameExtension: $0) }
+    private static let supportedReferenceDocumentTypes =
+        ProjectAIChatAttachmentPolicy.referenceContentTypes
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -335,12 +335,7 @@ struct ProjectAIChatView: View {
                         )
                 }
                 .buttonStyle(.plain)
-                .disabled(
-                    controller.isSending
-                        || controller.isLoadingAttachments
-                        || controller.pendingAttachments.count
-                            >= ProjectAIChatAttachmentPolicy.maximumCount
-                )
+                .disabled(!canAcceptMoreReferenceDocuments)
                 .help("引用 PDF、Word、Markdown 或文本")
                 .accessibilityLabel("引用文档")
                 .accessibilityHint("选择最多四份文档，与本次想法一起发送给 AI")
@@ -355,7 +350,7 @@ struct ProjectAIChatView: View {
                         }
                     )
                     if controller.draft.isEmpty {
-                        Text("记录想法，或向 AI 追问（⌘↩发送）")
+                        Text("记录想法，或向 AI 追问（↩ 发送，⇧↩ 换行）")
                             .font(.body)
                             .foregroundStyle(.tertiary)
                             .padding(.horizontal, 9)
@@ -371,7 +366,18 @@ struct ProjectAIChatView: View {
                 )
                 .overlay {
                     RoundedRectangle(cornerRadius: 7)
-                        .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
+                        .stroke(
+                            isDropTargeted
+                                ? BWTheme.accent
+                                : Color.secondary.opacity(0.18),
+                            lineWidth: isDropTargeted ? 2 : 1
+                        )
+                }
+                .onDrop(
+                    of: ProjectAIChatAttachmentPolicy.referenceContentTypes + [.fileURL],
+                    isTargeted: $isDropTargeted
+                ) { providers in
+                    handleReferenceDocumentDrop(providers)
                 }
 
                 Button {
@@ -383,7 +389,7 @@ struct ProjectAIChatView: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(BWTheme.accent)
                 .disabled(!controller.canSend)
-                .help("发送想法并获取 AI 反馈（⌘↩）")
+                .help("发送想法并获取 AI 反馈（↩）")
                 .accessibilityLabel("发送想法并获取 AI 反馈")
             }
 
@@ -392,6 +398,49 @@ struct ProjectAIChatView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 9)
         .background(.bar)
+    }
+
+    /// ＋ 按钮与拖放共用同一道闸：发送中、正在读取、已达上限都不再收新文档
+    private var canAcceptMoreReferenceDocuments: Bool {
+        !controller.isSending
+            && !controller.isLoadingAttachments
+            && controller.pendingAttachments.count
+                < ProjectAIChatAttachmentPolicy.maximumCount
+    }
+
+    /// 拖放引用文档：支持一次多份，超额与不支持类型由控制器和策略各自拦。
+    /// 类型不符时同步返回 false，光标直接显示「不接受」而不是先接受再弹错。
+    private func handleReferenceDocumentDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard canAcceptMoreReferenceDocuments else { return false }
+        let candidates = providers.filter { provider in
+            provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+                && ProjectAIChatAttachmentPolicy.acceptsDrop(
+                    registeredContentTypes:
+                        provider.registeredTypeIdentifiers.compactMap(UTType.init)
+                )
+        }
+        guard !candidates.isEmpty else { return false }
+        Task { @MainActor in
+            // NSItemProvider 不是 Sendable，不能塞进任务组并发加载；
+            // 最多 4 份文件 URL，顺序取回足够快，也不必冒数据竞争的风险。
+            var collected: [URL] = []
+            for provider in candidates {
+                let url = await withCheckedContinuation {
+                    (continuation: CheckedContinuation<URL?, Never>) in
+                    _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                        continuation.resume(returning: url)
+                    }
+                }
+                if let url { collected.append(url) }
+            }
+            let accepted = collected.filter(ProjectAIChatAttachmentPolicy.acceptsDroppedFile)
+            guard !accepted.isEmpty else {
+                controller.reportUnsupportedReferenceDocumentDrop()
+                return
+            }
+            await controller.addReferenceDocuments(from: accepted)
+        }
+        return true
     }
 
     @ViewBuilder

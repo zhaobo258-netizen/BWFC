@@ -118,6 +118,112 @@ final class CloudProviderKeyIsolationTests {
         #expect(!legacyStore.hasConfiguredKey)
     }
 
+    // MARK: - 跨 service 迁移（ad-hoc 时代条目 → 当前 service）
+
+    @Test("跨 service 迁移：搬来分析 Key 与登录凭证，且旧条目必须原样保留")
+    func adHocServiceMigrationCopiesAndPreservesLegacy() throws {
+        let oldService = "\(serviceName).adhoc"
+        let oldKeychain = KeychainService(service: oldService)
+        defer {
+            for account in ["kimi", "diarization", CloudProvider.legacyAccount,
+                            KimiOAuthTokenStore.account] {
+                try? oldKeychain.delete(account: account)
+            }
+        }
+        try oldKeychain.save("adhoc-kimi-key", account: CloudProvider.analysis.account)
+        try oldKeychain.save("{\"access_token\":\"a\"}", account: KimiOAuthTokenStore.account)
+
+        CloudAPIKeyStore.migrateAdHocServiceCredentialsIfNeeded(
+            from: oldService, to: serviceName
+        )
+
+        #expect(try store(for: .analysis).readKey() == "adhoc-kimi-key")
+        #expect(
+            try KeychainService(service: serviceName)
+                .read(account: KimiOAuthTokenStore.account) == "{\"access_token\":\"a\"}"
+        )
+        // 旧条目是老板仅有的凭证副本，删除有风险；迁移只读不删
+        #expect(try oldKeychain.read(account: CloudProvider.analysis.account) == "adhoc-kimi-key",
+                "旧 service 的分析条目必须原样保留")
+        #expect(try oldKeychain.read(account: KimiOAuthTokenStore.account) != nil,
+                "旧 service 的登录凭证必须原样保留")
+        #expect(!store(for: .diarization).hasConfiguredKey, "旧 service 没有分人条目时不得凭空创建")
+    }
+
+    @Test("跨 service 迁移：当前 service 已有值时不覆盖；同名 service 直接跳过")
+    func adHocServiceMigrationSkipsWhenPresent() throws {
+        let oldService = "\(serviceName).adhoc"
+        let oldKeychain = KeychainService(service: oldService)
+        defer { try? oldKeychain.delete(account: CloudProvider.analysis.account) }
+        try oldKeychain.save("adhoc-kimi-key", account: CloudProvider.analysis.account)
+        try store(for: .analysis).saveKey("current-kimi-key")
+
+        CloudAPIKeyStore.migrateAdHocServiceCredentialsIfNeeded(
+            from: oldService, to: serviceName
+        )
+        #expect(try store(for: .analysis).readKey() == "current-kimi-key", "不得覆盖当前 service 已有凭证")
+
+        // 源与目标同名：直接跳过，不做自我复制
+        try store(for: .analysis).deleteKey()
+        CloudAPIKeyStore.migrateAdHocServiceCredentialsIfNeeded(
+            from: serviceName, to: serviceName
+        )
+        #expect(!store(for: .analysis).hasConfiguredKey)
+    }
+
+    @Test("跨 service 迁移：旧 service 只有 openai 条目时兜底填入分析条目")
+    func adHocServiceMigrationFallsBackToLegacyAccount() throws {
+        let oldService = "\(serviceName).adhoc"
+        let oldKeychain = KeychainService(service: oldService)
+        defer { try? oldKeychain.delete(account: CloudProvider.legacyAccount) }
+        try oldKeychain.save("adhoc-openai-key", account: CloudProvider.legacyAccount)
+
+        CloudAPIKeyStore.migrateAdHocServiceCredentialsIfNeeded(
+            from: oldService, to: serviceName
+        )
+
+        #expect(try store(for: .analysis).readKey() == "adhoc-openai-key")
+        #expect(try oldKeychain.read(account: CloudProvider.legacyAccount) == "adhoc-openai-key",
+                "旧条目必须原样保留")
+    }
+
+    @Test("跨 service 迁移幂等：连续两次执行结果一致")
+    func adHocServiceMigrationIdempotent() throws {
+        let oldService = "\(serviceName).adhoc"
+        let oldKeychain = KeychainService(service: oldService)
+        defer { try? oldKeychain.delete(account: CloudProvider.analysis.account) }
+        try oldKeychain.save("adhoc-kimi-key", account: CloudProvider.analysis.account)
+
+        CloudAPIKeyStore.migrateAdHocServiceCredentialsIfNeeded(
+            from: oldService, to: serviceName
+        )
+        CloudAPIKeyStore.migrateAdHocServiceCredentialsIfNeeded(
+            from: oldService, to: serviceName
+        )
+        #expect(try store(for: .analysis).readKey() == "adhoc-kimi-key")
+        #expect(try oldKeychain.read(account: CloudProvider.analysis.account) == "adhoc-kimi-key")
+    }
+
+    @Test("跨 service 迁移后 OAuth 凭证可正常解码")
+    func adHocServiceMigrationPreservesOAuthRoundTrip() throws {
+        let oldService = "\(serviceName).adhoc"
+        let oldStore = KimiOAuthTokenStore(service: oldService)
+        defer { try? oldStore.delete() }
+        let tokens = KimiOAuthTokens(
+            accessToken: "access-abc",
+            refreshToken: "refresh-def",
+            expiresAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        try oldStore.save(tokens)
+
+        CloudAPIKeyStore.migrateAdHocServiceCredentialsIfNeeded(
+            from: oldService, to: serviceName
+        )
+
+        #expect(try KimiOAuthTokenStore(service: serviceName).read() == tokens)
+        #expect(try oldStore.read() == tokens, "旧 service 的登录凭证必须原样保留")
+    }
+
     // MARK: - AppEnvironment 分 provider 状态
 
     @Test("AppEnvironment：分 provider 配置状态与 keyStore 入口")

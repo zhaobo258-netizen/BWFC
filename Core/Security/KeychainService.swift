@@ -277,4 +277,38 @@ struct CloudAPIKeyStore: Sendable {
             ))
         }
     }
+
+    /// ad-hoc 签名时代的条目存在旧 service 下；改用 v2 service 时只留了常量、没写迁移，
+    /// 导致凭证「断链」：v2 为空，旧条目仍在，界面表现为「AI 未接入」。
+    /// 本迁移只读旧条目、只写新条目，**绝不删除旧条目** —— 旧条目可能是用户仅有的凭证副本，
+    /// 且其 ACL 属于另一签名身份，删除有触发系统授权框的风险。
+    /// 读取使用禁止交互的查询；ACL 不匹配时抛错即跳过该条，不阻塞其余条目。
+    static func migrateAdHocServiceCredentialsIfNeeded(
+        from legacyService: String = CloudAPIKeyStore.legacyAdHocService,
+        to service: String = CloudAPIKeyStore.defaultService
+    ) {
+        guard legacyService != service else { return }
+        // 源 → 目标 account 映射。openai 放最后：仅当 kimi 未被填上时才兜底，
+        // 因此不会复制任何没有读取方的密文。
+        let migrations: [(source: String, destination: String)] =
+            CloudProvider.allCases.map { ($0.account, $0.account) }
+            + [(KimiOAuthTokenStore.account, KimiOAuthTokenStore.account)]
+            + [(CloudProvider.legacyAccount, CloudProvider.analysis.account)]
+        let legacy = KeychainService(service: legacyService)
+        let current = KeychainService(service: service)
+        for migration in migrations {
+            guard !current.contains(account: migration.destination) else { continue }
+            do {
+                guard let value = try legacy.read(account: migration.source),
+                      !value.isEmpty else { continue }
+                try current.save(value, account: migration.destination)
+                AppLog.persistence.info("凭证已从旧 service 迁移到当前 service")
+            } catch {
+                AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent(
+                    "adhoc_service_migration_failed",
+                    error: String(describing: type(of: error))
+                ))
+            }
+        }
+    }
 }

@@ -670,11 +670,14 @@ final class AppEnvironment {
         }
     }
 
-    /// 旧版统一 Keychain 条目迁移（account=openai → 分析 kimi 条目）。
+    /// 旧版 Keychain 条目迁移：先跨 service（ad-hoc 时代 → 当前 v2），
+    /// 再在当前 service 内做 account=openai → 分析 kimi 的旧版迁移。
+    /// 顺序不可颠倒：跨 service 迁移要先把旧值搬进来，account 迁移才有东西可搬。
     /// 迁移使用禁止交互的 Keychain 读取；ACL 不匹配时立即跳过，不弹密码框。
     /// 仍放在 utility task，避免启动首帧等待安全存储 I/O。
     private static func scheduleLegacyKeyMigration(refreshing environment: AppEnvironment) {
         Task.detached(priority: .utility) {
+            CloudAPIKeyStore.migrateAdHocServiceCredentialsIfNeeded()
             CloudAPIKeyStore.migrateLegacyKeyIfNeeded()
             await MainActor.run {
                 environment.refreshCloudConfiguration()

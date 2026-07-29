@@ -105,6 +105,10 @@ final class ProjectAIChatController {
         errorMessage = "引用文档选择失败，请重新选择。"
     }
 
+    func reportUnsupportedReferenceDocumentDrop() {
+        errorMessage = ProjectAIChatAttachmentPolicy.unsupportedDropMessage
+    }
+
     func send() async {
         guard !isSending, let project else { return }
         let typedText = draft.trimmingCharacters(in: .whitespacesAndNewlines)

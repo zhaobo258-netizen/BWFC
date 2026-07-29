@@ -5,7 +5,7 @@ struct StableNoteEditor: NSViewRepresentable {
     @Binding var text: String
     var isEditable = true
     var accessibilityLabel = "AI 共创笔记输入"
-    var accessibilityHelp = "录音过程中也可连续输入；草稿自动保存在当前项目中；按 Command Return 发送"
+    var accessibilityHelp = "录音过程中也可连续输入；草稿自动保存在当前项目中；回车发送，Shift Return 换行"
     var onSubmit: () -> Void = {}
 
     func makeCoordinator() -> Coordinator {
@@ -97,15 +97,35 @@ struct StableNoteEditor: NSViewRepresentable {
             _ textView: NSTextView,
             doCommandBy commandSelector: Selector
         ) -> Bool {
-            guard commandSelector == #selector(NSResponder.insertNewline(_:)),
-                  NSEvent.modifierFlags
-                    .intersection(.deviceIndependentFlagsMask)
-                    .contains(.command) else {
+            guard commandSelector == #selector(NSResponder.insertNewline(_:)) else {
+                return false
+            }
+            guard NoteEditorSubmitDecision.shouldSubmit(
+                modifiers: NSEvent.modifierFlags,
+                hasMarkedText: textView.hasMarkedText()
+            ) else {
                 return false
             }
             parent.onSubmit()
             return true
         }
+    }
+}
+
+enum NoteEditorSubmitDecision {
+    /// 回车语义：↩ 发送，⇧↩ 换行，⌘↩ 仍发送（保留老习惯）。
+    ///
+    /// 中文输入法联想未上屏时（hasMarkedText），↩ 是「选中候选词」而不是「发送」，
+    /// 此刻发送会把半截拼音当成消息发出去，所以一律让位给输入法。
+    static func shouldSubmit(
+        modifiers: NSEvent.ModifierFlags,
+        hasMarkedText: Bool
+    ) -> Bool {
+        guard !hasMarkedText else { return false }
+        let flags = modifiers.intersection(.deviceIndependentFlagsMask)
+        if flags.contains(.command) { return true }
+        if flags.contains(.shift) { return false }
+        return !flags.contains(.option) && !flags.contains(.control)
     }
 }
 

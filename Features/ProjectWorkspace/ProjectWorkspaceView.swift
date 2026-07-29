@@ -196,7 +196,7 @@ struct ProjectWorkspaceView: View {
                     }
                     workspaceColumns(mode: mode, meeting: meeting)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    if meeting.status == .recording || meeting.status == .paused {
+                    if isLiveSessionActive(meeting: meeting) {
                         Divider()
                         bottomRecordBar(meeting: meeting)
                     }
@@ -420,6 +420,14 @@ struct ProjectWorkspaceView: View {
 
     private var isRecordingActive: Bool {
         meeting?.status == .recording || meeting?.status == .paused
+    }
+
+    /// 本次会话是否真的持有录音器（决定底部录音条是否出现）
+    private func isLiveSessionActive(meeting: Meeting) -> Bool {
+        ProjectRuntimeSession.showsRecordBar(
+            status: meeting.status,
+            hasLiveRecorder: recorder?.activeMeeting != nil
+        )
     }
 
     private func sidebarStatusColor(_ status: ProjectStatus) -> Color {
@@ -1628,6 +1636,9 @@ struct ProjectWorkspaceView: View {
                 operationError = nil
                 if environment.isAnalysisConfigured {
                     environment.finalReportCoordinator.start(projectID: projectID)
+                } else {
+                    // 静默跳过会让人误以为「完整总结」功能缺失；必须说清原因和补救入口
+                    operationError = "AI 未连接，完整总结未生成；可前往设置连接后在「完整总结」页签手动生成。"
                 }
             } catch {
                 operationError = error.localizedDescription

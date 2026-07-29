@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import UniformTypeIdentifiers
 @testable import BangWoFenXi
 
 private actor ProjectAIChatMockService: ProjectAIChatServing {
@@ -553,5 +554,66 @@ struct ProjectAIChatTests {
         #expect(projects[0].aiChatMessages.count == 1)
         #expect(projects[0].aiChatDraft == "尚未发送")
         #expect(projects[0].noteAIContextEnabled)
+    }
+
+    // MARK: - 拖放引用文档校验
+
+    @Test("拖放类型判定：文档接受，音视频、图片与文件夹拒绝")
+    func dropAcceptsDocumentsOnly() {
+        #expect(ProjectAIChatAttachmentPolicy.acceptsContentType(.pdf))
+        #expect(ProjectAIChatAttachmentPolicy.acceptsContentType(.plainText))
+        #expect(ProjectAIChatAttachmentPolicy.acceptsContentType(.rtf))
+        // 对话框引用的是读得出文字的资料；音视频要走首页导入，不是引用
+        #expect(!ProjectAIChatAttachmentPolicy.acceptsContentType(.mp3))
+        #expect(!ProjectAIChatAttachmentPolicy.acceptsContentType(.mpeg4Movie))
+        #expect(!ProjectAIChatAttachmentPolicy.acceptsContentType(.png))
+        #expect(!ProjectAIChatAttachmentPolicy.acceptsContentType(.folder))
+        #expect(!ProjectAIChatAttachmentPolicy.acceptsContentType(.directory))
+    }
+
+    @Test("落点预判：只登记 file-url 时放行，具体类型不符时同步拒绝")
+    func dropPrejudgesByRegisteredTypes() {
+        #expect(ProjectAIChatAttachmentPolicy.acceptsDrop(
+            registeredContentTypes: [.pdf, .fileURL]))
+        #expect(!ProjectAIChatAttachmentPolicy.acceptsDrop(
+            registeredContentTypes: [.mp3, .fileURL]))
+        #expect(!ProjectAIChatAttachmentPolicy.acceptsDrop(
+            registeredContentTypes: [.folder, .fileURL]))
+        // 拿不到具体类型时放行，由 acceptsDroppedFile 落地兜底
+        #expect(ProjectAIChatAttachmentPolicy.acceptsDrop(registeredContentTypes: [.fileURL]))
+        #expect(ProjectAIChatAttachmentPolicy.acceptsDrop(registeredContentTypes: []))
+    }
+
+    @Test("落地校验：真实文档接受，音频、文件夹与不存在的路径拒绝")
+    func acceptsDroppedReferenceFileOnDisk() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "chat-drop-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let document = directory.appending(path: "brief.txt")
+        try Data("客户背景".utf8).write(to: document)
+        let audio = directory.appending(path: "a.wav")
+        try Data([0x52, 0x49, 0x46, 0x46]).write(to: audio)
+        let missing = directory.appending(path: "missing.pdf")
+
+        #expect(ProjectAIChatAttachmentPolicy.acceptsDroppedFile(at: document))
+        #expect(!ProjectAIChatAttachmentPolicy.acceptsDroppedFile(at: audio))
+        #expect(!ProjectAIChatAttachmentPolicy.acceptsDroppedFile(at: directory))
+        #expect(!ProjectAIChatAttachmentPolicy.acceptsDroppedFile(at: missing))
+        #expect(!ProjectAIChatAttachmentPolicy.acceptsDroppedFile(
+            at: URL(string: "https://example.com/a.pdf")!))
+    }
+
+    @Test("拖放类型表与 ＋ 按钮一致，覆盖全部支持的扩展名")
+    func referenceContentTypesCoverAllSupportedExtensions() {
+        for ext in ["pdf", "md", "markdown", "txt", "rtf", "doc", "docx"] {
+            let type = try? #require(UTType(filenameExtension: ext))
+            #expect(
+                type.map(ProjectAIChatAttachmentPolicy.acceptsContentType) == true,
+                "扩展名 \(ext) 必须可拖入"
+            )
+        }
     }
 }
