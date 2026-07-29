@@ -158,4 +158,64 @@ enum ProjectHomeSupport {
 
     /// 本机目录尚未创建时的提示文案
     static let missingStorageDirectoryMessage = "本机保存目录尚未创建。"
+
+    // MARK: - 删除项目
+
+    /// 为什么不「移到废纸篓」：App Sandbox 下 `trashItem` 落到容器自己的
+    /// `.Trash` 里，Finder 看不见、用户捞不回来、磁盘也不释放——那是假的安全网。
+    /// 所以照 V1 整场删除的口径做永久删除，安全感由「逐项列明 + 二次确认 +
+    /// 状态守卫」提供，而不是靠一个用户永远打不开的回收站。
+    enum ProjectDeletionBlock: Equatable {
+        /// 此刻真正在录音/暂停（本次运行登记过 recorder）
+        case liveRecording
+        /// 导入流水线正在处理这个项目
+        case importProcessing
+
+        var message: String {
+            switch self {
+            case .liveRecording:
+                return "这个项目正在录音，先结束录音再删除。"
+            case .importProcessing:
+                return "这个项目的导入处理还在进行，先等它结束或失败再删除。"
+            }
+        }
+    }
+
+    /// 删除前的拒绝理由；nil 表示可以删。
+    /// 崩溃残留的 recording/paused/processing **不拦** —— 它们本来就是用户最想清掉的垃圾，
+    /// 拦住等于让磁盘上的坏项目永远删不掉。只拦此刻真有进程在写这些文件的情况，
+    /// 否则会一边删目录、一边有任务往里写，得到半删状态。
+    static func deletionBlock(
+        for project: Project,
+        liveProjectIDs: Set<UUID>,
+        importProcessingProjectID: UUID?
+    ) -> ProjectDeletionBlock? {
+        if liveProjectIDs.contains(project.id) { return .liveRecording }
+        if importProcessingProjectID == project.id { return .importProcessing }
+        return nil
+    }
+
+    /// 删除确认文案：逐项列明将消失的内容（与 V1 `deletionSummary` 同一口径）。
+    static func deletionSummary(for project: Project) -> String {
+        let sampleCount = project.speakers.filter {
+            $0.voiceSamplePath != nil || $0.legacyVoiceReferencePath != nil
+        }.count
+        var lines = [
+            "· 本地完整录音与提取音轨",
+            "· \(sampleCount) 份声音样本、全部临时分片与队列状态",
+            "· \(project.segments.count) 条转写、\(project.analysisSnapshots.count) 版分析与"
+                + "\(project.finalReportSnapshots.count) 版完整总结",
+            "· 项目笔记与 \(project.aiChatMessages.count) 条共创记录"
+        ]
+        if project.sourceType != .liveRecording {
+            // 留档的原始导入文件也在项目目录里，一起没了；用户自己选的那份原件不受影响。
+            lines.append("· 导入时留档的原始文件副本（你自己磁盘上的原件不受影响）")
+        }
+        return """
+        将永久删除「\(project.title)」的以下全部内容，且不可恢复：
+        \(lines.joined(separator: "\n"))
+
+        已导出到应用外的文件与已同步到 Obsidian 的内容不受影响。
+        """
+    }
 }

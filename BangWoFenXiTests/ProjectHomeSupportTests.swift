@@ -250,4 +250,71 @@ final class ProjectHomeSupportTests {
             fileExists: { _ in false }
         ) == nil)
     }
+
+    // MARK: - 删除项目
+
+    @Test("正在录音的项目拒绝删除")
+    func deletionBlockedWhileLiveRecording() {
+        let project = makeProject(title: "在录", lastActivityAt: Date())
+        project.status = .recording
+        #expect(ProjectHomeSupport.deletionBlock(
+            for: project,
+            liveProjectIDs: [project.id],
+            importProcessingProjectID: nil
+        ) == .liveRecording)
+    }
+
+    @Test("导入流水线正在处理的项目拒绝删除")
+    func deletionBlockedWhileImportProcessing() {
+        let project = makeProject(title: "导入中", lastActivityAt: Date())
+        project.status = .processing
+        #expect(ProjectHomeSupport.deletionBlock(
+            for: project,
+            liveProjectIDs: [],
+            importProcessingProjectID: project.id
+        ) == .importProcessing)
+    }
+
+    @Test("崩溃残留的 recording/paused/processing 允许删除——否则坏项目永远清不掉")
+    func deletionAllowedForAbnormalLeftover() {
+        for status in [ProjectStatus.recording, .paused, .processing] {
+            let project = makeProject(title: "残留", lastActivityAt: Date())
+            project.status = status
+            #expect(ProjectHomeSupport.deletionBlock(
+                for: project,
+                liveProjectIDs: [],
+                importProcessingProjectID: nil
+            ) == nil)
+        }
+    }
+
+    @Test("别的项目在录音或导入，不影响删除当前项目")
+    func deletionAllowedWhenOtherProjectIsBusy() {
+        let project = makeProject(title: "就绪", lastActivityAt: Date())
+        let other = makeProject(title: "别的", lastActivityAt: Date())
+        #expect(ProjectHomeSupport.deletionBlock(
+            for: project,
+            liveProjectIDs: [other.id],
+            importProcessingProjectID: other.id
+        ) == nil)
+    }
+
+    @Test("删除确认逐项列明内容，导入项目额外提示原件副本")
+    func deletionSummaryListsContents() {
+        let project = makeProject(title: "客户拜访", lastActivityAt: Date())
+        project.segments = [
+            TranscriptSegment(startMs: 0, endMs: 1000, text: "一",
+                              source: .local, state: .final),
+            TranscriptSegment(startMs: 1000, endMs: 2000, text: "二",
+                              source: .local, state: .final)
+        ]
+        let live = ProjectHomeSupport.deletionSummary(for: project)
+        #expect(live.contains("客户拜访"))
+        #expect(live.contains("2 条转写"))
+        #expect(live.contains("不可恢复"))
+        #expect(!live.contains("原始文件副本"))
+
+        project.sourceType = .importedVideo
+        #expect(ProjectHomeSupport.deletionSummary(for: project).contains("原始文件副本"))
+    }
 }

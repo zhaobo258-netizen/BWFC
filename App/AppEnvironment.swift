@@ -621,6 +621,17 @@ final class AppEnvironment {
         try projectStore.saveProjects(projects)
     }
 
+    /// 删除整个项目：先摘记录再删目录（镜像 `deleteMeeting(_:)`）。
+    /// 顺序不可颠倒——先删目录再写 projects.json，中途失败会留下「有记录、无文件」的
+    /// 幽灵项目，界面里点开就是一片空白；反过来失败只剩下一个孤儿目录，
+    /// 用户看不见、下次删同名项目也不会撞车，代价小得多。
+    func deleteProject(_ project: Project) throws {
+        var projects = try projectStore.loadProjects()
+        projects.removeAll { $0.id == project.id }
+        try projectStore.saveProjects(projects)
+        try fileStore.deleteMeetingFiles(for: project.id)
+    }
+
     /// 生产环境：默认 JSON 持久化 + 文件存储
     static func live() -> AppEnvironment {
         do {

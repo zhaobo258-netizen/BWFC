@@ -19,6 +19,10 @@ struct ProjectHomeView: View {
     @State private var isResolvingLeftover = false
     @State private var renameTarget: Project?
     @State private var renameDraft = ""
+    @State private var deleteTarget: Project?
+    /// 删除等操作的失败原因。不复用 loadError：那条带死板的「项目读取失败：」前缀，
+    /// 拿它显示「正在录音，先结束再删」会变成一句读不通的假错误。
+    @State private var operationError: String?
     /// 首次录音知情确认只做一次（03 §6.1）
     @AppStorage("bwfx.recordingConsentConfirmed") private var consentConfirmed = false
 
@@ -32,6 +36,11 @@ struct ProjectHomeView: View {
                     recordingScenarioSection
                     if let loadError {
                         Label("项目读取失败：\(loadError)", systemImage: "exclamationmark.triangle")
+                            .font(.callout)
+                            .foregroundStyle(.orange)
+                    }
+                    if let operationError {
+                        Label(operationError, systemImage: "exclamationmark.triangle")
                             .font(.callout)
                             .foregroundStyle(.orange)
                     }
@@ -76,6 +85,21 @@ struct ProjectHomeView: View {
             Button("取消", role: .cancel) { renameTarget = nil }
         } message: {
             Text("只改标题，不影响录音文件与已生成的分析。")
+        }
+        .confirmationDialog(
+            "删除这个项目？",
+            isPresented: Binding(
+                get: { deleteTarget != nil },
+                set: { if !$0 { deleteTarget = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("永久删除", role: .destructive) { commitDelete() }
+            Button("取消", role: .cancel) { deleteTarget = nil }
+        } message: {
+            if let deleteTarget {
+                Text(ProjectHomeSupport.deletionSummary(for: deleteTarget))
+            }
         }
     }
 
@@ -347,6 +371,9 @@ struct ProjectHomeView: View {
                     },
                     onRevealInFinder: {
                         revealInFinder(project)
+                    },
+                    onDelete: {
+                        requestDelete(project)
                     }
                 )
             }
@@ -380,7 +407,7 @@ struct ProjectHomeView: View {
         }
     }
 
-    // MARK: - 重命名与在 Finder 中显示（Bug 7 最小版；删除待单独授权）
+    // MARK: - 重命名、在 Finder 中显示与删除
 
     /// 只写 title 字段：走 .title 所有权，避免覆盖工作台或流水线正在改的其他字段。
     private func commitRename() {
@@ -407,6 +434,42 @@ struct ProjectHomeView: View {
             return
         }
         NSWorkspace.shared.activateFileViewerSelecting([target])
+    }
+
+    /// 守卫放在弹确认之前：不可删的项目就别先问「确定吗」再拒绝，
+    /// 那等于让用户按下「永久删除」之后才知道白按了。
+    private func requestDelete(_ project: Project) {
+        if let block = ProjectHomeSupport.deletionBlock(
+            for: project,
+            liveProjectIDs: environment.liveRecordingProjectIDs,
+            importProcessingProjectID: environment.importProcessing.activeProjectID
+        ) {
+            operationError = block.message
+            return
+        }
+        operationError = nil
+        deleteTarget = project
+    }
+
+    /// 确认后再查一次守卫：弹窗展示期间用户可能在别处开了录音或触发了导入。
+    private func commitDelete() {
+        guard let project = deleteTarget else { return }
+        deleteTarget = nil
+        if let block = ProjectHomeSupport.deletionBlock(
+            for: project,
+            liveProjectIDs: environment.liveRecordingProjectIDs,
+            importProcessingProjectID: environment.importProcessing.activeProjectID
+        ) {
+            operationError = block.message
+            return
+        }
+        do {
+            try environment.deleteProject(project)
+            operationError = nil
+        } catch {
+            operationError = "删除失败（\(String(describing: type(of: error)))）"
+        }
+        reload()
     }
 
     static func loadErrorMessage(for error: Error) -> String {
@@ -485,6 +548,7 @@ private struct ProjectHomeRow: View {
     let onOpen: () -> Void
     let onRename: () -> Void
     let onRevealInFinder: () -> Void
+    let onDelete: () -> Void
 
     @State private var isHovering = false
 
@@ -541,6 +605,8 @@ private struct ProjectHomeRow: View {
             Button("打开") { onOpen() }
             Button("重命名…") { onRename() }
             Button("在 Finder 中显示") { onRevealInFinder() }
+            Divider()
+            Button("删除项目…", role: .destructive) { onDelete() }
         }
         .accessibilityLabel("\(project.title)，\(display.text)，时长 \(LiveMeetingView.formatDuration(ms: project.durationMs))")
         .help("打开「\(project.title)」")

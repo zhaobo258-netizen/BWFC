@@ -607,4 +607,54 @@ final class ProjectStoreTests {
         #expect(workspace.aiChatMessages.first?.text == "工作台里的背景")
         #expect(workspace.noteAIContextEnabled)
     }
+
+    @Test("删除项目：记录与项目目录一起消失，其他项目和其他目录不受影响")
+    @MainActor
+    func deleteProjectRemovesRecordAndDirectory() throws {
+        let base = makeCaseDirectory("delete-project")
+        let fileStore = MeetingFileStore(baseDirectory: base)
+        let environment = AppEnvironment(
+            meetingStore: InMemoryMeetingStore(),
+            fileStore: fileStore,
+            projectStore: try JSONProjectStore(directory: base),
+            keychainServiceName: "com.zhaobo.BangWoFenXi.tests.delete-project-\(UUID().uuidString)"
+        )
+
+        let doomed = Project(title: "待删", sourceType: .liveRecording, status: .ready)
+        let keeper = Project(title: "保留", sourceType: .liveRecording, status: .ready)
+        try environment.persist(doomed)
+        try environment.persist(keeper)
+
+        let doomedDirectory = try fileStore.ensureMeetingDirectory(for: doomed.id)
+        let keeperDirectory = try fileStore.ensureMeetingDirectory(for: keeper.id)
+        try Data("假录音".utf8).write(
+            to: doomedDirectory.appending(path: "recording.caf", directoryHint: .notDirectory)
+        )
+
+        try environment.deleteProject(doomed)
+
+        let remaining = try environment.allProjects()
+        #expect(remaining.count == 1)
+        #expect(remaining.first?.id == keeper.id)
+        #expect(!FileManager.default.fileExists(atPath: doomedDirectory.path))
+        #expect(FileManager.default.fileExists(atPath: keeperDirectory.path))
+    }
+
+    @Test("删除没有落盘目录的项目不报错（创建中就被删）")
+    @MainActor
+    func deleteProjectWithoutDirectorySucceeds() throws {
+        let base = makeCaseDirectory("delete-project-no-dir")
+        let environment = AppEnvironment(
+            meetingStore: InMemoryMeetingStore(),
+            fileStore: MeetingFileStore(baseDirectory: base),
+            projectStore: try JSONProjectStore(directory: base),
+            keychainServiceName: "com.zhaobo.BangWoFenXi.tests.delete-project-\(UUID().uuidString)"
+        )
+        let project = Project(title: "刚建就删", sourceType: .liveRecording, status: .creating)
+        try environment.persist(project)
+
+        try environment.deleteProject(project)
+
+        #expect(try environment.allProjects().isEmpty)
+    }
 }
