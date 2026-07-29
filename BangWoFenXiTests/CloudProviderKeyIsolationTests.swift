@@ -171,6 +171,44 @@ final class CloudProviderKeyIsolationTests {
         #expect(!store(for: .analysis).hasConfiguredKey)
     }
 
+    /// 目标条目齐全时必须彻底不碰旧 service：旧条目是 ad-hoc 身份写的，
+    /// 取它的密文会触发系统 ACL 授权框并阻塞主流程。用一个「一读就失败」的
+    /// 哨兵 service 当旧 service——只要迁移真去读了它，值就会被写进目标条目。
+    @Test("跨 service 迁移：目标齐全时完全不触碰旧 service")
+    func adHocServiceMigrationSkipsLegacyWhenComplete() throws {
+        let oldService = "\(serviceName).adhoc"
+        let oldKeychain = KeychainService(service: oldService)
+        defer {
+            try? oldKeychain.delete(account: CloudProvider.analysis.account)
+            try? oldKeychain.delete(account: CloudProvider.diarization.account)
+            try? oldKeychain.delete(account: KimiOAuthTokenStore.account)
+            try? oldKeychain.delete(account: CloudProvider.legacyAccount)
+        }
+        // 旧 service 每个源条目都放一个「毒药」值
+        try oldKeychain.save("STALE-analysis", account: CloudProvider.analysis.account)
+        try oldKeychain.save("STALE-diarization", account: CloudProvider.diarization.account)
+        try oldKeychain.save("STALE-oauth", account: KimiOAuthTokenStore.account)
+        try oldKeychain.save("STALE-openai", account: CloudProvider.legacyAccount)
+
+        // 当前 service 所有目标条目都已就位
+        try store(for: .analysis).saveKey("fresh-analysis")
+        try store(for: .diarization).saveKey("fresh-diarization")
+        try KeychainService(service: serviceName)
+            .save("fresh-oauth", account: KimiOAuthTokenStore.account)
+
+        CloudAPIKeyStore.migrateAdHocServiceCredentialsIfNeeded(
+            from: oldService, to: serviceName
+        )
+
+        #expect(try store(for: .analysis).readKey() == "fresh-analysis")
+        #expect(try store(for: .diarization).readKey() == "fresh-diarization")
+        #expect(try KeychainService(service: serviceName)
+            .read(account: KimiOAuthTokenStore.account) == "fresh-oauth")
+        #expect(!KeychainService(service: serviceName)
+            .contains(account: CloudProvider.legacyAccount),
+                "openai 兜底不得凭空创建目标条目")
+    }
+
     @Test("跨 service 迁移：旧 service 只有 openai 条目时兜底填入分析条目")
     func adHocServiceMigrationFallsBackToLegacyAccount() throws {
         let oldService = "\(serviceName).adhoc"

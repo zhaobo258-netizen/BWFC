@@ -104,8 +104,11 @@ struct KeychainService: Sendable {
         )
     }
 
-    /// 自动读取一律禁止 SecurityAgent 弹出系统密码框；需要交互时立即失败，
-    /// 由业务层在设置页提供重新连接入口，录音与本地转写继续运行。
+    /// 首次读到值后进程内缓存，同一次启动不会重复走 SecItem。
+    /// 读不到时抛错而不阻塞，由业务层在设置页提供重新连接入口，
+    /// 录音与本地转写继续运行。
+    ///
+    /// 注意：**这里挡不住系统的钥匙串授权框**，原因见 `readQuery`。
     func read(account: String) throws -> String? {
         if let cached = KeychainValueCache.shared.value(
             service: service,
@@ -136,6 +139,20 @@ struct KeychainService: Sendable {
         return value
     }
 
+    /// 老式（文件）钥匙串的逐条 ACL 授权框**无法从调用方抑制**：2026-07-29 用
+    /// 与本 App 同身份同 entitlements 的探针实测，`LAContext.interactionNotAllowed`
+    /// 与已弃用的 `kSecUseAuthenticationUIFail` 都拦不住它——跨签名身份读取时
+    /// SecurityAgent 照样弹框，调用会一直阻塞到用户处理。
+    /// 保留 `interactionNotAllowed` 只为拦住 LocalAuthentication（Touch ID / 密码）
+    /// 这一类交互，不要据此以为读取是绝对静默的。
+    ///
+    /// 真正让读取静默的是签名身份一致：稳定身份写入的条目被稳定身份读取
+    /// 恒为 `errSecSuccess`，重新打包（CDHash 变化）不受影响。跨身份的历史条目
+    /// 需要用户在授权框上点一次「始终允许」，此后永久静默。
+    ///
+    /// 想彻底摆脱这套 ACL 得换现代（data protection）钥匙串，但那需要 Apple
+    /// Team ID：自签名下 `kSecUseDataProtectionKeychain` 返回 -34018，
+    /// 显式声明 `keychain-access-groups` 会让进程被内核直接 SIGKILL。
     func readQuery(account: String) -> [String: Any] {
         let authenticationContext = LAContext()
         authenticationContext.interactionNotAllowed = true
@@ -282,7 +299,11 @@ struct CloudAPIKeyStore: Sendable {
     /// 导致凭证「断链」：v2 为空，旧条目仍在，界面表现为「AI 未接入」。
     /// 本迁移只读旧条目、只写新条目，**绝不删除旧条目** —— 旧条目可能是用户仅有的凭证副本，
     /// 且其 ACL 属于另一签名身份，删除有触发系统授权框的风险。
-    /// 读取使用禁止交互的查询；ACL 不匹配时抛错即跳过该条，不阻塞其余条目。
+    ///
+    /// 读取**不能**假定静默：旧条目由 ad-hoc 身份写入，用当前身份取密文会触发
+    /// 系统 ACL 授权框并阻塞（见 `readQuery`）。所以先确认确有缺口再碰旧 service——
+    /// 目标条目齐全时整个迁移直接返回，一次 SecItem 都不发，
+    /// 免得每次启动都为一件早就做完的事去敲旧条目。
     static func migrateAdHocServiceCredentialsIfNeeded(
         from legacyService: String = CloudAPIKeyStore.legacyAdHocService,
         to service: String = CloudAPIKeyStore.defaultService
@@ -294,10 +315,18 @@ struct CloudAPIKeyStore: Sendable {
             CloudProvider.allCases.map { ($0.account, $0.account) }
             + [(KimiOAuthTokenStore.account, KimiOAuthTokenStore.account)]
             + [(CloudProvider.legacyAccount, CloudProvider.analysis.account)]
-        let legacy = KeychainService(service: legacyService)
         let current = KeychainService(service: service)
+        // 先只做一次「有没有缺口」的判断；全都齐了就一次 SecItem 都不发。
+        guard migrations.contains(where: { !current.contains(account: $0.destination) }) else {
+            return
+        }
+        let legacy = KeychainService(service: legacyService)
         for migration in migrations {
+            // 必须逐轮重查：openai 兜底排在最后，若 kimi 刚在本轮被填上，
+            // 这里要能看见并跳过，否则会用旧 openai 值盖掉刚迁好的 kimi。
             guard !current.contains(account: migration.destination) else { continue }
+            // 旧条目不存在时只查属性、不取密文，避免为一个空条目触发授权框。
+            guard legacy.contains(account: migration.source) else { continue }
             do {
                 guard let value = try legacy.read(account: migration.source),
                       !value.isEmpty else { continue }
