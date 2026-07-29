@@ -246,6 +246,188 @@ final class ProjectRuntimeSessionTests {
         #expect(!controller.hasPendingChanges)
     }
 
+    // MARK: - 时长兜底（Bug 2）
+
+    @Test("录音中回写：无片段无暂停时 durationMs 用墙钟兜底，不归零")
+    func durationFallsBackToWallClockWhileRecording() throws {
+        let startedAt = Date(timeIntervalSince1970: 1_753_000_000)
+        let project = Project(
+            title: "未命名录音", sourceType: .liveRecording, status: .recording,
+            startedAt: startedAt, durationMs: 0
+        )
+        let meeting = try ProjectRuntimeSession.makeRuntimeMeeting(from: project)
+        meeting.startedAt = startedAt
+        meeting.endedAt = nil
+        meeting.segments = []
+        meeting.pauseIntervals = []
+
+        try ProjectRuntimeSession.applyRuntime(
+            meeting, to: project, at: startedAt.addingTimeInterval(94)
+        )
+
+        #expect(project.durationMs == 94_000)
+    }
+
+    @Test("已结束会议仍按 endedAt - startedAt，口径不变")
+    func durationUsesEndedAtWhenAvailable() throws {
+        let project = makeProject(status: .ready)
+        let meeting = try ProjectRuntimeSession.makeRuntimeMeeting(from: project)
+
+        try ProjectRuntimeSession.applyRuntime(meeting, to: project)
+
+        #expect(project.durationMs == 3_600_000)
+    }
+
+    @Test("墙钟兜底取 max：片段/暂停末端更大时不被 now 拉低")
+    func wallClockTakesMaxOfTimelineAndElapsed() {
+        let startedAt = Date(timeIntervalSince1970: 1_753_000_000)
+        let elapsedWins = ProjectRuntimeSession.wallClockDurationMs(
+            startedAt: startedAt, endedAt: nil,
+            segmentEndMs: 5_000, pauseEndMs: 0,
+            now: startedAt.addingTimeInterval(60)
+        )
+        #expect(elapsedWins == 60_000)
+
+        let timelineWins = ProjectRuntimeSession.wallClockDurationMs(
+            startedAt: startedAt, endedAt: nil,
+            segmentEndMs: 120_000, pauseEndMs: 0,
+            now: startedAt.addingTimeInterval(60)
+        )
+        #expect(timelineWins == 120_000)
+    }
+
+    @Test("startedAt 缺失时退回片段/暂停末端与已有值，不凭空造数")
+    func wallClockWithoutStartedAt() {
+        let value = ProjectRuntimeSession.wallClockDurationMs(
+            startedAt: nil, endedAt: nil,
+            segmentEndMs: 0, pauseEndMs: 8_000,
+            fallbackDurationMs: 3_000
+        )
+        #expect(value == 8_000)
+
+        let noSignal = ProjectRuntimeSession.wallClockDurationMs(
+            startedAt: nil, endedAt: nil, segmentEndMs: 0, pauseEndMs: 0
+        )
+        #expect(noSignal == 0)
+    }
+
+    // MARK: - 落盘竞态与失败重试（Bug 4）
+
+    @Test("重复 flush 不产生重复写盘")
+    func repeatedFlushWritesOnce() throws {
+        let project = Project(
+            title: "重复落盘", sourceType: .liveRecording, status: .creating
+        )
+        let meeting = try ProjectRuntimeSession.makeRuntimeMeeting(from: project)
+        var persistCount = 0
+        let controller = ProjectRuntimePersistenceController(
+            meeting: meeting, project: project,
+            persist: { _ in persistCount += 1 },
+            debounce: .milliseconds(20)
+        )
+
+        meeting.segments.append(TranscriptSegment(
+            startMs: 0, endMs: 1_000, text: "一句",
+            source: .local, state: .final
+        ))
+        controller.schedule()
+        controller.flush()
+        controller.flush()
+        controller.flush()
+
+        #expect(persistCount == 1)
+        #expect(controller.writeAttemptCount == 1)
+        #expect(!controller.hasPendingChanges)
+    }
+
+    @Test("防抖任务在 flush 之后失去写盘资格，不再补写一次")
+    func inFlightTaskDoesNotWriteAfterFlush() async throws {
+        let project = Project(
+            title: "竞态", sourceType: .liveRecording, status: .creating
+        )
+        let meeting = try ProjectRuntimeSession.makeRuntimeMeeting(from: project)
+        var persistCount = 0
+        let controller = ProjectRuntimePersistenceController(
+            meeting: meeting, project: project,
+            persist: { _ in persistCount += 1 },
+            debounce: .milliseconds(30)
+        )
+
+        meeting.segments.append(TranscriptSegment(
+            startMs: 0, endMs: 1_000, text: "一句",
+            source: .local, state: .final
+        ))
+        controller.schedule()
+        controller.flush()
+        // 等过原防抖窗口，确认在途任务不会再写第二次
+        try? await Task.sleep(for: .milliseconds(120))
+
+        #expect(persistCount == 1)
+        #expect(controller.writeAttemptCount == 1)
+    }
+
+    @Test("写失败后自动退避重试，成功后清除错误")
+    func failedWriteRetriesUntilSuccess() async throws {
+        let project = Project(
+            title: "写失败重试", sourceType: .liveRecording, status: .creating
+        )
+        let meeting = try ProjectRuntimeSession.makeRuntimeMeeting(from: project)
+        var attempts = 0
+        let controller = ProjectRuntimePersistenceController(
+            meeting: meeting, project: project,
+            persist: { _ in
+                attempts += 1
+                if attempts == 1 { throw MeetingStoreError.directoryUnavailable }
+            },
+            debounce: .milliseconds(10)
+        )
+
+        meeting.segments.append(TranscriptSegment(
+            startMs: 0, endMs: 1_000, text: "一句",
+            source: .local, state: .final
+        ))
+        controller.schedule()
+
+        await waitUntil { attempts >= 1 && controller.saveError != nil }
+        #expect(controller.hasPendingChanges)
+        #expect(controller.retryCount >= 1)
+
+        // 重试排在 1 秒退避后；不再依赖新的 schedule() 触发
+        await waitUntil(timeout: .seconds(5)) {
+            attempts >= 2 && controller.saveError == nil
+        }
+        #expect(attempts >= 2)
+        #expect(controller.saveError == nil)
+        #expect(!controller.hasPendingChanges)
+    }
+
+    @Test("持续写失败达上限后停止重试并保留错误")
+    func retriesStopAtLimit() async throws {
+        let project = Project(
+            title: "持续失败", sourceType: .liveRecording, status: .creating
+        )
+        let meeting = try ProjectRuntimeSession.makeRuntimeMeeting(from: project)
+        let controller = ProjectRuntimePersistenceController(
+            meeting: meeting, project: project,
+            persist: { _ in throw MeetingStoreError.directoryUnavailable },
+            debounce: .milliseconds(10)
+        )
+
+        meeting.segments.append(TranscriptSegment(
+            startMs: 0, endMs: 1_000, text: "一句",
+            source: .local, state: .final
+        ))
+        controller.schedule()
+
+        await waitUntil(timeout: .seconds(20)) {
+            controller.retryCount >= ProjectRuntimePersistenceController.maxRetryAttempts
+        }
+        #expect(controller.retryCount == ProjectRuntimePersistenceController.maxRetryAttempts)
+        // 失败如实暴露，未保存的变更不被静默丢弃
+        #expect(controller.saveError != nil)
+        #expect(controller.hasPendingChanges)
+    }
+
     private func waitUntil(
         _ condition: () -> Bool,
         timeout: Duration = .seconds(10)

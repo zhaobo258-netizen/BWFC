@@ -25,9 +25,21 @@ protocol AudioCaptureServicing: AnyObject, Sendable {
     var onDeviceDisconnected: (@Sendable () -> Void)? { get set }
     /// 连续写文件失败达到阈值后的单次回调（派发到主线程触发）
     var onWriteFailure: (@Sendable () -> Void)? { get set }
-    /// 原始缓冲回调（阶段 2：同时送入录音文件与 SpeechAnalyzer；
-    /// 仅在「录音中」状态时触发，暂停期间不触发；在实时线程触发，不得阻塞）
-    var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)? { get set }
+    /// 当前缓冲回调的归属令牌（无回调时为 nil）
+    var bufferHandlerToken: UUID? { get }
+
+    /// 登记原始缓冲回调（阶段 2：同时送入录音文件与 SpeechAnalyzer；
+    /// 仅在「录音中」状态时触发，暂停期间不触发；在实时线程触发，不得阻塞）。
+    ///
+    /// 采集服务是单例，多个视图都会登记回调。token 标明归属：
+    /// 新会话登记后旧会话的清理不会误伤新回调，旧闭包也不会继续收到音频。
+    func setBufferHandler(
+        token: UUID,
+        _ handler: (@Sendable (AVAudioPCMBuffer) -> Void)?
+    )
+
+    /// 仅当当前归属为该 token 时清空回调；token 不匹配时什么都不做
+    func clearBufferHandler(token: UUID)
 
     /// 列出可用输入设备
     func inputDevices() -> [AudioInputDevice]
@@ -157,7 +169,33 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
     var onLevel: (@Sendable (Float) -> Void)?
     var onDeviceDisconnected: (@Sendable () -> Void)?
     var onWriteFailure: (@Sendable () -> Void)?
-    var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
+
+    /// 缓冲回调与其归属令牌；tap 在实时线程读取，统一由 bufferLock 保护
+    private let bufferLock = NSLock()
+    private var bufferHandler: (@Sendable (AVAudioPCMBuffer) -> Void)?
+    private var bufferToken: UUID?
+
+    var bufferHandlerToken: UUID? {
+        bufferLock.withLock { bufferToken }
+    }
+
+    func setBufferHandler(
+        token: UUID,
+        _ handler: (@Sendable (AVAudioPCMBuffer) -> Void)?
+    ) {
+        bufferLock.withLock {
+            bufferHandler = handler
+            bufferToken = handler == nil ? nil : token
+        }
+    }
+
+    func clearBufferHandler(token: UUID) {
+        bufferLock.withLock {
+            guard bufferToken == token else { return }
+            bufferHandler = nil
+            bufferToken = nil
+        }
+    }
 
     private var disconnectObserver: NSObjectProtocol?
     private var configChangeObserver: NSObjectProtocol?
@@ -391,8 +429,12 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
         }
         // 阶段 2：录音中把缓冲同时分发给语音分析（暂停期间不分发）
         if shouldWrite {
-            PerfCounters.increment(.bufferFed)
-            onBuffer?(buffer)
+            // 先在锁内取出闭包再调用，避免在实时线程持锁执行下游逻辑
+            let handler = bufferLock.withLock { bufferHandler }
+            if let handler {
+                PerfCounters.increment(.bufferFed)
+                handler(buffer)
+            }
         }
         // 电平：约每 8 个缓冲上报一次（4096 帧 @44.1kHz ≈ 93ms）
         bufferCountSinceLevel += 1

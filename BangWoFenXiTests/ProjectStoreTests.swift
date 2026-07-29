@@ -496,6 +496,35 @@ final class ProjectStoreTests {
         #expect(merged.segments.first?.isStarred == true)
     }
 
+    @Test("首页重命名只改标题：不冲掉磁盘上的片段、状态与分析（Bug 7）")
+    func homeRenameOnlyTouchesTitle() {
+        let id = UUID()
+        let stored = Project(
+            id: id,
+            title: "旧标题",
+            sourceType: .liveRecording,
+            status: .ready,
+            segments: [
+                TranscriptSegment(startMs: 0, endMs: 1_000, text: "已有文稿", source: .local, state: .final)
+            ]
+        )
+        stored.durationMs = 60_000
+        // 首页只拿到列表里的副本，改完标题就写库；其余字段必须保持磁盘上的值
+        let renamed = Project(id: id, title: "客户走访 · 张总", sourceType: .liveRecording, status: .creating)
+        renamed.lastActivityAt = stored.lastActivityAt.addingTimeInterval(60)
+        var projects = [stored]
+
+        ProjectPersistence.upsert(renamed, into: &projects, fields: .title)
+
+        let merged = projects[0]
+        #expect(merged.title == "客户走访 · 张总")
+        #expect(merged.lastActivityAt == renamed.lastActivityAt)
+        #expect(merged.status == .ready)
+        #expect(merged.durationMs == 60_000)
+        #expect(merged.segments.count == 1)
+        #expect(merged.segments.first?.text == "已有文稿")
+    }
+
     @Test("用户可从人工场景切回自动判断")
     func userScenarioCanReturnToAutomatic() {
         let id = UUID()

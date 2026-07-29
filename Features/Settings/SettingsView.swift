@@ -212,10 +212,14 @@ struct SettingsView: View {
                     aiMessage = "请填写 Base URL 和 Model ID 后保存；当前请求仍使用原模型。"
                 }
             }
-            LabeledContent(
-                "生效范围",
-                value: "实时分析 · 完整总结 · 项目对话 · 开花"
-            )
+            // LabeledContent 会把长值挤到右侧贴边截断，窄窗口读不全，改为上下两行
+            VStack(alignment: .leading, spacing: 3) {
+                Text("生效范围")
+                    .foregroundStyle(.secondary)
+                Text("实时分析 · 完整总结 · 项目对话 · 开花（把选中内容展开成延伸知识）")
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
             Text("修改从下一次 AI 请求开始生效；正在执行的请求不会被中断或切换模型。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
@@ -817,6 +821,7 @@ struct SettingsView: View {
             editingLexiconTerm = nil
             lexiconMessage = "词条已更新；下一次录音或导入生效。"
         } catch {
+            // 冲突等情况保持编辑态，让用户直接改回去，不丢输入
             lexiconMessage = "更新失败：\(error.localizedDescription)"
         }
     }

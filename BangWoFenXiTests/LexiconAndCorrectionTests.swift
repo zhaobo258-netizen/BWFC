@@ -98,6 +98,50 @@ struct LexiconStoreTests {
         #expect(environment.lexiconTerms.isEmpty)
         #expect(environment.lexiconRevision >= 7)
     }
+
+    @Test("改词撞已有词：抛错、原词条与总数都不丢")
+    @MainActor
+    func updateTermCollisionKeepsBothTerms() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "lexicon-collision-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let suiteName = "bwfx-lexicon-collision-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let environment = AppEnvironment(
+            meetingStore: InMemoryMeetingStore(),
+            fileStore: MeetingFileStore(baseDirectory: directory),
+            keychainServiceName: "com.zhaobo.BangWoFenXi.tests.lexicon.\(UUID().uuidString)",
+            aiProviderConfigurationStore: AIProviderConfigurationStore(defaults: defaults),
+            externalMCPConfigurationStore: ExternalMCPConfigurationStore(defaults: defaults)
+        )
+
+        try environment.addLexiconTerm("经销商")
+        try environment.addLexiconTerm("动销")
+
+        #expect(throws: LexiconEditError.duplicateTerm("经销商")) {
+            try environment.updateLexiconTerm("动销", to: "经销商")
+        }
+        #expect(environment.lexiconTerms == ["经销商", "动销"])
+
+        #expect(throws: LexiconEditError.emptyTerm) {
+            try environment.updateLexiconTerm("动销", to: "   ")
+        }
+        #expect(throws: LexiconEditError.termNotFound("不存在的词")) {
+            try environment.updateLexiconTerm("不存在的词", to: "新词")
+        }
+        #expect(environment.lexiconTerms == ["经销商", "动销"])
+
+        // 改成自己：静默成功，不重复写盘
+        let revisionBefore = environment.lexiconRevision
+        try environment.updateLexiconTerm("动销", to: "动销")
+        #expect(environment.lexiconTerms == ["经销商", "动销"])
+        #expect(environment.lexiconRevision == revisionBefore)
+
+        // 正常改词仍生效，且保持原有位置
+        try environment.updateLexiconTerm("动销", to: "终端动销")
+        #expect(environment.lexiconTerms == ["经销商", "终端动销"])
+    }
 }
 
 /// 转写纠错引擎（全局替换 + 自动套用）

@@ -64,6 +64,9 @@ struct TranscriptPanelView: View {
     var unknownSpeakerDisplay: ((TranscriptSegment) -> String?)?
     /// 证据定位高亮的片段 ID（点击左右两栏证据时设置）
     var highlightedSegmentID: UUID?
+    /// 录音中的实时电平（0…1）。空态时把「已在录、收到声音了」放到用户正在看的位置，
+    /// 而不是只留在窗口边缘的电平条上。非录音场景传 nil。
+    var liveAudioLevel: Float?
     /// 编辑回调（由父视图持久化）
     var onAssignSpeaker: ((TranscriptSegment, Participant?) -> Void)?
     var onEditText: ((TranscriptSegment, String) -> Void)?
@@ -96,6 +99,9 @@ struct TranscriptPanelView: View {
                                 Text("开始说话后，实时转写会显示在这里")
                                     .font(.caption)
                                     .foregroundStyle(.tertiary)
+                                if let liveAudioLevel {
+                                    emptyStateLevelMeter(level: liveAudioLevel)
+                                }
                             }
                             .frame(maxWidth: .infinity, alignment: .center)
                             .padding(.top, 28)
@@ -183,6 +189,27 @@ struct TranscriptPanelView: View {
                 }
             )
         }
+    }
+
+    /// 空态里的电平反馈：录音刚开始时用户最需要的是「设备真的在收音」的确认
+    private func emptyStateLevelMeter(level: Float) -> some View {
+        VStack(spacing: 5) {
+            ProgressView(value: Double(min(max(level, 0), 1)))
+                .frame(width: 140)
+                .tint(BWTheme.accent)
+            if level > 0.02 {
+                Text("已收到声音")
+                    .font(.caption2)
+                    .foregroundStyle(BWTheme.accent)
+            } else {
+                Text("正在收音，暂未检测到声音")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.top, 6)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(level > 0.02 ? "已收到声音" : "正在收音，暂未检测到声音")
     }
 
     /// 片段 → 行数据（纯映射；行 Equatable 保证未变化行零重建）

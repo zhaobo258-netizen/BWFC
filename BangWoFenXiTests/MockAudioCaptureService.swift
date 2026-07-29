@@ -28,7 +28,28 @@ final class MockAudioCaptureService: AudioCaptureServicing, @unchecked Sendable 
     var onLevel: (@Sendable (Float) -> Void)?
     var onDeviceDisconnected: (@Sendable () -> Void)?
     var onWriteFailure: (@Sendable () -> Void)?
-    var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
+
+    private var bufferHandler: (@Sendable (AVAudioPCMBuffer) -> Void)?
+    private(set) var bufferHandlerToken: UUID?
+    /// 归属不匹配而被忽略的清理次数（供测试断言旧会话不会误清新回调）
+    private(set) var ignoredClearCount = 0
+
+    func setBufferHandler(
+        token: UUID,
+        _ handler: (@Sendable (AVAudioPCMBuffer) -> Void)?
+    ) {
+        bufferHandler = handler
+        bufferHandlerToken = handler == nil ? nil : token
+    }
+
+    func clearBufferHandler(token: UUID) {
+        guard bufferHandlerToken == token else {
+            ignoredClearCount += 1
+            return
+        }
+        bufferHandler = nil
+        bufferHandlerToken = nil
+    }
 
     private(set) var activeDeviceID: String?
     var activeDeviceName: String? {
@@ -76,5 +97,23 @@ final class MockAudioCaptureService: AudioCaptureServicing, @unchecked Sendable 
     /// 模拟上报一次电平
     func simulateLevel(_ level: Float) {
         onLevel?(level)
+    }
+
+    /// 模拟一次采集缓冲分发（走与真实实现相同的归属判断路径）
+    func simulateBuffer(_ buffer: AVAudioPCMBuffer) {
+        bufferHandler?(buffer)
+    }
+
+    /// 构造一段静音缓冲，仅用于验证回调是否投递
+    static func makeSilentBuffer(frames: AVAudioFrameCount = 512) -> AVAudioPCMBuffer? {
+        guard let format = AVAudioFormat(
+            standardFormatWithSampleRate: 44_100,
+            channels: 1
+        ), let buffer = AVAudioPCMBuffer(
+            pcmFormat: format,
+            frameCapacity: frames
+        ) else { return nil }
+        buffer.frameLength = frames
+        return buffer
     }
 }

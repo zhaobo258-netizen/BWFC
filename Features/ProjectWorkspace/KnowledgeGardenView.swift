@@ -12,7 +12,7 @@ struct KnowledgeGardenView: View {
                     ContentUnavailableView(
                         "还没有可开花的内容",
                         systemImage: "leaf",
-                        description: Text("完成一次分析或标记一段原话后，这里会出现知识种子。")
+                        description: Text("「开花」是把一段内容展开成概念解释与延伸知识。完成一次分析或标记一段原话后，这里会出现知识种子。")
                     )
                     .padding(.vertical, 32)
                 } else {

@@ -46,6 +46,8 @@ struct ProjectWorkspaceView: View {
     /// 本会话已在当前视图内实际开录（恢复横幅只在「打开时即异常」的旧会话上出现，
     /// 当前活动录音不算异常）
     @State private var didStartSessionThisView = false
+    /// 本视图这次录音会话在采集服务上的归属令牌（Bug 3：单例回调按会话归属清理）
+    @State private var audioSessionToken = UUID()
     @State private var timerAnchor = Date()
     private let chunkPollTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
@@ -54,6 +56,16 @@ struct ProjectWorkspaceView: View {
         case finalReport = "完整总结"
         case insights = "动机与目的"
         case bloom = "开花"
+
+        /// 「开花」是自造术语，第一次看到的人不知道指什么，鼠标停留时给出解释
+        var explanation: String {
+            switch self {
+            case .summary: return "录音过程中滚动更新的要点"
+            case .finalReport: return "录音结束后生成的完整报告"
+            case .insights: return "对方动机与目的的推断"
+            case .bloom: return "开花：把选中的内容展开成概念解释与延伸知识"
+            }
+        }
     }
 
     var body: some View {
@@ -70,6 +82,12 @@ struct ProjectWorkspaceView: View {
         }
         .onDisappear {
             environment.audioCapture.onLevel = nil
+            // 录音中直接返回首页时也必须撤回缓冲回调，否则旧闭包会把音频
+            // 继续喂给已废弃的转写会话（只清自己登记的那份）
+            environment.audioCapture.clearBufferHandler(token: audioSessionToken)
+            // 回调已撤回，这个会话不再可能产生音频：注销「正在录」登记，
+            // 首页不应再把它显示成活跃录音
+            environment.clearProjectLive(projectID)
             projectAIChat?.saveDraftNow()
             noteController?.saveNow()
             runtimePersistence?.flush()
@@ -678,6 +696,7 @@ struct ProjectWorkspaceView: View {
                     return diarization?.displayName(forRemoteLabel: segment.remoteSpeakerLabel)
                 },
                 highlightedSegmentID: highlightedSegmentID,
+                liveAudioLevel: meeting.status == .recording ? liveAudioLevel : nil,
                 onAssignSpeaker: { segment, participant in
                     if let participant {
                         MeetingTranscriptEditor.assignSpeaker(segment, to: participant)
@@ -747,7 +766,9 @@ struct ProjectWorkspaceView: View {
 
                 Picker("", selection: $centerTab) {
                     ForEach(CenterTab.allCases, id: \.self) { tab in
-                        Text(tab.rawValue).tag(tab)
+                        Text(tab.rawValue)
+                            .help(tab.explanation)
+                            .tag(tab)
                     }
                 }
                 .pickerStyle(.segmented)
@@ -1555,6 +1576,7 @@ struct ProjectWorkspaceView: View {
                 liveAudioLevel = 0
                 try recorder?.startRecording(for: meeting, deviceID: meeting.preferredInputDeviceID)
                 didStartSessionThisView = true
+                environment.markProjectLive(projectID)
                 syncAndPersist(meeting)
                 operationError = nil
                 environment.audioCapture.onLevel = { level in
@@ -1569,7 +1591,9 @@ struct ProjectWorkspaceView: View {
                         recorder?.timeline
                     }
                     let transcriptionService = environment.localTranscription
-                    environment.audioCapture.onBuffer = { buffer in
+                    let token = UUID()
+                    audioSessionToken = token
+                    environment.audioCapture.setBufferHandler(token: token) { buffer in
                         let boxed = SendableAudioBuffer(buffer)
                         Task { await transcriptionService.feed(boxed.buffer) }
                     }
@@ -1595,11 +1619,12 @@ struct ProjectWorkspaceView: View {
                 environment.audioCapture.onLevel = nil
                 try recorder?.beginFinish()
                 syncAndPersist(meeting)
-                environment.audioCapture.onBuffer = nil
+                environment.audioCapture.clearBufferHandler(token: audioSessionToken)
                 await transcription?.finish()
                 await diarization?.finishAndDrain()
                 try recorder?.completeFinalizing()
                 syncAndPersist(meeting)
+                environment.clearProjectLive(projectID)
                 operationError = nil
                 if environment.isAnalysisConfigured {
                     environment.finalReportCoordinator.start(projectID: projectID)

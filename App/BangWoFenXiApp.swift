@@ -31,8 +31,9 @@ struct RootView: View {
     @Environment(AppEnvironment.self) private var environment
     let onStorageLocationChanged: () -> Void
 
-    /// 启动时发现的未正常结束会议（实施计划 11.1 恢复提示）
-    @State private var abnormalMeetings: [Meeting] = []
+    /// 启动时发现的未正常结束项目（实施计划 11.1 恢复提示）；
+    /// 同时覆盖 V2 项目（projects.json，权威存储）与 V1 遗留会议
+    @State private var abnormalItems: [AbnormalRecoveryItem] = []
     @State private var finalReportNotification: FinalReportCoordinator.Completion?
 
     var body: some View {
@@ -71,15 +72,26 @@ struct RootView: View {
             // 首次启动：申请麦克风权限（实施计划 5.1）。
             // 拒绝时不阻断进入本地界面，录音前会再次校验并给出系统设置入口。
             _ = await MicrophonePermission.requestAccess()
-            // 异常退出恢复：发现 recording/paused/finalizing 状态的会议时提示，
+            // 异常退出恢复：发现 recording/paused/processing 状态的项目时提示，
             // 保留已写入音频和片段，不自动删除（实施计划 11.1）。
-            if let meetings = try? environment.allMeetings() {
-                abnormalMeetings = MeetingRecovery.abnormalMeetings(from: meetings)
+            // V2 项目的权威存储是 projects.json，必须与 V1 会议一起收集，
+            // 否则新项目永远进不了恢复弹窗。
+            var items: [AbnormalRecoveryItem] = []
+            if let projects = try? environment.allProjects() {
+                items += MeetingRecovery.abnormalProjects(from: projects)
+                    .map(AbnormalRecoveryItem.init(project:))
             }
+            if let meetings = try? environment.allMeetings() {
+                let projectIDs = Set(items.map(\.id))
+                items += MeetingRecovery.abnormalMeetings(from: meetings)
+                    .filter { !projectIDs.contains($0.id) }
+                    .map(AbnormalRecoveryItem.init(meeting:))
+            }
+            abnormalItems = items
         }
-        .sheet(isPresented: .constant(!abnormalMeetings.isEmpty)) {
-            AbnormalRecoveryView(meetings: abnormalMeetings) { meeting, action in
-                handleRecovery(meeting: meeting, action: action)
+        .sheet(isPresented: .constant(!abnormalItems.isEmpty)) {
+            AbnormalRecoveryView(items: abnormalItems) { item, action in
+                handleRecovery(item: item, action: action)
             }
             .interactiveDismissDisabled()
         }
@@ -123,27 +135,47 @@ struct RootView: View {
         }
     }
 
-    /// 处理恢复动作：标记已结束 / 查看 / 稍后处理
-    private func handleRecovery(meeting: Meeting?, action: AbnormalRecoveryView.Action) {
+    /// 处理恢复动作：标记已结束 / 查看 / 稍后处理。
+    /// 「查看」只跳转，不改状态——状态修正留给用户在工作台显式操作，
+    /// 否则「查看」与「标记结束」两个动作没有区别。
+    private func handleRecovery(item: AbnormalRecoveryItem?, action: AbnormalRecoveryView.Action) {
         switch action {
         case .markCompleted:
-            if let meeting {
-                try? MeetingRecovery.markCompletedAfterAbnormalExit(meeting)
-                try? environment.persist(meeting)
+            if let item {
+                markResolved(item)
             }
         case .openMeeting:
-            if let meeting {
-                try? MeetingRecovery.markCompletedAfterAbnormalExit(meeting)
-                try? environment.persist(meeting)
-                router.showMeetingReview(meeting.id)
+            if let item {
+                switch item.source {
+                case .project:
+                    router.showProjectWorkspace(item.id, autoStart: false)
+                case .meeting:
+                    router.showMeetingReview(item.id)
+                }
             }
         case .later:
             break
         }
-        if let meeting {
-            abnormalMeetings.removeAll { $0.id == meeting.id }
+        if let item {
+            abnormalItems.removeAll { $0.id == item.id }
         } else {
-            abnormalMeetings = []
+            abnormalItems = []
+        }
+    }
+
+    /// 按来源把状态推进到可回看：V2 → ready，V1 → completed
+    private func markResolved(_ item: AbnormalRecoveryItem) {
+        switch item.source {
+        case .project:
+            guard let project = try? environment.allProjects()
+                .first(where: { $0.id == item.id }) else { return }
+            try? MeetingRecovery.markResolvedAfterAbnormalExit(project)
+            try? environment.persist(project)
+        case .meeting:
+            guard let meeting = try? environment.allMeetings()
+                .first(where: { $0.id == item.id }) else { return }
+            try? MeetingRecovery.markCompletedAfterAbnormalExit(meeting)
+            try? environment.persist(meeting)
         }
     }
 }

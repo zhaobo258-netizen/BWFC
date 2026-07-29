@@ -7,6 +7,29 @@ struct CorrectionRule: Codable, Equatable, Sendable, Identifiable {
     var id: String { wrong + "→" + right }
 }
 
+/// 词库编辑错误：改词冲突等情况必须让用户看见原因，不能静默丢词
+enum LexiconEditError: Error, Equatable {
+    /// 改后的内容解析不出有效词条
+    case emptyTerm
+    /// 要修改的词条已不在列表中
+    case termNotFound(String)
+    /// 改后的词与列表中已有词重复
+    case duplicateTerm(String)
+}
+
+extension LexiconEditError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .emptyTerm:
+            return "词条内容为空或不合法，未做修改。"
+        case .termNotFound(let term):
+            return "词条“\(term)”已不在词库中，可能已被其他操作删除。"
+        case .duplicateTerm(let term):
+            return "词库中已有“\(term)”，原词条保持不变。"
+        }
+    }
+}
+
 /// 全局专业词库（老板 2026-07-27 需求 1）：提前导入专有名词，
 /// 本地转写作为上下文词汇（contextualStrings，改善识别不改写原意），
 /// 云端分析作为「已知名词表」（还原同音误写）；纠错规则一并存放。

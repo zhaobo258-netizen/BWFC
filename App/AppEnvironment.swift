@@ -183,6 +183,21 @@ final class AppEnvironment {
     /// 持有安全作用域访问直至环境释放，避免运行中 Vault 权限提前失效。
     private let securityScopedStorageAccess: SecurityScopedStorageAccess?
 
+    /// 本次 App 运行期间真正在录音/暂停的项目 id。
+    /// 首页据此区分「此刻正在录」与「上次异常退出留下的 recording 状态」：
+    /// 磁盘状态无法自证是哪一种，只有运行时登记能区分。
+    private(set) var liveRecordingProjectIDs: Set<UUID> = []
+
+    /// 工作台开始录音时登记
+    func markProjectLive(_ projectID: UUID) {
+        liveRecordingProjectIDs.insert(projectID)
+    }
+
+    /// 录音正常结束或页面收尾时注销
+    func clearProjectLive(_ projectID: UUID) {
+        liveRecordingProjectIDs.remove(projectID)
+    }
+
     /// 音频采集（阶段 1：AVAudioEngine 实现）
     let audioCapture: any AudioCaptureServicing
     /// 本地转写（阶段 2 实现）
@@ -433,14 +448,21 @@ final class AppEnvironment {
         lexiconRevision += 1
     }
 
+    /// 改词。改后的值与列表里其他词重复时抛错并保持原样——
+    /// 旧实现走 merge 去重会让数组少一位，表现为「改了一个词，另一个词消失」。
     func updateLexiconTerm(_ existing: String, to rawValue: String) throws {
-        guard let replacement = LexiconStore.parse(rawValue).first,
-              let index = lexiconTerms.firstIndex(of: existing) else {
-            return
+        guard let replacement = LexiconStore.parse(rawValue).first else {
+            throw LexiconEditError.emptyTerm
+        }
+        guard let index = lexiconTerms.firstIndex(of: existing) else {
+            throw LexiconEditError.termNotFound(existing)
+        }
+        if replacement == existing { return }
+        if lexiconTerms.contains(replacement) {
+            throw LexiconEditError.duplicateTerm(replacement)
         }
         var updated = lexiconTerms
         updated[index] = replacement
-        updated = LexiconStore.merge([], adding: updated)
         try lexiconStore.save(terms: updated, corrections: correctionRules)
         lexiconTerms = updated
         lexiconRevision += 1

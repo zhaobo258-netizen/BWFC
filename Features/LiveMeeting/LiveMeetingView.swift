@@ -22,6 +22,8 @@ struct LiveMeetingView: View {
     @State private var highlightedSegmentID: UUID?
     /// 结束时分片未处理完毕的选择弹窗（实施计划 11.2：允许稍后继续处理）
     @State private var showPendingChunksChoice = false
+    /// 本视图这次录音会话在采集服务上的归属令牌（Bug 3）
+    @State private var audioSessionToken = UUID()
     /// 计时器锚点（固定在视图创建时；避免 TimelineView(from: .now)
     /// 因每次父级重建重新锚定而引发的额外调度）
     @State private var timerAnchor = Date()
@@ -91,6 +93,10 @@ struct LiveMeetingView: View {
         .navigationTitle(meeting?.title ?? "会中")
         .onAppear {
             loadMeetingAndRecorder()
+        }
+        .onDisappear {
+            // 离开会中页时撤回本会话登记的缓冲回调，避免旧闭包继续喂音频
+            environment.audioCapture.clearBufferHandler(token: audioSessionToken)
         }
         .onReceive(chunkPollTimer) { _ in
             diarization?.pollProgress()
@@ -523,7 +529,9 @@ struct LiveMeetingView: View {
                     }
                     // 采集线程直接喂给转写服务（服务内部按会话状态丢弃空转输入）
                     let transcriptionService = environment.localTranscription
-                    environment.audioCapture.onBuffer = { buffer in
+                    let token = UUID()
+                    audioSessionToken = token
+                    environment.audioCapture.setBufferHandler(token: token) { buffer in
                         let boxed = SendableAudioBuffer(buffer)
                         Task { await transcriptionService.feed(boxed.buffer) }
                     }
@@ -547,7 +555,7 @@ struct LiveMeetingView: View {
             do {
                 try recorder?.beginFinish()
                 persist(meeting)
-                environment.audioCapture.onBuffer = nil
+                environment.audioCapture.clearBufferHandler(token: audioSessionToken)
                 await transcription?.finish()
                 await diarization?.finishAndDrain()
                 // 仍有待处理分片：由用户选择稍后处理或重试等待（实施计划 11.2）
