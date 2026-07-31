@@ -56,7 +56,7 @@ final class KimiAnalysisAPITests {
             "id": "msg_test",
             "type": "message",
             "role": "assistant",
-            "model": "kimi-for-coding",
+            "model": "k3-256k",
             "content": blocks,
             "stop_reason": "end_turn"
         ]
@@ -86,10 +86,9 @@ final class KimiAnalysisAPITests {
 
         let body = try #require(mockRequestBodyData(of: request))
         let object = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
-        #expect(object["model"] as? String == "kimi-for-coding")
-        #expect(object["max_tokens"] as? Int == 16_384, "max_tokens 必须含思考预算防截断")
-        let thinking = try #require(object["thinking"] as? [String: Any])
-        #expect(thinking["type"] as? String == "disabled", "必须关闭思考（实测可防 JSON 截断且更快）")
+        #expect(object["model"] as? String == "k3-256k")
+        #expect(object["max_tokens"] as? Int == 32_768, "K3 必须为思考与 JSON 正文保留预算")
+        #expect(object["thinking"] == nil, "K3 始终思考，不能发送 disabled 使其路由到 K2.6")
         #expect(object["store"] == nil, "Kimi 接口不得发送 store 字段")
         #expect(request.timeoutInterval == 240, "超时必须为 240s（长上下文响应慢）")
         let system = try #require(object["system"] as? String)

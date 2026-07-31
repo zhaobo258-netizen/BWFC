@@ -50,6 +50,7 @@ enum KnowledgeProviderKind: String, Codable, Sendable, CaseIterable {
 struct KnowledgeConnection: Identifiable, Codable, Sendable, Hashable {
     var id: UUID
     var provider: KnowledgeProviderKind
+    var providerId: String?
     var providerName: String
     var sourceId: String
     var title: String
@@ -61,6 +62,7 @@ struct KnowledgeConnection: Identifiable, Codable, Sendable, Hashable {
     init(
         id: UUID = UUID(),
         provider: KnowledgeProviderKind,
+        providerId: String? = nil,
         providerName: String? = nil,
         sourceId: String,
         title: String,
@@ -71,6 +73,7 @@ struct KnowledgeConnection: Identifiable, Codable, Sendable, Hashable {
     ) {
         self.id = id
         self.provider = provider
+        self.providerId = providerId
         self.providerName = providerName ?? provider.displayName
         self.sourceId = sourceId
         self.title = title
@@ -78,6 +81,32 @@ struct KnowledgeConnection: Identifiable, Codable, Sendable, Hashable {
         self.sourceLocation = sourceLocation
         self.relevance = relevance
         self.retrievedAt = retrievedAt
+    }
+
+    var stableProviderID: String {
+        providerId ?? provider.rawValue
+    }
+}
+
+struct KnowledgeSourceSynthesis: Codable, Sendable, Hashable {
+    var summary: String
+    var keyPoints: [String]
+    var discussionRelevance: String
+    var sourceIds: [String]
+    var generatedAt: Date
+
+    init(
+        summary: String,
+        keyPoints: [String],
+        discussionRelevance: String,
+        sourceIds: [String],
+        generatedAt: Date = Date()
+    ) {
+        self.summary = summary
+        self.keyPoints = keyPoints
+        self.discussionRelevance = discussionRelevance
+        self.sourceIds = sourceIds
+        self.generatedAt = generatedAt
     }
 }
 
@@ -88,6 +117,7 @@ struct KnowledgeSeed: Identifiable, Codable, Sendable, Hashable {
     var evidenceSegmentIds: [UUID]
     var branches: [KnowledgeBranch]
     var connections: [KnowledgeConnection]
+    var sourceSynthesis: KnowledgeSourceSynthesis?
     var searchQueries: [String]
     var isAddedToProject: Bool
     var createdAt: Date
@@ -100,6 +130,7 @@ struct KnowledgeSeed: Identifiable, Codable, Sendable, Hashable {
         evidenceSegmentIds: [UUID],
         branches: [KnowledgeBranch] = [],
         connections: [KnowledgeConnection] = [],
+        sourceSynthesis: KnowledgeSourceSynthesis? = nil,
         searchQueries: [String] = [],
         isAddedToProject: Bool = false,
         createdAt: Date = Date(),
@@ -111,6 +142,7 @@ struct KnowledgeSeed: Identifiable, Codable, Sendable, Hashable {
         self.evidenceSegmentIds = evidenceSegmentIds
         self.branches = branches
         self.connections = connections
+        self.sourceSynthesis = sourceSynthesis
         self.searchQueries = searchQueries
         self.isAddedToProject = isAddedToProject
         self.createdAt = createdAt

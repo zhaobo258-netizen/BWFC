@@ -2,7 +2,7 @@ import SwiftUI
 import AppKit
 
 /// 项目工作台（阶段 B，方案 3「知识花园」三栏骨架，03 文档 §6.3）：
-/// 左栏录音文稿 / 中栏 AI 工作区 / 右栏我的笔记。
+/// 左栏录音文稿 / 中栏 AI 工作区 / 右栏 AI 共创笔记。
 ///
 /// 持久化权威为 ProjectStoring：现有录音、转写、分人、分析链路在内存中
 /// 驱动同 id 的运行时 Meeting（ProjectRuntimeSession 桥接），状态变化回写 Project。
@@ -25,6 +25,7 @@ struct ProjectWorkspaceView: View {
     @State private var diarization: DiarizationController?
     @State private var analysis: ConversationAnalysisController?
     @State private var knowledgeGarden: KnowledgeGardenController?
+    @State private var projectAIChat: ProjectAIChatController?
     @State private var noteController: NoteController?
     @State private var runtimePersistence: ProjectRuntimePersistenceController?
     @State private var operationError: String?
@@ -38,18 +39,33 @@ struct ProjectWorkspaceView: View {
     @AppStorage("bwfx.workspace.projectSidebarVisible") private var prefersProjectSidebarVisible = true
     @State private var isProjectSidebarOverlayPresented = false
     @State private var isNotesInspectorPresented = false
-    /// 中栏页签：结构总结 / 分析卡片（阶段 D 换通用分析后扩展四页签）
     @State private var centerTab: CenterTab = .summary
+    @State private var liveAudioLevel: Float = 0
+    @State private var audioQuality = RecordingAudioQualityTracker()
+    @State private var hasResolvedAbnormalExit = false
     /// 本会话已在当前视图内实际开录（恢复横幅只在「打开时即异常」的旧会话上出现，
     /// 当前活动录音不算异常）
     @State private var didStartSessionThisView = false
+    /// 本视图这次录音会话在采集服务上的归属令牌（Bug 3：单例回调按会话归属清理）
+    @State private var audioSessionToken = UUID()
     @State private var timerAnchor = Date()
     private let chunkPollTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
     private enum CenterTab: String, CaseIterable {
         case summary = "实时总结"
+        case finalReport = "完整总结"
         case insights = "动机与目的"
         case bloom = "开花"
+
+        /// 「开花」是自造术语，第一次看到的人不知道指什么，鼠标停留时给出解释
+        var explanation: String {
+            switch self {
+            case .summary: return "录音过程中滚动更新的要点"
+            case .finalReport: return "录音结束后生成的完整报告"
+            case .insights: return "对方动机与目的的推断"
+            case .bloom: return "开花：把选中的内容展开成概念解释与延伸知识"
+            }
+        }
     }
 
     var body: some View {
@@ -62,8 +78,17 @@ struct ProjectWorkspaceView: View {
         .onAppear {
             loadProject()
             reloadSidebarProjects()
+            openRequestedFinalReportIfNeeded()
         }
         .onDisappear {
+            environment.audioCapture.onLevel = nil
+            // 录音中直接返回首页时也必须撤回缓冲回调，否则旧闭包会把音频
+            // 继续喂给已废弃的转写会话（只清自己登记的那份）
+            environment.audioCapture.clearBufferHandler(token: audioSessionToken)
+            // 回调已撤回，这个会话不再可能产生音频：注销「正在录」登记，
+            // 首页不应再把它显示成活跃录音
+            environment.clearProjectLive(projectID)
+            projectAIChat?.saveDraftNow()
             noteController?.saveNow()
             runtimePersistence?.flush()
         }
@@ -73,6 +98,15 @@ struct ProjectWorkspaceView: View {
         }
         .onChange(of: importJobsStatusKey) { _, _ in
             reloadImportedProjectFromStore()
+        }
+        .onChange(of: environment.finalReportCoordinator.revision) { _, _ in
+            reloadFinalReportFromStore()
+        }
+        .onChange(of: environment.lexiconRevision) { _, _ in
+            transcription?.correctionRules = environment.correctionRules
+        }
+        .onChange(of: router.requestedFinalReportProjectID) { _, _ in
+            openRequestedFinalReportIfNeeded()
         }
         .confirmationDialog("结束录音？", isPresented: $showEndConfirmation, titleVisibility: .visible) {
             Button("结束录音", role: .destructive) { finishRecording() }
@@ -101,7 +135,7 @@ struct ProjectWorkspaceView: View {
             }
             Button("继续录音", role: .cancel) {}
         } message: {
-            Text("返回首页前需要先结束录音。笔记未保存成功时不会离开工作台。")
+            Text("返回首页前需要先结束录音。此前笔记或共创草稿未保存成功时不会离开工作台。")
         }
     }
 
@@ -150,6 +184,7 @@ struct ProjectWorkspaceView: View {
                         analysisSuspendedBanner(reason: reason)
                     }
                     if meeting.status.isAbnormalIfAppRelaunched, !isFinishing, !didStartSessionThisView,
+                       !hasResolvedAbnormalExit,
                        environment.importProcessing.activeProjectID != project.id {
                         abnormalBanner(meeting: meeting)
                     }
@@ -161,7 +196,7 @@ struct ProjectWorkspaceView: View {
                     }
                     workspaceColumns(mode: mode, meeting: meeting)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    if meeting.status == .recording || meeting.status == .paused {
+                    if isLiveSessionActive(meeting: meeting) {
                         Divider()
                         bottomRecordBar(meeting: meeting)
                     }
@@ -323,6 +358,23 @@ struct ProjectWorkspaceView: View {
                 .controlSize(.small)
             }
             .padding(12)
+
+            Divider()
+
+            Button {
+                router.showSettings()
+                if isOverlay {
+                    isProjectSidebarOverlayPresented = false
+                }
+            } label: {
+                Label("设置", systemImage: "gearshape")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 11)
+            .help("打开设置中心")
+            .accessibilityLabel("打开设置中心")
         }
         .background(BWTheme.columnBackground)
     }
@@ -370,6 +422,14 @@ struct ProjectWorkspaceView: View {
         meeting?.status == .recording || meeting?.status == .paused
     }
 
+    /// 本次会话是否真的持有录音器（决定底部录音条是否出现）
+    private func isLiveSessionActive(meeting: Meeting) -> Bool {
+        ProjectRuntimeSession.showsRecordBar(
+            status: meeting.status,
+            hasLiveRecorder: recorder?.activeMeeting != nil
+        )
+    }
+
     private func sidebarStatusColor(_ status: ProjectStatus) -> Color {
         switch status {
         case .recording, .failed: return .red
@@ -393,9 +453,13 @@ struct ProjectWorkspaceView: View {
             operationError = "录音进行中，请结束录音后再切换项目。"
             return
         }
-        let saved = noteController?.saveNow() ?? true
-        guard Self.canNavigateHome(afterNoteSave: saved) else {
-            operationError = "笔记尚未保存成功，已阻止切换项目。请在右栏检查错误并重试保存。"
+        let noteSaved = noteController?.saveNow() ?? true
+        let draftSaved = projectAIChat?.saveDraftNow() ?? true
+        guard Self.canNavigateHome(
+            afterNoteSave: noteSaved,
+            afterCoCreateDraftSave: draftSaved
+        ) else {
+            operationError = "此前笔记或共创草稿尚未保存成功，已阻止切换项目。请在右栏检查错误并重试。"
             return
         }
         runtimePersistence?.flush()
@@ -428,16 +492,23 @@ struct ProjectWorkspaceView: View {
 
     // MARK: - 导航门禁
 
-    /// 笔记保存门禁（Codex 审计补强）：保存失败不得离开工作台
-    static func canNavigateHome(afterNoteSave saveSucceeded: Bool) -> Bool {
-        saveSucceeded
+    /// 此前笔记与共创草稿任一保存失败时，不得离开工作台。
+    static func canNavigateHome(
+        afterNoteSave noteSaveSucceeded: Bool,
+        afterCoCreateDraftSave draftSaveSucceeded: Bool = true
+    ) -> Bool {
+        noteSaveSucceeded && draftSaveSucceeded
     }
 
-    /// 返回首页前强制落盘笔记；失败则停留并显示错误与重试入口
+    /// 返回首页前强制落盘此前笔记与共创草稿。
     private func attemptNavigateHome() {
-        let saved = noteController?.saveNow() ?? true
-        guard Self.canNavigateHome(afterNoteSave: saved) else {
-            operationError = "笔记尚未保存成功，已阻止返回。请在右栏检查错误并重试保存。"
+        let noteSaved = noteController?.saveNow() ?? true
+        let draftSaved = projectAIChat?.saveDraftNow() ?? true
+        guard Self.canNavigateHome(
+            afterNoteSave: noteSaved,
+            afterCoCreateDraftSave: draftSaved
+        ) else {
+            operationError = "此前笔记或共创草稿尚未保存成功，已阻止返回。请在右栏检查错误并重试。"
             return
         }
         router.showProjectHome()
@@ -535,10 +606,18 @@ struct ProjectWorkspaceView: View {
                 Button {
                     isNotesInspectorPresented.toggle()
                 } label: {
-                    Image(systemName: "note.text")
+                    Image(systemName: "bubble.left.and.text.bubble.right")
                 }
-                .help(isNotesInspectorPresented ? "关闭我的笔记" : "打开我的笔记")
-                .accessibilityLabel(isNotesInspectorPresented ? "关闭我的笔记" : "打开我的笔记")
+                .help(
+                    isNotesInspectorPresented
+                        ? "关闭 AI 共创笔记"
+                        : "打开 AI 共创笔记"
+                )
+                .accessibilityLabel(
+                    isNotesInspectorPresented
+                        ? "关闭 AI 共创笔记"
+                        : "打开 AI 共创笔记"
+                )
                 .accessibilityValue(isNotesInspectorPresented ? "已打开" : "已关闭")
             }
 
@@ -625,6 +704,7 @@ struct ProjectWorkspaceView: View {
                     return diarization?.displayName(forRemoteLabel: segment.remoteSpeakerLabel)
                 },
                 highlightedSegmentID: highlightedSegmentID,
+                liveAudioLevel: meeting.status == .recording ? liveAudioLevel : nil,
                 onAssignSpeaker: { segment, participant in
                     if let participant {
                         MeetingTranscriptEditor.assignSpeaker(segment, to: participant)
@@ -651,102 +731,138 @@ struct ProjectWorkspaceView: View {
 
     private func analysisColumn(meeting: Meeting) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 7) {
-                RoundedRectangle(cornerRadius: 1.5)
-                    .fill(BWTheme.accent)
-                    .frame(width: 3, height: 13)
-                Text("AI 工作区")
-                    .font(.subheadline)
-                    .fontWeight(.semibold)
-                if let project {
-                    scenarioPicker(project: project)
-                }
-                Spacer()
-                if centerTab == .bloom, knowledgeGarden?.state == .expanding {
-                    HStack(spacing: 4) {
-                        ProgressView().controlSize(.mini)
-                        Text("开花中")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+            VStack(spacing: 7) {
+                HStack(spacing: 7) {
+                    RoundedRectangle(cornerRadius: 1.5)
+                        .fill(BWTheme.accent)
+                        .frame(width: 3, height: 13)
+                    Text("AI 工作区")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                    if let project {
+                        scenarioPicker(project: project)
                     }
-                } else if analysis?.state == .analyzing {
-                    HStack(spacing: 4) {
-                        ProgressView().controlSize(.mini)
-                        Text("分析中")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+                    Spacer()
+                    if centerTab == .finalReport, finalReportState == .generating {
+                        HStack(spacing: 4) {
+                            ProgressView().controlSize(.mini)
+                            Text("总结中")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else if centerTab == .bloom, knowledgeGarden?.state == .expanding {
+                        HStack(spacing: 4) {
+                            ProgressView().controlSize(.mini)
+                            Text("开花中")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else if analysis?.state == .analyzing {
+                        HStack(spacing: 4) {
+                            ProgressView().controlSize(.mini)
+                            Text("分析中")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else if analysis?.hasRecentFailure == true {
+                        Image(systemName: "exclamationmark.circle")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .help(analysis?.statusDescription ?? "")
                     }
-                } else if analysis?.hasRecentFailure == true {
-                    Image(systemName: "exclamationmark.circle")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .help(analysis?.statusDescription ?? "")
                 }
+
                 Picker("", selection: $centerTab) {
                     ForEach(CenterTab.allCases, id: \.self) { tab in
-                        Text(tab.rawValue).tag(tab)
+                        Text(tab.rawValue)
+                            .help(tab.explanation)
+                            .tag(tab)
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(maxWidth: 300)
+                .frame(maxWidth: 420)
                 .labelsHidden()
                 .tint(BWTheme.accent)
             }
             .padding(.horizontal, 16)
-            .frame(minHeight: 44)
+            .padding(.vertical, 7)
+            .frame(minHeight: 72)
             .background(.bar)
 
-            // 旧谈判项目（仅有迁移快照、无 V2 快照）继续用旧渲染（03 §16D 兼容显示）
-            let showLegacy = analysis?.currentSnapshot == nil
-                && !(project?.legacySnapshots.isEmpty ?? true)
-            switch centerTab {
-            case .summary:
-                if showLegacy {
-                    StructureSummaryView(
-                        snapshot: legacySnapshot,
-                        participants: meeting.participants,
-                        segments: transcription?.segments ?? meeting.segments,
-                        onEvidenceTap: locateEvidence
-                    )
-                } else {
-                    ConversationAnalysisView(
-                        snapshot: analysis?.currentSnapshot,
-                        summaryTab: true,
-                        speakers: project?.speakers ?? [],
-                        onEvidenceTap: locateEvidence
-                    )
-                }
-            case .insights:
-                if showLegacy {
-                    InsightCardListView(
-                        snapshot: legacySnapshot,
-                        participants: meeting.participants,
-                        segments: transcription?.segments ?? meeting.segments,
-                        onEvidenceTap: locateEvidence
-                    )
-                } else {
-                    ConversationAnalysisView(
-                        snapshot: analysis?.currentSnapshot,
-                        summaryTab: false,
-                        speakers: project?.speakers ?? [],
-                        onEvidenceTap: locateEvidence
-                    )
-                }
-            case .bloom:
-                if let knowledgeGarden {
-                    KnowledgeGardenView(
-                        controller: knowledgeGarden,
-                        onEvidenceTap: locateEvidence
-                    )
-                } else {
-                    ContentUnavailableView(
-                        "开花功能正在准备",
-                        systemImage: "leaf"
-                    )
-                }
+            Group {
+                analysisTabContent(meeting: meeting)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    @ViewBuilder
+    private func analysisTabContent(meeting: Meeting) -> some View {
+        let showLegacy = analysis?.currentSnapshot == nil
+            && !(project?.legacySnapshots.isEmpty ?? true)
+        switch centerTab {
+        case .summary:
+            if showLegacy {
+                StructureSummaryView(
+                    snapshot: legacySnapshot,
+                    participants: meeting.participants,
+                    segments: transcription?.segments ?? meeting.segments,
+                    onEvidenceTap: locateEvidence
+                )
+            } else {
+                ConversationAnalysisView(
+                    snapshot: analysis?.currentSnapshot,
+                    summaryTab: true,
+                    speakers: project?.speakers ?? [],
+                    onEvidenceTap: locateEvidence
+                )
+            }
+        case .finalReport:
+            if let project {
+                FinalReportView(
+                    project: project,
+                    state: finalReportState,
+                    isAIConfigured: environment.isAnalysisConfigured,
+                    onGenerate: startFinalReportGeneration,
+                    onOpenSettings: router.showSettings,
+                    onEvidenceTap: locateEvidence
+                )
+            } else {
+                ContentUnavailableView(
+                    "完整总结正在准备",
+                    systemImage: "doc.text.magnifyingglass"
+                )
+            }
+        case .insights:
+            if showLegacy {
+                InsightCardListView(
+                    snapshot: legacySnapshot,
+                    participants: meeting.participants,
+                    segments: transcription?.segments ?? meeting.segments,
+                    onEvidenceTap: locateEvidence
+                )
+            } else {
+                ConversationAnalysisView(
+                    snapshot: analysis?.currentSnapshot,
+                    summaryTab: false,
+                    speakers: project?.speakers ?? [],
+                    onEvidenceTap: locateEvidence
+                )
+            }
+        case .bloom:
+            if let knowledgeGarden {
+                KnowledgeGardenView(
+                    controller: knowledgeGarden,
+                    onEvidenceTap: locateEvidence
+                )
+            } else {
+                ContentUnavailableView(
+                    "开花功能正在准备",
+                    systemImage: "leaf"
+                )
+            }
+        }
     }
 
     /// 旧谈判快照（迁移项目回看）
@@ -807,59 +923,30 @@ struct ProjectWorkspaceView: View {
     }
 
     private var noteColumn: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            columnHeader("我的笔记")
-            if let noteController {
-                TextEditor(text: Binding(
-                    get: { noteController.markdown },
-                    set: { noteController.update(markdown: $0) }
-                ))
-                .font(.body)
-                .scrollContentBackground(.hidden)
-                .padding(.horizontal, 12)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .overlay(alignment: .topLeading) {
-                    if noteController.markdown.isEmpty {
-                        HStack(spacing: 8) {
-                            Image(systemName: "square.and.pencil")
-                                .foregroundStyle(BWTheme.accent.opacity(0.7))
-                            Text("在这里记录判断、问题和待办")
-                                .font(.callout)
-                                .foregroundStyle(.tertiary)
-                        }
-                        .padding(.horizontal, 18)
-                        .padding(.vertical, 12)
-                        .allowsHitTesting(false)
-                        .accessibilityHidden(true)
-                    }
-                }
-
-                Divider()
-                // 保存状态：成功显示时间；失败如实显示（不静默丢失）
-                HStack(spacing: 6) {
-                    if let saveError = noteController.saveError {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.orange)
-                        Text("笔记保存失败（\(saveError)），内容仍保留在编辑区，请重试")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                        Spacer()
-                        Button("重试") { noteController.saveNow() }
-                            .font(.caption)
-                    } else if let savedAt = noteController.lastSavedAt {
-                        Text("已自动保存 \(Self.timeString(savedAt))")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                        Spacer()
-                    } else {
-                        Text("输入后自动保存")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                        Spacer()
-                    }
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 6)
+        Group {
+            if let projectAIChat, let project {
+                ProjectAIChatView(
+                    controller: projectAIChat,
+                    legacyNoteMarkdown: noteController?.markdown
+                        ?? project.note.markdown,
+                    legacyNoteContextEnabled: project.noteAIContextEnabled,
+                    canReanalyze: project.segments.contains {
+                        ($0.state == .final || $0.state == .edited)
+                            && !$0.text.trimmingCharacters(
+                                in: .whitespacesAndNewlines
+                            ).isEmpty
+                    },
+                    onLegacyNoteContextChanged: setNoteAIContextEnabled,
+                    onReanalyze: {
+                        Task { await analysis?.generateFinalAnalysis() }
+                    },
+                    onOpenSettings: router.showSettings
+                )
+            } else {
+                ContentUnavailableView(
+                    "AI 共创笔记正在准备",
+                    systemImage: "bubble.left.and.text.bubble.right"
+                )
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -900,6 +987,25 @@ struct ProjectWorkspaceView: View {
                     .monospacedDigit()
                     .font(.callout)
             }
+
+            HStack(spacing: 6) {
+                Image(systemName: "waveform")
+                    .foregroundStyle(audioQuality.isPersistentlyLow ? .orange : .secondary)
+                ProgressView(value: Double(liveAudioLevel))
+                    .frame(width: 70)
+                if audioQuality.isPersistentlyLow {
+                    Text("声音偏小，请靠近麦克风或提高播放音量")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            }
+            .help("持续偏小会显著降低专有名词和数字的识别准确率")
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(
+                audioQuality.isPersistentlyLow
+                    ? "录音声音持续偏小，建议靠近麦克风或提高播放音量"
+                    : "当前录音电平"
+            )
 
             Spacer()
 
@@ -1006,7 +1112,7 @@ struct ProjectWorkspaceView: View {
     private func cloudSuspendedBanner(reason: String) -> some View {
         HStack(spacing: 8) {
             Image(systemName: "person.2.waveform")
-            Text("说话人识别暂停，本地录音与转写正常。\(reason)")
+            Text("高精度转写与说话人识别暂停；当前仍保留本地 Apple Speech 文稿。\(reason)")
                 .font(.callout)
             Spacer()
             Button("已修复，重试") {
@@ -1049,7 +1155,9 @@ struct ProjectWorkspaceView: View {
             Button("标记为已结束") {
                 do {
                     try MeetingRecovery.markCompletedAfterAbnormalExit(meeting)
-                    syncAndPersist(meeting)
+                    if syncAndPersist(meeting) {
+                        hasResolvedAbnormalExit = true
+                    }
                 } catch {
                     operationError = error.localizedDescription
                 }
@@ -1081,6 +1189,7 @@ struct ProjectWorkspaceView: View {
         case .transcription: return "转写"
         case .diarization: return "分人"
         case .analysis: return "分析"
+        case .finalReport: return "完整总结"
         case .knowledgeExpansion: return "知识关联"
         case .obsidianArchive: return "归档"
         }
@@ -1128,11 +1237,17 @@ struct ProjectWorkspaceView: View {
                             .lineLimit(1)
                     }
                     if !isActive, needsAttention {
-                        Button("继续处理") {
+                        let reportState = environment.finalReportCoordinator.state(
+                            for: project.id
+                        )
+                        Button(
+                            reportState == .generating ? "完整总结生成中" : "继续处理"
+                        ) {
                             environment.importProcessing.resume(projectID: project.id)
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
+                        .disabled(reportState == .generating)
                     }
                     if isActive {
                         Button("暂停处理") {
@@ -1181,6 +1296,7 @@ struct ProjectWorkspaceView: View {
         project.endedAt = fresh.endedAt
         project.legacySnapshots = fresh.legacySnapshots
         project.analysisSnapshots = fresh.analysisSnapshots
+        project.finalReportSnapshots = fresh.finalReportSnapshots
         project.knowledgeSeeds = fresh.knowledgeSeeds
         project.segments = fresh.segments
         project.scenario = fresh.scenario
@@ -1195,15 +1311,16 @@ struct ProjectWorkspaceView: View {
             return
         }
         project = loaded
+        let notes = NoteController(project: loaded) { [environment] in
+            try environment.persist($0, fields: .note)
+        }
+        noteController = notes
         do {
             let runtime = try ProjectRuntimeSession.makeRuntimeMeeting(from: loaded)
             meeting = runtime
-            wireControllers(to: runtime, project: loaded)
+            wireControllers(to: runtime, project: loaded, noteController: notes)
         } catch {
             operationError = "项目读取失败（\(String(describing: type(of: error)))"
-        }
-        noteController = NoteController(project: loaded) { [environment] in
-            try environment.persist($0, fields: .note)
         }
         // 进入界面即检查本地转写可用性（不可用时显示真实原因）
         Task { await transcription?.checkAvailability() }
@@ -1213,7 +1330,11 @@ struct ProjectWorkspaceView: View {
         }
     }
 
-    private func wireControllers(to meeting: Meeting, project: Project) {
+    private func wireControllers(
+        to meeting: Meeting,
+        project: Project,
+        noteController: NoteController
+    ) {
         let recordingService = MeetingRecordingService(
             capture: environment.audioCapture,
             fileStore: environment.fileStore
@@ -1254,8 +1375,12 @@ struct ProjectWorkspaceView: View {
             expansionService: environment.knowledgeExpansion,
             providerFactory: { [environment] in
                 environment.makeKnowledgeProviders()
-            }
+            },
+            automaticallyBloomNewSeeds: true
         )
+        knowledgeController.noteContextProvider = { [weak noteController] in
+            noteController?.markdown
+        }
         knowledgeController.onUpdated = { [environment] in
             do {
                 try environment.persist(project, fields: .knowledgeGarden)
@@ -1265,6 +1390,54 @@ struct ProjectWorkspaceView: View {
         }
         knowledgeController.attach(to: project)
         knowledgeGarden = knowledgeController
+
+        let chatController = ProjectAIChatController(
+            service: environment.projectAIChat,
+            persist: { [environment] project in
+                try environment.persist(project, fields: .aiContext)
+            }
+        )
+        chatController.noteContextProvider = { [weak noteController] in
+            noteController?.markdown
+        }
+        chatController.prepareRequestContext = {
+            self.syncAndPersist(meeting)
+        }
+        chatController.onTranscriptCorrection = { correction in
+            guard TranscriptCorrector.hasVerifiedMatch(
+                wrong: correction.wrong,
+                right: correction.right,
+                evidenceSegmentIDs: correction.evidenceSegmentIDs,
+                segments: meeting.segments
+            ) else {
+                return 0
+            }
+            return self.globalCorrect(
+                wrong: correction.wrong,
+                right: correction.right,
+                meeting: meeting
+            )
+        }
+        chatController.onConversationUpdated = { [environment, weak project] in
+            guard let project,
+                  project.status == .ready
+                    || project.status == .readyWithWarnings,
+                  project.segments.contains(where: {
+                      ($0.state == .final || $0.state == .edited)
+                          && !$0.text.trimmingCharacters(
+                              in: .whitespacesAndNewlines
+                          ).isEmpty
+                  }),
+                  environment.isAnalysisConfigured else {
+                return
+            }
+            environment.finalReportCoordinator.start(
+                projectID: project.id,
+                refreshIfRunning: true
+            )
+        }
+        chatController.attach(to: project)
+        projectAIChat = chatController
 
         let analysisController = ConversationAnalysisController(
             service: environment.conversationAnalysis,
@@ -1289,14 +1462,16 @@ struct ProjectWorkspaceView: View {
     }
 
     /// 运行时 → Project 回写并落库（所有状态变化的统一出口）
-    private func syncAndPersist(_ meeting: Meeting) {
-        guard let project else { return }
+    @discardableResult
+    private func syncAndPersist(_ meeting: Meeting) -> Bool {
+        guard let project else { return false }
         if let runtimePersistence {
             if runtimePersistence.flush(force: true) {
                 operationError = nil
                 reloadSidebarProjects()
+                return true
             }
-            return
+            return false
         }
         do {
             try ProjectRuntimeSession.applyRuntime(meeting, to: project)
@@ -1306,8 +1481,10 @@ struct ProjectWorkspaceView: View {
             try environment.persist(project, fields: fields)
             operationError = nil
             reloadSidebarProjects()
+            return true
         } catch {
             operationError = "项目保存失败（\(String(describing: type(of: error)))）"
+            return false
         }
     }
 
@@ -1318,6 +1495,33 @@ struct ProjectWorkspaceView: View {
             reloadSidebarProjects()
         } catch {
             operationError = "项目保存失败（\(String(describing: type(of: error)))）"
+        }
+    }
+
+    private func setNoteAIContextEnabled(_ enabled: Bool) {
+        guard let project else { return }
+        let previous = project.noteAIContextEnabled
+        project.noteAIContextEnabled = enabled
+        do {
+            try environment.persist(project, fields: .aiContext)
+            operationError = nil
+            if environment.isAnalysisConfigured,
+               project.status == .ready
+                || project.status == .readyWithWarnings,
+               project.segments.contains(where: {
+                   ($0.state == .final || $0.state == .edited)
+                       && !$0.text.trimmingCharacters(
+                           in: .whitespacesAndNewlines
+                       ).isEmpty
+               }) {
+                environment.finalReportCoordinator.start(
+                    projectID: project.id,
+                    refreshIfRunning: true
+                )
+            }
+        } catch {
+            project.noteAIContextEnabled = previous
+            operationError = "笔记 AI 授权保存失败，设置未改变。"
         }
     }
 
@@ -1376,17 +1580,28 @@ struct ProjectWorkspaceView: View {
             }
 
             do {
+                audioQuality.reset()
+                liveAudioLevel = 0
                 try recorder?.startRecording(for: meeting, deviceID: meeting.preferredInputDeviceID)
                 didStartSessionThisView = true
+                environment.markProjectLive(projectID)
                 syncAndPersist(meeting)
                 operationError = nil
+                environment.audioCapture.onLevel = { level in
+                    Task { @MainActor in
+                        liveAudioLevel = level
+                        audioQuality.observe(level)
+                    }
+                }
 
                 if let recorder, let transcription {
                     try await transcription.start(for: meeting) { [weak recorder] in
                         recorder?.timeline
                     }
                     let transcriptionService = environment.localTranscription
-                    environment.audioCapture.onBuffer = { buffer in
+                    let token = UUID()
+                    audioSessionToken = token
+                    environment.audioCapture.setBufferHandler(token: token) { buffer in
                         let boxed = SendableAudioBuffer(buffer)
                         Task { await transcriptionService.feed(boxed.buffer) }
                     }
@@ -1402,27 +1617,114 @@ struct ProjectWorkspaceView: View {
         }
     }
 
-    /// 结束录音：收尾流水线在后台继续，用户可立即返回首页
     private func finishRecording() {
-        guard let meeting else { return }
+        guard let meeting, !isFinishing else { return }
         noteController?.saveNow()
+        projectAIChat?.saveDraftNow()
         isFinishing = true
         Task {
             do {
+                environment.audioCapture.onLevel = nil
                 try recorder?.beginFinish()
                 syncAndPersist(meeting)
-                environment.audioCapture.onBuffer = nil
+                environment.audioCapture.clearBufferHandler(token: audioSessionToken)
                 await transcription?.finish()
                 await diarization?.finishAndDrain()
-                await analysis?.generateFinalAnalysis()
                 try recorder?.completeFinalizing()
                 syncAndPersist(meeting)
+                environment.clearProjectLive(projectID)
                 operationError = nil
+                if environment.isAnalysisConfigured {
+                    environment.finalReportCoordinator.start(projectID: projectID)
+                } else {
+                    // 静默跳过会让人误以为「完整总结」功能缺失；必须说清原因和补救入口
+                    operationError = "AI 未连接，完整总结未生成；可前往设置连接后在「完整总结」页签手动生成。"
+                }
             } catch {
                 operationError = error.localizedDescription
             }
             isFinishing = false
         }
+    }
+
+    private var finalReportState: FinalReportCoordinator.State {
+        let coordinatorState = environment.finalReportCoordinator.state(for: projectID)
+        guard coordinatorState == .idle,
+              let job = project?.processingJobs.last(where: { $0.kind == .finalReport }) else {
+            return coordinatorState
+        }
+        switch job.status {
+        case .running:
+            return environment.importProcessing.activeProjectID == projectID
+                ? .generating
+                : .idle
+        case .failedRetryable, .failedFinal:
+            return .failed(message: "完整总结暂时生成失败，可重试")
+        case .pending, .completed:
+            return coordinatorState
+        }
+    }
+
+    private func startFinalReportGeneration() {
+        guard environment.isAnalysisConfigured else {
+            router.showSettings()
+            return
+        }
+        guard let project,
+              project.segments.contains(where: {
+                  ($0.state == .final || $0.state == .edited)
+                      && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+              }) else {
+            operationError = "还没有可用于完整总结的最终文稿。"
+            return
+        }
+        guard meeting?.status != .recording,
+              meeting?.status != .paused,
+              !isFinishing else {
+            operationError = "请先结束录音，完成收尾后再生成完整总结。"
+            return
+        }
+        if project.sourceType != .liveRecording,
+           project.status == .processing,
+           environment.importProcessing.activeProjectID == nil,
+           project.processingJobs.contains(where: {
+               $0.kind == .finalReport
+                   && ($0.status == .running || $0.status == .pending)
+           }) {
+            environment.importProcessing.resume(projectID: projectID)
+            return
+        }
+        if project.sourceType != .liveRecording,
+           project.status == .processing
+            || environment.importProcessing.activeProjectID == projectID {
+            operationError = "导入处理尚未结束，请等待当前流水线完成。"
+            return
+        }
+        environment.finalReportCoordinator.start(projectID: projectID)
+    }
+
+    private func openRequestedFinalReportIfNeeded() {
+        if router.consumeFinalReportRequest(for: projectID) {
+            centerTab = .finalReport
+        }
+    }
+
+    private func reloadFinalReportFromStore() {
+        guard let project,
+              let fresh = try? environment.allProjects().first(where: {
+                  $0.id == projectID
+              }) else {
+            return
+        }
+        project.analysisSnapshots = fresh.analysisSnapshots
+        project.finalReportSnapshots = fresh.finalReportSnapshots
+        project.processingJobs = fresh.processingJobs
+        if !project.scenarioWasUserSelected {
+            project.scenario = fresh.scenario
+        }
+        analysis?.attach(to: project)
+        knowledgeGarden?.refreshCandidates()
+        reloadSidebarProjects()
     }
 
     /// 执行可失败操作并把错误转为界面提示
@@ -1435,12 +1737,6 @@ struct ProjectWorkspaceView: View {
         }
     }
 
-    /// HH:mm:ss（笔记保存状态）
-    static func timeString(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
-        return formatter.string(from: date)
-    }
 }
 
 /// 处理详情弹层（03 §6.3：Provider Key 状态、分片计数等技术细节不占据主工作区，仅在此查看）
@@ -1478,11 +1774,16 @@ private struct ProcessingDetailsButton: View {
             VStack(alignment: .leading, spacing: 10) {
                 row("麦克风", microphoneName ?? "系统默认")
                 row("本地转写", transcriptionStatusText)
-                row("说话人识别", diarizationStatusText)
+                row("高精度转写与说话人", diarizationStatusText)
                 row("云端分析", analysis?.statusDescription ?? "分析待启动")
                 Divider()
-                row("分析 Key", isAnalysisConfigured ? "已配置" : "未配置")
-                row("分人 Key", isDiarizationConfigured ? "已配置" : "未配置（可手动标注）")
+                row("文字分析模型", isAnalysisConfigured ? "已连接" : "未连接")
+                row(
+                    "高精度音频服务",
+                    isDiarizationConfigured
+                        ? "已连接"
+                        : "未连接（当前仅 Apple Speech）"
+                )
                 if let diarization, diarization.awaitingUserRetryCount > 0 {
                     Button("重试 \(diarization.awaitingUserRetryCount) 个失败分片", action: onRetryChunks)
                 }
@@ -1518,7 +1819,7 @@ private struct ProcessingDetailsButton: View {
         case .idle: return "正常"
         case .working(let pending): return pending > 0 ? "识别中（待处理 \(pending)）" : "正常"
         case .suspended: return "已暂停"
-        case .unconfigured: return "未配置"
+        case .unconfigured: return "未配置（仅本地转写）"
         }
     }
 }

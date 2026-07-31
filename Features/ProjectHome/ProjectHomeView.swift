@@ -15,6 +15,14 @@ struct ProjectHomeView: View {
     @State private var importErrorMessage: String?
     @State private var isDropTargeted = false
     @State private var selectedRecordingScenario: ProjectScenario?
+    @State private var isScenarioExpanded = false
+    @State private var isResolvingLeftover = false
+    @State private var renameTarget: Project?
+    @State private var renameDraft = ""
+    @State private var deleteTarget: Project?
+    /// 删除等操作的失败原因。不复用 loadError：那条带死板的「项目读取失败：」前缀，
+    /// 拿它显示「正在录音，先结束再删」会变成一句读不通的假错误。
+    @State private var operationError: String?
     /// 首次录音知情确认只做一次（03 §6.1）
     @AppStorage("bwfx.recordingConsentConfirmed") private var consentConfirmed = false
 
@@ -31,6 +39,11 @@ struct ProjectHomeView: View {
                             .font(.callout)
                             .foregroundStyle(.orange)
                     }
+                    if let operationError {
+                        Label(operationError, systemImage: "exclamationmark.triangle")
+                            .font(.callout)
+                            .foregroundStyle(.orange)
+                    }
                     abnormalNotice
                     recentSection
                 }
@@ -43,6 +56,7 @@ struct ProjectHomeView: View {
         .navigationTitle("帮我分析")
         .onAppear {
             selectedRecordingScenario = nil
+            isScenarioExpanded = false
             reload()
         }
         .confirmationDialog("开始录音前请确认", isPresented: $showConsent, titleVisibility: .visible) {
@@ -62,8 +76,30 @@ struct ProjectHomeView: View {
         } message: {
             Text(importErrorMessage ?? "")
         }
-        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
-            handleDrop(providers)
+        .alert("重命名项目", isPresented: Binding(
+            get: { renameTarget != nil },
+            set: { if !$0 { renameTarget = nil } }
+        )) {
+            TextField("项目标题", text: $renameDraft)
+            Button("保存") { commitRename() }
+            Button("取消", role: .cancel) { renameTarget = nil }
+        } message: {
+            Text("只改标题，不影响录音文件与已生成的分析。")
+        }
+        .confirmationDialog(
+            "删除这个项目？",
+            isPresented: Binding(
+                get: { deleteTarget != nil },
+                set: { if !$0 { deleteTarget = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("永久删除", role: .destructive) { commitDelete() }
+            Button("取消", role: .cancel) { deleteTarget = nil }
+        } message: {
+            if let deleteTarget {
+                Text(ProjectHomeSupport.deletionSummary(for: deleteTarget))
+            }
         }
     }
 
@@ -160,33 +196,59 @@ struct ProjectHomeView: View {
             }
             .buttonStyle(.plain)
             .disabled(environment.importProcessing.isRunning)
+            .onDrop(of: ProjectHomeSupport.importContentTypes + [.fileURL],
+                    isTargeted: $isDropTargeted) { providers in
+                handleDrop(providers)
+            }
         }
         .padding(.bottom, 6)
     }
 
     // MARK: - 录音场景
 
+    /// 可选项不该占满一屏：默认折叠成一行，纵向空间留给项目列表（界面 3）
     private var recordingScenarioSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline) {
-                Text("录音场景（可选）")
-                    .font(.headline)
-                Spacer()
-                Text("仅用于现场录音")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-            }
-
-            HStack(spacing: 8) {
-                recordingScenarioButton(nil)
-                ForEach(ProjectHomeSupport.recordingScenarioOrder, id: \.self) { scenario in
-                    recordingScenarioButton(scenario)
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    isScenarioExpanded.toggle()
                 }
+            } label: {
+                HStack(spacing: 6) {
+                    Text("录音场景")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Text(selectedRecordingScenario?.displayName ?? "自动判断")
+                        .font(.callout)
+                        .fontWeight(.medium)
+                        .foregroundStyle(selectedRecordingScenario == nil ? .primary : BWTheme.accent)
+                    Image(systemName: "chevron.down")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(isScenarioExpanded ? 180 : 0))
+                    Spacer()
+                    Text("仅用于现场录音")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .accessibilityLabel("录音场景：\(selectedRecordingScenario?.displayName ?? "自动判断")")
+            .help(isScenarioExpanded ? "收起录音场景选项" : "展开选择录音场景")
 
-            Text("默认由 AI 根据内容判断，也可以提前指定；进入工作台后仍可随时修改。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            if isScenarioExpanded {
+                HStack(spacing: 8) {
+                    recordingScenarioButton(nil)
+                    ForEach(ProjectHomeSupport.recordingScenarioOrder, id: \.self) { scenario in
+                        recordingScenarioButton(scenario)
+                    }
+                }
+
+                Text("默认由 AI 根据内容判断，也可以提前指定；进入工作台后仍可随时修改。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(14)
         .background(BWTheme.card, in: RoundedRectangle(cornerRadius: 14))
@@ -237,17 +299,48 @@ struct ProjectHomeView: View {
 
     @ViewBuilder
     private var abnormalNotice: some View {
-        let abnormal = projects.filter { $0.status.isAbnormalIfAppRelaunched }
-        if !abnormal.isEmpty {
+        let leftover = ProjectHomeSupport.leftoverProjects(
+            in: projects,
+            liveProjectIDs: environment.liveRecordingProjectIDs
+        )
+        if !leftover.isEmpty {
             HStack(spacing: 8) {
                 Image(systemName: "exclamationmark.arrow.triangle.2.circlepath")
-                Text("有 \(abnormal.count) 个项目上次未正常结束，打开后可查看或标记结束。")
+                Text("有 \(leftover.count) 个项目上次未正常结束。")
                     .font(.callout)
                 Spacer()
+                // 提示必须带得动手的入口，不能只说「打开后可以」
+                Button("查看第一个") {
+                    if let first = leftover.first {
+                        router.showProjectWorkspace(first.id, autoStart: false)
+                    }
+                }
+                .buttonStyle(.link)
+                Button("全部标记结束") {
+                    markAllLeftoverResolved(leftover)
+                }
+                .buttonStyle(.link)
+                .disabled(isResolvingLeftover)
             }
             .padding(12)
             .background(.yellow.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
         }
+    }
+
+    /// 把残留状态推进到 ready，口径与异常恢复弹窗一致（复用同一函数，不另立映射）
+    private func markAllLeftoverResolved(_ leftover: [Project]) {
+        isResolvingLeftover = true
+        defer { isResolvingLeftover = false }
+        for project in leftover {
+            do {
+                try MeetingRecovery.markResolvedAfterAbnormalExit(project)
+                try environment.persist(project)
+            } catch {
+                loadError = error.localizedDescription
+                break
+            }
+        }
+        reload()
     }
 
     // MARK: - 最近项目
@@ -263,60 +356,27 @@ struct ProjectHomeView: View {
                     .padding(.vertical, 24)
             }
             ForEach(ProjectHomeSupport.sortedForDisplay(projects)) { project in
-                Button {
-                    router.showProjectWorkspace(project.id, autoStart: false)
-                } label: {
-                    projectRow(project)
-                }
-                .buttonStyle(.plain)
+                ProjectHomeRow(
+                    project: project,
+                    display: ProjectHomeSupport.displayStatus(
+                        for: project,
+                        liveProjectIDs: environment.liveRecordingProjectIDs
+                    ),
+                    onOpen: {
+                        router.showProjectWorkspace(project.id, autoStart: false)
+                    },
+                    onRename: {
+                        renameTarget = project
+                        renameDraft = project.title
+                    },
+                    onRevealInFinder: {
+                        revealInFinder(project)
+                    },
+                    onDelete: {
+                        requestDelete(project)
+                    }
+                )
             }
-        }
-    }
-
-    private func projectRow(_ project: Project) -> some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 8) {
-                    Text(project.title)
-                        .font(.callout)
-                        .fontWeight(.medium)
-                        .lineLimit(1)
-                    statusBadge(project.status)
-                }
-                Text(ProjectHomeSupport.summary(for: project))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            Spacer()
-            VStack(alignment: .trailing, spacing: 4) {
-                Text(ProjectHomeSupport.sourceLabel(for: project.sourceType))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text(LiveMeetingView.formatDuration(ms: project.durationMs))
-                    .font(.caption)
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-                Text(project.lastActivityAt, format: .dateTime.month().day().hour().minute())
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-        }
-        .bwCard(padding: 14)
-        .contentShape(RoundedRectangle(cornerRadius: 12))
-    }
-
-    private func statusBadge(_ status: ProjectStatus) -> some View {
-        BWBadge(text: status.displayName, color: badgeColor(status))
-    }
-
-    private func badgeColor(_ status: ProjectStatus) -> Color {
-        switch status {
-        case .recording: return .red
-        case .paused, .processing, .readyWithWarnings: return .orange
-        case .ready: return .green
-        case .creating: return .gray
-        case .failed: return .red
         }
     }
 
@@ -347,6 +407,71 @@ struct ProjectHomeView: View {
         }
     }
 
+    // MARK: - 重命名、在 Finder 中显示与删除
+
+    /// 只写 title 字段：走 .title 所有权，避免覆盖工作台或流水线正在改的其他字段。
+    private func commitRename() {
+        guard let project = renameTarget else { return }
+        renameTarget = nil
+        guard let title = ProjectHomeSupport.normalizedTitle(renameDraft),
+              title != project.title else { return }
+        project.title = title
+        project.lastActivityAt = Date()
+        do {
+            try environment.persist(project, fields: .title)
+        } catch {
+            loadError = "重命名保存失败（\(String(describing: type(of: error)))）"
+        }
+        reload()
+    }
+
+    private func revealInFinder(_ project: Project) {
+        guard let target = ProjectHomeSupport.finderRevealTarget(
+            projectDirectory: environment.fileStore.meetingDirectory(for: project.id),
+            baseDirectory: environment.fileStore.baseDirectory
+        ) else {
+            loadError = ProjectHomeSupport.missingStorageDirectoryMessage
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([target])
+    }
+
+    /// 守卫放在弹确认之前：不可删的项目就别先问「确定吗」再拒绝，
+    /// 那等于让用户按下「永久删除」之后才知道白按了。
+    private func requestDelete(_ project: Project) {
+        if let block = ProjectHomeSupport.deletionBlock(
+            for: project,
+            liveProjectIDs: environment.liveRecordingProjectIDs,
+            importProcessingProjectID: environment.importProcessing.activeProjectID
+        ) {
+            operationError = block.message
+            return
+        }
+        operationError = nil
+        deleteTarget = project
+    }
+
+    /// 确认后再查一次守卫：弹窗展示期间用户可能在别处开了录音或触发了导入。
+    private func commitDelete() {
+        guard let project = deleteTarget else { return }
+        deleteTarget = nil
+        if let block = ProjectHomeSupport.deletionBlock(
+            for: project,
+            liveProjectIDs: environment.liveRecordingProjectIDs,
+            importProcessingProjectID: environment.importProcessing.activeProjectID
+        ) {
+            operationError = block.message
+            return
+        }
+        do {
+            try environment.deleteProject(project)
+            operationError = nil
+        } catch {
+            operationError = "删除失败（\(String(describing: type(of: error)))）"
+        }
+        reload()
+    }
+
     static func loadErrorMessage(for error: Error) -> String {
         guard case let ProjectStoreError.dataCorrupted(backupFileName) = error else {
             return String(describing: type(of: error))
@@ -370,16 +495,27 @@ struct ProjectHomeView: View {
         beginImport(url: url)
     }
 
-    /// 拖放导入：只取第一个文件（首版一次一个）
+    /// 拖放导入：只取第一个文件（首版一次一个）。
+    /// 落点收敛到导入卡片本身，高亮区域与真实可放区域一致；
+    /// 类型不符时同步返回 false，光标直接显示「不接受」而不是先接受再弹错。
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
-        guard let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }) else {
-            return false
+        guard !environment.importProcessing.isRunning else { return false }
+        let candidate = providers.first { provider in
+            provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+                && ProjectHomeSupport.acceptsDrop(
+                    registeredContentTypes: provider.registeredTypeIdentifiers.compactMap(UTType.init)
+                )
         }
+        guard let provider = candidate else { return false }
         _ = provider.loadObject(ofClass: URL.self) { url, _ in
             guard let url else { return }
             Task { @MainActor in
                 // provider 只交付 file URL；外部文件的 security scope 由导入控制器
                 // 覆盖检查与原件复制，后续阶段只读取项目目录内副本。
+                guard ProjectHomeSupport.acceptsDroppedFile(at: url) else {
+                    importErrorMessage = ProjectHomeSupport.unsupportedDropMessage
+                    return
+                }
                 beginImport(url: url)
             }
         }
@@ -398,6 +534,104 @@ struct ProjectHomeView: View {
                 importErrorMessage = error.userMessage
             } catch {
                 importErrorMessage = "导入失败：\(error.localizedDescription)"
+            }
+        }
+    }
+}
+
+/// 最近项目的一行。独立成 View 才能持有 hover 状态：
+/// 整行可点却毫无反馈时用户不知道能点（界面 4）。
+/// 右侧信息重新分层——时长为主，来源降级成小图标，时间最弱。
+private struct ProjectHomeRow: View {
+    let project: Project
+    let display: ProjectHomeSupport.DisplayStatus
+    let onOpen: () -> Void
+    let onRename: () -> Void
+    let onRevealInFinder: () -> Void
+    let onDelete: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: onOpen) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Text(project.title)
+                            .font(.callout)
+                            .fontWeight(.medium)
+                            .lineLimit(1)
+                        BWBadge(text: display.text, color: Self.badgeColor(display))
+                    }
+                    Text(ProjectHomeSupport.summary(for: project))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 3) {
+                    Text(LiveMeetingView.formatDuration(ms: project.durationMs))
+                        .font(.callout)
+                        .fontWeight(.medium)
+                        .monospacedDigit()
+                        .foregroundStyle(.primary)
+                    HStack(spacing: 5) {
+                        Image(systemName: Self.sourceIcon(project.sourceType))
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .help(ProjectHomeSupport.sourceLabel(for: project.sourceType))
+                        Text(project.lastActivityAt,
+                             format: .dateTime.month().day().hour().minute())
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                Image(systemName: "chevron.right")
+                    .font(.caption)
+                    .foregroundStyle(isHovering ? BWTheme.accent : Color.secondary.opacity(0.4))
+            }
+            .bwCard(padding: 14)
+            .overlay(
+                RoundedRectangle(cornerRadius: 12)
+                    .strokeBorder(isHovering ? BWTheme.accent.opacity(0.5) : .clear, lineWidth: 1.5)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.12)) { isHovering = hovering }
+        }
+        .contextMenu {
+            Button("打开") { onOpen() }
+            Button("重命名…") { onRename() }
+            Button("在 Finder 中显示") { onRevealInFinder() }
+            Divider()
+            Button("删除项目…", role: .destructive) { onDelete() }
+        }
+        .accessibilityLabel("\(project.title)，\(display.text)，时长 \(LiveMeetingView.formatDuration(ms: project.durationMs))")
+        .help("打开「\(project.title)」")
+    }
+
+    private static func sourceIcon(_ sourceType: ProjectSourceType) -> String {
+        switch sourceType {
+        case .liveRecording: return "mic"
+        case .importedAudio: return "waveform"
+        case .importedVideo: return "film"
+        }
+    }
+
+    /// 红色只留给此刻真正活跃的录音；异常残留用灰色，避免误读成「正在进行」
+    static func badgeColor(_ display: ProjectHomeSupport.DisplayStatus) -> Color {
+        switch display {
+        case .abnormalLeftover:
+            return .secondary
+        case .liveRecording(let status), .normal(let status):
+            switch status {
+            case .recording: return .red
+            case .paused, .processing, .readyWithWarnings: return .orange
+            case .ready: return .green
+            case .creating: return .gray
+            case .failed: return .red
             }
         }
     }

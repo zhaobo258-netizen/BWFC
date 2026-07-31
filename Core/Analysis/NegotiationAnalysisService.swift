@@ -1,8 +1,8 @@
 import Foundation
 
 /// 分析接口错误（分类驱动调度行为，实施计划 11.2）
-enum AnalysisAPIError: Error, Equatable {
-    /// 401：API Key 无效 → 云端分析暂停，修复后可重试
+enum AnalysisAPIError: Error, Equatable, Sendable {
+    /// 401：凭证无效或所选模型未授权 → 云端分析暂停，修复后可重试
     case unauthorized
     /// 429：限流 → 失败退避
     case rateLimited
@@ -20,12 +20,15 @@ enum AnalysisAPIError: Error, Equatable {
     case invalidResponse
     /// 未配置 API Key
     case missingAPIKey
+    /// 当前 App 身份无法静默读取旧 Keychain 凭证
+    case credentialAccessRequired
 }
 
 extension AnalysisAPIError: LocalizedError {
     var errorDescription: String? {
         switch self {
-        case .unauthorized: return "API Key 无效（401），请在设置中更新后重试"
+        case .unauthorized:
+            return "凭证无效或所选模型未开通（401），请在设置中检查后重试"
         case .rateLimited: return "云端限流（429），稍后自动重试"
         case .serverError(let code): return "云端服务失败（\(code)），稍后自动重试"
         case .clientError(let code): return "请求被拒绝（\(code)）"
@@ -34,6 +37,8 @@ extension AnalysisAPIError: LocalizedError {
         case .truncated: return "分析输出被长度限制截断，已丢弃并保留上一版"
         case .invalidResponse: return "分析结果不合规，已丢弃并保留上一版"
         case .missingAPIKey: return "未配置 API Key"
+        case .credentialAccessRequired:
+            return "当前 App 无法读取旧凭证，请前往设置重新登录或保存 API Key"
         }
     }
 }
@@ -74,7 +79,13 @@ struct OpenAIAnalysisService: NegotiationAnalysisServicing {
     }
 
     func analyze(instructions: String, inputJSON: String) async throws -> AnalysisOutputDTO {
-        guard let apiKey = try apiKeyStore.readKey(), !apiKey.isEmpty else {
+        let apiKey: String?
+        do {
+            apiKey = try apiKeyStore.readKey()
+        } catch KeychainError.interactionNotAllowed {
+            throw AnalysisAPIError.credentialAccessRequired
+        }
+        guard let apiKey, !apiKey.isEmpty else {
             throw AnalysisAPIError.missingAPIKey
         }
 
@@ -115,7 +126,13 @@ struct OpenAIAnalysisService: NegotiationAnalysisServicing {
 
     /// 连接测试（OpenAI 兼容形态：GET /models）
     func testConnection() async throws -> Bool {
-        guard let apiKey = try apiKeyStore.readKey(), !apiKey.isEmpty else {
+        let apiKey: String?
+        do {
+            apiKey = try apiKeyStore.readKey()
+        } catch KeychainError.interactionNotAllowed {
+            throw AnalysisAPIError.credentialAccessRequired
+        }
+        guard let apiKey, !apiKey.isEmpty else {
             throw AnalysisAPIError.missingAPIKey
         }
         var request = URLRequest(url: baseURL.appending(path: "/models"))

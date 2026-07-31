@@ -346,7 +346,11 @@ final class ProjectStoreTests {
         #expect(project.speakers.isEmpty)
         #expect(project.segments.isEmpty)
         #expect(project.legacySnapshots.isEmpty)
+        #expect(project.finalReportSnapshots.isEmpty)
         #expect(project.knowledgeSeeds.isEmpty)
+        #expect(project.aiChatMessages.isEmpty)
+        #expect(project.aiChatDraft.isEmpty)
+        #expect(!project.noteAIContextEnabled)
         // 补强前生成的 Project JSON 无 legacyMetadata 键：解码为 nil，不报错
         #expect(project.legacyMetadata == nil)
         #expect(project.note.markdown == "")
@@ -492,6 +496,62 @@ final class ProjectStoreTests {
         #expect(merged.segments.first?.isStarred == true)
     }
 
+    @Test("首页重命名只改标题：不冲掉磁盘上的片段、状态与分析（Bug 7）")
+    func homeRenameOnlyTouchesTitle() {
+        let id = UUID()
+        let stored = Project(
+            id: id,
+            title: "旧标题",
+            sourceType: .liveRecording,
+            status: .ready,
+            segments: [
+                TranscriptSegment(startMs: 0, endMs: 1_000, text: "已有文稿", source: .local, state: .final)
+            ]
+        )
+        stored.durationMs = 60_000
+        // 首页只拿到列表里的副本，改完标题就写库；其余字段必须保持磁盘上的值
+        let renamed = Project(id: id, title: "客户走访 · 张总", sourceType: .liveRecording, status: .creating)
+        renamed.lastActivityAt = stored.lastActivityAt.addingTimeInterval(60)
+        var projects = [stored]
+
+        ProjectPersistence.upsert(renamed, into: &projects, fields: .title)
+
+        let merged = projects[0]
+        #expect(merged.title == "客户走访 · 张总")
+        #expect(merged.lastActivityAt == renamed.lastActivityAt)
+        #expect(merged.status == .ready)
+        #expect(merged.durationMs == 60_000)
+        #expect(merged.segments.count == 1)
+        #expect(merged.segments.first?.text == "已有文稿")
+    }
+
+    @Test("用户可从人工场景切回自动判断")
+    func userScenarioCanReturnToAutomatic() {
+        let id = UUID()
+        let stored = Project(
+            id: id,
+            title: "场景",
+            sourceType: .liveRecording,
+            scenario: .clientVisit,
+            scenarioWasUserSelected: true
+        )
+        let incoming = Project(
+            id: id,
+            title: "场景",
+            sourceType: .liveRecording,
+            scenario: nil,
+            scenarioWasUserSelected: false
+        )
+        var projects = [stored]
+        ProjectPersistence.upsert(
+            incoming,
+            into: &projects,
+            fields: .userScenario
+        )
+        #expect(projects[0].scenario == nil)
+        #expect(!projects[0].scenarioWasUserSelected)
+    }
+
     @Test("导入项目刷新清单包含后台场景建议与选择来源")
     @MainActor
     func importedRefreshIncludesScenarioSuggestion() {
@@ -499,7 +559,11 @@ final class ProjectStoreTests {
         let workspace = Project(
             id: id,
             title: "打开中的工作台",
-            sourceType: .importedAudio
+            sourceType: .importedAudio,
+            aiChatMessages: [
+                ProjectAIChatMessage(role: .user, text: "工作台里的背景")
+            ],
+            noteAIContextEnabled: true
         )
         let fresh = Project(
             id: id,
@@ -508,19 +572,89 @@ final class ProjectStoreTests {
             scenario: .journalistInterview,
             scenarioWasUserSelected: false,
             status: .ready,
+            finalReportSnapshots: [
+                FinalReportSnapshot(
+                    version: 1,
+                    providerID: "p",
+                    providerName: "P",
+                    modelID: "m",
+                    promptVersion: "v",
+                    inputFingerprint: "f",
+                    headline: "完整总结",
+                    overview: "后台完整总结",
+                    items: []
+                )
+            ],
             knowledgeSeeds: [
                 KnowledgeSeed(
                     seedText: "后台生成的知识种子",
                     whyItMatters: "测试刷新",
                     evidenceSegmentIds: [UUID()]
                 )
-            ]
+            ],
+            aiChatMessages: [
+                ProjectAIChatMessage(role: .assistant, text: "后台旧副本")
+            ],
+            noteAIContextEnabled: false
         )
 
         ProjectWorkspaceView.applyImportedStorageRefresh(from: fresh, to: workspace)
 
         #expect(workspace.scenario == .journalistInterview)
         #expect(workspace.scenarioWasUserSelected == false)
+        #expect(workspace.finalReportSnapshots.count == 1)
         #expect(workspace.knowledgeSeeds.count == 1)
+        #expect(workspace.aiChatMessages.first?.text == "工作台里的背景")
+        #expect(workspace.noteAIContextEnabled)
+    }
+
+    @Test("删除项目：记录与项目目录一起消失，其他项目和其他目录不受影响")
+    @MainActor
+    func deleteProjectRemovesRecordAndDirectory() throws {
+        let base = makeCaseDirectory("delete-project")
+        let fileStore = MeetingFileStore(baseDirectory: base)
+        let environment = AppEnvironment(
+            meetingStore: InMemoryMeetingStore(),
+            fileStore: fileStore,
+            projectStore: try JSONProjectStore(directory: base),
+            keychainServiceName: "com.zhaobo.BangWoFenXi.tests.delete-project-\(UUID().uuidString)"
+        )
+
+        let doomed = Project(title: "待删", sourceType: .liveRecording, status: .ready)
+        let keeper = Project(title: "保留", sourceType: .liveRecording, status: .ready)
+        try environment.persist(doomed)
+        try environment.persist(keeper)
+
+        let doomedDirectory = try fileStore.ensureMeetingDirectory(for: doomed.id)
+        let keeperDirectory = try fileStore.ensureMeetingDirectory(for: keeper.id)
+        try Data("假录音".utf8).write(
+            to: doomedDirectory.appending(path: "recording.caf", directoryHint: .notDirectory)
+        )
+
+        try environment.deleteProject(doomed)
+
+        let remaining = try environment.allProjects()
+        #expect(remaining.count == 1)
+        #expect(remaining.first?.id == keeper.id)
+        #expect(!FileManager.default.fileExists(atPath: doomedDirectory.path))
+        #expect(FileManager.default.fileExists(atPath: keeperDirectory.path))
+    }
+
+    @Test("删除没有落盘目录的项目不报错（创建中就被删）")
+    @MainActor
+    func deleteProjectWithoutDirectorySucceeds() throws {
+        let base = makeCaseDirectory("delete-project-no-dir")
+        let environment = AppEnvironment(
+            meetingStore: InMemoryMeetingStore(),
+            fileStore: MeetingFileStore(baseDirectory: base),
+            projectStore: try JSONProjectStore(directory: base),
+            keychainServiceName: "com.zhaobo.BangWoFenXi.tests.delete-project-\(UUID().uuidString)"
+        )
+        let project = Project(title: "刚建就删", sourceType: .liveRecording, status: .creating)
+        try environment.persist(project)
+
+        try environment.deleteProject(project)
+
+        #expect(try environment.allProjects().isEmpty)
     }
 }

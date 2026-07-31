@@ -28,6 +28,46 @@ enum ProjectRuntimeSession {
         MeetingToProjectMigrator.projectStatus(for: status)
     }
 
+    // MARK: - 底部录音条可见性
+
+    /// 底部录音条只在「本次会话真的持有录音器」时出现。
+    ///
+    /// 崩溃遗留的项目状态仍是 recording/paused，但进程重启后 recorder 里没有 activeMeeting，
+    /// 此时露出录音条会让人按到暂停 —— 状态机必然抛 noActiveMeeting，且「继续」分支永远够不着。
+    /// 这类项目该走的是异常横幅的「标记为已结束」，不是录音条。
+    /// 修的是显示前提而不是放宽状态机守卫：守卫报错是对的，不能让真实的状态机错误被吞掉。
+    static func showsRecordBar(status: MeetingStatus, hasLiveRecorder: Bool) -> Bool {
+        guard hasLiveRecorder else { return false }
+        return status == .recording || status == .paused
+    }
+
+    // MARK: - 时长口径
+
+    /// 墙钟时长（毫秒），口径与迁移器一致：含暂停区间，不等于媒体真实时长。
+    ///
+    /// - endedAt 已知：直接取 endedAt - startedAt；
+    /// - endedAt 缺失（录音中或异常退出未收尾）：用 now - startedAt 与片段/暂停末端取 max，
+    ///   避免「无片段无暂停」时归零并在恢复后固化为 0（Bug 2）；
+    /// - startedAt 也缺失：退回片段/暂停末端与已有值，不凭空造数。
+    static func wallClockDurationMs(
+        startedAt: Date?,
+        endedAt: Date?,
+        segmentEndMs: Int64,
+        pauseEndMs: Int64,
+        fallbackDurationMs: Int64 = 0,
+        now: Date = Date()
+    ) -> Int64 {
+        let timelineEnd = max(segmentEndMs, pauseEndMs)
+        guard let startedAt else {
+            return max(timelineEnd, fallbackDurationMs)
+        }
+        if let endedAt {
+            return Int64((endedAt.timeIntervalSince(startedAt) * 1000).rounded())
+        }
+        let elapsed = max(0, Int64((now.timeIntervalSince(startedAt) * 1000).rounded()))
+        return max(elapsed, max(timelineEnd, fallbackDurationMs))
+    }
+
     // MARK: - Project → 运行时 Meeting
 
     /// 把 Project 水合为同 id 的运行时 Meeting。
@@ -92,13 +132,14 @@ enum ProjectRuntimeSession {
         // 录音资产关联：运行时为权威（开录时由录音服务写入相对路径），必须回写项目
         project.runtimeAssetRelativePath = meeting.audioRelativePath
 
-        if let startedAt = meeting.startedAt, let endedAt = meeting.endedAt {
-            project.durationMs = Int64((endedAt.timeIntervalSince(startedAt) * 1000).rounded())
-        } else {
-            let segmentEnd = meeting.segments.map(\.endMs).max() ?? 0
-            let pauseEnd = meeting.pauseIntervals.map(\.endMs).max() ?? 0
-            project.durationMs = max(segmentEnd, pauseEnd)
-        }
+        project.durationMs = wallClockDurationMs(
+            startedAt: meeting.startedAt,
+            endedAt: meeting.endedAt,
+            segmentEndMs: meeting.segments.map(\.endMs).max() ?? 0,
+            pauseEndMs: meeting.pauseIntervals.map(\.endMs).max() ?? 0,
+            fallbackDurationMs: project.durationMs,
+            now: now
+        )
 
         var legacy = project.legacyMetadata ?? LegacyMeetingMetadata()
         legacy.lastAnalyzedSegmentEndMs = meeting.lastAnalyzedSegmentEndMs
@@ -125,9 +166,21 @@ final class ProjectRuntimePersistenceController {
     private let debounce: Duration
     private let onFailure: (Error) -> Void
     private var flushTask: Task<Void, Never>?
+    /// 单调递增的落盘任务代号：只有当前代号的任务有权清空 flushTask，
+    /// 避免 await 边界后 cancel() 作用在已被替换的引用上导致重复写盘。
+    private var flushGeneration = 0
+    /// 连续写失败次数（决定退避时长，达上限后停止自动重试）
+    private var consecutiveFailures = 0
+
+    /// 写失败后的自动重试上限；超过后保留 saveError 等用户显式操作，不静默丢数据
+    static let maxRetryAttempts = 3
 
     private(set) var hasPendingChanges = false
     private(set) var saveError: String?
+    /// 已执行的落盘次数（供测试断言不重复写盘）
+    private(set) var writeAttemptCount = 0
+    /// 因写失败排入的重试次数
+    private(set) var retryCount = 0
 
     init(
         meeting: Meeting,
@@ -147,11 +200,16 @@ final class ProjectRuntimePersistenceController {
         hasPendingChanges = true
         // 窗口从第一条未保存片段起算，持续转写时也能保证最多约 2 秒未落盘。
         guard flushTask == nil else { return }
-        flushTask = Task { [weak self, debounce] in
-            try? await Task.sleep(for: debounce)
+        scheduleFlush(after: debounce)
+    }
+
+    private func scheduleFlush(after delay: Duration) {
+        flushGeneration += 1
+        let generation = flushGeneration
+        flushTask = Task { [weak self] in
+            try? await Task.sleep(for: delay)
             guard let self, !Task.isCancelled else { return }
-            self.flushTask = nil
-            self.writeThrough()
+            self.writeThrough(generation: generation)
         }
     }
 
@@ -159,20 +217,44 @@ final class ProjectRuntimePersistenceController {
     func flush(force: Bool = false) -> Bool {
         flushTask?.cancel()
         flushTask = nil
+        // 提升代号使在途任务失去写盘资格，重复 flush() 不会各写一次
+        flushGeneration += 1
         guard hasPendingChanges || force else { return saveError == nil }
-        writeThrough()
+        writeThrough(generation: flushGeneration)
         return saveError == nil
     }
 
-    private func writeThrough() {
+    /// generation 不是当前代号时说明该任务已被取代，直接放弃。
+    /// 写盘完成后才清 flushTask，避免与 flush() 的 cancel() 竞态。
+    private func writeThrough(generation: Int) {
+        guard generation == flushGeneration else { return }
+        writeAttemptCount += 1
         do {
             try ProjectRuntimeSession.applyRuntime(meeting, to: project)
             try persist(project)
             hasPendingChanges = false
             saveError = nil
+            consecutiveFailures = 0
+            flushTask = nil
         } catch {
             saveError = String(describing: type(of: error))
             onFailure(error)
+            flushTask = nil
+            scheduleRetryIfPossible()
         }
+    }
+
+    /// 写失败时 hasPendingChanges 仍为 true；这里按次数退避重排，
+    /// 否则没有新 schedule() 时这批变更会一直躺着不重试。
+    private func scheduleRetryIfPossible() {
+        consecutiveFailures += 1
+        guard consecutiveFailures <= Self.maxRetryAttempts else { return }
+        retryCount += 1
+        scheduleFlush(after: retryBackoff(attempt: consecutiveFailures))
+    }
+
+    private func retryBackoff(attempt: Int) -> Duration {
+        // 1s / 2s / 4s，上限在 maxRetryAttempts 处收敛
+        .seconds(1 << min(attempt - 1, 2))
     }
 }

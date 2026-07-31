@@ -78,6 +78,43 @@ struct ConversationAnalysisOutputDTO: Decodable, Equatable, Sendable {
     }
 }
 
+extension ConversationAnalysisOutputDTO {
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        headline = try? container.decode(String.self, forKey: .headline)
+        detectedScenario = try? container.decode(
+            String.self,
+            forKey: .detectedScenario
+        )
+        scenarioConfidence = try? container.decode(
+            String.self,
+            forKey: .scenarioConfidence
+        )
+        items = (try? container.decode([ItemDTO].self, forKey: .items)) ?? []
+    }
+}
+
+extension ConversationAnalysisOutputDTO.ItemDTO {
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        category = (try? container.decode(String.self, forKey: .category)) ?? ""
+        text = (try? container.decode(String.self, forKey: .text)) ?? ""
+        subjectSpeakerId = try? container.decode(
+            String.self,
+            forKey: .subjectSpeakerId
+        )
+        epistemicStatus = (
+            try? container.decode(String.self, forKey: .epistemicStatus)
+        ) ?? ""
+        confidence = (
+            try? container.decode(String.self, forKey: .confidence)
+        ) ?? ""
+        evidenceSegmentIds = (
+            try? container.decode([String].self, forKey: .evidenceSegmentIds)
+        ) ?? []
+    }
+}
+
 /// V2 快照构建与证据校验：
 /// 任何 evidence_segment_ids 为空、无法解析或引用不存在片段的条目都不进 UI；
 /// 枚举白名单外的值整条丢弃（不猜测归类）。

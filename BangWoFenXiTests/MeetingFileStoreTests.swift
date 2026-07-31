@@ -155,6 +155,14 @@ final class MeetingFileStoreTests {
         #expect(FileManager.default.fileExists(
             atPath: meetingDirectory.appending(path: MeetingFileStore.recordingFileName).path
         ))
+
+        let repeatedDestination = try AppStorageLocation.prepareVault(
+            vault,
+            migratingFrom: source
+        )
+        #expect(repeatedDestination == destination)
+        #expect(try JSONProjectStore(directory: repeatedDestination)
+            .loadProjects().first?.id == project.id)
     }
 
     @Test("目标子文件夹已有未知内容时拒绝覆盖")
@@ -180,5 +188,40 @@ final class MeetingFileStoreTests {
             contentsOf: destination.appending(path: "existing.txt"),
             encoding: .utf8
         ) == "keep")
+    }
+
+    @Test("目标已有另一份有效项目数据时拒绝静默切换")
+    func obsidianMigrationRejectsDifferentValidDestination() throws {
+        let caseDirectory = makeCaseDirectory("valid-conflict")
+        let source = caseDirectory.appending(path: "source", directoryHint: .isDirectory)
+        let sourceProject = Project(
+            title: "当前项目",
+            sourceType: .liveRecording
+        )
+        try JSONProjectStore(directory: source).saveProjects([sourceProject])
+
+        let vault = caseDirectory.appending(path: "vault", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(
+            at: vault.appending(path: ".obsidian", directoryHint: .isDirectory),
+            withIntermediateDirectories: true
+        )
+        let destination = AppStorageLocation.storageDirectory(inVault: vault)
+        let destinationProject = Project(
+            title: "Vault 中的另一份项目",
+            sourceType: .importedAudio
+        )
+        try JSONProjectStore(directory: destination).saveProjects([destinationProject])
+
+        #expect(throws: AppStorageLocationError.self) {
+            _ = try AppStorageLocation.prepareVault(
+                vault,
+                migratingFrom: source
+            )
+        }
+
+        #expect(try JSONProjectStore(directory: source)
+            .loadProjects().first?.id == sourceProject.id)
+        #expect(try JSONProjectStore(directory: destination)
+            .loadProjects().first?.id == destinationProject.id)
     }
 }

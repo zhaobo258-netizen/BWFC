@@ -20,16 +20,17 @@ enum CloudModelConfig {
 
     /// 分析 provider 名称（设置页展示）
     static let analysisProviderName = "Kimi"
-    /// 分析模型（Anthropic 风格 messages 接口）
-    static let analysisModelID = "kimi-for-coding"
+    /// 默认分析模型：Kimi K3 256K。官方建议日常任务优先使用该版本，
+    /// 与 K3 同属旗舰模型且比 1M 版本节省额度；设置页可改为 K3 1M。
+    static let analysisModelID = "k3-256k"
     /// 分析网关基础地址（以 / 结尾；消息路径见 analysisMessagesPath）。
     /// 2026-07-24 起切换到 kimi-code 新体系网关（旧 agent-gw.kimi.com 为遗留通道，
     /// 新体系 OAuth token 在旧通道全部 401，实测确认）。
     static let analysisBaseURL = URL(string: "https://api.kimi.com/coding/")!
     /// messages 接口路径（相对基础地址）
     static let analysisMessagesPath = "v1/messages"
-    /// 单次分析最大输出 token 数（含思考预算；调大防止长上下文下 JSON 被截断）
-    static let analysisMaxTokens = 16384
+    /// K3 始终思考；为思考与结构化正文共同预留预算。
+    static let analysisMaxTokens = 32768
     /// 分析请求超时（秒；thinking 模型在长上下文下响应较慢）
     static let analysisRequestTimeout: TimeInterval = 240
     /// Anthropic messages 协议版本头

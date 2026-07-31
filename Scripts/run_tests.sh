@@ -66,4 +66,5 @@ swiftc -parse-as-library \
     -Xlinker -rpath -Xlinker "$TESTLIB"
 
 echo "==> 执行测试"
-"$OUT_DIR/BangWoFenXiTestsRunner" --testing-library swift-testing
+# 多个 @MainActor 防抖用例并行时会互相饿死，导致计时断言随机超时。
+"$OUT_DIR/BangWoFenXiTestsRunner" --testing-library swift-testing --no-parallel

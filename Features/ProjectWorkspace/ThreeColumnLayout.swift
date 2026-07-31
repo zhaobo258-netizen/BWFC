@@ -90,7 +90,7 @@ enum ThreeColumnMetrics {
 }
 
 /// 三栏布局（阶段 B 工作台骨架，03 文档 §6.3）：
-/// 左文稿 / 中分析 / 右笔记，宽度可拖动调整并经 @AppStorage 记忆；
+/// 左文稿 / 中分析 / 右 AI 共创笔记，宽度可拖动调整并经 @AppStorage 记忆；
 /// 宽度由 ThreeColumnMetrics.solve 统一求解（联合约束）；
 /// 分隔条带可访问标签与键盘调整能力（方向键 ±2%）。
 struct ThreeColumnLayout<Left: View, Center: View, Right: View>: View {
@@ -163,7 +163,7 @@ struct ThreeColumnLayout<Left: View, Center: View, Right: View>: View {
                 center()
                     .frame(width: widths.center)
                 ColumnDragHandle(
-                    label: "调整笔记栏宽度",
+                    label: "调整 AI 共创笔记栏宽度",
                     fraction: effectiveRight,
                     onChanged: { value in rightDragDelta = value },
                     onEnded: { value in

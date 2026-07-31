@@ -8,17 +8,25 @@ enum ImportPlanner {
 
     /// 阶段 C 流水线的规范执行顺序
     static let canonicalOrder: [ProcessingJobKind] = [
-        .audioExtraction, .transcription, .diarization, .analysis, .knowledgeExpansion, .obsidianArchive
+        .audioExtraction, .transcription, .diarization, .analysis, .finalReport,
+        .knowledgeExpansion, .obsidianArchive
     ]
 
     /// 新导入项目的 Job 计划
-    static func planJobs(analysisConfigured: Bool, now: Date = Date()) -> [ProcessingJob] {
+    static func planJobs(
+        analysisConfigured: Bool,
+        finalReportConfigured: Bool = false,
+        now: Date = Date()
+    ) -> [ProcessingJob] {
         var jobs: [ProcessingJob] = [
             ProcessingJob(kind: .audioExtraction, updatedAt: now),
             ProcessingJob(kind: .transcription, updatedAt: now)
         ]
         if analysisConfigured {
             jobs.append(ProcessingJob(kind: .analysis, updatedAt: now))
+            if finalReportConfigured {
+                jobs.append(ProcessingJob(kind: .finalReport, updatedAt: now))
+            }
         }
         return jobs
     }
@@ -29,6 +37,7 @@ enum ImportPlanner {
     /// 若分析 Key 在中途配置好且尚无分析 Job，补建（转写已完成的项目也能补分析）。
     static func jobsForResume(_ existing: [ProcessingJob],
                               analysisConfigured: Bool,
+                              finalReportConfigured: Bool = false,
                               now: Date = Date()) -> [ProcessingJob] {
         var jobs = existing.map { job -> ProcessingJob in
             var job = job
@@ -41,6 +50,11 @@ enum ImportPlanner {
         }
         if analysisConfigured, !jobs.contains(where: { $0.kind == .analysis }) {
             jobs.append(ProcessingJob(kind: .analysis, updatedAt: now))
+        }
+        if analysisConfigured,
+           finalReportConfigured,
+           !jobs.contains(where: { $0.kind == .finalReport }) {
+            jobs.append(ProcessingJob(kind: .finalReport, updatedAt: now))
         }
         return sortedCanonically(jobs)
     }

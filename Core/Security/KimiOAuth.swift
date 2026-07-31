@@ -316,7 +316,15 @@ actor KimiCredentialProvider: KimiCredentialProviding {
     }
 
     func validCredential() async throws -> String {
-        if let tokens = (try? tokenStore.read()) ?? nil {
+        let storedTokens: KimiOAuthTokens?
+        do {
+            storedTokens = try tokenStore.read()
+        } catch KeychainError.interactionNotAllowed {
+            throw AnalysisAPIError.credentialAccessRequired
+        } catch {
+            storedTokens = nil
+        }
+        if let tokens = storedTokens {
             if tokens.expiresAt.timeIntervalSince(now()) > refreshLeeway {
                 return tokens.accessToken
             }
@@ -361,7 +369,15 @@ actor KimiCredentialProvider: KimiCredentialProviding {
                 throw AnalysisAPIError.network
             }
         }
-        if let key = try? staticKeyStore.readKey(), !key.isEmpty {
+        let staticKey: String?
+        do {
+            staticKey = try staticKeyStore.readKey()
+        } catch KeychainError.interactionNotAllowed {
+            throw AnalysisAPIError.credentialAccessRequired
+        } catch {
+            staticKey = nil
+        }
+        if let key = staticKey, !key.isEmpty {
             return key
         }
         throw AnalysisAPIError.missingAPIKey

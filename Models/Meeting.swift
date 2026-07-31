@@ -199,7 +199,7 @@ final class Meeting: Identifiable, Codable {
         switch newStatus {
         case .recording where startedAt == nil:
             startedAt = Date()
-        case .completed:
+        case .completed where endedAt == nil:
             endedAt = Date()
         default:
             break

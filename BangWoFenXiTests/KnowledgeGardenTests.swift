@@ -9,9 +9,84 @@ private struct MockKnowledgeExpansionService: KnowledgeExpansionServicing {
         seedText: String,
         whyItMatters: String,
         evidence: [KnowledgeEvidenceInput],
-        scenario: ProjectScenario?
+        scenario: ProjectScenario?,
+        userContext: [String],
+        noteMarkdown: String?
     ) async throws -> KnowledgeExpansionResult {
         result
+    }
+}
+
+private actor CapturingKnowledgeExpansionService:
+    KnowledgeExpansionServicing
+{
+    private var capturedUserContext: [String] = []
+    private var capturedNote: String?
+
+    func expand(
+        seedText: String,
+        whyItMatters: String,
+        evidence: [KnowledgeEvidenceInput],
+        scenario: ProjectScenario?,
+        userContext: [String],
+        noteMarkdown: String?
+    ) async throws -> KnowledgeExpansionResult {
+        capturedUserContext = userContext
+        capturedNote = noteMarkdown
+        return KnowledgeExpansionResult(
+            branches: [
+                KnowledgeBranch(
+                    type: .crossDomainConnection,
+                    title: "结合笔记",
+                    body: "已使用用户授权的项目笔记扩展联想。"
+                )
+            ],
+            searchQueries: []
+        )
+    }
+
+    func captured() -> (userContext: [String], note: String?) {
+        (capturedUserContext, capturedNote)
+    }
+}
+
+private actor SourceSynthesizingKnowledgeService:
+    KnowledgeExpansionServicing
+{
+    private(set) var receivedSources: [KnowledgeSourceInput] = []
+
+    func expand(
+        seedText: String,
+        whyItMatters: String,
+        evidence: [KnowledgeEvidenceInput],
+        scenario: ProjectScenario?,
+        userContext: [String],
+        noteMarkdown: String?
+    ) async throws -> KnowledgeExpansionResult {
+        KnowledgeExpansionResult(
+            branches: [
+                KnowledgeBranch(
+                    type: .conceptExplanation,
+                    title: "品牌叙事",
+                    body: "品牌叙事是在建立一套评价标准。"
+                )
+            ],
+            searchQueries: []
+        )
+    }
+
+    func synthesizeSources(
+        seedText: String,
+        whyItMatters: String,
+        sources: [KnowledgeSourceInput]
+    ) async throws -> KnowledgeSourceSynthesis? {
+        receivedSources = sources
+        return KnowledgeSourceSynthesis(
+            summary: "多个来源都指向评价标准与消费者价值变化。",
+            keyPoints: ["叙事不是广告语", "评价标准决定话语权"],
+            discussionRelevance: "补充了本场对白酒新叙事的解释。",
+            sourceIds: sources.map(\.id)
+        )
     }
 }
 
@@ -19,6 +94,9 @@ private struct MockKnowledgeProvider: KnowledgeProvider {
     var kind: KnowledgeProviderKind
     var displayName: String
     var shouldFail = false
+    var providerID: String {
+        "mock:\(kind.rawValue):\(displayName)"
+    }
 
     func healthCheck() async -> KnowledgeProviderHealth {
         KnowledgeProviderHealth(isAvailable: !shouldFail, message: shouldFail ? "不可用" : "正常")
@@ -200,8 +278,257 @@ struct KnowledgeGardenTests {
         #expect(bloomed.branches.count == 1)
         #expect(bloomed.connections.count == 2)
         #expect(Set(bloomed.connections.map(\.provider)) == [.obsidian, .internet])
-        #expect(controller.providerMessages[.externalMCP]?.contains("不可用") == true)
+        #expect(
+            controller.providerMessages["mock:externalMCP:得到大脑"]?
+                .contains("不可用") == true
+        )
         #expect(controller.state == .finished)
+    }
+
+    @Test("检索完成后生成带真实来源引用的一眼速览")
+    @MainActor
+    func sourceResultsAreSynthesized() async throws {
+        let segment = TranscriptSegment(
+            startMs: 0,
+            endMs: 1_000,
+            text: "白酒需要新的品牌叙事。",
+            source: .local,
+            state: .final
+        )
+        let project = Project(
+            title: "来源速览",
+            sourceType: .liveRecording,
+            segments: [segment],
+            knowledgeSeeds: [
+                KnowledgeSeed(
+                    seedText: "白酒品牌新叙事",
+                    whyItMatters: "本场讨论的核心观点",
+                    evidenceSegmentIds: [segment.id]
+                )
+            ]
+        )
+        let service = SourceSynthesizingKnowledgeService()
+        let controller = KnowledgeGardenController(
+            expansionService: service,
+            providerFactory: {
+                [MockKnowledgeProvider(kind: .obsidian, displayName: "Obsidian")]
+            }
+        )
+        controller.attach(to: project)
+
+        await controller.bloomSelected()
+
+        let seed = try #require(controller.selectedSeed)
+        let synthesis = try #require(seed.sourceSynthesis)
+        #expect(synthesis.keyPoints.count == 2)
+        #expect(synthesis.sourceIds == ["mock:obsidian:Obsidian|obsidian-source"])
+        let received = await service.receivedSources
+        #expect(received.count == 1)
+        #expect(received.first?.excerpt.contains("真实来源摘要") == true)
+    }
+
+    @Test("分析种子引用不存在的片段时不得进入知识花园")
+    @MainActor
+    func candidateRequiresExistingEvidenceSegments() {
+        let snapshot = ConversationAnalysisSnapshot(
+            version: 1,
+            analyzedThroughMs: 1_000,
+            items: [
+                AnalysisItem(
+                    category: .knowledgeSeed,
+                    text: "没有原话支撑的知识线索",
+                    epistemicStatus: .explicit,
+                    confidence: .high,
+                    evidenceSegmentIds: [UUID()]
+                )
+            ]
+        )
+        let project = Project(
+            title: "证据真实性",
+            sourceType: .importedAudio,
+            analysisSnapshots: [snapshot]
+        )
+        let controller = KnowledgeGardenController(
+            expansionService: MockKnowledgeExpansionService(
+                result: KnowledgeExpansionResult(
+                    branches: [],
+                    searchQueries: []
+                )
+            ),
+            providerFactory: { [] }
+        )
+
+        controller.attach(to: project)
+
+        #expect(controller.seeds.isEmpty)
+        #expect(project.knowledgeSeeds.isEmpty)
+    }
+
+    @Test("重新开花更换来源后不得保留旧来源速览")
+    @MainActor
+    func rebloomClearsStaleSourceSynthesis() async throws {
+        let segment = TranscriptSegment(
+            startMs: 0,
+            endMs: 1_000,
+            text: "渠道库存需要统一口径。",
+            source: .local,
+            state: .final
+        )
+        let oldConnection = KnowledgeConnection(
+            provider: .obsidian,
+            providerName: "旧来源",
+            sourceId: "old-source",
+            title: "旧资料",
+            excerpt: "旧来源摘要",
+            sourceLocation: "/tmp/old.md"
+        )
+        let project = Project(
+            title: "重新开花",
+            sourceType: .liveRecording,
+            segments: [segment],
+            knowledgeSeeds: [
+                KnowledgeSeed(
+                    seedText: "渠道库存口径",
+                    whyItMatters: "本场讨论的核心问题",
+                    evidenceSegmentIds: [segment.id],
+                    connections: [oldConnection],
+                    sourceSynthesis: KnowledgeSourceSynthesis(
+                        summary: "旧来源速览",
+                        keyPoints: ["旧结论"],
+                        discussionRelevance: "基于旧来源",
+                        sourceIds: ["obsidian|old-source"]
+                    )
+                )
+            ]
+        )
+        let controller = KnowledgeGardenController(
+            expansionService: MockKnowledgeExpansionService(
+                result: KnowledgeExpansionResult(
+                    branches: [],
+                    searchQueries: []
+                )
+            ),
+            providerFactory: {
+                [MockKnowledgeProvider(kind: .internet, displayName: "互联网")]
+            }
+        )
+        controller.attach(to: project)
+
+        await controller.bloomSelected()
+
+        let seed = try #require(controller.selectedSeed)
+        #expect(seed.connections.map(\.sourceId) == ["internet-source"])
+        #expect(seed.sourceSynthesis == nil)
+    }
+
+    @Test("开启实时开花后新分析种子会自动扩展一次")
+    @MainActor
+    func newSeedBloomsAutomatically() async throws {
+        let segment = TranscriptSegment(
+            startMs: 0,
+            endMs: 1_000,
+            text: "白酒行业需要建立新的评价标准。",
+            source: .local,
+            state: .final
+        )
+        let snapshot = ConversationAnalysisSnapshot(
+            version: 1,
+            analyzedThroughMs: 1_000,
+            items: [
+                AnalysisItem(
+                    category: .knowledgeSeed,
+                    text: "白酒行业的新评价标准",
+                    epistemicStatus: .explicit,
+                    confidence: .high,
+                    evidenceSegmentIds: [segment.id]
+                )
+            ]
+        )
+        let project = Project(
+            title: "实时开花",
+            sourceType: .liveRecording,
+            segments: [segment],
+            analysisSnapshots: [snapshot]
+        )
+        let controller = KnowledgeGardenController(
+            expansionService: MockKnowledgeExpansionService(
+                result: KnowledgeExpansionResult(
+                    branches: [
+                        KnowledgeBranch(
+                            type: .crossDomainConnection,
+                            title: "评价权",
+                            body: "建立标准意味着掌握评价权。"
+                        )
+                    ],
+                    searchQueries: []
+                )
+            ),
+            providerFactory: { [] },
+            automaticallyBloomNewSeeds: true
+        )
+
+        controller.attach(to: project)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while ContinuousClock.now < deadline,
+              controller.seeds.first?.branches.isEmpty == true {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(controller.seeds.first?.branches.count == 1)
+    }
+
+    @Test("开花读取用户补充与编辑器最新笔记，但必须经过项目授权")
+    @MainActor
+    func bloomUsesAuthorizedLiveNote() async throws {
+        let segmentID = UUID()
+        let segment = TranscriptSegment(
+            id: segmentID,
+            startMs: 0,
+            endMs: 1_000,
+            text: "讨论品牌出版背景。",
+            source: .local,
+            state: .final
+        )
+        let project = Project(
+            title: "笔记开花",
+            sourceType: .liveRecording,
+            segments: [segment],
+            knowledgeSeeds: [
+                KnowledgeSeed(
+                    seedText: "品牌出版背景",
+                    whyItMatters: "用户关注的主题",
+                    evidenceSegmentIds: [segmentID]
+                )
+            ],
+            aiChatMessages: [
+                ProjectAIChatMessage(
+                    role: .user,
+                    text: "品牌名应为白景徽。"
+                )
+            ],
+            noteAIContextEnabled: true
+        )
+        let service = CapturingKnowledgeExpansionService()
+        let controller = KnowledgeGardenController(
+            expansionService: service,
+            providerFactory: { [] }
+        )
+        controller.noteContextProvider = {
+            "尚未自动保存的最新笔记：关注酒业案例。"
+        }
+        controller.attach(to: project)
+        await controller.bloomSelected()
+        let captured = await service.captured()
+        #expect(captured.userContext == ["品牌名应为白景徽。"])
+        #expect(
+            captured.note
+                == "尚未自动保存的最新笔记：关注酒业案例。"
+        )
+
+        project.noteAIContextEnabled = false
+        await controller.bloomSelected()
+        let disabled = await service.captured()
+        #expect(disabled.note == nil)
     }
 
     @Test("Obsidian 只检索真实 Markdown，并忽略应用数据目录")
@@ -267,6 +594,10 @@ struct KnowledgeGardenTests {
     func externalMCPFlow() async throws {
         KnowledgeMCPMockURLProtocol.storage.reset()
         KnowledgeMCPMockURLProtocol.storage.requestHandler = { request in
+            #expect(
+                request.value(forHTTPHeaderField: "Authorization")
+                    == "Bearer token-at-start"
+            )
             let body = try #require(mockRequestBodyData(of: request))
             let object = try #require(
                 try JSONSerialization.jsonObject(with: body) as? [String: Any]
@@ -293,6 +624,36 @@ struct KnowledgeGardenTests {
                     "result": [
                         "tools": [
                             [
+                                "name": "delete_note",
+                                "description": "删除一条笔记",
+                                "inputSchema": [
+                                    "type": "object",
+                                    "properties": [
+                                        "query": ["type": "string"]
+                                    ]
+                                ]
+                            ],
+                            [
+                                "name": "read_object",
+                                "description": "读取知识对象",
+                                "inputSchema": [
+                                    "type": "object",
+                                    "properties": [
+                                        "query": ["type": "object"]
+                                    ]
+                                ]
+                            ],
+                            [
+                                "name": "note_manager",
+                                "description": "管理笔记",
+                                "inputSchema": [
+                                    "type": "object",
+                                    "properties": [
+                                        "query": ["type": "string"]
+                                    ]
+                                ]
+                            ],
+                            [
                                 "name": "search_notes",
                                 "description": "搜索知识和笔记",
                                 "inputSchema": [
@@ -307,6 +668,18 @@ struct KnowledgeGardenTests {
                     ]
                 ]
             case "tools/call":
+                let params = try #require(object["params"] as? [String: Any])
+                #expect(params["name"] as? String == "search_notes")
+                let arguments = try #require(params["arguments"] as? [String: Any])
+                let query = try #require(arguments["query"] as? String)
+                #expect(query.count == 24)
+                #expect(
+                    query
+                        == String(
+                            "这是一整段不应该发送给 MCP 的完整逐字稿内容，长度明显超过二十四个字符。"
+                                .prefix(24)
+                        )
+                )
                 responseObject = [
                     "jsonrpc": "2.0",
                     "id": 3,
@@ -345,6 +718,7 @@ struct KnowledgeGardenTests {
             account: ExternalMCPConfigurationStore.tokenAccount
         )
         defer { try? tokenStore.deleteKey() }
+        try tokenStore.saveKey("token-at-start")
         let provider = ExternalMCPKnowledgeProvider(
             configuration: ExternalMCPConfiguration(
                 displayName: "得到大脑",
@@ -353,7 +727,11 @@ struct KnowledgeGardenTests {
             tokenStore: tokenStore,
             session: KnowledgeMCPMockURLProtocol.makeSession()
         )
-        let results = try await provider.search("库存口径", limit: 5)
+        try tokenStore.saveKey("token-after-start")
+        let results = try await provider.search(
+            "这是一整段不应该发送给 MCP 的完整逐字稿内容，长度明显超过二十四个字符。",
+            limit: 5
+        )
         #expect(results.count == 1)
         #expect(results.first?.providerName == "得到大脑")
         #expect(results.first?.sourceId == "note-1")
@@ -415,6 +793,7 @@ struct KnowledgeGardenTests {
         /// 初次查询返回结果、refined 查询返回空的 provider
         struct QueryAwareProvider: KnowledgeProvider {
             let kind: KnowledgeProviderKind = .internet
+            let providerID = "internet:test"
             let displayName = "互联网"
             let initialQuery: String
 
@@ -455,7 +834,11 @@ struct KnowledgeGardenTests {
                     searchQueries: ["完全不同的refined检索词"]
                 )
             ),
-            providerFactory: { [QueryAwareProvider(initialQuery: seedText)] }
+            providerFactory: {
+                [QueryAwareProvider(
+                    initialQuery: seedText
+                )]
+            }
         )
         refinedController.attach(to: project)
         let seed = try #require(refinedController.selectedSeed)
@@ -465,7 +848,7 @@ struct KnowledgeGardenTests {
         let bloomed = try #require(refinedController.selectedSeed)
         #expect(bloomed.connections.count == 1, "初次检索结果必须保留")
         #expect(
-            refinedController.providerMessages[.internet] == nil,
+            refinedController.providerMessages["internet:test"] == nil,
             "已有真实结果时不得显示「没有找到相关内容」"
         )
     }
@@ -537,5 +920,78 @@ struct KnowledgeGardenTests {
         #expect(ExternalMCPConfiguration(
             endpoint: "file:///tmp/mcp"
         ).validatedURL == nil)
+    }
+
+    @Test("旧单 MCP 自动迁移为启用连接并保留旧凭证账号")
+    func legacySingleMCPMigration() throws {
+        let suiteName = "bwfx-mcp-migration-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(
+            Data("""
+            {
+              "displayName": "得到大脑",
+              "endpoint": "https://example.com/mcp",
+              "toolName": "search_notes"
+            }
+            """.utf8),
+            forKey: ExternalMCPConfigurationStore.legacyDefaultsKey
+        )
+        let store = ExternalMCPConfigurationStore(defaults: defaults)
+        let migrated = try #require(store.loadAll().first)
+        #expect(migrated.isEnabled)
+        #expect(migrated.toolName == "search_notes")
+        #expect(migrated.isReadOnlyToolVerified)
+        #expect(
+            migrated.credentialAccount
+                == ExternalMCPConfigurationStore.legacyTokenAccount
+        )
+        #expect(
+            defaults.data(
+                forKey: ExternalMCPConfigurationStore.legacyDefaultsKey
+            ) == nil
+        )
+    }
+
+    @Test("多 MCP 配置和 Token 使用稳定 ID 独立保存")
+    func multipleMCPConnectionsAreIsolated() throws {
+        let suiteName = "bwfx-mcp-array-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = ExternalMCPConfigurationStore(defaults: defaults)
+        let first = ExternalMCPConfiguration(
+            displayName: "知识源一",
+            endpoint: "https://one.example.com/mcp",
+            toolName: "search_one",
+            verifiedReadOnlyToolName: "search_one"
+        )
+        let second = ExternalMCPConfiguration(
+            displayName: "知识源二",
+            endpoint: "https://two.example.com/mcp",
+            toolName: "search_two",
+            verifiedReadOnlyToolName: "search_two"
+        )
+        try store.saveAll([first, second])
+        #expect(store.loadAll().map(\.id) == [first.id, second.id])
+        #expect(first.credentialAccount != second.credentialAccount)
+
+        let serviceName = "com.zhaobo.BangWoFenXi.tests.mcp.\(UUID().uuidString)"
+        let firstToken = CloudAPIKeyStore(
+            service: serviceName,
+            account: first.credentialAccount
+        )
+        let secondToken = CloudAPIKeyStore(
+            service: serviceName,
+            account: second.credentialAccount
+        )
+        defer {
+            try? firstToken.deleteKey()
+            try? secondToken.deleteKey()
+        }
+        try firstToken.saveKey("token-one")
+        try secondToken.saveKey("token-two")
+        try firstToken.deleteKey()
+        #expect(!firstToken.hasConfiguredKey)
+        #expect(try secondToken.readKey() == "token-two")
     }
 }

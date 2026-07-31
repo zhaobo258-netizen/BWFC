@@ -187,9 +187,15 @@ final class ConversationAnalysisController {
             lastErrorDescription = error.localizedDescription
             lastFailureKind = Self.failureKind(of: error)
             if error == .unauthorized {
-                state = .suspended(reason: "分析 Key 无效（401）。请在设置中检查「分析（Kimi）Key」。")
+                state = .suspended(
+                    reason: "当前分析模型凭证无效或模型未开通（401）。请在设置中检查连接与模型。"
+                )
             } else if error == .missingAPIKey {
-                state = .suspended(reason: "分析 Key 未配置。在设置中填写后即可启用 AI 分析。")
+                state = .suspended(reason: "AI 未连接。在设置中连接分析模型后即可启用。")
+            } else if error == .credentialAccessRequired {
+                state = .suspended(
+                    reason: "App 更新后需要重新连接 AI；请前往设置登录或保存 API Key。录音与转写不受影响。"
+                )
             }
             AppLog.logError(AppLog.analysis, LogSanitizer.formatEvent(
                 "conversation_analysis_failed",
@@ -233,6 +239,7 @@ final class ConversationAnalysisController {
         case .invalidResponse: return "结果不合规"
         case .unauthorized: return "Key 无效"
         case .missingAPIKey: return "未配置 Key"
+        case .credentialAccessRequired: return "凭证需重连"
         case .clientError: return "请求被拒"
         }
     }

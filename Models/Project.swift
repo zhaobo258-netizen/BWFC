@@ -131,8 +131,16 @@ final class Project: Identifiable, Codable {
     var legacySnapshots: [AnalysisSnapshot] = []
     /// V2 通用分析快照（阶段 D，03 §8.4）：新分析的权威存储
     var analysisSnapshots: [ConversationAnalysisSnapshot] = []
+    /// 录音或导入完成后的完整总结；与实时分析快照分开版本化
+    var finalReportSnapshots: [FinalReportSnapshot] = []
     /// 由分析条目继续延展的知识种子、联想分支与真实来源
     var knowledgeSeeds: [KnowledgeSeed] = []
+    /// 用户在 AI 工作区补充的背景/纠正，以及 AI 的项目级回应
+    var aiChatMessages: [ProjectAIChatMessage] = []
+    /// AI 共创笔记中尚未发送的本机草稿
+    var aiChatDraft: String = ""
+    /// 用户是否明确允许 AI 共创、开花和完整总结读取此前笔记
+    var noteAIContextEnabled: Bool = false
     /// 旧 Meeting 专属字段存档（谈判背景/目标/底线/词汇等）；迁移时必有值，新建 V2 项目为 nil
     var legacyMetadata: LegacyMeetingMetadata?
     /// 项目笔记
@@ -163,7 +171,11 @@ final class Project: Identifiable, Codable {
         segments: [TranscriptSegment] = [],
         legacySnapshots: [AnalysisSnapshot] = [],
         analysisSnapshots: [ConversationAnalysisSnapshot] = [],
+        finalReportSnapshots: [FinalReportSnapshot] = [],
         knowledgeSeeds: [KnowledgeSeed] = [],
+        aiChatMessages: [ProjectAIChatMessage] = [],
+        aiChatDraft: String = "",
+        noteAIContextEnabled: Bool = false,
         legacyMetadata: LegacyMeetingMetadata? = nil,
         note: NoteDocument = NoteDocument(markdown: "", updatedAt: Date()),
         processingJobs: [ProcessingJob] = [],
@@ -189,7 +201,11 @@ final class Project: Identifiable, Codable {
         self.segments = segments
         self.legacySnapshots = legacySnapshots
         self.analysisSnapshots = analysisSnapshots
+        self.finalReportSnapshots = finalReportSnapshots
         self.knowledgeSeeds = knowledgeSeeds
+        self.aiChatMessages = aiChatMessages
+        self.aiChatDraft = aiChatDraft
+        self.noteAIContextEnabled = noteAIContextEnabled
         self.legacyMetadata = legacyMetadata
         self.note = note
         self.processingJobs = processingJobs
@@ -220,7 +236,23 @@ final class Project: Identifiable, Codable {
         legacySnapshots = try container.decodeIfPresent([AnalysisSnapshot].self, forKey: .legacySnapshots) ?? []
         // 兼容阶段 D 之前的 Project JSON（无 analysisSnapshots 键）
         analysisSnapshots = try container.decodeIfPresent([ConversationAnalysisSnapshot].self, forKey: .analysisSnapshots) ?? []
+        finalReportSnapshots = try container.decodeIfPresent(
+            [FinalReportSnapshot].self,
+            forKey: .finalReportSnapshots
+        ) ?? []
         knowledgeSeeds = try container.decodeIfPresent([KnowledgeSeed].self, forKey: .knowledgeSeeds) ?? []
+        aiChatMessages = try container.decodeIfPresent(
+            [ProjectAIChatMessage].self,
+            forKey: .aiChatMessages
+        ) ?? []
+        aiChatDraft = try container.decodeIfPresent(
+            String.self,
+            forKey: .aiChatDraft
+        ) ?? ""
+        noteAIContextEnabled = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .noteAIContextEnabled
+        ) ?? false
         // 兼容补强前生成的 Project JSON（无 legacyMetadata 键）
         legacyMetadata = try container.decodeIfPresent(LegacyMeetingMetadata.self, forKey: .legacyMetadata)
         note = try container.decodeIfPresent(NoteDocument.self, forKey: .note) ?? NoteDocument(markdown: "", updatedAt: createdAt)

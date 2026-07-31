@@ -3,6 +3,90 @@ import AVFoundation
 import Testing
 @testable import BangWoFenXi
 
+private final class BlockingFinishTranscriptionService:
+    LocalTranscriptionServicing,
+    @unchecked Sendable
+{
+    let results: AsyncStream<LocalTranscriptResult>
+
+    private let lock = NSLock()
+    private let resultsContinuation: AsyncStream<LocalTranscriptResult>.Continuation
+    private var finishContinuation: CheckedContinuation<Void, Never>?
+    private var finishStartedStorage = false
+    private var cancelRequested = false
+    private var cancelCountStorage = 0
+
+    init() {
+        var continuation: AsyncStream<LocalTranscriptResult>.Continuation!
+        results = AsyncStream { continuation = $0 }
+        resultsContinuation = continuation
+    }
+
+    func checkMandarinAvailability() async -> TranscriptionAvailability {
+        TranscriptionAvailability(
+            transcriberAvailable: true,
+            mandarinSupported: true,
+            assetState: .installed,
+            issues: []
+        )
+    }
+
+    func installMandarinAssets(
+        onProgress: @escaping @Sendable (Double) -> Void
+    ) async throws {}
+
+    func startSession(contextualStrings: [String]) async throws {}
+
+    func feed(_ buffer: AVAudioPCMBuffer) async {}
+
+    func finishSession() async {
+        await withCheckedContinuation { continuation in
+            let shouldResume = lock.withLock {
+                finishStartedStorage = true
+                if cancelRequested {
+                    return true
+                }
+                finishContinuation = continuation
+                return false
+            }
+            if shouldResume {
+                continuation.resume()
+            }
+        }
+        resultsContinuation.finish()
+    }
+
+    func cancelSession() async {
+        let continuation = lock.withLock {
+            cancelCountStorage += 1
+            cancelRequested = true
+            let continuation = finishContinuation
+            finishContinuation = nil
+            return continuation
+        }
+        continuation?.resume()
+        resultsContinuation.finish()
+    }
+
+    func releaseFinish() {
+        let continuation = lock.withLock {
+            let continuation = finishContinuation
+            finishContinuation = nil
+            return continuation
+        }
+        continuation?.resume()
+        resultsContinuation.finish()
+    }
+
+    var finishStarted: Bool {
+        lock.withLock { finishStartedStorage }
+    }
+
+    var cancelCount: Int {
+        lock.withLock { cancelCountStorage }
+    }
+}
+
 /// 文件转写执行器（阶段 C）：读文件喂服务、结果去重、时间轴、取消响应
 @Suite("文件转写执行器", .serialized)
 final class FileTranscriptionRunnerTests {
@@ -97,20 +181,62 @@ final class FileTranscriptionRunnerTests {
         let mock = MockLocalTranscriptionService()
         mock.finishEndsStream = false // 模拟服务收尾迟迟不结束流
         let url = try makeAudioFile(seconds: 0.2)
+        let outcome = CancellationOutcome()
         let task = Task {
-            try await FileTranscriptionRunner(service: mock).run(audioURL: url)
+            do {
+                _ = try await FileTranscriptionRunner(service: mock).run(audioURL: url)
+                outcome.set(.completed)
+            } catch is CancellationError {
+                outcome.set(.cancelled)
+            } catch {
+                outcome.set(.other(String(describing: type(of: error))))
+            }
         }
         // 等喂入完成进入等待流阶段后取消
         try await Task.sleep(for: .milliseconds(200))
         task.cancel()
-        do {
-            _ = try await task.value
-            Issue.record("取消后不应正常返回")
-        } catch is CancellationError {
-            // 预期
-        } catch {
-            Issue.record("应抛出 CancellationError，实际 \(type(of: error))")
+        await task.value
+        #expect(outcome.value == .cancelled, "取消后应如实抛出 CancellationError")
+    }
+
+    @Test("取消会唤醒卡在有限输入收尾的转写会话")
+    func cancellationInterruptsBlockedFinish() async throws {
+        let service = BlockingFinishTranscriptionService()
+        let url = try makeAudioFile(seconds: 0.2)
+        let outcome = CancellationOutcome()
+        let task = Task {
+            do {
+                _ = try await FileTranscriptionRunner(service: service)
+                    .run(audioURL: url)
+                outcome.set(.completed)
+            } catch is CancellationError {
+                outcome.set(.cancelled)
+            } catch {
+                outcome.set(.other(String(describing: type(of: error))))
+            }
         }
+
+        let finishDeadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while ContinuousClock.now < finishDeadline, !service.finishStarted {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(service.finishStarted)
+
+        task.cancel()
+        let cancellationDeadline = ContinuousClock.now.advanced(by: .seconds(1))
+        while ContinuousClock.now < cancellationDeadline,
+              outcome.value == .pending {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let completedBeforeDeadline = outcome.value != .pending
+        if !completedBeforeDeadline {
+            service.releaseFinish()
+        }
+        await task.value
+
+        #expect(completedBeforeDeadline, "取消必须主动结束卡住的 finishSession")
+        #expect(outcome.value == .cancelled)
+        #expect(service.cancelCount >= 1)
     }
 
     private final class ProgressRecorder: @unchecked Sendable {
@@ -118,5 +244,19 @@ final class FileTranscriptionRunnerTests {
         private var storage: [Double] = []
         var values: [Double] { lock.withLock { storage } }
         func append(_ value: Double) { lock.withLock { storage.append(value) } }
+    }
+
+    private final class CancellationOutcome: @unchecked Sendable {
+        enum Value: Equatable {
+            case pending
+            case completed
+            case cancelled
+            case other(String)
+        }
+
+        private let lock = NSLock()
+        private var storage: Value = .pending
+        var value: Value { lock.withLock { storage } }
+        func set(_ value: Value) { lock.withLock { storage = value } }
     }
 }

@@ -2,6 +2,8 @@
 .build/
 # 自制 .app 输出目录
 build/
+# 本机录音、转写与真实媒体探针输出
+output/
 # macOS 杂项
 .DS_Store
 # 敏感数据一律不进仓库（实施计划第 0 节）：API Key、录音、声音样本

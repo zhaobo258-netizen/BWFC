@@ -12,8 +12,10 @@ final class AppRouterTests {
         let router = AppRouter()
         router.showProjectHome()
         router.showSettings()
-        #expect(router.route == .settings)
+        #expect(router.isSettingsPresented)
+        #expect(router.route == .projectHome)
         router.closeSettings()
+        #expect(!router.isSettingsPresented)
         #expect(router.route == .projectHome)
     }
 
@@ -23,7 +25,9 @@ final class AppRouterTests {
         let id = UUID()
         router.showProjectWorkspace(id, autoStart: true)
         router.showSettings()
+        #expect(router.isSettingsPresented)
         router.closeSettings()
+        #expect(!router.isSettingsPresented)
         #expect(router.route == .projectWorkspace(id, autoStart: true))
     }
 
@@ -54,11 +58,23 @@ final class AppRouterTests {
         router.showProjectHome()
         router.showSettings()
         router.showSettings() // 重复进入
+        #expect(router.isSettingsPresented)
         router.closeSettings()
+        #expect(!router.isSettingsPresented)
         #expect(router.route == .projectHome)
         // 返回后再次关闭：缺省回首页且不崩溃
         router.closeSettings()
         #expect(router.route == .projectHome)
+    }
+
+    @Test("完整总结通知可定向打开项目且请求只消费一次")
+    func finalReportDeepLink() {
+        let router = AppRouter()
+        let id = UUID()
+        router.showProjectFinalReport(id)
+        #expect(router.route == .projectWorkspace(id, autoStart: false))
+        #expect(router.consumeFinalReportRequest(for: id))
+        #expect(!router.consumeFinalReportRequest(for: id))
     }
 }
 

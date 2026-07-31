@@ -110,13 +110,15 @@ final class FinalizingFlowTests {
         try service.beginFinish()
         #expect(meeting.status == .finalizing)
         #expect(mock.stopCount == 1, "beginFinish 必须停止采集")
+        let captureEndedAt = try #require(meeting.endedAt)
 
         // finalizing 期间不允许再次 beginFinish
         #expect(throws: (any Error).self) { try service.beginFinish() }
 
+        Thread.sleep(forTimeInterval: 0.01)
         try service.completeFinalizing()
         #expect(meeting.status == .completed)
-        #expect(meeting.endedAt != nil)
+        #expect(meeting.endedAt == captureEndedAt, "AI 与转写收尾耗时不得计入录音时长")
     }
 
     @Test("未 beginFinish 直接 completeFinalizing 抛错")

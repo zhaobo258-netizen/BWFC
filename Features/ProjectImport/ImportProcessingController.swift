@@ -16,6 +16,7 @@ final class ImportProcessingController {
     /// 转写服务工厂：每次导入用独立实例，不与实时录音会话争抢
     private let makeTranscriptionService: () -> any LocalTranscriptionServicing
     private let analysisService: any ConversationAnalysisServicing
+    private let finalReportGenerator: (any FinalReportGenerating)?
     private let fileStore: MeetingFileStore
     private let loadProject: (UUID) throws -> Project?
     private let persistProject: (Project, ProjectFieldOwnership) throws -> Void
@@ -34,6 +35,9 @@ final class ImportProcessingController {
     private(set) var lastErrorMessage: String?
     /// 是否正在执行流水线
     var isRunning: Bool { pipelineTask != nil }
+    private(set) var finalReportNotificationRevision = 0
+    private(set) var latestFinalReportCompletion: FinalReportCoordinator.Completion?
+    private var pendingFinalReportCompletion: FinalReportCoordinator.Completion?
 
     private var pipelineTask: Task<Void, Never>?
     /// 流水线当前操作的项目对象（MainActor 持有；进度回调经 self 访问，避免跨并发域传递非 Sendable 的 Project）
@@ -43,6 +47,7 @@ final class ImportProcessingController {
         importService: any AudioImportServicing,
         makeTranscriptionService: @escaping () -> any LocalTranscriptionServicing,
         analysisService: any ConversationAnalysisServicing,
+        finalReportGenerator: (any FinalReportGenerating)? = nil,
         fileStore: MeetingFileStore,
         isAnalysisConfigured: @escaping () -> Bool,
         loadProject: @escaping (UUID) throws -> Project?,
@@ -51,6 +56,7 @@ final class ImportProcessingController {
         self.importService = importService
         self.makeTranscriptionService = makeTranscriptionService
         self.analysisService = analysisService
+        self.finalReportGenerator = finalReportGenerator
         self.fileStore = fileStore
         self.isAnalysisConfigured = isAnalysisConfigured
         self.loadProject = loadProject
@@ -81,7 +87,10 @@ final class ImportProcessingController {
             startedAt: Date(),
             originalFileName: info.fileName,
             durationMs: info.durationMs,
-            processingJobs: ImportPlanner.planJobs(analysisConfigured: isAnalysisConfigured())
+            processingJobs: ImportPlanner.planJobs(
+                analysisConfigured: isAnalysisConfigured(),
+                finalReportConfigured: finalReportGenerator != nil
+            )
         )
         try persistProject(project, .importPipeline)
 
@@ -105,6 +114,7 @@ final class ImportProcessingController {
     // MARK: - 流水线
 
     private func startPipeline(projectID: UUID, sourceURL: URL?) {
+        pendingFinalReportCompletion = nil
         activeProjectID = projectID
         pipelineTask = Task { [weak self] in
             await self?.runPipeline(projectID: projectID, sourceURL: sourceURL)
@@ -122,7 +132,10 @@ final class ImportProcessingController {
         defer { activeProject = nil }
         // 续跑准备：running/failedRetryable 回 pending；分析 Key 补配置则补建分析 Job
         project.processingJobs = ImportPlanner.jobsForResume(
-            project.processingJobs, analysisConfigured: isAnalysisConfigured())
+            project.processingJobs,
+            analysisConfigured: isAnalysisConfigured(),
+            finalReportConfigured: finalReportGenerator != nil
+        )
         project.status = .processing
         persistQuietly(project)
 
@@ -133,13 +146,25 @@ final class ImportProcessingController {
             switch outcome {
             case .completed:
                 setJob(job.kind, status: .completed, progress: 1, in: project)
+                if job.kind == .finalReport,
+                   let completion = pendingFinalReportCompletion {
+                    latestFinalReportCompletion = completion
+                    pendingFinalReportCompletion = nil
+                    finalReportNotificationRevision += 1
+                }
             case .failed(let category, let retryable, let message):
+                if job.kind == .finalReport {
+                    pendingFinalReportCompletion = nil
+                }
                 setJob(job.kind, status: retryable ? .failedRetryable : .failedFinal,
                        errorCategory: category, in: project)
                 lastErrorMessage = message
                 AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent(
                     "import_job_failed_\(job.kind.rawValue)", error: category))
             case .cancelled:
+                if job.kind == .finalReport {
+                    pendingFinalReportCompletion = nil
+                }
                 setJob(job.kind, status: .pending, progress: nil, in: project)
                 persistQuietly(project)
                 activeProjectID = nil
@@ -170,6 +195,8 @@ final class ImportProcessingController {
             return await runTranscription(for: project)
         case .analysis:
             return await runAnalysis(for: project)
+        case .finalReport:
+            return await runFinalReport(for: project)
         case .diarization, .knowledgeExpansion, .obsidianArchive:
             // 阶段 C 不创建这些 Job；出现即为编排错误，如实失败而非静默跳过
             return .failed(category: "unsupported_stage", retryable: false, message: "该处理阶段尚未支持")
@@ -280,6 +307,106 @@ final class ImportProcessingController {
         }
         persistQuietly(project)
         return .completed
+    }
+
+    private func runFinalReport(for project: Project) async -> JobOutcome {
+        guard let finalReportGenerator,
+              let analysis = project.analysisSnapshots.max(by: {
+                  $0.version < $1.version
+              }) else {
+            return .failed(
+                category: "final_report_evidence_missing",
+                retryable: true,
+                message: "缺少完整分析证据，无法生成完整总结"
+            )
+        }
+        let fileWriter = FinalReportFileWriter(fileStore: fileStore)
+        let previousReports = project.finalReportSnapshots
+        let latestReport = previousReports.max {
+            $0.version < $1.version
+        }
+        var fileSnapshot: FinalReportFileWriter.Snapshot?
+        do {
+            var report = try await finalReportGenerator.generate(
+                project: project,
+                analysis: analysis,
+                knownTerms: lexiconProvider(),
+                version: (latestReport?.version ?? 0) + 1
+            )
+            let markdown = FinalReportMarkdownRenderer.makeMarkdown(
+                report: report,
+                project: project
+            )
+            fileSnapshot = try fileWriter.snapshot(projectID: project.id)
+            report.markdownHash = try fileWriter.write(
+                markdown: markdown,
+                projectID: project.id,
+                expectedExistingHash: latestReport?.markdownHash
+            )
+            project.finalReportSnapshots.append(report)
+            project.finalReportSnapshots = FinalReportSnapshotRetention.keepingMostRecent(
+                project.finalReportSnapshots
+            )
+            try persistProject(project, .importPipeline)
+            pendingFinalReportCompletion = FinalReportCoordinator.Completion(
+                projectID: project.id,
+                version: report.version
+            )
+            return .completed
+        } catch is CancellationError {
+            rollbackFinalReport(
+                project: project,
+                previousReports: previousReports,
+                fileWriter: fileWriter,
+                fileSnapshot: fileSnapshot
+            )
+            return .cancelled
+        } catch let error as AnalysisAPIError {
+            rollbackFinalReport(
+                project: project,
+                previousReports: previousReports,
+                fileWriter: fileWriter,
+                fileSnapshot: fileSnapshot
+            )
+            return .failed(
+                category: String(describing: error),
+                retryable: true,
+                message: "完整总结生成失败，可重试"
+            )
+        } catch {
+            rollbackFinalReport(
+                project: project,
+                previousReports: previousReports,
+                fileWriter: fileWriter,
+                fileSnapshot: fileSnapshot
+            )
+            return .failed(
+                category: String(describing: type(of: error)),
+                retryable: true,
+                message: "完整总结保存失败，可重试"
+            )
+        }
+    }
+
+    private func rollbackFinalReport(
+        project: Project,
+        previousReports: [FinalReportSnapshot],
+        fileWriter: FinalReportFileWriter,
+        fileSnapshot: FinalReportFileWriter.Snapshot?
+    ) {
+        project.finalReportSnapshots = previousReports
+        guard let fileSnapshot else { return }
+        do {
+            try fileWriter.restore(fileSnapshot, projectID: project.id)
+        } catch {
+            AppLog.logError(
+                AppLog.persistence,
+                LogSanitizer.formatEvent(
+                    "import_final_report_file_rollback_failed",
+                    error: String(describing: type(of: error))
+                )
+            )
+        }
     }
 
     // MARK: - Job 状态与持久化

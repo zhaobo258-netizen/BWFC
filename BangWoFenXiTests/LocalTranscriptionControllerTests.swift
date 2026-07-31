@@ -131,6 +131,7 @@ final class LocalTranscriptionControllerTests {
     @Test("结束会话：丢弃尾部临时片段并回到空闲")
     func finishDropsProvisional() async throws {
         let meeting = try makeMeeting()
+        mock.finishEndsStream = true
         try await controller.start(for: meeting) { nil }
 
         mock.emit(LocalTranscriptResult(startAudioMs: 0, endAudioMs: 1000,
@@ -145,6 +146,27 @@ final class LocalTranscriptionControllerTests {
         #expect(controller.segments.count == 1, "结束后临时片段被丢弃")
         #expect(controller.segments.first?.state == .final)
         #expect(mock.finishCount == 1)
+    }
+
+    @Test("结束会话期间产生的尾部最终结果必须入库")
+    func finishKeepsTailFinalResult() async throws {
+        let meeting = try makeMeeting()
+        mock.finishEndsStream = true
+        mock.finalResultsOnFinish = [
+            LocalTranscriptResult(
+                startAudioMs: 2_000,
+                endAudioMs: 3_000,
+                text: "这是结束录音后才确认的最后一句。",
+                isFinal: true
+            )
+        ]
+        try await controller.start(for: meeting) { nil }
+
+        await controller.finish()
+
+        #expect(meeting.segments.count == 1)
+        #expect(meeting.segments.first?.text == "这是结束录音后才确认的最后一句。")
+        #expect(controller.segments.first?.state == .final)
     }
 
     @Test("启动失败：错误透出且不进入运行态")
