@@ -48,6 +48,8 @@ private final class CoordinatorFinalReportGenerator:
 {
     var error: AnalysisAPIError?
     var delay: Duration = .zero
+    /// 前 N 次调用抛 error，之后成功（瞬时重试测试用）
+    var failuresBeforeSuccess = Int.max
     private(set) var callCount = 0
 
     func generate(
@@ -60,7 +62,7 @@ private final class CoordinatorFinalReportGenerator:
         if delay > .zero {
             try await Task.sleep(for: delay)
         }
-        if let error {
+        if let error, callCount <= failuresBeforeSuccess {
             throw error
         }
         guard let segment = project.segments.first else {
@@ -811,7 +813,8 @@ struct FinalReportTests {
                 )
                 try store.saveProjects(projects)
             },
-            knownTermsProvider: { [] }
+            knownTermsProvider: { [] },
+            sleep: { _ in }
         )
 
         coordinator.start(projectID: project.id)
@@ -859,8 +862,70 @@ struct FinalReportTests {
                 )
                 try store.saveProjects(projects)
             },
-            knownTermsProvider: { ["测试词"] }
+            knownTermsProvider: { ["测试词"] },
+            sleep: { _ in } // 测试不真实等待瞬时重试退避
         )
+    }
+
+    @Test("瞬时错误（超时）自动重试后成功，不进入失败态")
+    func transientErrorRetriesThenSucceeds() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "bwfx-final-retry-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileStore = try MeetingFileStore(baseDirectory: directory)
+        let store = InMemoryProjectStore()
+        let segment = TranscriptSegment(
+            startMs: 0, endMs: 2_000, text: "重试测试内容",
+            source: .local, state: .final
+        )
+        let project = Project(title: "重试", sourceType: .liveRecording, segments: [segment])
+        try store.saveProjects([project])
+        let analysis = MockConversationAnalysisService()
+        let generator = CoordinatorFinalReportGenerator()
+        generator.error = .timeout
+        generator.failuresBeforeSuccess = 2 // 前两次超时，第三次成功
+        let coordinator = makeCoordinator(
+            analysis: analysis, generator: generator,
+            fileStore: fileStore, store: store
+        )
+        coordinator.start(projectID: project.id)
+        await waitUntil {
+            if case .completed = coordinator.state(for: project.id) { return true }
+            return false
+        }
+        #expect(generator.callCount == 3, "两次瞬时失败 + 一次成功")
+        if case .completed = coordinator.state(for: project.id) {
+        } else {
+            Issue.record("应最终成功，实际 \(coordinator.state(for: project.id))")
+        }
+    }
+
+    @Test("非瞬时错误（结果不合规）不重试，一次即失败")
+    func nonTransientErrorFailsImmediately() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "bwfx-final-noretry-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileStore = try MeetingFileStore(baseDirectory: directory)
+        let store = InMemoryProjectStore()
+        let segment = TranscriptSegment(
+            startMs: 0, endMs: 2_000, text: "不重试测试",
+            source: .local, state: .final
+        )
+        let project = Project(title: "不重试", sourceType: .liveRecording, segments: [segment])
+        try store.saveProjects([project])
+        let analysis = MockConversationAnalysisService()
+        let generator = CoordinatorFinalReportGenerator()
+        generator.error = .invalidResponse
+        let coordinator = makeCoordinator(
+            analysis: analysis, generator: generator,
+            fileStore: fileStore, store: store
+        )
+        coordinator.start(projectID: project.id)
+        await waitUntil {
+            if case .failed = coordinator.state(for: project.id) { return true }
+            return false
+        }
+        #expect(generator.callCount == 1, "非瞬时错误不得重试")
     }
 
     private func waitUntil(

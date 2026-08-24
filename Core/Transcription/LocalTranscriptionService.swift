@@ -288,14 +288,26 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
                     let startSeconds = result.range.start.seconds
                     let endSeconds = startSeconds + result.range.duration.seconds
                     let text = String(result.text.characters)
-                    sessionContinuation.yield(
-                        LocalTranscriptResult(
-                            startAudioMs: Int64(startSeconds * 1000),
-                            endAudioMs: Int64(endSeconds * 1000),
-                            text: text,
-                            isFinal: result.isFinal
-                        )
+                    let fallback = LocalTranscriptResult(
+                        startAudioMs: Int64(startSeconds * 1000),
+                        endAudioMs: Int64(endSeconds * 1000),
+                        text: text,
+                        isFinal: result.isFinal
                     )
+
+                    // 临时结果在 reconciler 中只有一个可变槽位，保持整段更新；
+                    // 最终结果才按 SpeechTranscriber 真实 audioTimeRange 细分。
+                    if result.isFinal {
+                        let runs = TimedTranscriptSegmenter.audioTimedRuns(from: result.text)
+                        let segments = TimedTranscriptSegmenter.segment(runs: runs)
+                        if !segments.isEmpty {
+                            for segment in segments {
+                                sessionContinuation.yield(segment)
+                            }
+                            continue
+                        }
+                    }
+                    sessionContinuation.yield(fallback)
                 }
             } catch {
                 // 结果流异常：只记录脱敏错误类型

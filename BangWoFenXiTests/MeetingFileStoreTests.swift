@@ -69,6 +69,25 @@ final class MeetingFileStoreTests {
         #expect(throws: MeetingFileStoreError.self) { _ = try store.absoluteURL(forRelativePath: "Meetings/../../escape") }
     }
 
+    @Test("相对路径不能通过符号链接逃出存储根目录")
+    func symlinkEscapeIsRejected() throws {
+        let outside = FileManager.default.temporaryDirectory.appending(
+            path: "BangWoFenXiTests-outside-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        defer { try? FileManager.default.removeItem(at: outside) }
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: tempDirectory.appending(path: "escape"),
+            withDestinationURL: outside
+        )
+
+        #expect(throws: MeetingFileStoreError.self) {
+            _ = try store.absoluteURL(forRelativePath: "escape/reference.wav")
+        }
+    }
+
     @Test("会议录音 URL 与存在性检查")
     func audioFileURLAndExistence() throws {
         let meeting = Meeting(title: "路径测试")

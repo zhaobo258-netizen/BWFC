@@ -9,6 +9,12 @@ struct ConversationAnalysisView: View {
     let summaryTab: Bool
     let speakers: [Speaker]
     var onEvidenceTap: ((UUID) -> Void)?
+    /// 片段 id → 会议时间轴起始毫秒（09 号计划需求 1：条目时间标签；
+    /// 悬空 id 返回 nil，chip 不显示）
+    var segmentStartMs: ((UUID) -> Int64?)?
+    /// 点击条目说话人（09 号计划需求 2：标注/修改说话人的入口；
+    /// 传条目涉及的证据片段 id 列表与当前 subjectSpeakerId）
+    var onSpeakerTap: ((AnalysisItem) -> Void)?
 
     /// 类别显示顺序（场景增强类别自然排在其归属页签内）
     private static let displayOrder: [AnalysisItemCategory] = [
@@ -105,10 +111,41 @@ struct ConversationAnalysisView: View {
                 // 明确表达 / AI 推断：视觉必须可一眼区分（红线）
                 BWBadge(text: item.epistemicStatus == .explicit ? "明确表达" : "AI 推断",
                         color: item.epistemicStatus == .explicit ? .green : .orange)
+                // 时间标签：取最早证据片段的会议时间（与左栏转写同格式），点击回链原话
+                if let anchor = earliestEvidence(of: item) {
+                    Button {
+                        onEvidenceTap?(anchor.segmentId)
+                    } label: {
+                        Text(TranscriptRowView.formatMs(anchor.startMs))
+                            .font(.caption2)
+                            .monospacedDigit()
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.tertiary)
+                    .help("定位到这句原话")
+                }
                 Text(confidenceLabel(item.confidence))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                if let speakerName = speakerName(for: item.subjectSpeakerId) {
+                if let onSpeakerTap {
+                    // 说话人可点（有名字显示名字，未识别给标注入口）
+                    Button {
+                        onSpeakerTap(item)
+                    } label: {
+                        HStack(spacing: 3) {
+                            if speakerName(for: item.subjectSpeakerId) == nil {
+                                Image(systemName: "person.crop.circle.badge.questionmark")
+                            }
+                            Text(speakerName(for: item.subjectSpeakerId) ?? "标注说话人")
+                        }
+                        .font(.caption2)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(speakerName(for: item.subjectSpeakerId) == nil
+                                     ? AnyShapeStyle(BWTheme.accent)
+                                     : AnyShapeStyle(.secondary))
+                    .help("确认这条内容归谁；只有唯一证据时才可另选回写原话，永久声纹需试听确认")
+                } else if let speakerName = speakerName(for: item.subjectSpeakerId) {
                     Text(speakerName)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -141,7 +178,23 @@ struct ConversationAnalysisView: View {
     }
 
     private func speakerName(for id: UUID?) -> String? {
-        guard let id else { return nil }
-        return speakers.first { $0.id == id }?.displayName
+        guard let id,
+              let speaker = speakers.first(where: { $0.id == id }) else {
+            return nil
+        }
+        guard let role = speaker.role?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !role.isEmpty else {
+            return speaker.displayName
+        }
+        return "\(speaker.displayName) · \(role)"
+    }
+
+    /// 条目证据中会议时间最早的一条（时间标签锚点；证据悬空时为 nil）
+    private func earliestEvidence(of item: AnalysisItem) -> (segmentId: UUID, startMs: Int64)? {
+        guard let segmentStartMs else { return nil }
+        return item.evidenceSegmentIds
+            .compactMap { id in segmentStartMs(id).map { (id, $0) } }
+            .min { $0.1 < $1.1 }
+            .map { (segmentId: $0.0, startMs: $0.1) }
     }
 }

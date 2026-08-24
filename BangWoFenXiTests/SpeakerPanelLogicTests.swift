@@ -58,6 +58,43 @@ struct SpeakerPanelLogicTests {
         #expect(meeting.participants[0].voiceReferenceDurationMs == 2500)
     }
 
+    @Test("本场声纹容量统一统计 V2 与 legacy")
+    func activeReferenceCapacityUsesBothSchemas() {
+        let v2 = Speaker(
+            cloudAlias: "p_01",
+            displayName: "甲",
+            voiceSamplePath: "v2.wav",
+            voiceSampleDurationMs: 3_000
+        )
+        let legacy = Speaker(
+            cloudAlias: "p_02",
+            displayName: "乙",
+            legacyVoiceReferencePath: "legacy.wav",
+            legacyVoiceReferenceDurationMs: 3_000
+        )
+        let empty = Speaker(cloudAlias: "p_03", displayName: "丙")
+
+        #expect(SpeakerPanelLogic.activeVoiceReferenceCount(in: [v2, legacy, empty]) == 2)
+        #expect(SpeakerPanelLogic.voiceReferencePath(for: legacy) == "legacy.wav")
+    }
+
+    @Test("第五人不能激活新样本，已激活人可以重录")
+    func fifthReferenceIsRejectedBeforeRecording() {
+        let active = (1...4).map { index in
+            Speaker(
+                cloudAlias: String(format: "p_%02d", index),
+                displayName: "说话人 \(index)",
+                voiceSamplePath: "\(index).wav",
+                voiceSampleDurationMs: 3_000
+            )
+        }
+        let fifth = Speaker(cloudAlias: "p_05", displayName: "说话人 5")
+        let speakers = active + [fifth]
+
+        #expect(SpeakerPanelLogic.canActivateVoiceReference(for: active[0].id, in: speakers))
+        #expect(!SpeakerPanelLogic.canActivateVoiceReference(for: fifth.id, in: speakers))
+    }
+
     @Test("Speaker V2 样本字段：编解码回环 + 旧数据无字段容错")
     func speakerCodableRoundtrip() throws {
         let speaker = Speaker(cloudAlias: "p_01", displayName: "甲",

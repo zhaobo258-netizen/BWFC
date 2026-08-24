@@ -41,6 +41,18 @@ final class DiarizationController {
     private var mapper = SpeakerMapper(participants: [])
     private var processingTask: Task<Void, Never>?
     private var draining = false
+    private var suspensionCause: SuspensionCause?
+
+    private enum SuspensionCause: Equatable {
+        case providerCredential
+        case knownSpeakerConfiguration
+    }
+
+    private struct UploadedChunk {
+        var result: DiarizationChunkResult
+        /// 本次请求真实发送给 provider 的 known speaker 代号。
+        var knownAliases: Set<String>
+    }
 
     /// 队列变化回调（视图层刷新）
     var onQueueChanged: (() -> Void)?
@@ -74,6 +86,7 @@ final class DiarizationController {
         self.meeting = meeting
         self.timelineProvider = timelineProvider
         self.mapper = SpeakerMapper(participants: meeting.participants)
+        suspensionCause = nil
 
         let store = ChunkQueueStore(fileURL: fileStore.chunkQueueFileURL(for: meeting.id))
         queueStore = store
@@ -106,10 +119,30 @@ final class DiarizationController {
     }
 
     /// 说话人列表变化后刷新映射（工作台「说话人」面板编辑后调用；
-    /// 后续分片按新映射解析，已确认片段不回改）
+    /// 后续分片按新映射解析，已确认片段不回改）。
+    /// 手工指认的标签映射跨重建保留（09 号计划需求 2）。
     func refreshKnownSpeakers() {
         guard let meeting else { return }
-        mapper = SpeakerMapper(participants: meeting.participants)
+        let manual = mapper.manualAssignments
+        var rebuilt = SpeakerMapper(participants: meeting.participants)
+        let validIds = Set(meeting.participants.map(\.id))
+        rebuilt.restoreManualAssignments(manual.filter { validIds.contains($0.value) })
+        mapper = rebuilt
+        guard suspensionCause == .knownSpeakerConfiguration else { return }
+        suspensionCause = nil
+        guard keyStore.hasConfiguredKey else {
+            cloudState = .unconfigured
+            return
+        }
+        cloudState = .idle
+        kickProcessing()
+    }
+
+    /// 手工指认云端标签归属（09 号计划需求 2）。
+    /// generic label 已按 chunk 加作用域，仅回填该次请求的同标签片段；
+    /// 后续分片要等声纹样本作为 known alias 真实发送后才稳定映射。
+    func assignRemoteLabel(_ label: String, to participantId: UUID) {
+        mapper.assign(remoteLabel: label, to: participantId)
     }
 
     /// 停止编排（不等待队列完成；结束会议请用 finishAndDrain）
@@ -122,6 +155,7 @@ final class DiarizationController {
 
     /// 按当前音频进度产出新分片（录音中由界面定时器周期调用）
     func pollProgress() {
+        guard canProduceChunkFiles() else { return }
         guard let meeting, meeting.status == .recording,
               let timeline = timelineProvider?() else { return }
         let uptoAudioMs = timeline.effectiveAudioMs(at: Date())
@@ -130,6 +164,7 @@ final class DiarizationController {
 
     /// 按给定音频进度产出新分片（纯逻辑入口，测试可直接驱动）
     func produceChunks(uptoAudioMs: Int64) {
+        guard canProduceChunkFiles() else { return }
         guard let meeting, let timeline = timelineProvider?() else { return }
         let windows = planner.pendingWindows(uptoAudioMs: uptoAudioMs, nextIndex: nextChunkIndex)
         for window in windows {
@@ -144,6 +179,8 @@ final class DiarizationController {
     /// 返回时队列要么全部成功，要么进入 suspended / awaitingUserRetry。
     /// - Parameter uptoAudioMs: 尾部截止的音频进度；nil 表示按当前时间线计算（测试可注入）
     func finishAndDrain(uptoAudioMs: Int64? = nil) async {
+        // 未配置时连尾片也不切盘；start 仍然保留会议与时间线上下文。
+        guard canProduceChunkFiles() else { return }
         if let meeting {
             let audioMs = uptoAudioMs ?? timelineProvider?()?.effectiveAudioMs(at: Date()) ?? 0
             if audioMs > 0, let timeline = timelineProvider?(),
@@ -229,8 +266,12 @@ final class DiarizationController {
             persistQueue()
 
             do {
-                let result = try await upload(entry: entry)
-                try applyResult(result, for: entry)
+                let uploaded = try await upload(entry: entry)
+                try applyResult(
+                    uploaded.result,
+                    knownAliases: uploaded.knownAliases,
+                    for: entry
+                )
                 queue[entryIndex].status = .succeeded
                 // 上传成功且结果已持久化后删除临时分片文件（实施计划 7.4）
                 if let meeting {
@@ -252,30 +293,86 @@ final class DiarizationController {
     }
 
     /// 调用云端识别
-    private func upload(entry: ChunkQueueEntry) async throws -> DiarizationChunkResult {
+    private func upload(entry: ChunkQueueEntry) async throws -> UploadedChunk {
         guard let meeting else { throw DiarizationAPIError.network }
         let chunkURL = fileStore.chunksDirectory(for: meeting.id)
             .appending(path: entry.fileName)
-        let speakers: [KnownSpeakerReference] = meeting.participants.compactMap { participant in
-            guard let relativePath = participant.voiceReferencePath,
-                  let url = try? fileStore.absoluteURL(forRelativePath: relativePath),
-                  FileManager.default.fileExists(atPath: url.path),
-                  !participant.cloudAlias.isEmpty else { return nil }
-            return KnownSpeakerReference(alias: participant.cloudAlias, sampleURL: url)
+        var speakers: [KnownSpeakerReference] = []
+        for participant in meeting.participants {
+            guard let relativePath = participant.voiceReferencePath else { continue }
+            let alias = participant.cloudAlias
+            guard let durationMs = participant.voiceReferenceDurationMs,
+                  (VoiceSampleValidator.minDurationMs...VoiceSampleValidator.maxDurationMs)
+                    .contains(durationMs) else {
+                throw DiarizationAPIError.invalidKnownSpeakerSample(
+                    alias: alias,
+                    issue: .invalidDuration(actualMs: participant.voiceReferenceDurationMs)
+                )
+            }
+            let url: URL
+            do {
+                url = try fileStore.absoluteURL(forRelativePath: relativePath)
+            } catch {
+                throw DiarizationAPIError.invalidKnownSpeakerSample(
+                    alias: alias,
+                    issue: .invalidPath
+                )
+            }
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+                  !isDirectory.boolValue,
+                  FileManager.default.isReadableFile(atPath: url.path) else {
+                throw DiarizationAPIError.invalidKnownSpeakerSample(
+                    alias: alias,
+                    issue: .fileMissingOrUnreadable
+                )
+            }
+            speakers.append(KnownSpeakerReference(alias: alias, sampleURL: url))
         }
-        return try await diarization.transcribeChunk(at: chunkURL, knownSpeakers: speakers)
+        guard speakers.count <= KnownSpeakerReference.maximumCount else {
+            throw DiarizationAPIError.tooManyKnownSpeakers(
+                maximum: KnownSpeakerReference.maximumCount,
+                actual: speakers.count
+            )
+        }
+        let result = try await diarization.transcribeChunk(
+            at: chunkURL,
+            knownSpeakers: speakers
+        )
+        return UploadedChunk(result: result, knownAliases: Set(speakers.map(\.alias)))
     }
 
     /// 云端相对时间 → 会议时间轴 → 交给合并点
-    private func applyResult(_ result: DiarizationChunkResult, for entry: ChunkQueueEntry) throws {
+    private func applyResult(
+        _ result: DiarizationChunkResult,
+        knownAliases: Set<String>,
+        for entry: ChunkQueueEntry
+    ) throws {
         for segment in result.segments {
-            // 未知标签登记（模型层显式分配字母；渲染路径只做纯解析）
-            mapper.register(remoteLabel: segment.speakerLabel)
-            let resolution = mapper.resolve(remoteLabel: segment.speakerLabel)
+            let storedLabel: String?
             let participantId: UUID?
-            if case .known(let id) = resolution {
-                participantId = id
+
+            if let label = segment.speakerLabel, !label.isEmpty,
+               knownAliases.contains(label),
+               let knownParticipantId = mapper.participantId(forKnownAlias: label) {
+                // 只有本次确实发送过声纹样本的代号才能跨分片稳定映射。
+                storedLabel = label
+                participantId = knownParticipantId
+            } else if let label = segment.speakerLabel, !label.isEmpty {
+                // generic label 不保证跨请求一致，必须按 chunk 隔离。
+                let scopedLabel = SpeakerMapper.scopedRemoteLabel(
+                    label,
+                    chunkIndex: entry.index
+                )
+                storedLabel = scopedLabel
+                mapper.register(remoteLabel: scopedLabel)
+                if case .known(let id) = mapper.resolve(remoteLabel: scopedLabel) {
+                    participantId = id
+                } else {
+                    participantId = nil
+                }
             } else {
+                storedLabel = nil
                 participantId = nil
             }
             transcriptController.applyCloudSegment(
@@ -283,7 +380,7 @@ final class DiarizationController {
                 wallEndMs: entry.wallStartMs + segment.endMs,
                 text: segment.text,
                 participantId: participantId,
-                remoteSpeakerLabel: segment.speakerLabel
+                remoteSpeakerLabel: storedLabel
             )
         }
     }
@@ -294,16 +391,31 @@ final class DiarizationController {
         case .unauthorized:
             // 分人 Key 无效：仅暂停分人 provider，本地录音与分析继续
             queue[entryIndex].status = .pending
+            suspensionCause = .providerCredential
             cloudState = .suspended(reason: "分人 Key 无效（401）。请在设置中检查「分人 Key」，分析（Kimi）不受影响。")
             AppLog.logError(AppLog.diarization, LogSanitizer.formatEvent("cloud_suspended", statusCode: 401))
         case .missingAPIKey:
             // 运行中 Key 被删除：视为未配置，零请求
             queue[entryIndex].status = .pending
+            suspensionCause = nil
             cloudState = .unconfigured
         case .credentialAccessRequired:
             queue[entryIndex].status = .pending
+            suspensionCause = .providerCredential
             cloudState = .suspended(
                 reason: "App 更新后需要重新保存分人 Key。本地录音与转写不受影响。"
+            )
+        case .tooManyKnownSpeakers(let maximum, let actual):
+            queue[entryIndex].status = .pending
+            suspensionCause = .knownSpeakerConfiguration
+            cloudState = .suspended(
+                reason: "声纹配置暂停：已配置 \(actual) 个声纹样本，单次分人最多支持 \(maximum) 个，本次未上传。修正后将自动继续。"
+            )
+        case .invalidKnownSpeakerSample:
+            queue[entryIndex].status = .pending
+            suspensionCause = .knownSpeakerConfiguration
+            cloudState = .suspended(
+                reason: "声纹配置暂停：\(error.localizedDescription)。请修正或移除该样本，保存后将自动继续。"
             )
         case .rateLimited, .serverError, .network:
             queue[entryIndex].attemptCount += 1
@@ -333,7 +445,10 @@ final class DiarizationController {
             queue[index].status = .pending
             queue[index].attemptCount = 0
         }
-        if case .suspended = cloudState { cloudState = .idle }
+        if case .suspended = cloudState {
+            suspensionCause = nil
+            cloudState = .idle
+        }
         if case .unconfigured = cloudState { cloudState = .idle }
         persistQueue()
         kickProcessing()
@@ -345,7 +460,11 @@ final class DiarizationController {
             cloudState = .unconfigured
             return
         }
-        if case .suspended = cloudState { cloudState = .idle }
+        guard suspensionCause != .knownSpeakerConfiguration else { return }
+        if case .suspended = cloudState {
+            suspensionCause = nil
+            cloudState = .idle
+        }
         if case .unconfigured = cloudState { cloudState = .idle }
         kickProcessing()
     }
@@ -372,6 +491,19 @@ final class DiarizationController {
     }
 
     // MARK: - 内部
+
+    /// 未配置时不产生任何云端专用分片文件。
+    /// 运行中 Key 被删除时也在下一次 poll 立即收敛为 unconfigured。
+    private func canProduceChunkFiles() -> Bool {
+        guard keyStore.hasConfiguredKey else {
+            cloudState = .unconfigured
+            return false
+        }
+        if case .unconfigured = cloudState {
+            return false
+        }
+        return true
+    }
 
     private func updateCloudState() {
         if case .suspended = cloudState { return }

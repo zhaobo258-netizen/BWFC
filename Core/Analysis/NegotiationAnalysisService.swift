@@ -200,13 +200,3 @@ struct OpenAIAnalysisService: NegotiationAnalysisServicing {
         }
     }
 }
-
-/// 占位实现：未配置网络层时的兜底（报「未实现」）
-struct UnimplementedNegotiationAnalysisService: NegotiationAnalysisServicing {
-    func analyze(instructions: String, inputJSON: String) async throws -> AnalysisOutputDTO {
-        throw ServiceNotReadyError.notImplemented("谈判分析")
-    }
-    func testConnection() async throws -> Bool {
-        throw ServiceNotReadyError.notImplemented("连接测试")
-    }
-}

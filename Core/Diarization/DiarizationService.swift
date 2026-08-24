@@ -3,10 +3,19 @@ import Foundation
 /// 已知说话人参考（实施计划 10.1）：本地代号 + 声音样本文件。
 /// 真实姓名绝不作为云端参数（实施计划 7.5）。
 struct KnownSpeakerReference: Equatable, Sendable {
+    /// OpenAI diarization 单次请求支持的已知说话人上限。
+    static let maximumCount = 4
+
     /// 本地代号（p_01…p_04）
     var alias: String
     /// 声音样本文件（2–10 秒）
     var sampleURL: URL
+}
+
+enum KnownSpeakerSampleIssue: Equatable, Sendable {
+    case invalidPath
+    case fileMissingOrUnreadable
+    case invalidDuration(actualMs: Int64?)
 }
 
 /// 云端分片识别结果（时间均为相对分片起点的毫秒）
@@ -43,6 +52,10 @@ enum DiarizationAPIError: Error, Equatable {
     case missingAPIKey
     /// 当前 App 身份无法静默读取旧 Keychain 凭证
     case credentialAccessRequired
+    /// 已知说话人超过 provider 单次请求容量，不得静默截断。
+    case tooManyKnownSpeakers(maximum: Int, actual: Int)
+    /// 已配置声纹但样本无法安全上传，不得静默降级为未知说话人。
+    case invalidKnownSpeakerSample(alias: String, issue: KnownSpeakerSampleIssue)
 }
 
 extension DiarizationAPIError: LocalizedError {
@@ -57,6 +70,20 @@ extension DiarizationAPIError: LocalizedError {
         case .missingAPIKey: return "未配置 API Key"
         case .credentialAccessRequired:
             return "当前 App 无法读取旧凭证，请前往设置重新保存 API Key"
+        case .tooManyKnownSpeakers(let maximum, let actual):
+            return "已配置 \(actual) 个声纹样本，单次识别最多支持 \(maximum) 个"
+        case .invalidKnownSpeakerSample(let alias, let issue):
+            switch issue {
+            case .invalidPath:
+                return "说话人代号 \(alias) 的声纹样本路径无效"
+            case .fileMissingOrUnreadable:
+                return "说话人代号 \(alias) 的声纹样本文件缺失或不可读"
+            case .invalidDuration(let actualMs):
+                if let actualMs {
+                    return "说话人代号 \(alias) 的声纹样本时长为 \(actualMs) 毫秒，必须在 2–10 秒之间"
+                }
+                return "说话人代号 \(alias) 的声纹样本缺少时长，必须在 2–10 秒之间"
+            }
         }
     }
 }
@@ -98,6 +125,13 @@ struct OpenAIDiarizationService: DiarizationServicing {
         at chunkURL: URL,
         knownSpeakers: [KnownSpeakerReference]
     ) async throws -> DiarizationChunkResult {
+        guard knownSpeakers.count <= KnownSpeakerReference.maximumCount else {
+            throw DiarizationAPIError.tooManyKnownSpeakers(
+                maximum: KnownSpeakerReference.maximumCount,
+                actual: knownSpeakers.count
+            )
+        }
+
         let apiKey: String?
         do {
             apiKey = try apiKeyStore.readKey()
@@ -118,12 +152,21 @@ struct OpenAIDiarizationService: DiarizationServicing {
                         fileName: "chunk.wav",
                         mimeType: "audio/wav",
                         fileData: chunkData)
-        // 已知说话人：只传本地代号（≤4），样本转数据 URL
-        let speakers = Array(knownSpeakers.prefix(4))
+        // 已知说话人：只传本地代号，样本转数据 URL。
+        // 容量已在入口显式校验，这里不得 prefix 静默丢掉第 5 人。
+        let speakers = knownSpeakers
         builder.addArrayField(name: "known_speaker_names[]",
                               values: speakers.map(\.alias))
         for speaker in speakers {
-            let sampleData = try Data(contentsOf: speaker.sampleURL)
+            let sampleData: Data
+            do {
+                sampleData = try Data(contentsOf: speaker.sampleURL)
+            } catch {
+                throw DiarizationAPIError.invalidKnownSpeakerSample(
+                    alias: speaker.alias,
+                    issue: .fileMissingOrUnreadable
+                )
+            }
             let dataURL = "data:audio/wav;base64,\(sampleData.base64EncodedString())"
             builder.addField(name: "known_speaker_references[]", value: dataURL)
         }
@@ -193,16 +236,41 @@ struct OpenAIDiarizationService: DiarizationServicing {
         guard let dto = try? JSONDecoder().decode(ResponseDTO.self, from: data) else {
             throw DiarizationAPIError.invalidResponse
         }
-        let segments = (dto.segments ?? []).map { segment in
-            DiarizationChunkResult.Segment(
-                startMs: Int64((segment.start ?? 0) * 1000),
-                endMs: Int64((segment.end ?? 0) * 1000),
-                text: segment.text ?? "",
-                speakerLabel: segment.speaker
-            )
+        guard let rawSegments = dto.segments else {
+            throw DiarizationAPIError.invalidResponse
+        }
+        var segments: [DiarizationChunkResult.Segment] = []
+        for segment in rawSegments {
+            guard let start = segment.start,
+                  let end = segment.end,
+                  let text = segment.text?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !text.isEmpty,
+                  let speaker = segment.speaker?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !speaker.isEmpty,
+                  start.isFinite,
+                  end.isFinite,
+                  start >= 0,
+                  end > start,
+                  end <= Double(Int64.max) / 1_000 else {
+                throw DiarizationAPIError.invalidResponse
+            }
+            segments.append(DiarizationChunkResult.Segment(
+                startMs: Int64((start * 1_000).rounded()),
+                endMs: Int64((end * 1_000).rounded()),
+                text: text,
+                speakerLabel: speaker
+            ))
+        }
+        let duration = dto.duration
+        if let duration {
+            guard duration.isFinite,
+                  duration >= 0,
+                  duration <= Double(Int64.max) / 1_000 else {
+                throw DiarizationAPIError.invalidResponse
+            }
         }
         return DiarizationChunkResult(
-            durationMs: Int64((dto.duration ?? 0) * 1000),
+            durationMs: Int64(((duration ?? rawSegments.compactMap(\.end).max() ?? 0) * 1_000).rounded()),
             segments: segments
         )
     }
@@ -218,16 +286,5 @@ struct OpenAIDiarizationService: DiarizationServicing {
             let text: String?
             let speaker: String?
         }
-    }
-}
-
-/// 占位实现：未配置网络层时的兜底（报「未实现」）
-struct UnimplementedDiarizationService: DiarizationServicing {
-    func transcribeChunk(at chunkURL: URL,
-                         knownSpeakers: [KnownSpeakerReference]) async throws -> DiarizationChunkResult {
-        throw ServiceNotReadyError.notImplemented("云端说话人识别")
-    }
-    func testConnection() async throws -> Bool {
-        throw ServiceNotReadyError.notImplemented("连接测试")
     }
 }

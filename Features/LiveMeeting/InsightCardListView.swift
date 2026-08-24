@@ -10,6 +10,7 @@ struct InsightCardListView: View {
     let segments: [TranscriptSegment]
     /// 点击证据定位到底部片段
     var onEvidenceTap: ((UUID) -> Void)?
+    var onSpeakerTap: ((Insight) -> Void)? = nil
 
     var body: some View {
         ScrollView {
@@ -34,7 +35,8 @@ struct InsightCardListView: View {
                                     insight: insight,
                                     participant: participants.first(where: { $0.id == insight.subjectParticipantId }),
                                     segments: segments,
-                                    onEvidenceTap: onEvidenceTap
+                                    onEvidenceTap: onEvidenceTap,
+                                    onSpeakerTap: onSpeakerTap
                                 )
                             }
                         }
@@ -57,6 +59,7 @@ struct InsightCardView: View {
     let participant: Participant?
     let segments: [TranscriptSegment]
     var onEvidenceTap: ((UUID) -> Void)?
+    var onSpeakerTap: ((Insight) -> Void)?
 
     var body: some View {
         HStack(alignment: .top, spacing: 0) {
@@ -72,7 +75,28 @@ struct InsightCardView: View {
 
                 HStack(spacing: 6) {
                     // 涉及参会人
-                    if let participant {
+                    if let onSpeakerTap {
+                        Button {
+                            onSpeakerTap(insight)
+                        } label: {
+                            Label(
+                                participant?.displayName ?? "标注说话人",
+                                systemImage: participant == nil
+                                    ? "person.crop.circle.badge.questionmark"
+                                    : "person.crop.circle"
+                            )
+                            .font(.caption2)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(
+                                participant.map { colorForToken($0.colorToken).opacity(0.15) }
+                                    ?? BWTheme.accent.opacity(0.12),
+                                in: Capsule()
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .help("确认这条 AI 内容归谁")
+                    } else if let participant {
                         Text(participant.displayName)
                             .font(.caption2)
                             .padding(.horizontal, 6)

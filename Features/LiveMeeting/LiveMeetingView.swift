@@ -47,6 +47,10 @@ struct LiveMeetingView: View {
                 if case .suspended(let reason) = diarization?.cloudState {
                     cloudSuspendedBanner(reason: reason)
                 }
+                if case .unconfigured = diarization?.cloudState,
+                   meeting.status == .recording || meeting.status == .paused {
+                    diarizationUnconfiguredBanner
+                }
                 if case .suspended(let reason) = analysis?.state {
                     analysisSuspendedBanner(reason: reason)
                 }
@@ -102,6 +106,10 @@ struct LiveMeetingView: View {
             diarization?.pollProgress()
             // 分析调度器周期驱动（触发条件与防抖由 AnalysisTrigger 判定）
             Task { await analysis?.tick() }
+        }
+        .onChange(of: environment.cloudConfigurationRevision) { _, _ in
+            diarization?.resumeAfterKeyFix()
+            analysis?.resumeAfterKeyFix()
         }
         .confirmationDialog(
             "结束本场会议？",
@@ -395,6 +403,18 @@ struct LiveMeetingView: View {
         .background(.orange.opacity(0.12))
     }
 
+    private var diarizationUnconfiguredBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "person.2.slash")
+            Text("说话人识别未连接；当前只有 Apple Speech 文稿，不会自动产生可靠的说话人归属。")
+                .font(.callout)
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.orange.opacity(0.12))
+    }
+
     // MARK: - 云端分析暂停提示（401：本地继续，修复后可重试）
 
     private func analysisSuspendedBanner(reason: String) -> some View {
@@ -535,12 +555,10 @@ struct LiveMeetingView: View {
                         let boxed = SendableAudioBuffer(buffer)
                         Task { await transcriptionService.feed(boxed.buffer) }
                     }
-                    // 启动云端说话人识别编排（仅分人 Key 已配置时发请求；
-                    // 未配置时进入 unconfigured 灰态，说话人显示待识别，可手动标注）
-                    if environment.isConfigured(.diarization) {
-                        diarization?.start(for: meeting) { [weak recorder] in
-                            recorder?.timeline
-                        }
+                    // 始终启动编排：未配置时由 controller 进入 unconfigured，
+                    // 让界面如实提示且不切分音频、不发请求。
+                    diarization?.start(for: meeting) { [weak recorder] in
+                        recorder?.timeline
                     }
                 }
             } catch {

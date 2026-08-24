@@ -209,6 +209,173 @@ final class ConversationAnalysisControllerTests {
         #expect(service.calls.count == 2, "推进假时钟越过防抖后才补发")
     }
 
+    @Test("成功请求在途新增片段不丢失，当前请求完成后自动补发")
+    func successfulInFlightRequestPreservesPendingSegments() async throws {
+        var trigger = AnalysisTrigger()
+        trigger.minNewSegments = 1
+        trigger.debounceMs = 0
+        trigger.failureRetryMs = 0
+        let clock = LockedBox<Int64>(3_000_000)
+        let service = MockConversationAnalysisService()
+        service.suspendNextCall = true
+        let controller = ConversationAnalysisController(
+            service: service,
+            triggerConfig: trigger,
+            nowMs: { clock.withLock { $0 } }
+        )
+        let project = Project(title: "在途新片段", sourceType: .liveRecording)
+        controller.attach(to: project)
+
+        func addSegment(_ index: Int) {
+            project.segments.append(TranscriptSegment(
+                startMs: Int64(index * 2_000),
+                endMs: Int64((index + 1) * 2_000),
+                text: "在途片段 \(index)",
+                source: .local,
+                state: .final
+            ))
+            controller.noteNewFinalSegment()
+        }
+
+        addSegment(0)
+        async let first: Void = controller.tick()
+        await waitUntil { service.hasSuspendedCall }
+
+        addSegment(1)
+        await controller.tick()
+        service.resumeSuspendedCall()
+        await first
+
+        #expect(service.calls.count == 2, "在途到达的最终片段必须自动补发")
+        let secondInput = try #require(service.calls.last?.inputJSON)
+        #expect(secondInput.contains("在途片段 1"))
+        #expect(!secondInput.contains("在途片段 0"), "补发仍按游标做增量")
+        #expect(controller.currentSnapshot?.analyzedThroughMs == 4_000)
+    }
+
+    @Test("旧片段说话人修正后重新进入增量分析，游标不回退")
+    func changedSpeakerContextReentersIncrementalAnalysis() async throws {
+        addThreeSegments()
+        advance(10_100)
+        await controller.tick()
+        #expect(controller.currentSnapshot?.analyzedThroughMs == 6_000)
+
+        let firstSegment = try #require(project.segments.first)
+        let correctedSpeaker = Speaker(
+            cloudAlias: "p_02",
+            displayName: "李经理",
+            role: "项目负责人"
+        )
+        project.speakers.append(correctedSpeaker)
+        firstSegment.participantId = correctedSpeaker.id
+        controller.noteSpeakerContextChanged(segmentIDs: [firstSegment.id])
+
+        advance(10_100)
+        await controller.tick()
+
+        #expect(mock.calls.count == 2)
+        let inputData = try #require(mock.calls.last?.inputJSON.data(using: .utf8))
+        let input = try #require(
+            try JSONSerialization.jsonObject(with: inputData) as? [String: Any]
+        )
+        let untrusted = try #require(
+            input["untrusted_transcript_data"] as? [String: Any]
+        )
+        let segments = try #require(untrusted["new_segments"] as? [[String: Any]])
+        #expect(segments.count == 1)
+        #expect(segments[0]["id"] as? String == firstSegment.id.uuidString)
+        #expect(segments[0]["speaker_id"] as? String == "p_02")
+        #expect(controller.currentSnapshot?.analyzedThroughMs == 6_000,
+                "只重发旧片段时不得使分析游标回退")
+    }
+
+    @Test("AI 推断卡片可独立确认说话人并持久化，不篡改多条证据原话")
+    func confirmsAnalysisItemSpeakerWithoutChangingTranscript() async throws {
+        let first = addFinalSegment(startMs: 0, text: "甲方提问。")
+        let second = addFinalSegment(startMs: 2_000, text: "乙方回答。")
+        first.participantId = nil
+        second.participantId = nil
+        let item = AnalysisItem(
+            category: .possibleMotive,
+            text: "希望尽快推进",
+            epistemicStatus: .inference,
+            confidence: .medium,
+            evidenceSegmentIds: [first.id, second.id]
+        )
+        project.analysisSnapshots = [ConversationAnalysisSnapshot(
+            version: 3,
+            analyzedThroughMs: 4_000,
+            items: [item]
+        )]
+        controller.attach(to: project)
+        var persisted = false
+        controller.onSnapshotUpdated = { persisted = true }
+
+        let confirmed = controller.confirmSubjectSpeaker(
+            itemID: item.id,
+            speakerID: project.speakers[0].id
+        )
+
+        #expect(confirmed)
+        #expect(controller.currentSnapshot?.version == 4)
+        #expect(controller.currentSnapshot?.items.first?.subjectSpeakerId == project.speakers[0].id)
+        #expect(project.analysisSnapshots.last?.items.first?.subjectSpeakerId == project.speakers[0].id)
+        #expect(project.analysisSpeakerOverrides.count == 1)
+        #expect(first.participantId == nil)
+        #expect(second.participantId == nil)
+        #expect(persisted)
+
+        mock.resultQueue = [ConversationAnalysisOutputDTO(
+            headline: nil,
+            detectedScenario: nil,
+            scenarioConfidence: nil,
+            items: [ConversationAnalysisOutputDTO.ItemDTO(
+                category: "possible_motive",
+                text: "希望尽快推进",
+                subjectSpeakerId: nil,
+                epistemicStatus: "inference",
+                confidence: "medium",
+                evidenceSegmentIds: [first.id.uuidString, second.id.uuidString]
+            )]
+        )]
+        await controller.generateFinalAnalysis()
+        #expect(controller.currentSnapshot?.items.first?.subjectSpeakerId == project.speakers[0].id,
+                "后续模型遗漏 subject 时仍保留用户确认")
+    }
+
+    @Test("说话人确认持久化失败时回滚快照和覆盖")
+    func confirmationPersistenceFailureRollsBack() throws {
+        let evidence = addFinalSegment(startMs: 0, text: "需要确认归属。")
+        let item = AnalysisItem(
+            category: .possibleMotive,
+            text: "希望尽快推进",
+            epistemicStatus: .inference,
+            confidence: .medium,
+            evidenceSegmentIds: [evidence.id]
+        )
+        let original = ConversationAnalysisSnapshot(
+            version: 3,
+            analyzedThroughMs: evidence.endMs,
+            items: [item]
+        )
+        project.analysisSnapshots = [original]
+        controller.attach(to: project)
+        controller.persistManualSpeakerConfirmation = {
+            throw AnalysisAPIError.network
+        }
+
+        let confirmed = controller.confirmSubjectSpeaker(
+            itemID: item.id,
+            speakerID: project.speakers[0].id
+        )
+
+        #expect(!confirmed)
+        #expect(controller.currentSnapshot === original)
+        #expect(project.analysisSnapshots.count == 1)
+        #expect(project.analysisSnapshots[0] === original)
+        #expect(project.analysisSpeakerOverrides.isEmpty)
+    }
+
     @Test("非法 JSON：保留上一版快照，不推进游标，状态如实提示")
     func invalidResponseKeepsPreviousSnapshot() async throws {
         addThreeSegments()
@@ -405,5 +572,52 @@ final class ConversationAnalysisControllerTests {
         while ContinuousClock.now < deadline, !condition() {
             try? await Task.sleep(for: .milliseconds(10))
         }
+    }
+
+    // MARK: - 实时尾巴（09 号计划需求 3-②）
+
+    @Test("临时尾巴进入输入并标记 provisional，但游标只按最终片段推进")
+    func provisionalTailInInputButNotCursor() async throws {
+        addThreeSegments()
+        let tail = TranscriptSegment(
+            startMs: 6_000, endMs: 9_000, text: "这句话还在识别中但已经够长了",
+            source: .local, state: .provisional
+        )
+        controller.provisionalTailProvider = { tail }
+
+        advance(10_100)
+        await controller.tick()
+        #expect(mock.calls.count == 1)
+        let input = try #require(mock.calls.first?.inputJSON)
+        #expect(input.contains(tail.id.uuidString), "尾巴片段进入输入")
+        #expect(input.contains("\"provisional\":true"), "尾巴带 provisional 标记")
+        #expect(controller.currentSnapshot?.analyzedThroughMs == 6_000,
+                "游标只按最终片段推进，不吃尾巴的 endMs")
+    }
+
+    @Test("无新最终片段时，仅有尾巴不驱动分析")
+    func tailAloneDoesNotFire() async {
+        let tail = TranscriptSegment(
+            startMs: 0, endMs: 3_000, text: "只有识别中的临时内容在这里",
+            source: .local, state: .provisional
+        )
+        controller.provisionalTailProvider = { tail }
+        advance(60_000)
+        await controller.tick()
+        #expect(mock.calls.isEmpty)
+    }
+
+    @Test("最终分析（forceFullTranscript）不带临时尾巴")
+    func finalAnalysisSkipsTail() async throws {
+        addThreeSegments()
+        let tail = TranscriptSegment(
+            startMs: 6_000, endMs: 9_000, text: "识别中的尾巴不该进入最终分析",
+            source: .local, state: .provisional
+        )
+        controller.provisionalTailProvider = { tail }
+        await controller.generateFinalAnalysis()
+        #expect(mock.calls.count == 1)
+        let input = try #require(mock.calls.first?.inputJSON)
+        #expect(!input.contains(tail.id.uuidString))
     }
 }

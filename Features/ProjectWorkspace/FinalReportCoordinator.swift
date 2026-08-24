@@ -21,6 +21,11 @@ final class FinalReportCoordinator {
     private let loadProject: (UUID) throws -> Project?
     private let persistProject: (Project, ProjectFieldOwnership) throws -> Void
     private let knownTermsProvider: () -> [String]
+    /// 可注入的延迟（测试避免真实等待）
+    private let sleep: (Duration) async -> Void
+
+    /// 瞬时错误自动重试上限（10 号计划需求 2：长录音生成一次超时就静默失败太脆）
+    static let maxTransientRetries = 2
 
     private var tasks: [UUID: Task<Void, Never>] = [:]
     private var refreshRequestedWhileRunning: Set<UUID> = []
@@ -38,7 +43,10 @@ final class FinalReportCoordinator {
         fileWriter: FinalReportFileWriter,
         loadProject: @escaping (UUID) throws -> Project?,
         persistProject: @escaping (Project, ProjectFieldOwnership) throws -> Void,
-        knownTermsProvider: @escaping () -> [String]
+        knownTermsProvider: @escaping () -> [String],
+        sleep: @escaping (Duration) async -> Void = { duration in
+            try? await Task.sleep(for: duration)
+        }
     ) {
         self.analysisService = analysisService
         self.finalReportGenerator = finalReportGenerator
@@ -46,6 +54,7 @@ final class FinalReportCoordinator {
         self.loadProject = loadProject
         self.persistProject = persistProject
         self.knownTermsProvider = knownTermsProvider
+        self.sleep = sleep
     }
 
     func state(for projectID: UUID) -> State {
@@ -136,10 +145,9 @@ final class FinalReportCoordinator {
         }
         var fileSnapshot: FinalReportFileWriter.Snapshot?
         do {
-            var report = try await finalReportGenerator.generate(
+            var report = try await generateWithTransientRetry(
                 project: project,
                 analysis: snapshot,
-                knownTerms: knownTermsProvider(),
                 version: (latestReport?.version ?? 0) + 1
             )
             let markdown = FinalReportMarkdownRenderer.makeMarkdown(
@@ -185,6 +193,46 @@ final class FinalReportCoordinator {
                 projectID: projectID,
                 message: Self.userMessage(error)
             )
+        }
+    }
+
+    /// 生成 + 瞬时错误重试：超时/断网/限流/服务繁忙自动退避重试，
+    /// 其他错误（凭证、结果不合规）立刻抛出交给统一失败路径。
+    private func generateWithTransientRetry(
+        project: Project,
+        analysis: ConversationAnalysisSnapshot,
+        version: Int
+    ) async throws -> FinalReportSnapshot {
+        var attempt = 0
+        while true {
+            do {
+                return try await finalReportGenerator.generate(
+                    project: project,
+                    analysis: analysis,
+                    knownTerms: knownTermsProvider(),
+                    version: version
+                )
+            } catch let error as AnalysisAPIError
+                where attempt < Self.maxTransientRetries
+                    && Self.isTransient(error)
+                    && !Task.isCancelled {
+                attempt += 1
+                AppLog.logWarning(AppLog.analysis, LogSanitizer.formatEvent(
+                    "final_report_transient_retry",
+                    error: "attempt=\(attempt) \(String(describing: error))"
+                ))
+                await sleep(.seconds(15 * attempt))
+            }
+        }
+    }
+
+    private static func isTransient(_ error: AnalysisAPIError) -> Bool {
+        switch error {
+        case .timeout, .network, .rateLimited, .serverError:
+            return true
+        case .unauthorized, .missingAPIKey, .credentialAccessRequired,
+             .truncated, .invalidResponse, .clientError:
+            return false
         }
     }
 

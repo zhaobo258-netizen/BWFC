@@ -105,6 +105,7 @@ enum TranscriptCorrector {
             segment.text = segment.text.replacingOccurrences(of: wrong, with: right)
             segment.source = .manual
             segment.state = .edited
+            segment.textWasUserEdited = true
             segment.updatedAt = now
             changed += 1
         }

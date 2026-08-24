@@ -125,9 +125,10 @@ enum ConversationAnalysisSnapshotBuilder {
         speakerIdByAlias: [String: UUID],
         version: Int,
         analyzedThroughMs: Int64,
+        speakerOverrides: [AnalysisSpeakerOverride] = [],
         now: Date = Date()
     ) -> ConversationAnalysisSnapshot {
-        let items: [AnalysisItem] = dto.items.compactMap { item in
+        var items: [AnalysisItem] = dto.items.compactMap { item in
             guard let category = ConversationAnalysisTaxonomy.category(fromWire: item.category),
                   let epistemic = EpistemicStatus(rawValue: item.epistemicStatus),
                   let confidence = Confidence(rawValue: item.confidence),
@@ -145,6 +146,14 @@ enum ConversationAnalysisSnapshotBuilder {
                 firstObservedAt: now,
                 lastUpdatedAt: now
             )
+        }
+
+        let validSpeakerIds = Set(speakerIdByAlias.values)
+        for index in items.indices {
+            guard let override = speakerOverrides
+                .filter({ validSpeakerIds.contains($0.speakerId) && $0.matches(items[index]) })
+                .max(by: { $0.confirmedAt < $1.confirmedAt }) else { continue }
+            items[index].subjectSpeakerId = override.speakerId
         }
 
         let headline = dto.headline?.trimmingCharacters(in: .whitespacesAndNewlines)

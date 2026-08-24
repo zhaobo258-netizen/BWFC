@@ -162,6 +162,7 @@ struct TranscriptCorrectorTests {
         #expect(hit.text == "这家经销商的动销不错")
         #expect(hit.state == .edited)
         #expect(hit.source == .manual)
+        #expect(hit.textWasUserEdited == true)
         #expect(miss.text == "今天天气不错")
         #expect(miss.state == .final)
     }

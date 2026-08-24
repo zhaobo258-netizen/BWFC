@@ -79,6 +79,25 @@ final class DiarizationAPITests {
         #expect(!bodyText.contains("张总"))
     }
 
+    @Test("第 5 个已知说话人返回明确容量错误，不静默截断也不发请求")
+    func knownSpeakerCapacityIsExplicit() async throws {
+        try saveTestKey()
+        let chunk = try makeTempFile()
+        defer { try? FileManager.default.removeItem(at: chunk) }
+        let sample = try makeTempFile(named: "sample.wav")
+        defer { try? FileManager.default.removeItem(at: sample) }
+        let speakers = (1...5).map {
+            KnownSpeakerReference(alias: "p_0\($0)", sampleURL: sample)
+        }
+
+        await #expect(
+            throws: DiarizationAPIError.tooManyKnownSpeakers(maximum: 4, actual: 5)
+        ) {
+            try await service.transcribeChunk(at: chunk, knownSpeakers: speakers)
+        }
+        #expect(storage.capturedRequests.isEmpty)
+    }
+
     // MARK: - 响应解析
 
     @Test("识别成功：只读取总时长、起止、文字与 speaker")
@@ -115,6 +134,31 @@ final class DiarizationAPITests {
         }
         let result = try await service.transcribeChunk(at: chunk, knownSpeakers: [])
         #expect(result.segments.isEmpty)
+    }
+
+    @Test("缺 speaker、缺时间或非法时间的片段拒绝持久化")
+    func malformedSegmentsRejected() async throws {
+        try saveTestKey()
+        let chunk = try makeTempFile()
+        defer { try? FileManager.default.removeItem(at: chunk) }
+        let malformed = [
+            #"{"duration":20,"segments":[{"start":0,"end":2,"text":"一句"}]}"#,
+            #"{"duration":20,"segments":[{"end":2,"text":"一句","speaker":"p_01"}]}"#,
+            #"{"duration":20,"segments":[{"start":3,"end":2,"text":"一句","speaker":"p_01"}]}"#,
+        ]
+
+        for json in malformed {
+            storage.requestHandler = { request in
+                let response = HTTPURLResponse(
+                    url: request.url!, statusCode: 200,
+                    httpVersion: nil, headerFields: nil
+                )!
+                return (response, Data(json.utf8))
+            }
+            await #expect(throws: DiarizationAPIError.invalidResponse) {
+                try await service.transcribeChunk(at: chunk, knownSpeakers: [])
+            }
+        }
     }
 
     // MARK: - 错误分类（实施计划 11.2）

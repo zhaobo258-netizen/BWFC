@@ -19,6 +19,24 @@ enum SpeakerPanelLogic {
         return tokens.first { !used.contains($0) } ?? tokens[existing.count % tokens.count]
     }
 
+    static func voiceReferencePath(for speaker: Speaker) -> String? {
+        speaker.voiceSamplePath ?? speaker.legacyVoiceReferencePath
+    }
+
+    static func voiceReferenceDurationMs(for speaker: Speaker) -> Int64? {
+        speaker.voiceSampleDurationMs ?? speaker.legacyVoiceReferenceDurationMs
+    }
+
+    static func activeVoiceReferenceCount(in speakers: [Speaker]) -> Int {
+        speakers.filter { voiceReferencePath(for: $0) != nil }.count
+    }
+
+    static func canActivateVoiceReference(for speakerID: UUID, in speakers: [Speaker]) -> Bool {
+        guard let speaker = speakers.first(where: { $0.id == speakerID }) else { return false }
+        return voiceReferencePath(for: speaker) != nil
+            || activeVoiceReferenceCount(in: speakers) < KnownSpeakerReference.maximumCount
+    }
+
     /// 把 V2 说话人同步进运行时参会人列表（id 对齐；样本路径 V2 优先）。
     /// 已有片段的 participantId 不动，后续分片按新列表解析。
     static func syncRuntimeParticipants(speakers: [Speaker], meeting: Meeting) {
@@ -30,8 +48,8 @@ enum SpeakerPanelLogic {
                 side: speaker.legacySide.flatMap { ParticipantSide(rawValue: $0) } ?? .neutral,
                 role: speaker.role ?? "",
                 colorToken: speaker.colorToken,
-                voiceReferencePath: speaker.voiceSamplePath ?? speaker.legacyVoiceReferencePath,
-                voiceReferenceDurationMs: speaker.voiceSampleDurationMs ?? speaker.legacyVoiceReferenceDurationMs
+                voiceReferencePath: voiceReferencePath(for: speaker),
+                voiceReferenceDurationMs: voiceReferenceDurationMs(for: speaker)
             )
         }
     }
@@ -56,6 +74,12 @@ struct SpeakerPanelView: View {
     @State private var samplePlayer = AudioPlaybackController()
     @State private var editingSpeaker: Speaker?
     @State private var refreshTick = 0
+    @State private var voiceProfiles: [SpeakerVoiceProfile] = []
+    @State private var pendingPermanentSpeaker: Speaker?
+    @State private var pendingDeleteProfile: SpeakerVoiceProfile?
+    @State private var editingProfile: SpeakerVoiceProfile?
+    @State private var profileLibraryHasValidationFailure = false
+    @State private var profileNotice: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -76,6 +100,16 @@ struct SpeakerPanelView: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
 
+                    Text("跨会议使用前必须试听并确认只有此人；确认后的样本才会复制进本机永久声纹库。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    if let profileNotice {
+                        Label(profileNotice, systemImage: "info.circle")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+
                     if microphoneBusy {
                         Label("录音进行中，麦克风被占用；暂停或结束录音后可录制声纹样本。", systemImage: "mic.slash")
                             .font(.caption)
@@ -93,6 +127,19 @@ struct SpeakerPanelView: View {
                         Label("添加说话人", systemImage: "person.badge.plus")
                     }
                     .padding(.top, 4)
+
+                    if !voiceProfiles.isEmpty {
+                        Divider().padding(.vertical, 4)
+                        Text("跨会议自动识别")
+                            .font(.subheadline)
+                            .fontWeight(.semibold)
+                        Text("当前服务每场最多自动匹配 4 个永久声纹。关闭自动使用不会删除样本。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        ForEach(voiceProfiles) { profile in
+                            profileRow(profile)
+                        }
+                    }
                 }
                 .padding(16)
             }
@@ -102,11 +149,58 @@ struct SpeakerPanelView: View {
             sampleRecorder?.cancelRecording()
             if samplePlayer.isPlaying { samplePlayer.togglePlay() }
         }
+        .onAppear(perform: reloadProfiles)
         .sheet(item: $editingSpeaker) { speaker in
             SpeakerEditSheet(speaker: speaker) {
                 changed()
                 refreshTick += 1
             }
+        }
+        .sheet(item: $editingProfile) { profile in
+            VoiceProfileEditSheet(profile: profile) { name, role, colorToken in
+                updateProfileMetadata(
+                    profile,
+                    displayName: name,
+                    role: role,
+                    colorToken: colorToken
+                )
+            }
+        }
+        .confirmationDialog(
+            "保存为永久声纹？",
+            isPresented: Binding(
+                get: { pendingPermanentSpeaker != nil },
+                set: { if !$0 { pendingPermanentSpeaker = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("我已试听，确认只有此人") {
+                if let speaker = pendingPermanentSpeaker {
+                    enrollPermanentProfile(for: speaker)
+                }
+                pendingPermanentSpeaker = nil
+            }
+            Button("取消", role: .cancel) { pendingPermanentSpeaker = nil }
+        } message: {
+            Text("确认后样本会复制到本机永久声纹库，并在后续新录音中自动用于匹配。混有他人声音的样本会污染之后的识别。")
+        }
+        .confirmationDialog(
+            "删除永久声纹？",
+            isPresented: Binding(
+                get: { pendingDeleteProfile != nil },
+                set: { if !$0 { pendingDeleteProfile = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("删除样本与资料", role: .destructive) {
+                if let profile = pendingDeleteProfile {
+                    deleteProfile(profile)
+                }
+                pendingDeleteProfile = nil
+            }
+            Button("取消", role: .cancel) { pendingDeleteProfile = nil }
+        } message: {
+            Text("会从本机永久删除该人的声音样本和资料；已有会议文稿不会被删除。")
         }
     }
 
@@ -145,7 +239,7 @@ struct SpeakerPanelView: View {
                     .buttonStyle(.borderedProminent)
                     .tint(.red)
             } else {
-                if speaker.voiceSamplePath != nil {
+                if SpeakerPanelLogic.voiceReferencePath(for: speaker) != nil {
                     Button {
                         playSample(speaker)
                     } label: {
@@ -154,10 +248,16 @@ struct SpeakerPanelView: View {
                     .buttonStyle(.plain)
                     .help("试听样本")
                 }
-                Button(speaker.voiceSamplePath == nil ? "录样本" : "重录") {
+                Button(SpeakerPanelLogic.voiceReferencePath(for: speaker) == nil ? "录样本" : "重录") {
                     startSample(for: speaker)
                 }
                 .disabled(microphoneBusy || sampleRecorder?.phase != .idle && sampleRecorder != nil)
+                if SpeakerPanelLogic.voiceReferencePath(for: speaker) != nil {
+                    Button(permanentActionTitle(for: speaker)) {
+                        pendingPermanentSpeaker = speaker
+                    }
+                    .disabled(!isSafeDuration(SpeakerPanelLogic.voiceReferenceDurationMs(for: speaker)))
+                }
                 Button {
                     editingSpeaker = speaker
                 } label: {
@@ -180,8 +280,8 @@ struct SpeakerPanelView: View {
             Text(verdict.displayName)
                 .font(.caption2)
                 .foregroundStyle(.orange)
-        } else if let duration = speaker.voiceSampleDurationMs {
-            Label("声纹样本 \(String(format: "%.1f", Double(duration) / 1000)) 秒", systemImage: "waveform")
+        } else if let duration = SpeakerPanelLogic.voiceReferenceDurationMs(for: speaker) {
+            Label(sampleStatusText(for: speaker, duration: duration), systemImage: "waveform")
                 .font(.caption2)
                 .foregroundStyle(.green)
         } else {
@@ -217,11 +317,22 @@ struct SpeakerPanelView: View {
 
     private func startSample(for speaker: Speaker) {
         guard !microphoneBusy else { return }
-        try? ensureRecorder().startRecording(
-            meetingID: meeting.id,
-            participantID: speaker.id,
-            deviceID: meeting.preferredInputDeviceID
-        )
+        guard SpeakerPanelLogic.canActivateVoiceReference(
+            for: speaker.id,
+            in: project.speakers
+        ) else {
+            profileNotice = "本场已启用 4 个声纹，请先在下方将一人「本场停用」再录制。"
+            return
+        }
+        do {
+            try ensureRecorder().startRecording(
+                meetingID: meeting.id,
+                participantID: speaker.id,
+                deviceID: meeting.preferredInputDeviceID
+            )
+        } catch {
+            profileNotice = "声纹录制未开始（\(String(describing: type(of: error)))）"
+        }
         refreshTick += 1
     }
 
@@ -236,15 +347,341 @@ struct SpeakerPanelView: View {
     }
 
     private func playSample(_ speaker: Speaker) {
-        guard let path = speaker.voiceSamplePath,
-              let url = try? environment.fileStore.absoluteURL(forRelativePath: path) else { return }
-        try? samplePlayer.load(url: url)
-        samplePlayer.togglePlay()
+        guard let path = SpeakerPanelLogic.voiceReferencePath(for: speaker) else {
+            profileNotice = "当前没有可试听的声纹样本。"
+            return
+        }
+        do {
+            let url = try environment.fileStore.absoluteURL(forRelativePath: path)
+            try samplePlayer.load(url: url)
+            samplePlayer.togglePlay()
+        } catch {
+            profileNotice = "声纹样本无法试听，请重新录制或更新永久声纹。"
+        }
+    }
+
+    @ViewBuilder
+    private func profileRow(_ profile: SpeakerVoiceProfile) -> some View {
+        let linkedSpeaker = project.speakers.first { $0.voiceProfileId == profile.id }
+        let activeThisMeeting = linkedSpeaker.flatMap {
+            SpeakerPanelLogic.voiceReferencePath(for: $0)
+        } != nil
+        HStack(spacing: 8) {
+            BWSpeakerDot(name: profile.displayName,
+                         color: colorForToken(profile.colorToken), size: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(profile.displayName).font(.callout)
+                Text(profile.role ?? "未填写角色")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                if profileLibraryHasValidationFailure {
+                    Text("样本需试听确认；失效时请更新或删除")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+            }
+            Spacer()
+            Button {
+                playProfile(profile)
+            } label: {
+                Image(systemName: "play.circle")
+            }
+            .buttonStyle(.plain)
+            .help("试听永久声纹")
+            Button {
+                editingProfile = profile
+            } label: {
+                Image(systemName: "pencil")
+            }
+            .buttonStyle(.plain)
+            .help("修正永久姓名与角色")
+            Button(profile.isAutoEnabled ? "自动使用中" : "设为自动") {
+                setAutoEnabled(!profile.isAutoEnabled, profile: profile)
+            }
+            .buttonStyle(.bordered)
+            if activeThisMeeting {
+                Button("本场停用") { deactivateProfileForCurrentMeeting(profile) }
+                    .buttonStyle(.bordered)
+            } else {
+                Button("加入本场") { addProfileToCurrentMeeting(profile) }
+                    .buttonStyle(.bordered)
+            }
+            Button(role: .destructive) {
+                pendingDeleteProfile = profile
+            } label: {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.plain)
+            .help("删除永久声纹")
+        }
+        .bwCard(padding: 9)
+    }
+
+    private func reloadProfiles() {
+        do {
+            voiceProfiles = try environment.speakerVoiceProfileStore.load()
+                .sorted { $0.updatedAt > $1.updatedAt }
+            profileLibraryHasValidationFailure = false
+        } catch {
+            do {
+                voiceProfiles = try environment.speakerVoiceProfileStore.loadForManagement()
+                    .sorted { $0.updatedAt > $1.updatedAt }
+                profileLibraryHasValidationFailure = true
+                profileNotice = "永久声纹库中有样本丢失或损坏，已停止自动带入；请试听后更新或删除。"
+            } catch {
+                voiceProfiles = []
+                profileLibraryHasValidationFailure = true
+                profileNotice = "永久声纹库读取失败（\(String(describing: type(of: error)))）"
+            }
+        }
+    }
+
+    private func enrollPermanentProfile(for speaker: Speaker) {
+        guard let relativePath = SpeakerPanelLogic.voiceReferencePath(for: speaker),
+              let durationMs = SpeakerPanelLogic.voiceReferenceDurationMs(for: speaker),
+              let sourceURL = try? environment.fileStore.absoluteURL(forRelativePath: relativePath) else {
+            profileNotice = "没有可保存的声纹样本。"
+            return
+        }
+        do {
+            let profile = try environment.speakerVoiceProfileStore.enroll(
+                profileID: speaker.voiceProfileId,
+                displayName: speaker.displayName,
+                role: speaker.role,
+                colorToken: speaker.colorToken,
+                sourceSampleURL: sourceURL,
+                durationMs: durationMs
+            )
+            speaker.voiceProfileId = profile.id
+            speaker.voiceSamplePath = profile.sampleRelativePath
+            speaker.voiceSampleDurationMs = profile.sampleDurationMs
+            profileNotice = profile.isAutoEnabled
+                ? "已保存为永久声纹，后续新录音会自动带入。"
+                : "已保存；自动名额已满，可先关闭一个现有声纹再启用。"
+            changed()
+            reloadProfiles()
+        } catch {
+            profileNotice = "永久声纹保存失败（\(profileErrorText(error))）"
+        }
+    }
+
+    private func setAutoEnabled(_ enabled: Bool, profile: SpeakerVoiceProfile) {
+        do {
+            try environment.speakerVoiceProfileStore.setAutoEnabled(enabled, profileID: profile.id)
+            profileNotice = enabled ? "后续新录音会自动带入此人。" : "已停止自动带入，永久样本仍保留。"
+            reloadProfiles()
+        } catch {
+            profileNotice = profileErrorText(error)
+        }
+    }
+
+    private func addProfileToCurrentMeeting(_ profile: SpeakerVoiceProfile) {
+        if let linked = project.speakers.first(where: { $0.voiceProfileId == profile.id }) {
+            activateProfile(profile, for: linked)
+            return
+        }
+        let knownCount = SpeakerPanelLogic.activeVoiceReferenceCount(in: project.speakers)
+        guard knownCount < SpeakerVoiceProfileStore.maximumAutoEnabledProfiles else {
+            profileNotice = "本场已有 4 个声纹样本；当前服务无法再加入第 5 个。"
+            return
+        }
+        let speaker = Speaker(
+            cloudAlias: SpeakerPanelLogic.nextCloudAlias(existing: project.speakers),
+            displayName: profile.displayName,
+            role: profile.role,
+            colorToken: profile.colorToken,
+            isUserConfirmed: true,
+            voiceSamplePath: profile.sampleRelativePath,
+            voiceSampleDurationMs: profile.sampleDurationMs,
+            voiceProfileId: profile.id
+        )
+        project.speakers.append(speaker)
+        changed()
+        profileNotice = "已将 \(profile.displayName) 加入本场识别。"
+    }
+
+    private func permanentActionTitle(for speaker: Speaker) -> String {
+        guard let profileID = speaker.voiceProfileId,
+              let profile = voiceProfiles.first(where: { $0.id == profileID }),
+              profile.sampleRelativePath == speaker.voiceSamplePath else {
+            return speaker.voiceProfileId == nil ? "永久保存" : "更新永久声纹"
+        }
+        return "已永久保存"
+    }
+
+    private func sampleStatusText(for speaker: Speaker, duration: Int64) -> String {
+        let durationText = String(format: "%.1f", Double(duration) / 1000)
+        if let profileID = speaker.voiceProfileId,
+           let profile = voiceProfiles.first(where: { $0.id == profileID }),
+           profile.sampleRelativePath == speaker.voiceSamplePath {
+            return "永久声纹 \(durationText) 秒"
+        }
+        return "本场样本 \(durationText) 秒 · 尚未永久保存"
+    }
+
+    private func isSafeDuration(_ durationMs: Int64?) -> Bool {
+        guard let durationMs else { return false }
+        return (2_000...10_000).contains(durationMs)
+    }
+
+    private func profileErrorText(_ error: Error) -> String {
+        switch error as? SpeakerVoiceProfileStoreError {
+        case .autoRecognitionLimitReached:
+            return "自动声纹已达 4 人上限，请先关闭一个现有声纹"
+        case .invalidSample:
+            return "样本必须存在且为 2–10 秒"
+        case .profileNotFound:
+            return "永久声纹已不存在，请刷新后重试"
+        case nil:
+            return String(describing: type(of: error))
+        }
     }
 
     private func changed() {
         SpeakerPanelLogic.syncRuntimeParticipants(speakers: project.speakers, meeting: meeting)
         onSpeakersChanged()
+    }
+
+    private func updateProfileMetadata(
+        _ profile: SpeakerVoiceProfile,
+        displayName: String,
+        role: String?,
+        colorToken: String
+    ) -> String? {
+        do {
+            try environment.speakerVoiceProfileStore.updateMetadata(
+                profileID: profile.id,
+                displayName: displayName,
+                role: role,
+                colorToken: colorToken
+            )
+            if let linked = project.speakers.first(where: { $0.voiceProfileId == profile.id }) {
+                linked.displayName = displayName
+                linked.role = role
+                linked.colorToken = colorToken
+                changed()
+            }
+            reloadProfiles()
+            profileNotice = "永久资料已更新。"
+            return nil
+        } catch {
+            return "永久资料未保存（\(profileErrorText(error))）"
+        }
+    }
+
+    private func playProfile(_ profile: SpeakerVoiceProfile) {
+        do {
+            let url = try environment.fileStore.absoluteURL(
+                forRelativePath: profile.sampleRelativePath
+            )
+            try samplePlayer.load(url: url)
+            samplePlayer.togglePlay()
+        } catch {
+            profileNotice = "\(profile.displayName) 的永久样本无法试听，请重新录制更新或删除。"
+        }
+    }
+
+    private func deleteProfile(_ profile: SpeakerVoiceProfile) {
+        do {
+            try environment.speakerVoiceProfileStore.delete(profileID: profile.id)
+            if let linked = project.speakers.first(where: { $0.voiceProfileId == profile.id }) {
+                linked.voiceProfileId = nil
+                if linked.voiceSamplePath == profile.sampleRelativePath {
+                    linked.voiceSamplePath = nil
+                    linked.voiceSampleDurationMs = nil
+                }
+                changed()
+            }
+            reloadProfiles()
+            profileNotice = "已删除 \(profile.displayName) 的永久声纹与资料。"
+        } catch {
+            profileNotice = "永久声纹未删除（\(profileErrorText(error))）"
+        }
+    }
+
+    private func activateProfile(_ profile: SpeakerVoiceProfile, for speaker: Speaker) {
+        guard SpeakerPanelLogic.activeVoiceReferenceCount(in: project.speakers)
+                < SpeakerVoiceProfileStore.maximumAutoEnabledProfiles else {
+            profileNotice = "本场已有 4 个声纹样本；请先停用一人再替换。"
+            return
+        }
+        speaker.voiceSamplePath = profile.sampleRelativePath
+        speaker.voiceSampleDurationMs = profile.sampleDurationMs
+        changed()
+        profileNotice = "已将 \(profile.displayName) 加入本场识别。"
+    }
+
+    private func deactivateProfileForCurrentMeeting(_ profile: SpeakerVoiceProfile) {
+        guard let speaker = project.speakers.first(where: { $0.voiceProfileId == profile.id }) else {
+            return
+        }
+        speaker.voiceSamplePath = nil
+        speaker.voiceSampleDurationMs = nil
+        changed()
+        profileNotice = "已在本场停用 \(profile.displayName)；永久样本未删除。"
+    }
+}
+
+private struct VoiceProfileEditSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    let profile: SpeakerVoiceProfile
+    let onSave: (String, String?, String) -> String?
+
+    @State private var name = ""
+    @State private var role = ""
+    @State private var colorToken = "blue"
+    @State private var saveError: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("修正永久资料")
+                .font(.headline)
+            Text("这里的修改会用于以后的新会议。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextField("姓名（只存本机）", text: $name)
+                .textFieldStyle(.roundedBorder)
+            TextField("角色 / 职位（可选）", text: $role)
+                .textFieldStyle(.roundedBorder)
+            Picker("颜色", selection: $colorToken) {
+                ForEach(MeetingSetupFormModel.colorTokens, id: \.token) { item in
+                    Text(item.displayName).tag(item.token)
+                }
+            }
+            if let saveError {
+                Text(saveError).font(.caption).foregroundStyle(.red)
+            }
+            HStack {
+                Spacer()
+                Button("取消") { dismiss() }
+                Button("保存") {
+                    let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmedName.isEmpty else {
+                        saveError = "姓名不能为空。"
+                        return
+                    }
+                    let trimmedRole = role.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let error = onSave(
+                        trimmedName,
+                        trimmedRole.isEmpty ? nil : trimmedRole,
+                        colorToken
+                    ) {
+                        saveError = error
+                    } else {
+                        dismiss()
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(20)
+        .frame(width: 380)
+        .onAppear {
+            name = profile.displayName
+            role = profile.role ?? ""
+            colorToken = profile.colorToken
+        }
     }
 }
 

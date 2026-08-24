@@ -407,9 +407,9 @@ final class ProjectRuntimeSessionTests {
         #expect(controller.retryCount >= 1)
 
         // 重试排在 1 秒退避后；不再依赖新的 schedule() 触发
-        await waitUntil(timeout: .seconds(5)) {
+        await waitUntil({
             attempts >= 2 && controller.saveError == nil
-        }
+        }, timeout: .seconds(5))
         #expect(attempts >= 2)
         #expect(controller.saveError == nil)
         #expect(!controller.hasPendingChanges)
@@ -433,9 +433,9 @@ final class ProjectRuntimeSessionTests {
         ))
         controller.schedule()
 
-        await waitUntil(timeout: .seconds(20)) {
+        await waitUntil({
             controller.retryCount >= ProjectRuntimePersistenceController.maxRetryAttempts
-        }
+        }, timeout: .seconds(20))
         #expect(controller.retryCount == ProjectRuntimePersistenceController.maxRetryAttempts)
         // 失败如实暴露，未保存的变更不被静默丢弃
         #expect(controller.saveError != nil)

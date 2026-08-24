@@ -30,6 +30,11 @@ enum ConversationAnalysisPrompt {
     - 新内容让旧判断更确定或动摇的，更新该条目的置信度或改写表述，    立场变化用 stance_change 显式呈现，不要静默改写历史；
     - 已被新内容否定的条目直接删除；headline 每轮都要反映到目前为止的全局，    而不是只总结最新几句。
     深度要求：优先输出「读转写稿的人自己看不出来」的东西——话题背后的分歧点、    多次绕回的话题（说明真正关心）、答非所问的位置；    同一层意思不要拆成多条，一条高质量判断胜过五条复述。
+    new_segments 中标有 provisional: true 的片段是实时识别中的临时文字，    之后可能被修正：可以利用它理解最新话题走向，但仅以它为证据的判断    置信度一律为 low，且能引用已确认片段时优先引用已确认片段。
+    人员与角色纪律：speakers[].id 是本场稳定代号，speakers[].role 是用户确认的职能；
+    只要条目描述某个人的汇报、提问、立场、决定或行动，就必须填写对应的
+    subject_speaker_id。不同 speaker_id 或不同角色立场的内容不得合并成一条；
+    片段没有 speaker_id 时不得猜人，角色为空时不得自行发明职位。
     """
 
     /// 红线约束（V1 的 8 条纪律在 V2 全部保留）
@@ -132,7 +137,8 @@ enum ConversationAnalysisPrompt {
     knowledge_seed；
     epistemic_status 只能是：explicit / inference；
     confidence 只能是：low / medium / high；
-    evidence_segment_ids 必须非空，且只能引用输入 untrusted_transcript_data.new_segments
-    中出现的片段 ID。证据不足时 items 输出空数组。
+    evidence_segment_ids 必须非空，且只能引用输入中真实存在的证据 ID：
+    previous_state.items[].evidence_segment_ids 与
+    untrusted_transcript_data.new_segments[].id 的并集。证据不足时 items 输出空数组。
     """
 }

@@ -385,12 +385,25 @@ struct ProjectHomeView: View {
     /// 开始录音：立即创建临时项目并直达工作台开录（两次交互内）
     private func startRecordingProject() {
         let now = Date()
-        let project = ProjectHomeSupport.makeRecordingProject(
-            at: now,
-            scenario: selectedRecordingScenario
-        )
+        let speakers: [Speaker]
+        let voiceProfileWarning: String?
         do {
+            speakers = try environment.speakerVoiceProfileStore.automaticSpeakers()
+            voiceProfileWarning = nil
+        } catch {
+            speakers = []
+            voiceProfileWarning = "永久声纹库无法读取，本次已不带声纹继续录音；可在「说话人」面板中修复。"
+        }
+        do {
+            let project = ProjectHomeSupport.makeRecordingProject(
+                at: now,
+                scenario: selectedRecordingScenario,
+                speakers: speakers
+            )
             try environment.persist(project)
+            if let voiceProfileWarning {
+                environment.setPendingWarning(voiceProfileWarning, for: project.id)
+            }
             router.showProjectWorkspace(project.id, autoStart: true)
         } catch {
             loadError = "项目创建失败（\(String(describing: type(of: error)))）"

@@ -218,4 +218,12 @@ struct ConversationAnalysisInputAssemblerTests {
         #expect(suffix.contains("low / medium / high"))
         #expect(suffix.contains("evidence_segment_ids 必须非空"))
     }
+
+    @Test("增量证据可以引用上一版状态与新片段的并集")
+    func incrementalEvidenceAllowsPreviousStateAndNewSegments() {
+        let suffix = ConversationAnalysisPrompt.jsonOutputSuffix
+        #expect(suffix.contains("previous_state"))
+        #expect(suffix.contains("new_segments"))
+        #expect(suffix.contains("并集"))
+    }
 }

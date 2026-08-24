@@ -42,9 +42,14 @@ struct AnalysisTrigger: Equatable, Sendable {
         lastChangeAtMs = now
     }
 
-    /// 分析成功：重置计数与游标
-    mutating func noteSuccess(atMs now: Int64) {
-        newSegmentCount = 0
+    /// 分析成功：只消费本次请求已纳入的片段计数。
+    /// 不传消费数时保持旧语义，重置全部计数。
+    mutating func noteSuccess(atMs now: Int64, consumingNewSegmentCount consumedCount: Int? = nil) {
+        if let consumedCount {
+            newSegmentCount = max(0, newSegmentCount - max(0, consumedCount))
+        } else {
+            newSegmentCount = 0
+        }
         lastSuccessAtMs = now
         lastFailureAtMs = nil
     }

@@ -26,6 +26,8 @@ final class Speaker: Identifiable, Codable {
     var voiceSamplePath: String?
     /// V2 声纹样本时长（毫秒）
     var voiceSampleDurationMs: Int64?
+    /// 应用级永久声纹 id；有值时样本来自独立 VoiceProfiles 目录，删除项目不删除该样本。
+    var voiceProfileId: UUID?
 
     init(
         id: UUID = UUID(),
@@ -38,7 +40,8 @@ final class Speaker: Identifiable, Codable {
         legacyVoiceReferencePath: String? = nil,
         legacyVoiceReferenceDurationMs: Int64? = nil,
         voiceSamplePath: String? = nil,
-        voiceSampleDurationMs: Int64? = nil
+        voiceSampleDurationMs: Int64? = nil,
+        voiceProfileId: UUID? = nil
     ) {
         self.id = id
         self.cloudAlias = cloudAlias
@@ -51,5 +54,6 @@ final class Speaker: Identifiable, Codable {
         self.legacyVoiceReferenceDurationMs = legacyVoiceReferenceDurationMs
         self.voiceSamplePath = voiceSamplePath
         self.voiceSampleDurationMs = voiceSampleDurationMs
+        self.voiceProfileId = voiceProfileId
     }
 }

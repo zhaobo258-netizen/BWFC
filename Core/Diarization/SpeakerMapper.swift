@@ -14,6 +14,9 @@ struct SpeakerMapper: Sendable {
     private let participantByAlias: [String: UUID]
     /// 未知标签 → 展示用字母
     private var unknownLabelLetters: [String: String] = [:]
+    /// 用户手工指认：未知标签 → 参会人 ID（09 号计划需求 2；
+    /// 参会人列表变化重建 mapper 时由调用方回灌，避免指认丢失）
+    private var manualLabelAssignments: [String: UUID] = [:]
 
     init(participants: [Participant]) {
         var map: [String: UUID] = [:]
@@ -21,6 +24,18 @@ struct SpeakerMapper: Sendable {
             map[participant.cloudAlias] = participant.id
         }
         self.participantByAlias = map
+    }
+
+    /// 只在该代号确实作为 known_speaker_names 发送时使用。
+    /// 调用方必须用本次请求的已发送代号集合先做限定。
+    func participantId(forKnownAlias alias: String) -> UUID? {
+        participantByAlias[alias]
+    }
+
+    /// provider 的 generic speaker label 只在单次音频请求内有意义。
+    /// 按分片加上稳定作用域，防止下一个分片的同名 label 被当成同一人。
+    static func scopedRemoteLabel(_ remoteLabel: String, chunkIndex: Int) -> String {
+        "chunk:\(chunkIndex):\(remoteLabel)"
     }
 
     /// 解析结果
@@ -40,6 +55,9 @@ struct SpeakerMapper: Sendable {
         if let participantId = participantByAlias[remoteLabel] {
             return .known(participantId: participantId)
         }
+        if let participantId = manualLabelAssignments[remoteLabel] {
+            return .known(participantId: participantId)
+        }
         if let letter = unknownLabelLetters[remoteLabel] {
             return .unknown(displayName: "待识别 \(letter)")
         }
@@ -55,6 +73,25 @@ struct SpeakerMapper: Sendable {
             return
         }
         unknownLabelLetters[remoteLabel] = Self.letter(forIndex: unknownLabelLetters.count)
+    }
+
+    /// 手工指认一个云端标签属于某参会人（09 号计划需求 2）。
+    /// generic label 由调用方按 chunk 加作用域，手工指认不会误传到后续独立请求。
+    /// 代号已能匹配的标签不需要也不允许指认（以云端代号为准）。
+    mutating func assign(remoteLabel: String, to participantId: UUID) {
+        guard participantByAlias[remoteLabel] == nil else { return }
+        manualLabelAssignments[remoteLabel] = participantId
+    }
+
+    /// 当前全部手工指认（重建 mapper 时回灌用）
+    var manualAssignments: [String: UUID] { manualLabelAssignments }
+
+    /// 回灌手工指认（参会人列表变化后重建 mapper 时调用；
+    /// 已能按代号匹配的标签跳过，指向已不存在参会人的条目由调用方过滤）
+    mutating func restoreManualAssignments(_ assignments: [String: UUID]) {
+        for (label, participantId) in assignments where participantByAlias[label] == nil {
+            manualLabelAssignments[label] = participantId
+        }
     }
 
     /// 当前已分配的未知标签数量

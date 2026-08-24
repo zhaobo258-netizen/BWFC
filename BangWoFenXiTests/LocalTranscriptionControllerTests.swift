@@ -169,6 +169,44 @@ final class LocalTranscriptionControllerTests {
         #expect(controller.segments.first?.state == .final)
     }
 
+    @Test("云端拆分本地多人粗块后，权威会议数组不保留旧长段")
+    func cloudSplitReplacesPersistedCoarseSegment() async throws {
+        let meeting = try makeMeeting()
+        try await controller.start(for: meeting) { nil }
+
+        mock.emit(LocalTranscriptResult(
+            startAudioMs: 0,
+            endAudioMs: 10_000,
+            text: "甲方问交付时间乙方回答下周完成",
+            isFinal: true
+        ))
+        await waitFor { meeting.segments.count == 1 }
+        let coarseID = try #require(meeting.segments.first?.id)
+
+        controller.applyCloudSegment(
+            wallStartMs: 0,
+            wallEndMs: 4_000,
+            text: "甲方问交付时间",
+            participantId: UUID(),
+            remoteSpeakerLabel: "chunk:0:speaker_0"
+        )
+        controller.applyCloudSegment(
+            wallStartMs: 4_000,
+            wallEndMs: 10_000,
+            text: "乙方回答下周完成",
+            participantId: UUID(),
+            remoteSpeakerLabel: "chunk:0:speaker_1"
+        )
+
+        #expect(meeting.segments.count == 2)
+        #expect(meeting.segments.map(\.text) == ["甲方问交付时间", "乙方回答下周完成"])
+        #expect(meeting.segments.allSatisfy { $0.source == .cloud })
+        #expect(meeting.segments.first?.id == coarseID,
+                "第一条细分沿用旧 id，已有证据回链不会全部悬空")
+        #expect(controller.segments.map(\.id) == meeting.segments.map(\.id))
+        await controller.cancel()
+    }
+
     @Test("启动失败：错误透出且不进入运行态")
     func startFailurePropagates() async throws {
         mock.startError = LocalTranscriptionError.noCompatibleAudioFormat

@@ -106,6 +106,36 @@ struct AnalysisItem: Identifiable, Codable, Sendable, Hashable {
     }
 }
 
+/// 用户对分析卡片说话人归属的确认。卡片 id 会随模型重建，因此用类别与
+/// 精确证据集合做稳定签名；证据变化时不把旧确认冒险迁移到新判断。
+struct AnalysisSpeakerOverride: Codable, Sendable, Equatable {
+    var category: AnalysisItemCategory
+    var evidenceSegmentIds: [UUID]
+    var speakerId: UUID
+    var confirmedAt: Date
+
+    init(
+        category: AnalysisItemCategory,
+        evidenceSegmentIds: [UUID],
+        speakerId: UUID,
+        confirmedAt: Date = Date()
+    ) {
+        self.category = category
+        self.evidenceSegmentIds = evidenceSegmentIds.sorted {
+            $0.uuidString < $1.uuidString
+        }
+        self.speakerId = speakerId
+        self.confirmedAt = confirmedAt
+    }
+
+    func matches(_ item: AnalysisItem) -> Bool {
+        category == item.category
+            && evidenceSegmentIds == item.evidenceSegmentIds.sorted {
+                $0.uuidString < $1.uuidString
+            }
+    }
+}
+
 /// 通用分析快照（产品文档 03 号 §8.4）：一次原子更新的完整结果。
 /// UI 以整个快照替换，不逐字段闪烁。
 final class ConversationAnalysisSnapshot: Identifiable, Codable, Sendable {

@@ -4,17 +4,38 @@ import AppKit
 struct KnowledgeGardenView: View {
     @Bindable var controller: KnowledgeGardenController
     var onEvidenceTap: ((UUID) -> Void)?
+    /// AI 是否已连接（09 号计划需求 3-③：空态如实区分「链路断了」和「内容不够」）
+    var isAIConfigured: Bool = true
+    /// 项目是否已有对话内容（已确认片段）
+    var hasConversationContent: Bool = true
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 if controller.seeds.isEmpty {
-                    ContentUnavailableView(
-                        "还没有可开花的内容",
-                        systemImage: "leaf",
-                        description: Text("「开花」是把一段内容展开成概念解释与延伸知识。完成一次分析或标记一段原话后，这里会出现知识种子。")
-                    )
-                    .padding(.vertical, 32)
+                    // 空态三分（09 号计划需求 3-③）：链路断了 / 没内容 / 等分析，不再静默
+                    if !isAIConfigured {
+                        ContentUnavailableView(
+                            "AI 未连接，开花不可用",
+                            systemImage: "leaf",
+                            description: Text("前往设置连接分析模型（登录 Kimi 或保存 API Key）后，对话内容会自动长出知识种子并开花。")
+                        )
+                        .padding(.vertical, 32)
+                    } else if !hasConversationContent {
+                        ContentUnavailableView(
+                            "还没有对话内容",
+                            systemImage: "leaf",
+                            description: Text("开始录音或导入音视频后，「开花」会把对话里值得展开的内容自动生成知识种子，并展开成概念解释与延伸知识。")
+                        )
+                        .padding(.vertical, 32)
+                    } else {
+                        ContentUnavailableView(
+                            "知识种子生成中",
+                            systemImage: "leaf",
+                            description: Text("AI 已连接。随对话推进，实时分析会持续产生知识种子并自动开花；也可以在总结页签标记一段原话作为种子。")
+                        )
+                        .padding(.vertical, 32)
+                    }
                 } else {
                     seedHeader
                     if let seed = controller.selectedSeed {

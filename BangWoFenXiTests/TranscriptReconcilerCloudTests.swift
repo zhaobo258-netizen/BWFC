@@ -95,11 +95,45 @@ struct TranscriptReconcilerCloudTests {
 
         let outcome = reconciler.applyCloudFinal(startMs: 0, endMs: 2000,
                                                  text: "返点需要确认。", participantId: nil, remoteSpeakerLabel: "spk_x")
-        guard case .skippedManual = outcome else {
-            Issue.record("人工映射必须被保护")
+        guard case .duplicate = outcome else {
+            Issue.record("相同云端片段应判重")
             return
         }
         #expect(segment.participantId == participant.id)
+    }
+
+    @Test("只改说话人不锁死分段：本地多人粗块可被两条云端结果拆开")
+    func speakerConfirmationAllowsCloudSplit() {
+        var reconciler = TranscriptReconciler()
+        _ = reconciler.applyFinal(
+            startMs: 0,
+            endMs: 10_000,
+            text: "甲方问交付时间乙方回答下周完成"
+        )
+        let coarse = reconciler.finalized[0]
+        let confirmed = Participant(
+            cloudAlias: "p_01",
+            displayName: "甲方",
+            side: .counterpart
+        )
+        let responder = UUID()
+        MeetingTranscriptEditor.assignSpeaker(coarse, to: confirmed)
+
+        _ = reconciler.applyCloudFinal(
+            startMs: 0, endMs: 4_000,
+            text: "甲方问交付时间", participantId: UUID(), remoteSpeakerLabel: "p_01"
+        )
+        _ = reconciler.applyCloudFinal(
+            startMs: 4_000, endMs: 10_000,
+            text: "乙方回答下周完成", participantId: responder, remoteSpeakerLabel: "p_02"
+        )
+
+        #expect(reconciler.finalized.count == 2)
+        #expect(reconciler.finalized[0].participantId == confirmed.id,
+                "用户确认的第一段归属保留")
+        #expect(reconciler.finalized[1].participantId == responder,
+                "后半段采用云端识别，不能把整条粗块都锁给同一人")
+        #expect(reconciler.finalized.allSatisfy { $0.source == .cloud && $0.state == .final })
     }
 
     @Test("重叠但文本不同的云端片段保留")
@@ -122,15 +156,17 @@ struct TranscriptReconcilerCloudTests {
 /// 转写片段人工编辑（说话人、文字、星标）
 @Suite("转写人工编辑")
 struct MeetingTranscriptEditorTests {
-    @Test("修改说话人：映射参会人并标记人工已修订")
+    @Test("修改说话人：只记录说话人确认，不把文字标为人工已修订")
     func assignSpeaker() {
         let segment = TranscriptSegment(startMs: 0, endMs: 1000, text: "测试",
                                         source: .cloud, state: .final)
         let participant = Participant(cloudAlias: "p_01", displayName: "张总", side: .counterpart)
         MeetingTranscriptEditor.assignSpeaker(segment, to: participant)
         #expect(segment.participantId == participant.id)
-        #expect(segment.state == .edited)
-        #expect(segment.source == .manual)
+        #expect(segment.state == .final)
+        #expect(segment.source == .cloud)
+        #expect(segment.speakerWasUserConfirmed == true)
+        #expect(segment.textWasUserEdited != true)
     }
 
     @Test("清除说话人映射")
@@ -139,7 +175,8 @@ struct MeetingTranscriptEditorTests {
                                         participantId: UUID(), source: .cloud, state: .final)
         MeetingTranscriptEditor.clearSpeaker(segment)
         #expect(segment.participantId == nil)
-        #expect(segment.state == .edited)
+        #expect(segment.state == .final)
+        #expect(segment.speakerWasUserConfirmed == true)
     }
 
     @Test("修改文字：内容更新并标记人工已修订；空白拒绝")
@@ -150,6 +187,7 @@ struct MeetingTranscriptEditorTests {
         #expect(segment.text == "修订后的文字")
         #expect(segment.state == .edited)
         #expect(segment.source == .manual)
+        #expect(segment.textWasUserEdited == true)
 
         MeetingTranscriptEditor.editText(segment, to: "   ")
         #expect(segment.text == "修订后的文字", "空白修改不得生效")

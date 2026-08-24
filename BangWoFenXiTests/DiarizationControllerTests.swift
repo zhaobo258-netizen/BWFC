@@ -73,6 +73,31 @@ final class DiarizationControllerTests {
         controller.start(for: meeting) { [timeline] in timeline }
     }
 
+    private func installVoiceSample(for participant: Participant) throws {
+        let relativePath = fileStore.relativeVoiceSamplePath(
+            meetingID: meeting.id,
+            participantID: participant.id
+        )
+        let sampleURL = try fileStore.absoluteURL(forRelativePath: relativePath)
+        try FileManager.default.createDirectory(
+            at: sampleURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data([0x01, 0x02]).write(to: sampleURL)
+        participant.voiceReferencePath = relativePath
+        participant.voiceReferenceDurationMs = 3_000
+    }
+
+    private func waitUntil(
+        _ condition: () -> Bool,
+        timeout: Duration = .seconds(2)
+    ) async {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline, !condition() {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
     @Test("分片产出：闭合窗口入队、文件生成、队列持久化")
     func chunkProduction() async throws {
         mockDiarization.delayMs = 600 // 让上传慢一点，先看出队列入队
@@ -98,6 +123,7 @@ final class DiarizationControllerTests {
 
     @Test("成功流：云端片段合并入库、说话人按代号映射、分片文件删除")
     func successFlow() async throws {
+        try installVoiceSample(for: meeting.participants[0])
         mockDiarization.resultQueue = [
             DiarizationChunkResult(durationMs: 20_000, segments: [
                 .init(startMs: 1_000, endMs: 5_000, text: "如果年度量能能保证。", speakerLabel: "p_01")
@@ -128,10 +154,54 @@ final class DiarizationControllerTests {
         // 第二个片段来自窗口 1（起点 18s）：18000+2000=20000
         #expect(segments[1].startMs == 20_000)
         #expect(segments[1].participantId == nil, "未知标签不映射")
-        #expect(segments[1].remoteSpeakerLabel == "spk_unknown")
+        let scopedUnknown = SpeakerMapper.scopedRemoteLabel("spk_unknown", chunkIndex: 1)
+        #expect(segments[1].remoteSpeakerLabel == scopedUnknown)
         // 待识别展示名
-        #expect(controller.displayName(forRemoteLabel: "spk_unknown") == "待识别 A")
+        #expect(controller.displayName(forRemoteLabel: scopedUnknown) == "待识别 A")
         #expect(controller.lastConfirmedAt != nil)
+    }
+
+    @Test("generic label 按 chunk 隔离，同名标签不跨请求误并")
+    func genericLabelsAreChunkScoped() async throws {
+        mockDiarization.resultQueue = [
+            DiarizationChunkResult(durationMs: 20_000, segments: [
+                .init(startMs: 1_000, endMs: 4_000, text: "第一个分片。", speakerLabel: "speaker_0")
+            ]),
+            DiarizationChunkResult(durationMs: 20_000, segments: [
+                .init(startMs: 1_000, endMs: 4_000, text: "第二个分片。", speakerLabel: "speaker_0")
+            ]),
+        ]
+        try await startAll()
+        controller.produceChunks(uptoAudioMs: 40_000)
+        await controller.finishAndDrain(uptoAudioMs: 38_000)
+
+        let labels = meeting.segments.compactMap(\.remoteSpeakerLabel)
+        #expect(labels == [
+            SpeakerMapper.scopedRemoteLabel("speaker_0", chunkIndex: 0),
+            SpeakerMapper.scopedRemoteLabel("speaker_0", chunkIndex: 1),
+        ])
+        #expect(Set(labels).count == 2)
+        #expect(controller.displayName(forRemoteLabel: labels[0]) == "待识别 A")
+        #expect(controller.displayName(forRemoteLabel: labels[1]) == "待识别 B")
+    }
+
+    @Test("未在本次请求发送样本的 alias 不得映射为已知说话人")
+    func unsentAliasDoesNotMap() async throws {
+        mockDiarization.resultQueue = [
+            DiarizationChunkResult(durationMs: 20_000, segments: [
+                .init(startMs: 1_000, endMs: 4_000, text: "没有发送样本。", speakerLabel: "p_01")
+            ])
+        ]
+        try await startAll()
+        controller.produceChunks(uptoAudioMs: 20_000)
+        await controller.finishAndDrain(uptoAudioMs: 18_500)
+
+        let segment = try #require(meeting.segments.first)
+        #expect(segment.participantId == nil)
+        #expect(
+            segment.remoteSpeakerLabel
+                == SpeakerMapper.scopedRemoteLabel("p_01", chunkIndex: 0)
+        )
     }
 
     @Test("结尾：尾部残缺分片（36–45s）入队并处理")
@@ -254,12 +324,7 @@ final class DiarizationControllerTests {
     func knownSpeakersAliasedOnly() async throws {
         // 给参会人准备样本文件
         let participant = meeting.participants[0]
-        let sampleRelative = fileStore.relativeVoiceSamplePath(meetingID: meeting.id, participantID: participant.id)
-        let sampleURL = try fileStore.absoluteURL(forRelativePath: sampleRelative)
-        try FileManager.default.createDirectory(at: sampleURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Data([0x01, 0x02]).write(to: sampleURL)
-        participant.voiceReferencePath = sampleRelative
-        participant.voiceReferenceDurationMs = 3_000
+        try installVoiceSample(for: participant)
 
         try await startAll()
         controller.produceChunks(uptoAudioMs: 20_000)
@@ -269,6 +334,122 @@ final class DiarizationControllerTests {
         #expect(speakers.count == 1)
         #expect(speakers[0].alias == "p_01", "云端只传本地代号（实施计划 7.5）")
         #expect(speakers[0].sampleURL.lastPathComponent.hasSuffix(".wav"))
+    }
+
+    @Test("第 5 个声纹样本使编排进入明确容量暂停，且零上传")
+    func knownSpeakerCapacitySuspendsWithoutUpload() async throws {
+        try installVoiceSample(for: meeting.participants[0])
+        for index in 2...5 {
+            let participant = Participant(
+                cloudAlias: "p_0\(index)",
+                displayName: "参会人\(index)",
+                side: .neutral
+            )
+            meeting.participants.append(participant)
+            try installVoiceSample(for: participant)
+        }
+
+        try await startAll()
+        controller.produceChunks(uptoAudioMs: 20_000)
+        await controller.finishAndDrain(uptoAudioMs: 18_500)
+
+        guard case .suspended(let reason) = controller.cloudState else {
+            Issue.record("超过 4 个样本必须暴露明确暂停原因")
+            return
+        }
+        #expect(reason.contains("5"))
+        #expect(reason.contains("4"))
+        #expect(mockDiarization.calls.isEmpty)
+        #expect(controller.queue.first?.status == .pending)
+    }
+
+    @Test("声纹路径指向缺失文件时明确暂停并带代号，零上传")
+    func missingKnownSpeakerSampleSuspendsWithoutUpload() async throws {
+        let participant = meeting.participants[0]
+        participant.voiceReferencePath = fileStore.relativeVoiceSamplePath(
+            meetingID: meeting.id,
+            participantID: participant.id
+        )
+        participant.voiceReferenceDurationMs = 3_000
+
+        try await startAll()
+        controller.produceChunks(uptoAudioMs: 20_000)
+        await controller.finishAndDrain(uptoAudioMs: 18_500)
+
+        guard case .suspended(let reason) = controller.cloudState else {
+            Issue.record("缺失声纹文件必须进入配置暂停")
+            return
+        }
+        #expect(reason.contains("p_01"))
+        #expect(reason.contains("缺失或不可读"))
+        #expect(mockDiarization.calls.isEmpty)
+        #expect(controller.queue.first?.status == .pending)
+    }
+
+    @Test("声纹时长不在二至十秒时明确暂停并带代号，零上传")
+    func invalidKnownSpeakerDurationSuspendsWithoutUpload() async throws {
+        let participant = meeting.participants[0]
+        try installVoiceSample(for: participant)
+        participant.voiceReferenceDurationMs = 1_999
+
+        try await startAll()
+        controller.produceChunks(uptoAudioMs: 20_000)
+        await controller.finishAndDrain(uptoAudioMs: 18_500)
+
+        guard case .suspended(let reason) = controller.cloudState else {
+            Issue.record("非法声纹时长必须进入配置暂停")
+            return
+        }
+        #expect(reason.contains("p_01"))
+        #expect(reason.contains("2–10 秒"))
+        #expect(mockDiarization.calls.isEmpty)
+        #expect(controller.queue.first?.status == .pending)
+    }
+
+    @Test("声纹配置修好并刷新后自动解除暂停并继续上传")
+    func refreshKnownSpeakersRecoversConfigurationSuspension() async throws {
+        let participant = meeting.participants[0]
+        participant.voiceReferencePath = fileStore.relativeVoiceSamplePath(
+            meetingID: meeting.id,
+            participantID: participant.id
+        )
+        participant.voiceReferenceDurationMs = 3_000
+
+        try await startAll()
+        controller.produceChunks(uptoAudioMs: 20_000)
+        await controller.finishAndDrain(uptoAudioMs: 18_500)
+        guard case .suspended = controller.cloudState else {
+            Issue.record("测试前置：缺失声纹应先暂停")
+            return
+        }
+
+        try installVoiceSample(for: participant)
+        controller.refreshKnownSpeakers()
+        await waitUntil { self.controller.queue.first?.status == .succeeded }
+
+        #expect(controller.queue.first?.status == .succeeded)
+        #expect(controller.cloudState == .idle)
+        #expect(mockDiarization.calls.count == 1)
+    }
+
+    @Test("刷新说话人不得解除 401 凭据暂停")
+    func refreshKnownSpeakersDoesNotRecoverUnauthorizedSuspension() async throws {
+        mockDiarization.errorQueue = [DiarizationAPIError.unauthorized]
+        try await startAll()
+        controller.produceChunks(uptoAudioMs: 20_000)
+        await controller.finishAndDrain(uptoAudioMs: 18_500)
+        let suspendedState = controller.cloudState
+        guard case .suspended(let reason) = suspendedState else {
+            Issue.record("测试前置：401 应先暂停")
+            return
+        }
+
+        controller.refreshKnownSpeakers()
+
+        #expect(reason.contains("401"))
+        #expect(controller.cloudState == suspendedState)
+        #expect(controller.queue.first?.status == .pending)
+        #expect(mockDiarization.calls.count == 1)
     }
 }
 

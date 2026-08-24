@@ -7,6 +7,14 @@ final class AIProviderMockURLProtocol: MockURLProtocolBase, @unchecked Sendable 
     override class var sharedStorage: MockURLProtocolStorage { storage }
 }
 
+private struct FixedKimiCredentials: KimiCredentialProviding {
+    let value: String
+
+    func validCredential() async throws -> String {
+        value
+    }
+}
+
 @Suite("分析模型配置", .serialized)
 struct AIProviderConfigurationTests {
     @Test("OpenAI 兼容地址只接受 HTTPS 或本机 HTTP")
@@ -103,7 +111,8 @@ struct AIProviderConfigurationTests {
         }
         let transport = KimiAnalysisService(
             session: AIProviderMockURLProtocol.makeSession(),
-            apiKeyStore: kimiKey
+            apiKeyStore: kimiKey,
+            credentials: FixedKimiCredentials(value: "kimi-k3-test-key")
         )
         let custom = CloudAPIKeyStore(
             service: serviceName,

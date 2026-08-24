@@ -168,9 +168,15 @@ struct TranscriptReconciler {
         return TranscriptText.similarity(newText, existing.text) >= Self.duplicateTextSimilarity
     }
 
-    /// 清空（会话结束/重新开始）
-    mutating func reset() {
-        finalized = []
+    /// 重置；恢复录音时可把已经落盘的最终/人工片段作为合并基线。
+    mutating func reset(finalized existing: [TranscriptSegment] = []) {
+        finalized = existing
+            .filter { $0.state == .final || $0.state == .edited }
+            .sorted {
+                $0.startMs == $1.startMs
+                    ? $0.endMs < $1.endMs
+                    : $0.startMs < $1.startMs
+            }
         provisional = nil
     }
 
@@ -197,8 +203,8 @@ struct TranscriptReconciler {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .discardedEmpty }
 
-        // 1) 人工保护：与人工已修订片段重叠则跳过
-        for existing in finalized where existing.state == .edited || existing.source == .manual {
+        // 1) 只保护人工改过的文字。仅确认说话人不能锁死后续云端细分。
+        for existing in finalized where isTextProtected(existing) {
             let overlap = Self.overlapMs(startA: startMs, endA: endMs,
                                          startB: existing.startMs, endB: existing.endMs)
             guard overlap > 0 else { continue }
@@ -210,15 +216,18 @@ struct TranscriptReconciler {
 
         // 2) 判重
         if let existing = findDuplicate(newStart: startMs, newEnd: endMs, newText: trimmed) {
-            switch (existing.source, existing.state) {
-            case (.manual, _), (_, .edited):
+            if isTextProtected(existing) {
                 return .skippedManual(existing)
-            case (.cloud, _):
+            }
+            switch existing.source {
+            case .cloud:
                 return .duplicate(existing: existing)
-            default:
+            case .local, .manual:
                 // 本地片段被云端确认：就地更新，ID 稳定
                 existing.text = trimmed
-                existing.participantId = participantId ?? existing.participantId
+                if existing.speakerWasUserConfirmed != true {
+                    existing.participantId = participantId ?? existing.participantId
+                }
                 existing.remoteSpeakerLabel = remoteSpeakerLabel ?? existing.remoteSpeakerLabel
                 existing.source = .cloud
                 existing.state = .final
@@ -227,18 +236,40 @@ struct TranscriptReconciler {
             }
         }
 
-        // 3) 清除被覆盖的临时片段
+        // 3) 云端给出更细边界时，移除被它实质覆盖的本地粗块，避免同一段
+        // 本地长句与多条云端分人结果并存。人工改过文字的块已在上面受保护。
+        let replaceable = finalized.filter { existing in
+            guard existing.source != .cloud, !isTextProtected(existing) else { return false }
+            let overlap = Self.overlapMs(
+                startA: startMs, endA: endMs,
+                startB: existing.startMs, endB: existing.endMs
+            )
+            let shorter = max(1, min(endMs - startMs, existing.endMs - existing.startMs))
+            return Double(overlap) / Double(shorter) >= Self.duplicateOverlapRatio
+        }
+        let carried = replaceable.min { $0.startMs < $1.startMs }
+        if !replaceable.isEmpty {
+            let ids = Set(replaceable.map(\.id))
+            finalized.removeAll { ids.contains($0.id) }
+        }
+
+        // 4) 清除被覆盖的临时片段
         clearProvisionalCoveredBy(startMs: startMs, endMs: endMs)
 
-        // 4) 按时间序插入
+        // 5) 按时间序插入；被拆分粗块的第一条沿用原 id 与星标，证据回链不悬空。
         let segment = TranscriptSegment(
+            id: carried?.id ?? UUID(),
             startMs: startMs,
             endMs: endMs,
             text: trimmed,
-            participantId: participantId,
+            participantId: carried?.speakerWasUserConfirmed == true
+                ? carried?.participantId
+                : participantId,
             remoteSpeakerLabel: remoteSpeakerLabel,
             source: .cloud,
-            state: .final
+            state: .final,
+            isStarred: carried?.isStarred ?? false,
+            speakerWasUserConfirmed: carried?.speakerWasUserConfirmed
         )
         let insertIndex = finalized.firstIndex { $0.startMs > startMs } ?? finalized.count
         finalized.insert(segment, at: insertIndex)
@@ -258,6 +289,13 @@ struct TranscriptReconciler {
         if coveredByTime || coveredByOrder {
             provisional = nil
         }
+    }
+
+    private func isTextProtected(_ segment: TranscriptSegment) -> Bool {
+        if segment.textWasUserEdited == true { return true }
+        // 旧数据没有细分审计字段；继续按旧状态保护，不能冒险覆盖历史人工文字。
+        return segment.textWasUserEdited == nil
+            && (segment.state == .edited || segment.source == .manual)
     }
 
     enum ApplyOutcome {

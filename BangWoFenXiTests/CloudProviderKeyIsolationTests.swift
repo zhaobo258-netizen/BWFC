@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 import Testing
 @testable import BangWoFenXi
 
@@ -328,7 +329,7 @@ final class DiarizationUnconfiguredTests {
         CloudAPIKeyStore.store(for: .diarization, service: keychainServiceName)
     }
 
-    @Test("未配置分人 Key：start 进入 unconfigured，零上传调用；配置后恢复正常")
+    @Test("未配置分人 Key：start 绑定上下文但 poll/收尾不切盘；配置后可恢复")
     func unconfiguredZeroRequests() async throws {
         let mock = MockDiarizationService()
         let transcriptController = LocalTranscriptionController(service: MockLocalTranscriptionService())
@@ -340,10 +341,38 @@ final class DiarizationUnconfiguredTests {
         )
         let meeting = Meeting(title: "未配置测试")
         try meeting.transition(to: .ready)
+        try meeting.transition(to: .recording)
+        meeting.audioRelativePath = fileStore.relativeAudioPath(for: meeting.id)
+        try fileStore.ensureMeetingDirectory(for: meeting.id)
+        let audioURL = fileStore.meetingDirectory(for: meeting.id)
+            .appending(path: MeetingFileStore.recordingFileName)
+        let format = AVAudioFormat(standardFormatWithSampleRate: 8_000, channels: 1)!
+        let file = try AVAudioFile(forWriting: audioURL, settings: format.settings)
+        let buffer = AVAudioPCMBuffer(
+            pcmFormat: format,
+            frameCapacity: AVAudioFrameCount(format.sampleRate * 25)
+        )!
+        buffer.frameLength = buffer.frameCapacity
+        for frame in 0..<Int(buffer.frameLength) {
+            buffer.floatChannelData![0][frame] = 0
+        }
+        try file.write(from: buffer)
+        let timeline = RecordingTimeline(startedAt: Date().addingTimeInterval(-25))
         try await transcriptController.start(for: meeting) { nil }
 
-        controller.start(for: meeting) { nil }
+        controller.start(for: meeting) { timeline }
         #expect(controller.cloudState == .unconfigured, "未配置必须为灰态 unconfigured")
+
+        controller.pollProgress()
+        controller.produceChunks(uptoAudioMs: 20_000)
+        await controller.finishAndDrain(uptoAudioMs: 20_000)
+        #expect(controller.queue.isEmpty)
+        #expect(
+            !FileManager.default.fileExists(
+                atPath: fileStore.chunksDirectory(for: meeting.id).path
+            ),
+            "未配置时不得为云端分人创建分片目录"
+        )
 
         // 恢复入口在未配置时不得触发处理
         controller.retryAwaitingUserChunks()
@@ -355,6 +384,9 @@ final class DiarizationUnconfiguredTests {
         try keyStore.saveKey("diarization-key")
         controller.resumeAfterKeyFix()
         #expect(controller.cloudState == .idle)
+        controller.produceChunks(uptoAudioMs: 20_000)
+        await controller.finishAndDrain(uptoAudioMs: 18_500)
+        #expect(!mock.calls.isEmpty, "start 在 unconfigured 时也必须保留会议与时间线上下文")
         await transcriptController.cancel()
     }
 }

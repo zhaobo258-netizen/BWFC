@@ -13,7 +13,8 @@ enum ProjectHomeSupport {
 
     static func makeRecordingProject(
         at date: Date,
-        scenario: ProjectScenario?
+        scenario: ProjectScenario?,
+        speakers: [Speaker] = []
     ) -> Project {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm"
@@ -24,7 +25,8 @@ enum ProjectHomeSupport {
             scenarioWasUserSelected: scenario != nil,
             status: .creating,
             createdAt: date,
-            lastActivityAt: date
+            lastActivityAt: date,
+            speakers: speakers
         )
     }
 

@@ -23,7 +23,8 @@ let package = Package(
                 "Agent.md",
                 "开发日志.md",
                 // 打包与测试执行器的临时产物
-                "build"
+                "build",
+                "output"
             ],
             sources: [
                 "App",

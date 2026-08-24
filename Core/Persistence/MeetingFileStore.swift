@@ -405,12 +405,23 @@ struct MeetingFileStore: Sendable {
     /// 相对路径 → 绝对 URL。
     /// 安全约束：拒绝空路径与任何逃逸出根目录的相对路径（如「..」、绝对路径）。
     func absoluteURL(forRelativePath relativePath: String) throws -> URL {
-        guard !relativePath.isEmpty,
-              !relativePath.hasPrefix("/"),
-              !relativePath.split(separator: "/").contains("..") else {
+        let components = relativePath.split(separator: "/", omittingEmptySubsequences: false)
+        guard !relativePath.hasPrefix("/"),
+              components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
             throw MeetingFileStoreError.invalidRelativePath
         }
-        return baseDirectory.appending(path: relativePath, directoryHint: .notDirectory)
+        let resolvedBase = baseDirectory.resolvingSymlinksInPath().standardizedFileURL
+        var resolvedURL = resolvedBase
+        for component in components {
+            resolvedURL = resolvedURL
+                .appending(path: String(component), directoryHint: .inferFromPath)
+                .resolvingSymlinksInPath()
+                .standardizedFileURL
+            guard resolvedURL.path.hasPrefix(resolvedBase.path + "/") else {
+                throw MeetingFileStoreError.invalidRelativePath
+            }
+        }
+        return resolvedURL
     }
 
     // MARK: - 阶段 3：声音样本与上传分片

@@ -29,11 +29,17 @@ struct ProjectWorkspaceView: View {
     @State private var noteController: NoteController?
     @State private var runtimePersistence: ProjectRuntimePersistenceController?
     @State private var operationError: String?
+    /// 收尾后 AI 全文复查的进行中/结果提示（非错误通道；10 号需求 1）
+    @State private var reviewNotice: String?
+    @State private var transcriptReviewCandidates: [TranscriptReviewCandidate] = []
+    @State private var showTranscriptReviewCandidates = false
     @State private var highlightedSegmentID: UUID?
     @State private var showEndConfirmation = false
     @State private var isFinishing = false
     @State private var showBackConfirmation = false
     @State private var showSpeakerPanel = false
+    /// 说话人指认弹层的锚点（09 号计划需求 2；总结条目或转写行进入）
+    @State private var speakerAssignRequest: SpeakerAssignRequest?
     @State private var newDeviceID: String?
     @State private var sidebarProjects: [Project] = []
     @AppStorage("bwfx.workspace.projectSidebarVisible") private var prefersProjectSidebarVisible = true
@@ -105,6 +111,10 @@ struct ProjectWorkspaceView: View {
         .onChange(of: environment.lexiconRevision) { _, _ in
             transcription?.correctionRules = environment.correctionRules
         }
+        .onChange(of: environment.cloudConfigurationRevision) { _, _ in
+            diarization?.resumeAfterKeyFix()
+            analysis?.resumeAfterKeyFix()
+        }
         .onChange(of: router.requestedFinalReportProjectID) { _, _ in
             openRequestedFinalReportIfNeeded()
         }
@@ -123,10 +133,72 @@ struct ProjectWorkspaceView: View {
                     onSpeakersChanged: {
                         persistProject(fields: .speakers)
                         diarization?.refreshKnownSpeakers()
+                        let speakerIDs = Set(project.speakers.map(\.id))
+                        let overriddenEvidenceIDs = project.analysisSpeakerOverrides
+                            .filter { speakerIDs.contains($0.speakerId) }
+                            .flatMap(\.evidenceSegmentIds)
+                        analysis?.noteSpeakerContextChanged(
+                            segmentIDs: meeting.segments.compactMap {
+                                guard let id = $0.participantId,
+                                      speakerIDs.contains(id) else { return nil }
+                                return $0.id
+                            } + overriddenEvidenceIDs
+                        )
                     }
                 )
                 .environment(environment)
             }
+        }
+        .sheet(item: $speakerAssignRequest) { request in
+            if let project {
+                SpeakerAssignSheet(
+                    speakers: project.speakers,
+                    anchorText: request.anchorText,
+                    isAnalysisItem: request.isAnalysisItem,
+                    canAlsoAssignTranscript: request.source.transcriptSegmentId != nil,
+                    onPickExisting: { speaker, alsoAssignTranscript in
+                        performSpeakerAssign(
+                            request: request,
+                            speaker: speaker,
+                            alsoAssignTranscript: alsoAssignTranscript
+                        )
+                    },
+                    onCreate: { name, role, alsoAssignTranscript in
+                        let speaker = Speaker(
+                            cloudAlias: SpeakerPanelLogic.nextCloudAlias(existing: project.speakers),
+                            displayName: name,
+                            role: role,
+                            colorToken: SpeakerPanelLogic.nextColorToken(existing: project.speakers),
+                            isUserConfirmed: true
+                        )
+                        project.speakers.append(speaker)
+                        let didAssign = performSpeakerAssign(
+                            request: request,
+                            speaker: speaker,
+                            alsoAssignTranscript: alsoAssignTranscript
+                        )
+                        if !didAssign {
+                            project.speakers.removeAll { $0.id == speaker.id }
+                            if let meeting {
+                                SpeakerPanelLogic.syncRuntimeParticipants(
+                                    speakers: project.speakers,
+                                    meeting: meeting
+                                )
+                            }
+                            _ = persistProject(fields: .speakers)
+                            diarization?.refreshKnownSpeakers()
+                        }
+                        return didAssign
+                    }
+                )
+            }
+        }
+        .sheet(isPresented: $showTranscriptReviewCandidates) {
+            TranscriptReviewCandidatesSheet(
+                candidates: transcriptReviewCandidates,
+                onApply: applyTranscriptReviewCandidates,
+                onDiscardAll: discardTranscriptReviewCandidates
+            )
         }
         .confirmationDialog("录音仍在进行", isPresented: $showBackConfirmation, titleVisibility: .visible) {
             Button("结束录音并返回", role: .destructive) {
@@ -180,6 +252,10 @@ struct ProjectWorkspaceView: View {
                     if case .suspended(let reason) = diarization?.cloudState {
                         cloudSuspendedBanner(reason: reason)
                     }
+                    if case .unconfigured = diarization?.cloudState,
+                       meeting.status == .recording || meeting.status == .paused {
+                        diarizationUnconfiguredBanner
+                    }
                     if case .suspended(let reason) = analysis?.state {
                         analysisSuspendedBanner(reason: reason)
                     }
@@ -190,6 +266,9 @@ struct ProjectWorkspaceView: View {
                     }
                     if let operationError {
                         errorBanner(text: operationError)
+                    }
+                    if let reviewNotice {
+                        noticeBanner(text: reviewNotice)
                     }
                     if project.sourceType != .liveRecording {
                         importProgressSection(project: project)
@@ -707,15 +786,26 @@ struct ProjectWorkspaceView: View {
                 liveAudioLevel: meeting.status == .recording ? liveAudioLevel : nil,
                 onAssignSpeaker: { segment, participant in
                     if let participant {
-                        MeetingTranscriptEditor.assignSpeaker(segment, to: participant)
+                        if let speaker = project?.speakers.first(where: { $0.id == participant.id }) {
+                            _ = performTranscriptSpeakerAssign(
+                                anchorSegmentId: segment.id,
+                                speaker: speaker
+                            )
+                        } else {
+                            MeetingTranscriptEditor.assignSpeaker(segment, to: participant)
+                            persistAndRefresh(meeting)
+                            analysis?.noteSpeakerContextChanged(segmentIDs: [segment.id])
+                        }
                     } else {
                         MeetingTranscriptEditor.clearSpeaker(segment)
+                        persistAndRefresh(meeting)
+                        analysis?.noteSpeakerContextChanged(segmentIDs: [segment.id])
                     }
-                    persistAndRefresh(meeting)
                 },
                 onEditText: { segment, newText in
                     MeetingTranscriptEditor.editText(segment, to: newText)
                     persistAndRefresh(meeting)
+                    analysis?.noteSpeakerContextChanged(segmentIDs: [segment.id])
                 },
                 onToggleStar: { segment in
                     MeetingTranscriptEditor.toggleStar(segment)
@@ -723,6 +813,12 @@ struct ProjectWorkspaceView: View {
                 },
                 onGlobalCorrect: { wrong, right in
                     globalCorrect(wrong: wrong, right: right, meeting: meeting)
+                },
+                onRequestNewSpeaker: { segment in
+                    speakerAssignRequest = SpeakerAssignRequest(
+                        source: .transcript(segmentId: segment.id),
+                        anchorText: String(segment.text.prefix(80))
+                    )
                 }
             )
         }
@@ -815,7 +911,13 @@ struct ProjectWorkspaceView: View {
                     snapshot: analysis?.currentSnapshot,
                     summaryTab: true,
                     speakers: project?.speakers ?? [],
-                    onEvidenceTap: locateEvidence
+                    onEvidenceTap: locateEvidence,
+                    segmentStartMs: { id in
+                        currentSegments(of: meeting).first(where: { $0.id == id })?.startMs
+                    },
+                    onSpeakerTap: { item in
+                        requestSpeakerAssign(for: item, meeting: meeting)
+                    }
                 )
             }
         case .finalReport:
@@ -840,21 +942,32 @@ struct ProjectWorkspaceView: View {
                     snapshot: legacySnapshot,
                     participants: meeting.participants,
                     segments: transcription?.segments ?? meeting.segments,
-                    onEvidenceTap: locateEvidence
+                    onEvidenceTap: locateEvidence,
+                    onSpeakerTap: { insight in
+                        requestSpeakerAssign(for: insight, meeting: meeting)
+                    }
                 )
             } else {
                 ConversationAnalysisView(
                     snapshot: analysis?.currentSnapshot,
                     summaryTab: false,
                     speakers: project?.speakers ?? [],
-                    onEvidenceTap: locateEvidence
+                    onEvidenceTap: locateEvidence,
+                    segmentStartMs: { id in
+                        currentSegments(of: meeting).first(where: { $0.id == id })?.startMs
+                    },
+                    onSpeakerTap: { item in
+                        requestSpeakerAssign(for: item, meeting: meeting)
+                    }
                 )
             }
         case .bloom:
             if let knowledgeGarden {
                 KnowledgeGardenView(
                     controller: knowledgeGarden,
-                    onEvidenceTap: locateEvidence
+                    onEvidenceTap: locateEvidence,
+                    isAIConfigured: environment.isAnalysisConfigured,
+                    hasConversationContent: !currentSegments(of: meeting).isEmpty
                 )
             } else {
                 ContentUnavailableView(
@@ -1127,6 +1240,19 @@ struct ProjectWorkspaceView: View {
         .background(.orange.opacity(0.12))
     }
 
+    private var diarizationUnconfiguredBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "person.2.slash")
+            Text("说话人识别未连接；当前只有 Apple Speech 文稿，不会自动产生可靠的说话人归属。")
+                .font(.callout)
+            Spacer()
+            Button("去连接") { router.showSettings() }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.orange.opacity(0.12))
+    }
+
     private func analysisSuspendedBanner(reason: String) -> some View {
         HStack(spacing: 8) {
             Image(systemName: "brain")
@@ -1166,6 +1292,24 @@ struct ProjectWorkspaceView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .background(.yellow.opacity(0.12))
+    }
+
+    /// 中性提示条（复查进行中/结果；与错误红条区分）
+    private func noticeBanner(text: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "text.magnifyingglass")
+            Text(text).font(.callout)
+            Spacer()
+            if !transcriptReviewCandidates.isEmpty {
+                Button("查看候选") { showTranscriptReviewCandidates = true }
+            }
+            if transcriptReviewCandidates.isEmpty {
+                Button("知道了") { reviewNotice = nil }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(BWTheme.accent.opacity(0.1))
     }
 
     private func errorBanner(text: String) -> some View {
@@ -1296,6 +1440,8 @@ struct ProjectWorkspaceView: View {
         project.endedAt = fresh.endedAt
         project.legacySnapshots = fresh.legacySnapshots
         project.analysisSnapshots = fresh.analysisSnapshots
+        project.analysisSpeakerOverrides = fresh.analysisSpeakerOverrides
+        project.transcriptReviewCandidates = fresh.transcriptReviewCandidates
         project.finalReportSnapshots = fresh.finalReportSnapshots
         project.knowledgeSeeds = fresh.knowledgeSeeds
         project.segments = fresh.segments
@@ -1311,6 +1457,13 @@ struct ProjectWorkspaceView: View {
             return
         }
         project = loaded
+        if !autoStart {
+            operationError = environment.consumePendingWarning(for: projectID)
+        }
+        transcriptReviewCandidates = loaded.transcriptReviewCandidates
+        if !loaded.transcriptReviewCandidates.isEmpty {
+            reviewNotice = "有 \(loaded.transcriptReviewCandidates.count) 处 AI 转写更正候选待确认，原文尚未修改。"
+        }
         let notes = NoteController(project: loaded) { [environment] in
             try environment.persist($0, fields: .note)
         }
@@ -1444,6 +1597,13 @@ struct ProjectWorkspaceView: View {
             triggerConfig: project.sourceType == .liveRecording ? .liveRecording : AnalysisTrigger()
         )
         analysisController.knownTermsProvider = { [environment] in environment.lexiconTerms }
+        // 实时尾巴（09 号计划需求 3-②）：把「识别中」的最新片段作为补充上下文
+        // 交给分析，实时总结/开花不再等云端说话人确认。太短的尾巴没有分析价值。
+        analysisController.provisionalTailProvider = { [weak controller] in
+            guard let tail = controller?.segments.last(where: { $0.state == .provisional }),
+                  tail.text.count >= 10 else { return nil }
+            return tail
+        }
         analysisController.attach(to: project)
         analysisController.onSnapshotUpdated = { [environment] in
             // V2 快照直接写在 Project 上，无需运行时桥接
@@ -1453,6 +1613,10 @@ struct ProjectWorkspaceView: View {
             } catch {
                 Task { @MainActor in self.operationError = "项目保存失败（\(String(describing: type(of: error)))）" }
             }
+        }
+        analysisController.persistManualSpeakerConfirmation = { [environment] in
+            try environment.persist(project, fields: .analysis)
+            knowledgeController.refreshCandidates()
         }
         // 新最终片段驱动分析调度
         controller.onNewFinalSegment = { [weak analysisController] in
@@ -1488,13 +1652,16 @@ struct ProjectWorkspaceView: View {
         }
     }
 
-    private func persistProject(fields: ProjectFieldOwnership) {
-        guard let project else { return }
+    @discardableResult
+    private func persistProject(fields: ProjectFieldOwnership) -> Bool {
+        guard let project else { return false }
         do {
             try environment.persist(project, fields: fields)
             reloadSidebarProjects()
+            return true
         } catch {
             operationError = "项目保存失败（\(String(describing: type(of: error)))）"
+            return false
         }
     }
 
@@ -1536,10 +1703,197 @@ struct ProjectWorkspaceView: View {
         highlightedSegmentID = segmentID
     }
 
+    // MARK: - 说话人指认（09 号计划需求 2）
+
+    /// 当前生效的片段序列（与转写面板同一口径：运行时优先，回看用已持久化）
+    private func currentSegments(of meeting: Meeting) -> [TranscriptSegment] {
+        (transcription?.segments.isEmpty ?? true) ? meeting.segments : (transcription?.segments ?? [])
+    }
+
+    /// 从总结条目发起指认：条目归属可独立确认；只有唯一证据时才允许用户另选回写原话。
+    private func requestSpeakerAssign(for item: AnalysisItem, meeting: Meeting) {
+        let segments = currentSegments(of: meeting)
+        let evidence = item.evidenceSegmentIds
+            .compactMap { id in segments.first(where: { $0.id == id }) }
+        guard !evidence.isEmpty else {
+            operationError = "这条内容的原话已被更新，暂时无法定位说话人；请稍候在新的总结上操作。"
+            return
+        }
+        let uniqueEvidenceSegmentId = evidence.count == 1 ? evidence[0].id : nil
+        speakerAssignRequest = SpeakerAssignRequest(
+            source: .analysisItem(
+                itemId: item.id,
+                uniqueEvidenceSegmentId: uniqueEvidenceSegmentId
+            ),
+            anchorText: String(item.text.prefix(100))
+        )
+    }
+
+    private func requestSpeakerAssign(for insight: Insight, meeting: Meeting) {
+        let segments = currentSegments(of: meeting)
+        let evidence = insight.evidenceSegmentIds
+            .compactMap { id in segments.first(where: { $0.id == id }) }
+        guard !evidence.isEmpty else {
+            operationError = "这条内容的原话已被更新，暂时无法定位说话人。"
+            return
+        }
+        speakerAssignRequest = SpeakerAssignRequest(
+            source: .legacyInsight(
+                insightId: insight.id,
+                uniqueEvidenceSegmentId: evidence.count == 1 ? evidence[0].id : nil
+            ),
+            anchorText: String(insight.statement.prefix(100))
+        )
+    }
+
+    @discardableResult
+    private func performSpeakerAssign(
+        request: SpeakerAssignRequest,
+        speaker: Speaker,
+        alsoAssignTranscript: Bool
+    ) -> Bool {
+        switch request.source {
+        case .transcript(let segmentId):
+            return performTranscriptSpeakerAssign(anchorSegmentId: segmentId, speaker: speaker)
+        case .analysisItem(let itemId, let uniqueEvidenceSegmentId):
+            guard let project, let meeting,
+                  analysis?.currentSnapshot?.items.contains(where: { $0.id == itemId }) == true else {
+                operationError = "这条总结已更新，请在最新内容上重新标注说话人。"
+                return false
+            }
+            SpeakerPanelLogic.syncRuntimeParticipants(speakers: project.speakers, meeting: meeting)
+            guard persistProject(fields: .speakers) else { return false }
+            diarization?.refreshKnownSpeakers()
+            guard analysis?.confirmSubjectSpeaker(itemID: itemId, speakerID: speaker.id) == true else {
+                operationError = analysis?.lastErrorDescription
+                    ?? "这条总结已更新，请在最新内容上重新标注说话人。"
+                return false
+            }
+            if alsoAssignTranscript, let uniqueEvidenceSegmentId {
+                _ = performTranscriptSpeakerAssign(
+                    anchorSegmentId: uniqueEvidenceSegmentId,
+                    speaker: speaker
+                )
+            }
+            return true
+        case .legacyInsight(let insightId, let uniqueEvidenceSegmentId):
+            guard let project, let meeting,
+                  let snapshot = project.legacySnapshots.max(by: { $0.version < $1.version }),
+                  let insight = snapshot.insights.first(where: { $0.id == insightId }) else {
+                operationError = "这条总结已更新，请在最新内容上重新标注说话人。"
+                return false
+            }
+            SpeakerPanelLogic.syncRuntimeParticipants(speakers: project.speakers, meeting: meeting)
+            guard persistProject(fields: .speakers) else { return false }
+            diarization?.refreshKnownSpeakers()
+            let previousSpeakerID = insight.subjectParticipantId
+            let previousUpdatedAt = insight.lastUpdatedAt
+            insight.subjectParticipantId = speaker.id
+            insight.lastUpdatedAt = Date()
+            guard persistProject(fields: .legacyAnalysis) else {
+                insight.subjectParticipantId = previousSpeakerID
+                insight.lastUpdatedAt = previousUpdatedAt
+                return false
+            }
+            if alsoAssignTranscript, let uniqueEvidenceSegmentId {
+                _ = performTranscriptSpeakerAssign(
+                    anchorSegmentId: uniqueEvidenceSegmentId,
+                    speaker: speaker
+                )
+            }
+            return true
+        }
+    }
+
+    /// 指认落地：回填同标签历史片段 + 自动提取声纹 + 前向匹配。
+    /// 声纹提取失败不阻断指认（回填仍生效，样本可后续手录）。
+    private func performTranscriptSpeakerAssign(anchorSegmentId: UUID, speaker: Speaker) -> Bool {
+        guard let project, let meeting else { return false }
+        // 指认操作永远作用在权威片段上（meeting.segments 与运行时是同一批实例；
+        // 回看场景 transcription 为空，meeting.segments 即持久化片段的运行时拷贝）
+        let segments = meeting.segments
+        guard segments.contains(where: { $0.id == anchorSegmentId }) else {
+            // 锚点是「识别中」的临时片段（只在转写控制器内存里）：定稿前无法指认
+            operationError = "这句话还在识别中，等它确认后（几秒内）再指认说话人。"
+            return false
+        }
+        let plan = SpeakerAssignPlanner.makePlan(
+            anchorSegmentId: anchorSegmentId,
+            speaker: speaker,
+            segments: segments,
+            pauseIntervals: meeting.pauseIntervals
+        )
+
+        // 声纹：从这个人的发言里切 2–10 秒存为样本（已有样本时 plan 为 nil）
+        if let window = plan.sampleWindow {
+            extractVoiceSample(window: window, for: speaker, meeting: meeting)
+        }
+
+        // 标签级前向匹配：同会话后续分片同标签直接解析为该说话人
+        if let label = plan.remoteLabel {
+            diarization?.assignRemoteLabel(label, to: speaker.id)
+        }
+
+        // 说话人列表 → 运行时参会人 → 云端映射刷新（known_speaker_references 随分片携带）
+        SpeakerPanelLogic.syncRuntimeParticipants(speakers: project.speakers, meeting: meeting)
+        diarization?.refreshKnownSpeakers()
+        persistProject(fields: .speakers)
+        persistAndRefresh(meeting)
+        analysis?.noteSpeakerContextChanged(segmentIDs: plan.changedSegmentIds)
+        return true
+    }
+
+    /// 从完整录音切出声纹样本（失败只提示，不阻断指认）
+    private func extractVoiceSample(
+        window: SpeakerSampleWindowPlanner.Window,
+        for speaker: Speaker,
+        meeting: Meeting
+    ) {
+        guard let project,
+              SpeakerPanelLogic.canActivateVoiceReference(
+                for: speaker.id,
+                in: project.speakers
+              ) else {
+            operationError = "已指认说话人，但本场已启用 4 个声纹，未自动录入第 5 份样本。可在「说话人」面板替换本场人员。"
+            return
+        }
+        do {
+            guard let audioURL = try environment.fileStore.audioFileURL(for: meeting),
+                  FileManager.default.fileExists(atPath: audioURL.path) else { return }
+            let relativePath = environment.fileStore.relativeVoiceSamplePath(
+                meetingID: meeting.id,
+                participantID: speaker.id
+            )
+            let sampleURL = try environment.fileStore.absoluteURL(forRelativePath: relativePath)
+            try FileManager.default.createDirectory(
+                at: sampleURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try AudioChunkExtractor.extract(
+                from: audioURL,
+                startMs: window.audioStartMs,
+                endMs: window.audioEndMs,
+                to: sampleURL
+            )
+            speaker.voiceSamplePath = relativePath
+            speaker.voiceSampleDurationMs = window.audioEndMs - window.audioStartMs
+        } catch {
+            // 指认本身已生效；样本提取失败如实提示，可去说话人面板手录
+            operationError = "已指认说话人，但自动提取声纹失败（\(String(describing: type(of: error)))）；可在「说话人」面板手动录制样本。"
+            AppLog.logError(AppLog.diarization, LogSanitizer.formatEvent(
+                "voice_sample_extract_failed", error: String(describing: type(of: error))
+            ))
+        }
+    }
+
     /// 全局纠错（老板 2026-07-27 需求 2）：
     /// 整场替换 + 规则入库（后续转写自动纠正、正词进词库）+ 运行中控制器同步。
     /// 修改过的片段标记人工已修订，不再被云端结果覆盖。
     private func globalCorrect(wrong: String, right: String, meeting: Meeting) -> Int {
+        let originalTexts = Dictionary(
+            meeting.segments.map { ($0.id, $0.text) },
+            uniquingKeysWith: { first, _ in first }
+        )
         let changed = TranscriptCorrector.applyGlobal(
             wrong: wrong, right: right, segments: meeting.segments)
         do {
@@ -1550,6 +1904,11 @@ struct ProjectWorkspaceView: View {
         transcription?.correctionRules = environment.correctionRules
         if changed > 0 {
             persistAndRefresh(meeting)
+            analysis?.noteSpeakerContextChanged(
+                segmentIDs: meeting.segments.compactMap { segment in
+                    originalTexts[segment.id] == segment.text ? nil : segment.id
+                }
+            )
         }
         return changed
     }
@@ -1586,7 +1945,7 @@ struct ProjectWorkspaceView: View {
                 didStartSessionThisView = true
                 environment.markProjectLive(projectID)
                 syncAndPersist(meeting)
-                operationError = nil
+                operationError = environment.consumePendingWarning(for: projectID)
                 environment.audioCapture.onLevel = { level in
                     Task { @MainActor in
                         liveAudioLevel = level
@@ -1605,15 +1964,126 @@ struct ProjectWorkspaceView: View {
                         let boxed = SendableAudioBuffer(buffer)
                         Task { await transcriptionService.feed(boxed.buffer) }
                     }
-                    if environment.isConfigured(.diarization) {
-                        diarization?.start(for: meeting) { [weak recorder] in
-                            recorder?.timeline
-                        }
+                    diarization?.start(for: meeting) { [weak recorder] in
+                        recorder?.timeline
                     }
                 }
             } catch {
                 operationError = error.localizedDescription
             }
+        }
+    }
+
+    /// 录音收尾后的 AI 全文转写复查（10 号需求 1）：
+    /// 整场最终文稿交给分析模型找识别错误，只生成候选；用户确认前绝不改权威文本。
+    private func reviewTranscriptAfterRecording(meeting: Meeting) async {
+        let eligible = meeting.segments.filter { $0.state == .final || $0.state == .edited }
+        guard !eligible.isEmpty else { return }
+        reviewNotice = "AI 正在复查全文转写，更正识别错误…"
+        do {
+            let agent = TranscriptReviewAgent(generationService: environment.aiProviderRegistry)
+            let request = try TranscriptReviewer.makeRequest(
+                segments: eligible,
+                globalTerms: environment.lexiconTerms,
+                meetingGlossary: meeting.glossary
+            )
+            let candidates = try await agent.review(request)
+            guard let project else { return }
+            let previousCandidates = project.transcriptReviewCandidates
+            project.transcriptReviewCandidates = candidates
+            do {
+                try environment.persist(project, fields: .transcriptReview)
+                transcriptReviewCandidates = candidates
+            } catch {
+                project.transcriptReviewCandidates = previousCandidates
+                transcriptReviewCandidates = previousCandidates
+                reviewNotice = "AI 已完成复查，但候选保存失败；原文保持不变。"
+                return
+            }
+            if candidates.isEmpty {
+                reviewNotice = "AI 已复查全文：未发现需要更正的识别错误。"
+            } else {
+                reviewNotice = "AI 找到 \(candidates.count) 处疑似错字；尚未修改，请逐条确认。"
+            }
+            AppLog.logInfo(AppLog.analysis, LogSanitizer.formatEvent(
+                "transcript_review_ok",
+                error: "candidates=\(candidates.count) applied=0"
+            ))
+        } catch {
+            reviewNotice = "AI 复查未完成（\(TranscriptReviewFailureText.message(for: error))），转写保持原样；完整总结不受影响。"
+            AppLog.logError(AppLog.analysis, LogSanitizer.formatEvent(
+                "transcript_review_failed", error: String(describing: type(of: error))
+            ))
+        }
+    }
+
+    private func applyTranscriptReviewCandidates(
+        _ selected: [TranscriptReviewCandidate]
+    ) -> String? {
+        guard let meeting, let project else { return "项目已关闭，无法应用更正。" }
+        let previousCandidates = project.transcriptReviewCandidates
+        let selectedIDs = Set(selected.map(\.id))
+        let remainingCandidates = previousCandidates.filter { !selectedIDs.contains($0.id) }
+        do {
+            let commit = try TranscriptReviewer.applyConfirmed(
+                selected,
+                to: meeting.segments
+            ) { commit in
+                project.transcriptReviewCandidates = remainingCandidates
+                do {
+                    try environment.applyTranscriptReviewCommit(commit) {
+                        guard syncAndPersist(meeting) else {
+                            throw TranscriptReviewPersistenceFailure()
+                        }
+                    }
+                } catch {
+                    project.transcriptReviewCandidates = previousCandidates
+                    throw error
+                }
+            }
+            transcription?.correctionRules = environment.correctionRules
+            transcription?.refreshSegments()
+            transcriptReviewCandidates = remainingCandidates
+            reviewNotice = transcriptReviewCandidates.isEmpty
+                ? "已确认并更正 \(commit.candidates.count) 处，纠错规则已保存。"
+                : "已更正 \(commit.candidates.count) 处；还有 \(transcriptReviewCandidates.count) 处候选未处理。"
+            analysis?.noteSpeakerContextChanged(
+                segmentIDs: Array(Set(commit.candidates.map(\.segmentId)))
+            )
+            if environment.isAnalysisConfigured {
+                environment.finalReportCoordinator.start(
+                    projectID: project.id,
+                    refreshIfRunning: true
+                )
+            }
+            return nil
+        } catch TranscriptReviewConfirmationError.segmentChanged {
+            project.transcriptReviewCandidates = previousCandidates
+            return "原文已在复查后发生变化，请关闭并重新复查。"
+        } catch TranscriptReviewConfirmationError.conflictingCorrection(let wrong) {
+            project.transcriptReviewCandidates = previousCandidates
+            return "「\(wrong)」同时有多个不同改法，请只选其中一种。"
+        } catch TranscriptReviewCommitPersistenceError.rollbackFailed {
+            project.transcriptReviewCandidates = previousCandidates
+            return "文稿已恢复，但纠错词库的磁盘回滚失败；本次未视为保存成功，请重试或检查存储位置。"
+        } catch {
+            project.transcriptReviewCandidates = previousCandidates
+            return "更正未保存（\(String(describing: type(of: error)))），文稿保持原样。"
+        }
+    }
+
+    private func discardTranscriptReviewCandidates() -> String? {
+        guard let project else { return "项目已关闭，无法清除候选。" }
+        let previous = project.transcriptReviewCandidates
+        project.transcriptReviewCandidates = []
+        do {
+            try environment.persist(project, fields: .transcriptReview)
+            transcriptReviewCandidates = []
+            reviewNotice = "已忽略全部更正候选，原文未修改。"
+            return nil
+        } catch {
+            project.transcriptReviewCandidates = previous
+            return "候选清除失败，未做任何修改。"
         }
     }
 
@@ -1635,6 +2105,9 @@ struct ProjectWorkspaceView: View {
                 environment.clearProjectLive(projectID)
                 operationError = nil
                 if environment.isAnalysisConfigured {
+                    // 先复查全文更正识别错误，再生成完整总结（报告用的是更正后文稿）。
+                    // 复查失败不阻断——转写保持原样，总结照常生成。
+                    await reviewTranscriptAfterRecording(meeting: meeting)
                     environment.finalReportCoordinator.start(projectID: projectID)
                 } else {
                     // 静默跳过会让人误以为「完整总结」功能缺失；必须说清原因和补救入口
@@ -1717,6 +2190,9 @@ struct ProjectWorkspaceView: View {
             return
         }
         project.analysisSnapshots = fresh.analysisSnapshots
+        project.analysisSpeakerOverrides = fresh.analysisSpeakerOverrides
+        project.transcriptReviewCandidates = fresh.transcriptReviewCandidates
+        transcriptReviewCandidates = fresh.transcriptReviewCandidates
         project.finalReportSnapshots = fresh.finalReportSnapshots
         project.processingJobs = fresh.processingJobs
         if !project.scenarioWasUserSelected {
@@ -1739,6 +2215,8 @@ struct ProjectWorkspaceView: View {
 
 }
 
+private struct TranscriptReviewPersistenceFailure: Error {}
+
 /// 处理详情弹层（03 §6.3：Provider Key 状态、分片计数等技术细节不占据主工作区，仅在此查看）
 private struct ProcessingDetailsButton: View {
     let transcription: LocalTranscriptionController?
@@ -1758,6 +2236,7 @@ private struct ProcessingDetailsButton: View {
         var count = 0
         if case .unavailable = transcription?.runState { count += 1 }
         if case .suspended = diarization?.cloudState { count += 1 }
+        if case .unconfigured = diarization?.cloudState { count += 1 }
         if case .suspended = analysis?.state { count += 1 }
         if (diarization?.awaitingUserRetryCount ?? 0) > 0 { count += 1 }
         return count

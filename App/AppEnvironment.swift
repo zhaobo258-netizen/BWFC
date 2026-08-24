@@ -1,5 +1,9 @@
 import Foundation
 
+enum TranscriptReviewCommitPersistenceError: Error, Equatable {
+    case rollbackFailed
+}
+
 enum ProjectFieldOwnership: Sendable, Equatable {
     case all
     case note
@@ -8,6 +12,8 @@ enum ProjectFieldOwnership: Sendable, Equatable {
     case speakers
     case manualSegments
     case analysis
+    case legacyAnalysis
+    case transcriptReview
     case finalReport
     case knowledgeGarden
     case aiContext
@@ -43,6 +49,8 @@ enum ProjectPersistence {
         "segments": .shared,
         "legacySnapshots": .runtime,
         "analysisSnapshots": .runtime,
+        "analysisSpeakerOverrides": .workspace,
+        "transcriptReviewCandidates": .workspace,
         "finalReportSnapshots": .runtime,
         "knowledgeSeeds": .workspace,
         "aiChatMessages": .workspace,
@@ -87,10 +95,15 @@ enum ProjectPersistence {
             stored.lastActivityAt = incoming.lastActivityAt
         case .analysis:
             stored.analysisSnapshots = incoming.analysisSnapshots
+            stored.analysisSpeakerOverrides = incoming.analysisSpeakerOverrides
             if !stored.scenarioWasUserSelected {
                 stored.scenario = incoming.scenario
                 stored.scenarioWasUserSelected = incoming.scenarioWasUserSelected
             }
+        case .legacyAnalysis:
+            stored.legacySnapshots = incoming.legacySnapshots
+        case .transcriptReview:
+            stored.transcriptReviewCandidates = incoming.transcriptReviewCandidates
         case .finalReport:
             stored.finalReportSnapshots = incoming.finalReportSnapshots
             stored.processingJobs = incoming.processingJobs
@@ -107,6 +120,7 @@ enum ProjectPersistence {
             mergePipelineSegments(incoming.segments, into: stored)
             stored.legacySnapshots = incoming.legacySnapshots
             stored.analysisSnapshots = incoming.analysisSnapshots
+            stored.analysisSpeakerOverrides = incoming.analysisSpeakerOverrides
             stored.finalReportSnapshots = incoming.finalReportSnapshots
             if !stored.scenarioWasUserSelected {
                 stored.scenario = incoming.scenario
@@ -130,7 +144,10 @@ enum ProjectPersistence {
         let manualChanges = Dictionary(
             uniqueKeysWithValues: incoming.compactMap { segment -> (UUID, TranscriptSegment)? in
                 guard let existing = storedByID[segment.id],
-                      segment.state == .edited || segment.isStarred != existing.isStarred else {
+                      segment.state == .edited
+                        || segment.speakerWasUserConfirmed == true
+                        || segment.participantId != existing.participantId
+                        || segment.isStarred != existing.isStarred else {
                     return nil
                 }
                 return (segment.id, segment)
@@ -150,13 +167,20 @@ enum ProjectPersistence {
         let incomingIDs = Set(incoming.map(\.id))
         var merged = incoming.map { segment in
             guard let existing = storedByID[segment.id],
-                  existing.state == .edited || existing.isStarred != segment.isStarred else {
+                  existing.state == .edited
+                    || existing.textWasUserEdited == true
+                    || existing.speakerWasUserConfirmed == true
+                    || existing.isStarred != segment.isStarred else {
                 return segment
             }
             return existing
         }
         merged.append(contentsOf: stored.segments.filter {
-            !incomingIDs.contains($0.id) && ($0.state == .edited || $0.isStarred)
+            !incomingIDs.contains($0.id)
+                && ($0.state == .edited
+                    || $0.textWasUserEdited == true
+                    || $0.speakerWasUserConfirmed == true
+                    || $0.isStarred)
         })
         stored.segments = merged.sorted {
             $0.startMs == $1.startMs ? $0.endMs < $1.endMs : $0.startMs < $1.startMs
@@ -176,6 +200,8 @@ final class AppEnvironment {
     let projectStore: any ProjectStoring
     /// 会议文件存储（录音文件布局与相对路径）
     let fileStore: MeetingFileStore
+    /// 应用级永久声纹库；与单个项目目录分离，供后续录音复用。
+    let speakerVoiceProfileStore: SpeakerVoiceProfileStore
     /// 已授权的 Obsidian Vault；为 nil 时使用 App Sandbox 内的安全回退目录。
     let obsidianVaultURL: URL?
     /// Vault 失权等情况下向设置页展示的可恢复提示。
@@ -187,6 +213,7 @@ final class AppEnvironment {
     /// 首页据此区分「此刻正在录」与「上次异常退出留下的 recording 状态」：
     /// 磁盘状态无法自证是哪一种，只有运行时登记能区分。
     private(set) var liveRecordingProjectIDs: Set<UUID> = []
+    private var pendingProjectWarnings: [UUID: String] = [:]
 
     /// 工作台开始录音时登记
     func markProjectLive(_ projectID: UUID) {
@@ -196,6 +223,14 @@ final class AppEnvironment {
     /// 录音正常结束或页面收尾时注销
     func clearProjectLive(_ projectID: UUID) {
         liveRecordingProjectIDs.remove(projectID)
+    }
+
+    func setPendingWarning(_ message: String, for projectID: UUID) {
+        pendingProjectWarnings[projectID] = message
+    }
+
+    func consumePendingWarning(for projectID: UUID) -> String? {
+        pendingProjectWarnings.removeValue(forKey: projectID)
     }
 
     /// 音频采集（阶段 1：AVAudioEngine 实现）
@@ -375,6 +410,7 @@ final class AppEnvironment {
 
         self.meetingStore = meetingStore
         self.fileStore = fileStore
+        self.speakerVoiceProfileStore = SpeakerVoiceProfileStore(baseDirectory: fileStore.baseDirectory)
         self.projectStore = projectStore ?? InMemoryProjectStore()
         self.obsidianVaultURL = obsidianVaultURL
         self.storageWarning = storageWarning
@@ -486,6 +522,42 @@ final class AppEnvironment {
         correctionRules = rules
         lexiconTerms = terms
         lexiconRevision += 1
+    }
+
+    /// 一次确认多条 AI 校对候选：先原子写入规则与正词，再保存文稿；
+    /// 文稿保存失败时恢复旧词库，避免两份权威数据只成功一半。
+    func applyTranscriptReviewCommit(
+        _ commit: TranscriptReviewCommit,
+        persistTranscript: () throws -> Void
+    ) throws {
+        let previousRules = correctionRules
+        let previousTerms = lexiconTerms
+        var rules = correctionRules
+        for rule in commit.correctionRules {
+            rules = TranscriptCorrector.mergeRule(rule, into: rules)
+        }
+        let terms = LexiconStore.merge(lexiconTerms, adding: commit.terms)
+        try lexiconStore.save(terms: terms, corrections: rules)
+        correctionRules = rules
+        lexiconTerms = terms
+        lexiconRevision += 1
+        do {
+            try persistTranscript()
+        } catch {
+            let transcriptPersistenceError = error
+            correctionRules = previousRules
+            lexiconTerms = previousTerms
+            lexiconRevision += 1
+            do {
+                try lexiconStore.save(
+                    terms: previousTerms,
+                    corrections: previousRules
+                )
+            } catch {
+                throw TranscriptReviewCommitPersistenceError.rollbackFailed
+            }
+            throw transcriptPersistenceError
+        }
     }
 
     /// 删除纠错规则

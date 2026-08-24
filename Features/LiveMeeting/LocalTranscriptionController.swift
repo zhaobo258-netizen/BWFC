@@ -127,8 +127,9 @@ final class LocalTranscriptionController {
 
         self.meeting = meeting
         self.timelineProvider = timelineProvider
-        reconciler.reset()
-        segments = []
+        reconciler.reset(finalized: meeting.segments)
+        segments = reconciler.allSegments
+        lastPublishedSignature = nil
 
         let contextual = meeting.glossary
             + extraContextualStrings
@@ -265,12 +266,12 @@ final class LocalTranscriptionController {
             remoteSpeakerLabel: remoteSpeakerLabel
         )
         switch outcome {
-        case .inserted(let segment):
-            meeting?.segments.append(segment)
+        case .inserted:
+            syncMeetingSegmentsWithReconciler()
             onFinalSegment?()
             onNewFinalSegment?()
         case .updated:
-            // 就地更新的片段已在会议片段数组中（同一实例）
+            syncMeetingSegmentsWithReconciler()
             onFinalSegment?()
             onNewFinalSegment?()
         case .skippedManual, .duplicate, .discardedEmpty:
@@ -298,8 +299,8 @@ final class LocalTranscriptionController {
                 endMs: endWallMs,
                 text: TranscriptCorrector.autoCorrect(result.text, rules: correctionRules)
             )
-            if case .inserted(let segment) = outcome {
-                meeting?.segments.append(segment)
+            if case .inserted = outcome {
+                syncMeetingSegmentsWithReconciler()
                 onFinalSegment?()
                 onNewFinalSegment?()
             }
@@ -317,5 +318,11 @@ final class LocalTranscriptionController {
             // 临时结果：节流发布（渲染风暴防护）
             publishProvisionalThrottled()
         }
+    }
+
+    /// 合并器是最终片段的唯一真相：云端把本地多人粗块拆开时，必须同时从
+    /// Meeting 权威数组移除旧粗块，否则重开项目会再次出现重复长段。
+    private func syncMeetingSegmentsWithReconciler() {
+        meeting?.segments = reconciler.finalized
     }
 }

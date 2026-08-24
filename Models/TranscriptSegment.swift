@@ -57,6 +57,10 @@ final class TranscriptSegment: Identifiable, Codable {
     var languageCode: String?
     /// 来源资产 ID（多资产项目中标注片段出自哪份素材）
     var sourceAssetId: UUID?
+    /// 仅文字被用户人工修改时为 true；说话人确认不能再锁死云端分段与文字更新。
+    var textWasUserEdited: Bool?
+    /// 说话人由用户明确确认；云端可更新文字/边界，但不得覆盖此归属。
+    var speakerWasUserConfirmed: Bool?
 
     init(
         id: UUID = UUID(),
@@ -72,7 +76,9 @@ final class TranscriptSegment: Identifiable, Codable {
         updatedAt: Date = Date(),
         speakerConfidence: Confidence? = nil,
         languageCode: String? = nil,
-        sourceAssetId: UUID? = nil
+        sourceAssetId: UUID? = nil,
+        textWasUserEdited: Bool? = nil,
+        speakerWasUserConfirmed: Bool? = nil
     ) {
         self.id = id
         self.startMs = startMs
@@ -88,5 +94,7 @@ final class TranscriptSegment: Identifiable, Codable {
         self.speakerConfidence = speakerConfidence
         self.languageCode = languageCode
         self.sourceAssetId = sourceAssetId
+        self.textWasUserEdited = textWasUserEdited
+        self.speakerWasUserConfirmed = speakerWasUserConfirmed
     }
 }

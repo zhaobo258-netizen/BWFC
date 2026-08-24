@@ -64,6 +64,19 @@ struct AnalysisTriggerTests {
         #expect(trigger.newSegmentCount == 0)
     }
 
+    @Test("成功只消费本次请求观测到的计数")
+    func successConsumesObservedCountOnly() {
+        var trigger = AnalysisTrigger()
+        trigger.noteNewSegment(atMs: 1_000)
+        trigger.noteNewSegment(atMs: 2_000)
+        let observedCount = trigger.newSegmentCount
+        trigger.noteNewSegment(atMs: 3_000)
+
+        trigger.noteSuccess(atMs: 20_000, consumingNewSegmentCount: observedCount)
+
+        #expect(trigger.newSegmentCount == 1, "请求在途到达的片段计数必须保留")
+    }
+
     @Test("失败后退避 30 秒，期间不触发")
     func failureBackoff() {
         var trigger = AnalysisTrigger()

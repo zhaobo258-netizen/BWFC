@@ -89,6 +89,13 @@ final class ProjectStoreTests {
             )
         )
 
+        let reviewCandidate = TranscriptReviewCandidate(
+            segmentId: segment.id,
+            wrong: "测试用转写",
+            right: "测试转写",
+            sourceTextAtReview: segment.text
+        )
+
         let project = Project(
             title: "年度采购谈判",
             sourceType: .liveRecording,
@@ -107,6 +114,7 @@ final class ProjectStoreTests {
             speakers: [speaker],
             segments: [segment],
             legacySnapshots: [snapshot],
+            transcriptReviewCandidates: [reviewCandidate],
             legacyMetadata: LegacyMeetingMetadata(
                 background: "背景", ourGoal: "目标", ourBottomLine: "底线",
                 counterpartContext: "对方背景", glossary: ["返点"],
@@ -186,6 +194,7 @@ final class ProjectStoreTests {
         #expect(restoredSnapshot.counterpartPositions.count == 1)
         #expect(restoredSnapshot.topics.count == 1)
         #expect(restoredSnapshot.insights.count == 1)
+        #expect(restored.transcriptReviewCandidates == [reviewCandidate])
 
         // legacyMetadata 逐字段
         let restoredLegacy = try #require(restored.legacyMetadata)
@@ -394,6 +403,80 @@ final class ProjectStoreTests {
         #expect(modelFields == registeredFields)
     }
 
+    @Test("转写复查候选只更新自己的字段")
+    func transcriptReviewOwnershipDoesNotOverwriteSegments() {
+        let segment = TranscriptSegment(
+            startMs: 0,
+            endMs: 1_000,
+            text: "存储中的原文",
+            source: .local,
+            state: .final
+        )
+        let stored = Project(
+            title: "持久化",
+            sourceType: .liveRecording,
+            segments: [segment]
+        )
+        let stale = Project(
+            id: stored.id,
+            title: stored.title,
+            sourceType: .liveRecording,
+            segments: []
+        )
+        stale.transcriptReviewCandidates = [TranscriptReviewCandidate(
+            segmentId: segment.id,
+            wrong: "原文",
+            right: "正文",
+            sourceTextAtReview: segment.text
+        )]
+        var projects = [stored]
+
+        ProjectPersistence.upsert(stale, into: &projects, fields: .transcriptReview)
+
+        #expect(projects[0].segments.count == 1)
+        #expect(projects[0].segments[0].text == "存储中的原文")
+        #expect(projects[0].transcriptReviewCandidates.count == 1)
+    }
+
+    @Test("旧 AI 推断卡片的说话人确认可单独持久化")
+    func legacyAnalysisOwnershipPersistsSpeakerOnly() throws {
+        let evidenceID = UUID()
+        let speakerID = UUID()
+        let stored = Project(
+            title: "旧快照",
+            sourceType: .liveRecording,
+            segments: [TranscriptSegment(
+                id: evidenceID,
+                startMs: 0,
+                endMs: 1_000,
+                text: "原话",
+                source: .cloud,
+                state: .final
+            )]
+        )
+        let snapshot = AnalysisSnapshot(version: 1, analyzedThroughMs: 1_000)
+        snapshot.insights = [Insight(
+            category: .possibleMotive,
+            subjectParticipantId: speakerID,
+            statement: "需要推进",
+            epistemicStatus: .inference,
+            confidence: .medium,
+            evidenceSegmentIds: [evidenceID]
+        )]
+        let incoming = Project(
+            id: stored.id,
+            title: stored.title,
+            sourceType: .liveRecording,
+            legacySnapshots: [snapshot]
+        )
+        var projects = [stored]
+
+        ProjectPersistence.upsert(incoming, into: &projects, fields: .legacyAnalysis)
+
+        #expect(projects[0].legacySnapshots.first?.insights.first?.subjectParticipantId == speakerID)
+        #expect(projects[0].segments.first?.text == "原话")
+    }
+
     @Test("流水线先写片段后，工作台旧副本只合并笔记且不冲掉片段")
     @MainActor
     func staleWorkspaceNoteDoesNotOverwritePipelineSegments() throws {
@@ -494,6 +577,50 @@ final class ProjectStoreTests {
         #expect(merged.segments.first?.text == "人工修订")
         #expect(merged.segments.first?.state == .edited)
         #expect(merged.segments.first?.isStarred == true)
+    }
+
+    @Test("流水线旧副本不覆盖用户只确认过的说话人")
+    func pipelineMergePreservesSpeakerOnlyConfirmation() {
+        let projectID = UUID()
+        let segmentID = UUID()
+        let confirmedSpeakerID = UUID()
+        let confirmed = TranscriptSegment(
+            id: segmentID,
+            startMs: 0,
+            endMs: 1_000,
+            text: "原始文字",
+            participantId: confirmedSpeakerID,
+            source: .cloud,
+            state: .final,
+            speakerWasUserConfirmed: true
+        )
+        let stored = Project(
+            id: projectID,
+            title: "存储项目",
+            sourceType: .importedAudio,
+            segments: [confirmed]
+        )
+        let pipeline = Project(
+            id: projectID,
+            title: "流水线旧副本",
+            sourceType: .importedAudio,
+            segments: [TranscriptSegment(
+                id: segmentID,
+                startMs: 0,
+                endMs: 1_000,
+                text: "原始文字",
+                participantId: nil,
+                source: .cloud,
+                state: .final
+            )]
+        )
+        var projects = [stored]
+
+        ProjectPersistence.upsert(pipeline, into: &projects, fields: .importPipeline)
+
+        #expect(projects[0].segments.first?.participantId == confirmedSpeakerID)
+        #expect(projects[0].segments.first?.speakerWasUserConfirmed == true)
+        #expect(projects[0].segments.first?.state == .final)
     }
 
     @Test("首页重命名只改标题：不冲掉磁盘上的片段、状态与分析（Bug 7）")

@@ -73,6 +73,8 @@ struct TranscriptPanelView: View {
     var onToggleStar: ((TranscriptSegment) -> Void)?
     /// 全局纠错（错词, 正词）→ 由父视图执行替换、持久化并记住规则
     var onGlobalCorrect: ((String, String) -> Int)?
+    /// 新建说话人并指认（09 号计划需求 2：工作台弹层编排回填+自动声纹；nil 时菜单不显示）
+    var onRequestNewSpeaker: ((TranscriptSegment) -> Void)?
 
     /// 是否贴底自动滚动
     @State private var pinnedToBottom = true
@@ -252,6 +254,12 @@ struct TranscriptPanelView: View {
                 Button("清除说话人映射") {
                     guard let segment = segment(for: row) else { return }
                     onAssignSpeaker?(segment, nil)
+                }
+            }
+            if onRequestNewSpeaker != nil {
+                Button("新建说话人并指认…") {
+                    guard let segment = segment(for: row) else { return }
+                    onRequestNewSpeaker?(segment)
                 }
             }
         }

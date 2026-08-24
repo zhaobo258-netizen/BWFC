@@ -143,6 +143,13 @@ struct SpeakerMapperTests {
         #expect(SpeakerMapper.letter(forIndex: 25) == "Z")
         #expect(SpeakerMapper.letter(forIndex: 26) == "AA")
     }
+
+    @Test("generic label 作用域对同一 chunk 稳定、跨 chunk 隔离")
+    func genericLabelScope() {
+        let first = SpeakerMapper.scopedRemoteLabel("speaker_0", chunkIndex: 3)
+        #expect(first == SpeakerMapper.scopedRemoteLabel("speaker_0", chunkIndex: 3))
+        #expect(first != SpeakerMapper.scopedRemoteLabel("speaker_0", chunkIndex: 4))
+    }
 }
 
 /// 声音样本校验：2–10 秒 + 有效音量（实施计划 7.5）

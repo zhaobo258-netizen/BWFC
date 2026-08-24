@@ -131,6 +131,10 @@ final class Project: Identifiable, Codable {
     var legacySnapshots: [AnalysisSnapshot] = []
     /// V2 通用分析快照（阶段 D，03 §8.4）：新分析的权威存储
     var analysisSnapshots: [ConversationAnalysisSnapshot] = []
+    /// 用户确认的分析卡片说话人归属；跨后续增量快照保留。
+    var analysisSpeakerOverrides: [AnalysisSpeakerOverride] = []
+    /// AI 全文复查产生、尚未由用户处理的转写更正候选。
+    var transcriptReviewCandidates: [TranscriptReviewCandidate] = []
     /// 录音或导入完成后的完整总结；与实时分析快照分开版本化
     var finalReportSnapshots: [FinalReportSnapshot] = []
     /// 由分析条目继续延展的知识种子、联想分支与真实来源
@@ -171,6 +175,8 @@ final class Project: Identifiable, Codable {
         segments: [TranscriptSegment] = [],
         legacySnapshots: [AnalysisSnapshot] = [],
         analysisSnapshots: [ConversationAnalysisSnapshot] = [],
+        analysisSpeakerOverrides: [AnalysisSpeakerOverride] = [],
+        transcriptReviewCandidates: [TranscriptReviewCandidate] = [],
         finalReportSnapshots: [FinalReportSnapshot] = [],
         knowledgeSeeds: [KnowledgeSeed] = [],
         aiChatMessages: [ProjectAIChatMessage] = [],
@@ -201,6 +207,8 @@ final class Project: Identifiable, Codable {
         self.segments = segments
         self.legacySnapshots = legacySnapshots
         self.analysisSnapshots = analysisSnapshots
+        self.analysisSpeakerOverrides = analysisSpeakerOverrides
+        self.transcriptReviewCandidates = transcriptReviewCandidates
         self.finalReportSnapshots = finalReportSnapshots
         self.knowledgeSeeds = knowledgeSeeds
         self.aiChatMessages = aiChatMessages
@@ -236,6 +244,14 @@ final class Project: Identifiable, Codable {
         legacySnapshots = try container.decodeIfPresent([AnalysisSnapshot].self, forKey: .legacySnapshots) ?? []
         // 兼容阶段 D 之前的 Project JSON（无 analysisSnapshots 键）
         analysisSnapshots = try container.decodeIfPresent([ConversationAnalysisSnapshot].self, forKey: .analysisSnapshots) ?? []
+        analysisSpeakerOverrides = try container.decodeIfPresent(
+            [AnalysisSpeakerOverride].self,
+            forKey: .analysisSpeakerOverrides
+        ) ?? []
+        transcriptReviewCandidates = try container.decodeIfPresent(
+            [TranscriptReviewCandidate].self,
+            forKey: .transcriptReviewCandidates
+        ) ?? []
         finalReportSnapshots = try container.decodeIfPresent(
             [FinalReportSnapshot].self,
             forKey: .finalReportSnapshots
