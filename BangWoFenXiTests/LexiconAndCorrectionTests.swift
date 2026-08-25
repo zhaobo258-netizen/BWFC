@@ -268,6 +268,15 @@ struct KnownTermsPromptTests {
         #expect(text.contains(ConversationAnalysisPrompt.rules), "红线 rules 必须原文保留")
     }
 
+    @Test("动机分析深度框架进入指令且不削弱红线")
+    func motiveFrameworkAppended() {
+        let text = ConversationAnalysisPrompt.text(scenario: nil)
+        #expect(text.contains(ConversationAnalysisPrompt.motiveFramework))
+        #expect(text.contains("四层透视"))
+        #expect(text.contains("禁止声称某人"), "越界说明必须保留在框架内")
+        #expect(text.contains(ConversationAnalysisPrompt.rules), "添加框架不得破坏红线原文")
+    }
+
     @Test("超过 200 词截断")
     func capAt200() {
         let terms = (1...300).map { "词\($0)" }
