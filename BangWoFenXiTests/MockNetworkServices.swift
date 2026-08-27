@@ -56,6 +56,12 @@ final class DiarizationMockURLProtocol: MockURLProtocolBase, @unchecked Sendable
     override class var sharedStorage: MockURLProtocolStorage { storage }
 }
 
+/// 火山引擎极速识别测试专用
+final class VolcengineMockURLProtocol: MockURLProtocolBase, @unchecked Sendable {
+    static let storage = MockURLProtocolStorage()
+    override class var sharedStorage: MockURLProtocolStorage { storage }
+}
+
 /// 阶段 4 谈判分析接口测试专用
 final class AnalysisMockURLProtocol: MockURLProtocolBase, @unchecked Sendable {
     static let storage = MockURLProtocolStorage()

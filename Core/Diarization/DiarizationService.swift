@@ -25,7 +25,7 @@ struct DiarizationProviderConfiguration: Codable, Equatable, Sendable {
         selectedProvider: DiarizationProvider = .openAICompatible,
         openAIBaseURL: String = CloudModelConfig.apiBaseURL.absoluteString,
         openAIModelID: String = CloudModelConfig.diarizationModelID,
-        volcengineResourceID: String = "volc.seedasr.sauc.duration"
+        volcengineResourceID: String = VolcengineDiarizationService.resourceID
     ) {
         self.selectedProvider = selectedProvider
         self.openAIBaseURL = openAIBaseURL
@@ -47,10 +47,16 @@ struct DiarizationProviderConfiguration: Codable, Equatable, Sendable {
             String.self,
             forKey: .openAIModelID
         ) ?? CloudModelConfig.diarizationModelID
-        volcengineResourceID = try container.decodeIfPresent(
+        let decodedVolcengineResourceID = try container.decodeIfPresent(
             String.self,
             forKey: .volcengineResourceID
-        ) ?? "volc.seedasr.sauc.duration"
+        ) ?? VolcengineDiarizationService.resourceID
+        switch decodedVolcengineResourceID {
+        case "volc.seedasr.sauc.duration", "volc.bigasr.sauc.duration":
+            volcengineResourceID = VolcengineDiarizationService.resourceID
+        default:
+            volcengineResourceID = decodedVolcengineResourceID
+        }
     }
 
     var validatedOpenAIBaseURL: URL? {
@@ -72,8 +78,7 @@ struct DiarizationProviderConfiguration: Codable, Equatable, Sendable {
         case .openAICompatible:
             return validatedOpenAIBaseURL != nil && !normalizedOpenAIModelID.isEmpty
         case .volcengine:
-            return normalizedVolcengineResourceID.hasPrefix("volc.")
-                && normalizedVolcengineResourceID.contains(".sauc.")
+            return normalizedVolcengineResourceID == VolcengineDiarizationService.resourceID
         }
     }
 
@@ -469,9 +474,9 @@ enum DiarizationServiceFactory {
                 return DisabledDiarizationService()
             }
             return VolcengineDiarizationService(
+                session: session,
                 apiKeyStore: volcengineKeyStore,
-                resourceID: configuration.normalizedVolcengineResourceID,
-                transport: URLSessionVolcengineWebSocketTransport(session: session)
+                resourceID: configuration.normalizedVolcengineResourceID
             )
         }
     }

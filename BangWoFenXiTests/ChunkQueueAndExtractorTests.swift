@@ -98,6 +98,16 @@ final class ChunkQueueAndExtractorTests {
         #expect(throws: DiarizationProviderConfigurationError.self) {
             try store.save(invalidVolcengine)
         }
+
+        let legacyVolcengine = Data("""
+        {"selectedProvider":"volcengine","openAIBaseURL":"https://api.openai.com/v1/","openAIModelID":"gpt-4o-transcribe-diarize","volcengineResourceID":"volc.seedasr.sauc.duration"}
+        """.utf8)
+        let migrated = try JSONDecoder().decode(
+            DiarizationProviderConfiguration.self,
+            from: legacyVolcengine
+        )
+        #expect(migrated.volcengineResourceID == VolcengineDiarizationService.resourceID)
+        #expect(migrated.isValid)
     }
 
     // MARK: - 分片提取

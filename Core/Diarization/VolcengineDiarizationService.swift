@@ -1,75 +1,27 @@
 import Foundation
 
-protocol VolcengineWebSocketConnection: Sendable {
-    func send(_ data: Data) async throws
-    func receive() async throws -> Data
-    func close() async
-}
-
-protocol VolcengineWebSocketTransport: Sendable {
-    func connect(request: URLRequest) async throws -> any VolcengineWebSocketConnection
-}
-
-struct URLSessionVolcengineWebSocketTransport: VolcengineWebSocketTransport {
-    private let session: URLSession
-
-    init(session: URLSession = .shared) {
-        self.session = session
-    }
-
-    func connect(request: URLRequest) async throws -> any VolcengineWebSocketConnection {
-        let task = session.webSocketTask(with: request)
-        task.resume()
-        return URLSessionVolcengineWebSocketConnection(task: task)
-    }
-}
-
-private actor URLSessionVolcengineWebSocketConnection: VolcengineWebSocketConnection {
-    private let task: URLSessionWebSocketTask
-
-    init(task: URLSessionWebSocketTask) {
-        self.task = task
-    }
-
-    func send(_ data: Data) async throws {
-        try await task.send(.data(data))
-    }
-
-    func receive() async throws -> Data {
-        switch try await task.receive() {
-        case .data(let data): return data
-        case .string: throw DiarizationAPIError.invalidResponse
-        @unknown default: throw DiarizationAPIError.invalidResponse
-        }
-    }
-
-    func close() {
-        task.cancel(with: .normalClosure, reason: nil)
-    }
-}
-
 struct VolcengineDiarizationService: DiarizationServicing {
-    static let endpoint = URL(string: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream")!
+    static let endpoint = URL(
+        string: "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash"
+    )!
+    static let resourceID = "volc.bigasr.auc_turbo"
     static let keychainAccount = "diarization-volcengine"
 
+    private let session: URLSession
     private let apiKeyStore: CloudAPIKeyStore
-    private let resourceID: String
-    private let transport: any VolcengineWebSocketTransport
+    private let configuredResourceID: String
     private let endpointURL: URL
-    private let timeout: Duration
 
     init(
+        session: URLSession = .shared,
         apiKeyStore: CloudAPIKeyStore,
-        resourceID: String,
-        transport: any VolcengineWebSocketTransport = URLSessionVolcengineWebSocketTransport(),
-        endpointURL: URL = endpoint,
-        timeout: Duration = .seconds(60)
+        resourceID: String = resourceID,
+        endpointURL: URL = endpoint
     ) {
+        self.session = session
         self.apiKeyStore = apiKeyStore
-        self.resourceID = resourceID
-        self.transport = transport
+        self.configuredResourceID = resourceID
         self.endpointURL = endpointURL
-        self.timeout = timeout
     }
 
     func transcribeChunk(
@@ -83,15 +35,15 @@ struct VolcengineDiarizationService: DiarizationServicing {
             throw DiarizationAPIError.network
         }
         guard !audioData.isEmpty else { throw DiarizationAPIError.invalidResponse }
-        return try await transcribe(audioData: audioData, format: "wav")
+        return try await recognize(wavData: audioData)
     }
 
     func testConnection() async throws -> Bool {
-        _ = try await transcribe(audioData: Self.silentPCM(), format: "raw")
+        _ = try await recognize(wavData: Self.silentWAV())
         return true
     }
 
-    private func transcribe(audioData: Data, format: String) async throws -> DiarizationChunkResult {
+    private func recognize(wavData: Data) async throws -> DiarizationChunkResult {
         let apiKey: String?
         do {
             apiKey = try apiKeyStore.readKey()
@@ -102,83 +54,54 @@ struct VolcengineDiarizationService: DiarizationServicing {
         }
         guard let apiKey, !apiKey.isEmpty else { throw DiarizationAPIError.missingAPIKey }
 
+        let requestBody = RequestDTO(
+            user: .init(uid: UUID().uuidString),
+            audio: .init(data: wavData.base64EncodedString()),
+            request: .init()
+        )
         var request = URLRequest(url: endpointURL)
-        request.timeoutInterval = timeout.timeInterval
+        request.httpMethod = "POST"
+        request.timeoutInterval = 60
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(apiKey, forHTTPHeaderField: "X-Api-Key")
-        request.setValue(resourceID, forHTTPHeaderField: "X-Api-Resource-Id")
+        request.setValue(configuredResourceID, forHTTPHeaderField: "X-Api-Resource-Id")
         request.setValue(UUID().uuidString, forHTTPHeaderField: "X-Api-Request-Id")
-
-        let connection: any VolcengineWebSocketConnection
+        request.setValue("-1", forHTTPHeaderField: "X-Api-Sequence")
         do {
-            connection = try await transport.connect(request: request)
+            request.httpBody = try JSONEncoder().encode(requestBody)
         } catch {
-            throw Self.mapTransportError(error)
+            throw DiarizationAPIError.invalidResponse
         }
-        defer { Task { await connection.close() } }
 
+        let data: Data
+        let response: URLResponse
         do {
-            let requestPayload = try JSONEncoder().encode(RequestDTO(format: format))
-            try await connection.send(VolcengineProtocolCodec.encodeJSONRequest(requestPayload))
-            let packetSize = 200 * 1024
-            var offset = 0
-            var sequence: Int32 = 2
-            while offset < audioData.count {
-                let end = min(offset + packetSize, audioData.count)
-                let isFinal = end == audioData.count
-                try await connection.send(VolcengineProtocolCodec.encodeAudio(
-                    audioData.subdata(in: offset..<end),
-                    sequence: sequence,
-                    isFinal: isFinal
-                ))
-                offset = end
-                sequence += 1
-            }
-            return try await receiveFinalResult(from: connection)
-        } catch let error as DiarizationAPIError {
-            throw error
+            (data, response) = try await session.data(for: request)
+        } catch let error as URLError where error.code == .userAuthenticationRequired {
+            throw DiarizationAPIError.unauthorized
         } catch {
-            throw Self.mapTransportError(error)
+            throw DiarizationAPIError.network
         }
-    }
+        guard let http = response as? HTTPURLResponse else {
+            throw DiarizationAPIError.invalidResponse
+        }
+        try Self.validateHTTPStatus(http.statusCode)
 
-    private func receiveFinalResult(
-        from connection: any VolcengineWebSocketConnection
-    ) async throws -> DiarizationChunkResult {
-        try await withThrowingTaskGroup(of: DiarizationChunkResult.self) { group in
-            group.addTask {
-                var latest: DiarizationChunkResult?
-                for _ in 0..<200 {
-                    let data = try await connection.receive()
-                    let frame: VolcengineFrame
-                    do {
-                        frame = try VolcengineProtocolCodec.decode(data)
-                    } catch {
-                        throw DiarizationAPIError.invalidResponse
-                    }
-                    switch frame.messageType {
-                    case .fullServerResponse:
-                        latest = try Self.parseResponse(frame.payload)
-                        if frame.isFinal, let latest { return latest }
-                    case .serverAcknowledgement:
-                        continue
-                    case .serverError:
-                        throw Self.mapServerError(frame.errorCode)
-                    default:
-                        throw DiarizationAPIError.invalidResponse
-                    }
-                }
-                throw DiarizationAPIError.invalidResponse
-            }
-            group.addTask {
-                try await Task.sleep(for: timeout)
-                await connection.close()
-                throw DiarizationAPIError.network
-            }
-            guard let result = try await group.next() else {
-                throw DiarizationAPIError.invalidResponse
-            }
-            group.cancelAll()
-            return result
+        guard let providerStatus = http.value(forHTTPHeaderField: "X-Api-Status-Code"),
+              let statusCode = Int(providerStatus) else {
+            throw DiarizationAPIError.invalidResponse
+        }
+        switch statusCode {
+        case 20_000_000:
+            return try Self.parseResponse(data)
+        case 20_000_003:
+            return DiarizationChunkResult(durationMs: 0, segments: [])
+        case 45_000_081:
+            throw DiarizationAPIError.network
+        case 55_000_000...55_999_999:
+            throw DiarizationAPIError.serverError(statusCode: statusCode)
+        default:
+            throw DiarizationAPIError.clientError(statusCode: statusCode)
         }
     }
 
@@ -189,12 +112,13 @@ struct VolcengineDiarizationService: DiarizationServicing {
         } catch {
             throw DiarizationAPIError.invalidResponse
         }
-        guard let result = dto.result, let utterances = result.utterances else {
+        guard let result = dto.result,
+              let utterances = result.utterances else {
             throw DiarizationAPIError.invalidResponse
         }
         var segments: [DiarizationChunkResult.Segment] = []
         var seen = Set<String>()
-        for utterance in utterances where utterance.definite != false {
+        for utterance in utterances {
             let text = utterance.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             guard let start = utterance.startTime,
                   let end = utterance.endTime,
@@ -224,62 +148,52 @@ struct VolcengineDiarizationService: DiarizationServicing {
         return DiarizationChunkResult(durationMs: duration, segments: segments)
     }
 
-    private static func mapServerError(_ code: Int32?) -> DiarizationAPIError {
-        guard let code else { return .invalidResponse }
-        switch code {
-        case 401: return .unauthorized
-        case 429: return .rateLimited
-        case 45000081: return .network
-        case 500...599, 55_000_000...55_999_999: return .serverError(statusCode: Int(code))
-        default: return .clientError(statusCode: Int(code))
+    private static func validateHTTPStatus(_ statusCode: Int) throws {
+        switch statusCode {
+        case 200..<300: return
+        case 401, 403: throw DiarizationAPIError.unauthorized
+        case 429: throw DiarizationAPIError.rateLimited
+        case 500...599: throw DiarizationAPIError.serverError(statusCode: statusCode)
+        default: throw DiarizationAPIError.clientError(statusCode: statusCode)
         }
     }
 
-    private static func mapTransportError(_ error: Error) -> DiarizationAPIError {
-        if let error = error as? DiarizationAPIError { return error }
-        if let urlError = error as? URLError,
-           urlError.code == .userAuthenticationRequired {
-            return .unauthorized
-        }
-        return .network
+    private static func silentWAV() -> Data {
+        let pcm = Data(repeating: 0, count: 3_200)
+        var wav = Data("RIFF".utf8)
+        appendLittleEndian(UInt32(36 + pcm.count), to: &wav)
+        wav.append(Data("WAVEfmt ".utf8))
+        appendLittleEndian(UInt32(16), to: &wav)
+        appendLittleEndian(UInt16(1), to: &wav)
+        appendLittleEndian(UInt16(1), to: &wav)
+        appendLittleEndian(UInt32(16_000), to: &wav)
+        appendLittleEndian(UInt32(32_000), to: &wav)
+        appendLittleEndian(UInt16(2), to: &wav)
+        appendLittleEndian(UInt16(16), to: &wav)
+        wav.append(Data("data".utf8))
+        appendLittleEndian(UInt32(pcm.count), to: &wav)
+        wav.append(pcm)
+        return wav
     }
 
-    private static func silentPCM() -> Data {
-        Data(repeating: 0, count: 3_200)
+    private static func appendLittleEndian<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
     }
 
     private struct RequestDTO: Encodable {
-        let user = User(uid: UUID().uuidString)
-        let audio: Audio
-        let request = RecognitionRequest()
+        let user: UserDTO
+        let audio: AudioDTO
+        let request: RecognitionRequestDTO
 
-        init(format: String) {
-            audio = Audio(format: format)
-        }
-
-        struct User: Encodable { let uid: String }
-        struct Audio: Encodable {
-            let format: String
-            let codec = "raw"
-            let rate: Int?
-            let bits: Int?
-            let channel: Int?
-
-            init(format: String) {
-                self.format = format
-                let isRaw = format == "raw"
-                rate = isRaw ? 16_000 : nil
-                bits = isRaw ? 16 : nil
-                channel = isRaw ? 1 : nil
-            }
-        }
-        struct RecognitionRequest: Encodable {
+        struct UserDTO: Encodable { let uid: String }
+        struct AudioDTO: Encodable { let data: String }
+        struct RecognitionRequestDTO: Encodable {
             let modelName = "bigmodel"
             let enableITN = true
             let enablePunc = true
             let showUtterances = true
             let enableSpeakerInfo = true
-            let resultType = "full"
 
             enum CodingKeys: String, CodingKey {
                 case modelName = "model_name"
@@ -287,7 +201,6 @@ struct VolcengineDiarizationService: DiarizationServicing {
                 case enablePunc = "enable_punc"
                 case showUtterances = "show_utterances"
                 case enableSpeakerInfo = "enable_speaker_info"
-                case resultType = "result_type"
             }
         }
     }
@@ -301,35 +214,26 @@ struct VolcengineDiarizationService: DiarizationServicing {
             case audioInfo = "audio_info"
         }
 
-        struct AudioInfoDTO: Decodable {
-            let duration: Int64?
-        }
-
+        struct AudioInfoDTO: Decodable { let duration: Int64? }
         struct ResultDTO: Decodable {
             let duration: Int64?
             let utterances: [UtteranceDTO]?
             let additions: ResultAdditionsDTO?
         }
-
-        struct ResultAdditionsDTO: Decodable {
-            let duration: FlexibleString?
-        }
-
+        struct ResultAdditionsDTO: Decodable { let duration: FlexibleString? }
         struct UtteranceDTO: Decodable {
             let startTime: Int64?
             let endTime: Int64?
             let text: String?
-            let definite: Bool?
             let additions: AdditionsDTO?
             let speaker: FlexibleString?
 
             enum CodingKeys: String, CodingKey {
                 case startTime = "start_time"
                 case endTime = "end_time"
-                case text, definite, additions, speaker
+                case text, additions, speaker
             }
         }
-
         struct AdditionsDTO: Decodable {
             let speaker: FlexibleString?
             let speakerID: FlexibleString?
@@ -339,10 +243,8 @@ struct VolcengineDiarizationService: DiarizationServicing {
                 case speakerID = "speaker_id"
             }
         }
-
         struct FlexibleString: Decodable {
             let value: String
-
             var int64Value: Int64? { Int64(value) }
 
             init(from decoder: any Decoder) throws {
@@ -359,12 +261,5 @@ struct VolcengineDiarizationService: DiarizationServicing {
                 }
             }
         }
-    }
-}
-
-private extension Duration {
-    var timeInterval: TimeInterval {
-        let components = self.components
-        return Double(components.seconds) + Double(components.attoseconds) / 1e18
     }
 }

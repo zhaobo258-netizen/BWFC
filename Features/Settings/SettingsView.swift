@@ -252,12 +252,13 @@ struct SettingsView: View {
     private var diarizationVolcengineConfigurationSection: some View {
         let keyStore = environment.volcengineDiarizationKeyStore
         let hasSavedKey = keyStore.hasConfiguredKey
-        return Section("火山引擎 Seed ASR") {
+        return Section("火山引擎录音文件极速识别") {
             TextField(
                 "Resource ID",
                 text: $diarizationConfiguration.volcengineResourceID
             )
             .textFieldStyle(.roundedBorder)
+            .disabled(true)
             SecureField(
                 hasSavedKey
                     ? "API Key 已安全保存；粘贴新 Key 可替换"
@@ -297,7 +298,7 @@ struct SettingsView: View {
             if let result = volcengineTestResult {
                 statusText(result.text)
             }
-            Text("使用新控制台 X-Api-Key 鉴权。默认 Resource ID 为 Seed ASR 2.0 小时版；连接测试只发送约 0.1 秒合成静音，不发送项目、录音或逐字稿。火山阶段只返回匿名说话人标签，真实姓名仍由本地映射。")
+            Text("使用新版控制台单 X-Api-Key 鉴权，Resource ID 固定为极速版。连接测试只发送约 0.1 秒合成静音，不发送项目、录音或逐字稿。火山阶段只返回匿名说话人标签，真实姓名仍由本地映射。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
