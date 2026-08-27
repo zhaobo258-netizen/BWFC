@@ -1517,11 +1517,13 @@ struct ProjectWorkspaceView: View {
         }
         transcription = controller
 
+        let diarizationConfiguration = environment.diarizationConfigurationSnapshot()
         diarization = DiarizationController(
-            diarization: environment.diarization,
+            diarization: environment.makeDiarizationService(for: diarizationConfiguration),
             fileStore: environment.fileStore,
             transcriptController: controller,
-            keyStore: environment.keyStore(for: .diarization)
+            keyStore: environment.keyStore(for: .diarization),
+            configurationSnapshot: diarizationConfiguration
         )
 
         let knowledgeController = KnowledgeGardenController(

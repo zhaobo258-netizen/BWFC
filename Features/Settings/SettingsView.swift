@@ -29,6 +29,8 @@ struct SettingsView: View {
     @State private var selectedSection: SettingsSection? = .ai
     @State private var analysisKeyInput = ""
     @State private var diarizationKeyInput = ""
+    @State private var diarizationConfiguration = DiarizationProviderConfiguration()
+    @State private var diarizationMessage: String?
     @State private var testResults: [CloudProvider: (ok: Bool, text: String)] = [:]
     @State private var testingProvider: CloudProvider?
     @State private var login: KimiLoginController?
@@ -85,6 +87,7 @@ struct SettingsView: View {
         }
         .onAppear {
             aiConfiguration = environment.aiProviderConfigurationStore.load()
+            diarizationConfiguration = environment.diarizationProviderConfigurationStore.load()
             reloadMCPConfigurations()
         }
         .confirmationDialog(
@@ -171,17 +174,22 @@ struct SettingsView: View {
             .formStyle(.grouped)
         case .recording:
             Form {
-                keySection(
-                    provider: .diarization,
-                    title: "高精度转写与说话人 API Key（OpenAI 兼容）",
-                    input: $diarizationKeyInput,
-                    footnote: "Kimi 只负责文字分析，不能直接识别录音。未配置时使用本地 Apple Speech；配置后新录音会把音频分片发送到兼容服务，用高精度结果校正本地文稿并识别说话人。"
-                )
-                Section("当前能力") {
-                    LabeledContent(
-                        "高精度转写与说话人",
-                        value: "OpenAI 兼容 · \(CloudModelConfig.diarizationModelID)"
+                diarizationProviderSection
+                if diarizationConfiguration.selectedProvider == .openAICompatible {
+                    diarizationOpenAIConfigurationSection
+                    keySection(
+                        provider: .diarization,
+                        title: "高精度转写与说话人 API Key（OpenAI 兼容）",
+                        input: $diarizationKeyInput,
+                        footnote: "凭证只供当前分人 provider 使用，不会借给 Kimi 或其他服务。"
                     )
+                }
+                Section("当前能力") {
+                    LabeledContent("本地实时转写", value: "Apple Speech · 始终启用")
+                    LabeledContent("云端增强", value: diarizationConfiguration.selectedProvider.displayName)
+                    Text("设置变更从下一次会议生效；正在录音或恢复中的队列继续使用会议开始时冻结的配置。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                     Text("专业词条在下一次录音或导入时进入 Apple Speech 上下文；录音中不会重启转写。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -194,6 +202,51 @@ struct SettingsView: View {
                 privacySection
             }
             .formStyle(.grouped)
+        }
+    }
+
+    private var diarizationProviderSection: some View {
+        Section("云端高精度转写与分人") {
+            Picker("Provider", selection: $diarizationConfiguration.selectedProvider) {
+                ForEach(DiarizationProvider.allCases, id: \.self) { provider in
+                    Text(provider == .volcengine ? "火山引擎（待探针）" : provider.displayName)
+                        .tag(provider)
+                        .disabled(!provider.isImplemented)
+                }
+            }
+            .pickerStyle(.segmented)
+            .onChange(of: diarizationConfiguration.selectedProvider) { _, provider in
+                guard provider == .volcengine else { return }
+                diarizationConfiguration = environment.diarizationProviderConfigurationStore.load()
+                diarizationMessage = "火山引擎尚未完成官方接口与账号探针，当前不能设为会议 Provider。"
+            }
+            Button("保存默认 Provider") {
+                saveDiarizationConfiguration()
+            }
+            if let diarizationMessage {
+                statusText(diarizationMessage)
+            }
+            Text("关闭云端增强不会关闭本地录音和 Apple Speech。火山引擎需先完成官方接口、账号鉴权和 Resource ID 探针，当前不会伪装成可用。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var diarizationOpenAIConfigurationSection: some View {
+        Section("OpenAI 兼容配置") {
+            TextField(
+                "Base URL，例如 https://api.openai.com/v1",
+                text: $diarizationConfiguration.openAIBaseURL
+            )
+            .textFieldStyle(.roundedBorder)
+            TextField("Model ID", text: $diarizationConfiguration.openAIModelID)
+                .textFieldStyle(.roundedBorder)
+            Button("保存非敏感配置") {
+                saveDiarizationConfiguration()
+            }
+            Text("仅允许 HTTPS；本机服务可使用 localhost。音频分片会发送到该服务，高精度结果用于校正文稿和匿名说话人分离。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -1051,6 +1104,17 @@ struct SettingsView: View {
         }
     }
 
+    private func saveDiarizationConfiguration() {
+        do {
+            try environment.diarizationProviderConfigurationStore.save(diarizationConfiguration)
+            environment.refreshCloudConfiguration()
+            diarizationMessage = "已保存；从下一次会议开始生效。"
+        } catch {
+            diarizationMessage = "保存失败：\(error.localizedDescription)"
+            diarizationConfiguration = environment.diarizationProviderConfigurationStore.load()
+        }
+    }
+
     private func deleteKey(provider: CloudProvider) {
         do {
             try environment.keyStore(for: provider).deleteKey()
@@ -1084,7 +1148,10 @@ struct SettingsView: View {
                     _ = try await environment.aiProviderRegistry.testActiveConnection()
                     ok = true
                 case .diarization:
-                    ok = try await environment.diarization.testConnection()
+                    let configuration = environment.diarizationProviderConfigurationStore.load()
+                    ok = try await environment.makeDiarizationService(
+                        for: configuration
+                    ).testConnection()
                 }
                 testResults[provider] = ok
                     ? (true, "连接正常（\(provider.displayName) 可用）")

@@ -1,5 +1,142 @@
 import Foundation
 
+enum DiarizationProvider: String, Codable, Sendable, CaseIterable {
+    case disabled
+    case openAICompatible
+    case volcengine
+
+    var displayName: String {
+        switch self {
+        case .disabled: return "关闭"
+        case .openAICompatible: return "OpenAI 兼容"
+        case .volcengine: return "火山引擎"
+        }
+    }
+
+    var isImplemented: Bool {
+        self != .volcengine
+    }
+}
+
+struct DiarizationProviderConfiguration: Codable, Equatable, Sendable {
+    var selectedProvider: DiarizationProvider
+    var openAIBaseURL: String
+    var openAIModelID: String
+    var volcengineResourceID: String
+
+    init(
+        selectedProvider: DiarizationProvider = .openAICompatible,
+        openAIBaseURL: String = CloudModelConfig.apiBaseURL.absoluteString,
+        openAIModelID: String = CloudModelConfig.diarizationModelID,
+        volcengineResourceID: String = ""
+    ) {
+        self.selectedProvider = selectedProvider
+        self.openAIBaseURL = openAIBaseURL
+        self.openAIModelID = openAIModelID
+        self.volcengineResourceID = volcengineResourceID
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        selectedProvider = try container.decodeIfPresent(
+            DiarizationProvider.self,
+            forKey: .selectedProvider
+        ) ?? .openAICompatible
+        openAIBaseURL = try container.decodeIfPresent(
+            String.self,
+            forKey: .openAIBaseURL
+        ) ?? CloudModelConfig.apiBaseURL.absoluteString
+        openAIModelID = try container.decodeIfPresent(
+            String.self,
+            forKey: .openAIModelID
+        ) ?? CloudModelConfig.diarizationModelID
+        volcengineResourceID = try container.decodeIfPresent(
+            String.self,
+            forKey: .volcengineResourceID
+        ) ?? ""
+    }
+
+    var validatedOpenAIBaseURL: URL? {
+        AIProviderConfiguration.validatedBaseURL(openAIBaseURL)
+    }
+
+    var normalizedOpenAIModelID: String {
+        openAIModelID.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var isValid: Bool {
+        switch selectedProvider {
+        case .disabled:
+            return true
+        case .openAICompatible:
+            return validatedOpenAIBaseURL != nil && !normalizedOpenAIModelID.isEmpty
+        case .volcengine:
+            // 阶段 0 尚未确认账号鉴权合同和 Resource ID，不允许伪装为可用配置。
+            return false
+        }
+    }
+
+    var fingerprint: String {
+        let value = [
+            selectedProvider.rawValue,
+            openAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines),
+            normalizedOpenAIModelID,
+            volcengineResourceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        ].joined(separator: "\u{1F}")
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in value.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return String(hash, radix: 16)
+    }
+}
+
+struct DiarizationProviderConfigurationStore: @unchecked Sendable {
+    static let defaultsKey = "bwfx.diarization.provider.configuration"
+    static let legacyProviderKey = "bwfx.diarization.provider"
+
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    func load() -> DiarizationProviderConfiguration {
+        if let data = defaults.data(forKey: Self.defaultsKey),
+           let configuration = try? JSONDecoder().decode(
+               DiarizationProviderConfiguration.self,
+               from: data
+           ) {
+            return configuration
+        }
+        let legacy = defaults.string(forKey: Self.legacyProviderKey)
+        let provider: DiarizationProvider = legacy == "disabled" ? .disabled : .openAICompatible
+        return DiarizationProviderConfiguration(selectedProvider: provider)
+    }
+
+    func save(_ configuration: DiarizationProviderConfiguration) throws {
+        guard configuration.isValid else {
+            throw DiarizationProviderConfigurationError.invalidConfiguration(
+                provider: configuration.selectedProvider
+            )
+        }
+        defaults.set(try JSONEncoder().encode(configuration), forKey: Self.defaultsKey)
+        defaults.removeObject(forKey: Self.legacyProviderKey)
+    }
+}
+
+enum DiarizationProviderConfigurationError: Error, Equatable, LocalizedError {
+    case invalidConfiguration(provider: DiarizationProvider)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidConfiguration(let provider):
+            return "\(provider.displayName) 配置不完整或无效。"
+        }
+    }
+}
+
 /// 已知说话人参考（实施计划 10.1）：本地代号 + 声音样本文件。
 /// 真实姓名绝不作为云端参数（实施计划 7.5）。
 struct KnownSpeakerReference: Equatable, Sendable {
@@ -285,6 +422,45 @@ struct OpenAIDiarizationService: DiarizationServicing {
             let end: Double?
             let text: String?
             let speaker: String?
+        }
+    }
+}
+
+struct DisabledDiarizationService: DiarizationServicing {
+    func transcribeChunk(
+        at chunkURL: URL,
+        knownSpeakers: [KnownSpeakerReference]
+    ) async throws -> DiarizationChunkResult {
+        throw DiarizationProviderConfigurationError.invalidConfiguration(provider: .disabled)
+    }
+
+    func testConnection() async throws -> Bool {
+        throw DiarizationProviderConfigurationError.invalidConfiguration(provider: .disabled)
+    }
+}
+
+enum DiarizationServiceFactory {
+    static func make(
+        configuration: DiarizationProviderConfiguration,
+        keyStore: CloudAPIKeyStore = CloudAPIKeyStore.store(for: .diarization),
+        session: URLSession = .shared
+    ) -> any DiarizationServicing {
+        switch configuration.selectedProvider {
+        case .disabled:
+            return DisabledDiarizationService()
+        case .openAICompatible:
+            guard let baseURL = configuration.validatedOpenAIBaseURL,
+                  !configuration.normalizedOpenAIModelID.isEmpty else {
+                return DisabledDiarizationService()
+            }
+            return OpenAIDiarizationService(
+                session: session,
+                apiKeyStore: keyStore,
+                baseURL: baseURL,
+                modelID: configuration.normalizedOpenAIModelID
+            )
+        case .volcengine:
+            return DisabledDiarizationService()
         }
     }
 }

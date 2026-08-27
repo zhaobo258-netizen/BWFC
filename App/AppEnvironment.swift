@@ -237,8 +237,8 @@ final class AppEnvironment {
     let audioCapture: any AudioCaptureServicing
     /// 本地转写（阶段 2 实现）
     let localTranscription: any LocalTranscriptionServicing
-    /// 云端说话人识别（阶段 3 实现）
-    let diarization: any DiarizationServicing
+    /// 测试可注入固定服务；生产运行按会议配置快照创建实例。
+    private let diarizationServiceOverride: (any DiarizationServicing)?
     /// 云端谈判分析（阶段 4 实现；V1 遗留，旧会议页面使用）
     let negotiationAnalysis: any NegotiationAnalysisServicing
     /// V2 通用对话分析（阶段 D，语义分析师；工作台与导入流水线使用）
@@ -311,6 +311,7 @@ final class AppEnvironment {
     /// Kimi 账号 OAuth 凭证存储（设备码登录；与静态分析 Key 独立条目）
     let kimiOAuthTokenStore: KimiOAuthTokenStore
     let aiProviderConfigurationStore: AIProviderConfigurationStore
+    let diarizationProviderConfigurationStore: DiarizationProviderConfigurationStore
     let openAICompatibleKeyStore: CloudAPIKeyStore
     let aiProviderRegistry: AIProviderRegistry
     /// 外部知识 MCP 的非敏感连接配置与独立 Keychain Token
@@ -366,7 +367,8 @@ final class AppEnvironment {
         securityScopedStorageAccess: SecurityScopedStorageAccess? = nil,
         audioCapture: any AudioCaptureServicing = AVAudioCaptureService(),
         localTranscription: any LocalTranscriptionServicing = AppleSpeechTranscriptionService(),
-        diarization: any DiarizationServicing = OpenAIDiarizationService(),
+        diarization: (any DiarizationServicing)? = nil,
+        diarizationProvider: DiarizationProvider? = nil,
         negotiationAnalysis: (any NegotiationAnalysisServicing)? = nil,
         conversationAnalysis: (any ConversationAnalysisServicing)? = nil,
         knowledgeExpansion: (any KnowledgeExpansionServicing)? = nil,
@@ -378,6 +380,7 @@ final class AppEnvironment {
         makeImportTranscriptionService: (() -> any LocalTranscriptionServicing)? = nil,
         keychainServiceName: String = CloudAPIKeyStore.defaultService,
         aiProviderConfigurationStore: AIProviderConfigurationStore? = nil,
+        diarizationProviderConfigurationStore: DiarizationProviderConfigurationStore? = nil,
         externalMCPConfigurationStore: ExternalMCPConfigurationStore? = nil,
         isPersistentStorageUnavailable: Bool = false
     ) {
@@ -398,6 +401,8 @@ final class AppEnvironment {
         )
         let aiConfigurationStore = aiProviderConfigurationStore
             ?? AIProviderConfigurationStore()
+        let diarizationConfigurationStore = diarizationProviderConfigurationStore
+            ?? DiarizationProviderConfigurationStore()
         let openAIKeyStore = CloudAPIKeyStore(
             service: keychainServiceName,
             account: AIProviderConfigurationStore.openAIKeychainAccount
@@ -417,7 +422,22 @@ final class AppEnvironment {
         self.securityScopedStorageAccess = securityScopedStorageAccess
         self.audioCapture = audioCapture
         self.localTranscription = localTranscription
-        self.diarization = diarization
+        var diarizationConfiguration = diarizationConfigurationStore.load()
+        if let diarizationProvider {
+            diarizationConfiguration.selectedProvider = diarizationProvider
+        }
+        let diarizationStore = stores[.diarization]
+            ?? CloudAPIKeyStore.store(for: .diarization, service: keychainServiceName)
+        self.diarizationServiceOverride = diarization
+        if !diarizationConfiguration.selectedProvider.isImplemented {
+            AppLog.logWarning(
+                AppLog.diarization,
+                LogSanitizer.formatEvent(
+                    "diarization_provider_not_ready",
+                    error: "provider=\(diarizationConfiguration.selectedProvider.rawValue)"
+                )
+            )
+        }
         self.negotiationAnalysis = negotiationAnalysis ?? sharedTransport
         self.conversationAnalysis = conversationAnalysis
             ?? KimiConversationAnalysisService(generationService: providerRegistry)
@@ -445,13 +465,17 @@ final class AppEnvironment {
         self.keychainServiceName = keychainServiceName
         self.kimiOAuthTokenStore = oauthStore
         self.aiProviderConfigurationStore = aiConfigurationStore
+        self.diarizationProviderConfigurationStore = diarizationConfigurationStore
         self.openAICompatibleKeyStore = openAIKeyStore
         self.aiProviderRegistry = providerRegistry
         self.externalMCPConfigurationStore = externalMCPConfigurationStore
             ?? ExternalMCPConfigurationStore()
         let hasStoredOAuthTokens = oauthStore.hasStoredTokens
         self.isKimiAccountConnected = hasStoredOAuthTokens
-        self.isDiarizationConfigured = stores[.diarization]?.hasConfiguredKey ?? false
+        self.isDiarizationConfigured = Self.isDiarizationConfigured(
+            configuration: diarizationConfiguration,
+            keyStore: diarizationStore
+        )
     }
 
     // MARK: - 专业词库与纠错规则
@@ -601,11 +625,44 @@ final class AppEnvironment {
         keyStore(for: provider).hasConfiguredKey
     }
 
+    func makeDiarizationService(
+        for configuration: DiarizationProviderConfiguration
+    ) -> any DiarizationServicing {
+        if let diarizationServiceOverride {
+            return diarizationServiceOverride
+        }
+        return DiarizationServiceFactory.make(
+            configuration: configuration,
+            keyStore: keyStore(for: .diarization)
+        )
+    }
+
+    func diarizationConfigurationSnapshot() -> DiarizationProviderConfiguration {
+        diarizationProviderConfigurationStore.load()
+    }
+
     /// API Key / 登录状态变更后刷新各 provider 配置状态
     func refreshCloudConfiguration() {
         isKimiAccountConnected = kimiOAuthTokenStore.hasStoredTokens
-        isDiarizationConfigured = isConfigured(.diarization)
+        isDiarizationConfigured = Self.isDiarizationConfigured(
+            configuration: diarizationProviderConfigurationStore.load(),
+            keyStore: keyStore(for: .diarization)
+        )
         cloudConfigurationRevision += 1
+    }
+
+    private static func isDiarizationConfigured(
+        configuration: DiarizationProviderConfiguration,
+        keyStore: CloudAPIKeyStore
+    ) -> Bool {
+        switch configuration.selectedProvider {
+        case .disabled:
+            return false
+        case .openAICompatible:
+            return configuration.isValid && keyStore.hasConfiguredKey
+        case .volcengine:
+            return false
+        }
     }
 
     /// Obsidian 检索索引跨多次“开花”复用（actor 内含 5 分钟缓存；

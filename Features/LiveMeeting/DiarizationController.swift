@@ -19,6 +19,8 @@ final class DiarizationController {
     }
 
     private let diarization: any DiarizationServicing
+    /// 会议开始时冻结；设置变化只影响下一次创建的控制器。
+    private let configurationSnapshot: DiarizationProviderConfiguration
     private let fileStore: MeetingFileStore
     private let transcriptController: LocalTranscriptionController
     private let retryPolicy: RetryPolicy
@@ -46,6 +48,7 @@ final class DiarizationController {
     private enum SuspensionCause: Equatable {
         case providerCredential
         case knownSpeakerConfiguration
+        case providerConfigurationMismatch
     }
 
     private struct UploadedChunk {
@@ -64,6 +67,7 @@ final class DiarizationController {
         retryPolicy: RetryPolicy = RetryPolicy(),
         planner: ChunkPlanner = ChunkPlanner(),
         keyStore: CloudAPIKeyStore = CloudAPIKeyStore.store(for: .diarization),
+        configurationSnapshot: DiarizationProviderConfiguration = DiarizationProviderConfiguration(),
         sleep: @escaping (Int64) async -> Void = { ms in
             try? await Task.sleep(for: .milliseconds(ms))
         }
@@ -74,6 +78,7 @@ final class DiarizationController {
         self.retryPolicy = retryPolicy
         self.planner = planner
         self.keyStore = keyStore
+        self.configurationSnapshot = configurationSnapshot
         self.sleep = sleep
     }
 
@@ -95,6 +100,10 @@ final class DiarizationController {
             queue = restored.map { entry in
                 var entry = entry
                 if entry.status == .uploading { entry.status = .failed }
+                if entry.providerConfigurationFingerprint.isEmpty,
+                   entry.provider == configurationSnapshot.selectedProvider {
+                    entry.providerConfigurationFingerprint = configurationSnapshot.fingerprint
+                }
                 return entry
             }
             nextChunkIndex = (queue.map(\.index).max() ?? -1) + 1
@@ -109,8 +118,20 @@ final class DiarizationController {
             try? store.save(queue)
         }
 
+        if queue.contains(where: {
+            $0.needsProcessing
+                && ($0.provider != configurationSnapshot.selectedProvider
+                    || $0.providerConfigurationFingerprint != configurationSnapshot.fingerprint)
+        }) {
+            suspensionCause = .providerConfigurationMismatch
+            cloudState = .suspended(
+                reason: "待处理分片属于另一套云端配置。请恢复原配置后重开会议；系统不会静默改投其他 provider。"
+            )
+            return
+        }
+
         // 未配置分人 Key：零请求，仅保留本地能力
-        guard keyStore.hasConfiguredKey else {
+        guard isProviderConfigured else {
             cloudState = .unconfigured
             return
         }
@@ -130,7 +151,7 @@ final class DiarizationController {
         mapper = rebuilt
         guard suspensionCause == .knownSpeakerConfiguration else { return }
         suspensionCause = nil
-        guard keyStore.hasConfiguredKey else {
+        guard isProviderConfigured else {
             cloudState = .unconfigured
             return
         }
@@ -221,6 +242,8 @@ final class DiarizationController {
                 wallStartMs: timeline.wallMs(forEffectiveAudioMs: window.audioStartMs),
                 wallEndMs: timeline.wallMs(forEffectiveAudioMs: window.audioEndMs),
                 fileName: fileName,
+                provider: configurationSnapshot.selectedProvider,
+                providerConfigurationFingerprint: configurationSnapshot.fingerprint,
                 status: .pending,
                 attemptCount: 0
             )
@@ -266,7 +289,25 @@ final class DiarizationController {
             persistQueue()
 
             do {
+                AppLog.logInfo(
+                    AppLog.diarization,
+                    LogSanitizer.formatEvent(
+                        "chunk_upload_started",
+                        error: "index=\(entry.index),file=\(entry.fileName)"
+                    )
+                )
+                let startedAt = Date()
                 let uploaded = try await upload(entry: entry)
+                let uploadDurationMs = Int(startedAt.timeIntervalSinceNow.magnitude * 1_000)
+                AppLog.logInfo(
+                    AppLog.diarization,
+                    LogSanitizer.formatEvent(
+                        "chunk_upload_succeeded",
+                        durationMs: uploadDurationMs,
+                        statusCode: 200,
+                        error: "index=\(entry.index),segments=\(uploaded.result.segments.count)"
+                    )
+                )
                 try applyResult(
                     uploaded.result,
                     knownAliases: uploaded.knownAliases,
@@ -282,10 +323,25 @@ final class DiarizationController {
                 }
                 lastConfirmedAt = Date()
             } catch let error as DiarizationAPIError {
+                AppLog.logWarning(
+                    AppLog.diarization,
+                    LogSanitizer.formatEvent(
+                        "chunk_upload_failed",
+                        statusCode: nil,
+                        error: "index=\(entry.index),reason=\(error.localizedDescription)"
+                    )
+                )
                 handleUploadError(error, entryIndex: entryIndex)
                 if case .suspended = cloudState { return }
                 if queue[entryIndex].status == .awaitingUserRetry { continue }
             } catch {
+                AppLog.logError(
+                    AppLog.diarization,
+                    LogSanitizer.formatEvent(
+                        "chunk_upload_failed",
+                        error: "index=\(entry.index),reason=\(String(describing: error))"
+                    )
+                )
                 handleUploadError(.network, entryIndex: entryIndex)
             }
             persistQueue()
@@ -387,6 +443,7 @@ final class DiarizationController {
 
     /// 上传失败分类处理（实施计划 11.2；401 语义收窄到分人 provider 自身）
     private func handleUploadError(_ error: DiarizationAPIError, entryIndex: Int) {
+        let attemptCount = queue[entryIndex].attemptCount
         switch error {
         case .unauthorized:
             // 分人 Key 无效：仅暂停分人 provider，本地录音与分析继续
@@ -408,6 +465,13 @@ final class DiarizationController {
         case .tooManyKnownSpeakers(let maximum, let actual):
             queue[entryIndex].status = .pending
             suspensionCause = .knownSpeakerConfiguration
+            AppLog.logWarning(
+                AppLog.diarization,
+                LogSanitizer.formatEvent(
+                    "chunk_error_too_many_speakers",
+                    error: "index=\(entryIndex),max=\(maximum),actual=\(actual),attempt=\(attemptCount)"
+                )
+            )
             cloudState = .suspended(
                 reason: "声纹配置暂停：已配置 \(actual) 个声纹样本，单次分人最多支持 \(maximum) 个，本次未上传。修正后将自动继续。"
             )
@@ -430,6 +494,13 @@ final class DiarizationController {
         case .clientError, .invalidResponse:
             // 请求/响应问题：不重试，直接待用户处理
             queue[entryIndex].status = .awaitingUserRetry
+            AppLog.logWarning(
+                AppLog.diarization,
+                LogSanitizer.formatEvent(
+                    "chunk_error_non_retriable",
+                    error: "attempt=\(attemptCount),index=\(entryIndex),reason=\(error.localizedDescription)"
+                )
+            )
         }
     }
 
@@ -437,7 +508,8 @@ final class DiarizationController {
 
     /// 用户手动重试「待重试」分片（重置失败计数）
     func retryAwaitingUserChunks() {
-        guard keyStore.hasConfiguredKey else {
+        guard suspensionCause != .providerConfigurationMismatch else { return }
+        guard isProviderConfigured else {
             cloudState = .unconfigured
             return
         }
@@ -456,11 +528,12 @@ final class DiarizationController {
 
     /// API Key 修复后恢复云端处理
     func resumeAfterKeyFix() {
-        guard keyStore.hasConfiguredKey else {
+        guard isProviderConfigured else {
             cloudState = .unconfigured
             return
         }
-        guard suspensionCause != .knownSpeakerConfiguration else { return }
+        guard suspensionCause != .knownSpeakerConfiguration,
+              suspensionCause != .providerConfigurationMismatch else { return }
         if case .suspended = cloudState {
             suspensionCause = nil
             cloudState = .idle
@@ -495,7 +568,7 @@ final class DiarizationController {
     /// 未配置时不产生任何云端专用分片文件。
     /// 运行中 Key 被删除时也在下一次 poll 立即收敛为 unconfigured。
     private func canProduceChunkFiles() -> Bool {
-        guard keyStore.hasConfiguredKey else {
+        guard isProviderConfigured else {
             cloudState = .unconfigured
             return false
         }
@@ -503,6 +576,17 @@ final class DiarizationController {
             return false
         }
         return true
+    }
+
+    private var isProviderConfigured: Bool {
+        switch configurationSnapshot.selectedProvider {
+        case .disabled:
+            return false
+        case .openAICompatible:
+            return configurationSnapshot.isValid && keyStore.hasConfiguredKey
+        case .volcengine:
+            return false
+        }
     }
 
     private func updateCloudState() {

@@ -60,6 +60,41 @@ final class ChunkQueueAndExtractorTests {
         #expect(try store.load().isEmpty)
     }
 
+    @Test("旧队列缺少 provider 字段时安全迁移为 OpenAI 兼容")
+    func legacyQueueMigration() throws {
+        let data = Data("""
+        [{"index":0,"audioStartMs":0,"audioEndMs":20000,"wallStartMs":0,"wallEndMs":20000,"fileName":"chunk_0000.wav","status":"pending","attemptCount":1}]
+        """.utf8)
+        let fileURL = tempDirectory.appending(path: "legacy-queue.json")
+        try data.write(to: fileURL)
+
+        let entry = try #require(ChunkQueueStore(fileURL: fileURL).load().first)
+        #expect(entry.provider == .openAICompatible)
+        #expect(entry.providerConfigurationFingerprint.isEmpty)
+    }
+
+    @Test("分人配置使用独立 defaults 且指纹随非敏感配置变化")
+    func providerConfigurationRoundTrip() throws {
+        let suiteName = "com.zhaobo.BangWoFenXi.tests.diarization.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = DiarizationProviderConfigurationStore(defaults: defaults)
+        let configuration = DiarizationProviderConfiguration(
+            selectedProvider: .openAICompatible,
+            openAIBaseURL: "https://api.openai.com/v1",
+            openAIModelID: "gpt-test"
+        )
+
+        try store.save(configuration)
+        #expect(store.load() == configuration)
+        var changed = configuration
+        changed.openAIModelID = "gpt-test-2"
+        #expect(changed.fingerprint != configuration.fingerprint)
+        #expect(throws: DiarizationProviderConfigurationError.self) {
+            try store.save(DiarizationProviderConfiguration(selectedProvider: .volcengine))
+        }
+    }
+
     // MARK: - 分片提取
 
     @Test("按窗口提取：帧数精确（含 2 秒重叠语义）")

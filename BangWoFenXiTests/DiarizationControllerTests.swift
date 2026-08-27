@@ -121,6 +121,35 @@ final class DiarizationControllerTests {
         await controller.finishAndDrain()
     }
 
+    @Test("恢复队列配置不匹配时暂停且不静默改投")
+    func restoredQueueConfigurationMismatch() throws {
+        let chunksDirectory = try fileStore.ensureChunksDirectory(for: meeting.id)
+        try Data([0x00]).write(to: chunksDirectory.appending(path: "chunk_0000.wav"))
+        try ChunkQueueStore(fileURL: fileStore.chunkQueueFileURL(for: meeting.id)).save([
+            ChunkQueueEntry(
+                index: 0,
+                audioStartMs: 0,
+                audioEndMs: 20_000,
+                wallStartMs: 0,
+                wallEndMs: 20_000,
+                fileName: "chunk_0000.wav",
+                provider: .openAICompatible,
+                providerConfigurationFingerprint: "different-configuration",
+                status: .pending,
+                attemptCount: 0
+            )
+        ])
+
+        controller.start(for: meeting) { [timeline] in timeline }
+
+        guard case .suspended(let reason) = controller.cloudState else {
+            Issue.record("配置不匹配的恢复队列应暂停")
+            return
+        }
+        #expect(reason.contains("不会静默改投"))
+        #expect(mockDiarization.calls.isEmpty)
+    }
+
     @Test("成功流：云端片段合并入库、说话人按代号映射、分片文件删除")
     func successFlow() async throws {
         try installVoiceSample(for: meeting.participants[0])
