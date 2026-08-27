@@ -51,6 +51,17 @@ struct SpeakerMenuItem: Equatable, Identifiable {
     }
 }
 
+enum TranscriptScrollPolicy {
+    static func isAtBottom(
+        contentOffsetY: CGFloat,
+        containerHeight: CGFloat,
+        contentHeight: CGFloat,
+        tolerance: CGFloat = 24
+    ) -> Bool {
+        contentOffsetY + containerHeight >= contentHeight - tolerance
+    }
+}
+
 /// 底部同声转写面板（实施计划 6.5）：
 /// - 默认自动滚动到最新；用户向上浏览后暂停滚动并显示「回到最新」；
 /// - 临时文字使用较浅颜色；最终替换就地更新（片段 ID 稳定，不整页跳动）；
@@ -78,6 +89,7 @@ struct TranscriptPanelView: View {
 
     /// 是否贴底自动滚动
     @State private var pinnedToBottom = true
+    @State private var pendingScrollTask: Task<Void, Never>?
     /// 正在编辑文字的片段
     @State private var editingTextSegment: TranscriptSegment?
     @State private var editingText: String = ""
@@ -118,12 +130,25 @@ struct TranscriptPanelView: View {
                     .padding(.horizontal, 16)
                     .padding(.vertical, 8)
                 }
-                // 跟踪是否贴底（用户上翻时取消自动滚动）
-                .onScrollGeometryChange(for: Bool.self) { geometry in
-                    geometry.contentOffset.y + geometry.containerSize.height
-                        >= geometry.contentSize.height - 24
-                } action: { _, isAtBottom in
-                    pinnedToBottom = isAtBottom
+                .onScrollPhaseChange { _, newPhase, context in
+                    switch newPhase {
+                    case .interacting:
+                        if pinnedToBottom {
+                            pinnedToBottom = false
+                        }
+                    case .idle:
+                        let geometry = context.geometry
+                        let isAtBottom = TranscriptScrollPolicy.isAtBottom(
+                            contentOffsetY: geometry.contentOffset.y,
+                            containerHeight: geometry.containerSize.height,
+                            contentHeight: geometry.contentSize.height
+                        )
+                        if pinnedToBottom != isAtBottom {
+                            pinnedToBottom = isAtBottom
+                        }
+                    default:
+                        break
+                    }
                 }
                 .onChange(of: segments.count) { _, _ in
                     scrollToLatest(proxy: proxy)
@@ -143,6 +168,7 @@ struct TranscriptPanelView: View {
 
                 if !pinnedToBottom {
                     Button {
+                        pendingScrollTask?.cancel()
                         pinnedToBottom = true
                         withAnimation {
                             proxy.scrollTo(segments.last?.id, anchor: .bottom)
@@ -155,6 +181,9 @@ struct TranscriptPanelView: View {
                     .padding(10)
                 }
             }
+        }
+        .onDisappear {
+            pendingScrollTask?.cancel()
         }
         .sheet(item: $editingTextSegment) { segment in
             VStack(alignment: .leading, spacing: 12) {
@@ -290,7 +319,12 @@ struct TranscriptPanelView: View {
 
     private func scrollToLatest(proxy: ScrollViewProxy) {
         guard pinnedToBottom, let lastID = segments.last?.id else { return }
-        proxy.scrollTo(lastID, anchor: .bottom)
+        pendingScrollTask?.cancel()
+        pendingScrollTask = Task { @MainActor in
+            await Task.yield()
+            guard !Task.isCancelled, pinnedToBottom else { return }
+            proxy.scrollTo(lastID, anchor: .bottom)
+        }
     }
 }
 

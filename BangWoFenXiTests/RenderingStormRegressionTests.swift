@@ -168,4 +168,23 @@ final class RenderingStormRegressionTests {
         // 时钟回拨防御
         #expect(!policy.shouldReuse(checkedAt: t0, now: t0.addingTimeInterval(-1)))
     }
+
+    @Test("转写面板贴底判定：容差边界稳定")
+    func transcriptBottomPolicy() {
+        #expect(TranscriptScrollPolicy.isAtBottom(
+            contentOffsetY: 476,
+            containerHeight: 500,
+            contentHeight: 1_000
+        ))
+        #expect(!TranscriptScrollPolicy.isAtBottom(
+            contentOffsetY: 475,
+            containerHeight: 500,
+            contentHeight: 1_000
+        ))
+        #expect(TranscriptScrollPolicy.isAtBottom(
+            contentOffsetY: 0,
+            containerHeight: 500,
+            contentHeight: 300
+        ))
+    }
 }
