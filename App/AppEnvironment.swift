@@ -314,6 +314,7 @@ final class AppEnvironment {
     let diarizationProviderConfigurationStore: DiarizationProviderConfigurationStore
     let openAICompatibleKeyStore: CloudAPIKeyStore
     let volcengineDiarizationKeyStore: CloudAPIKeyStore
+    let volcengineDiarizationAccessTokenStore: CloudAPIKeyStore
     let aiProviderRegistry: AIProviderRegistry
     /// 外部知识 MCP 的非敏感连接配置与独立 Keychain Token
     let externalMCPConfigurationStore: ExternalMCPConfigurationStore
@@ -433,6 +434,10 @@ final class AppEnvironment {
             service: keychainServiceName,
             account: VolcengineDiarizationService.keychainAccount
         )
+        let volcengineDiarizationAccessTokenStore = CloudAPIKeyStore(
+            service: keychainServiceName,
+            account: VolcengineDiarizationService.accessTokenKeychainAccount
+        )
         self.diarizationServiceOverride = diarization
         self.negotiationAnalysis = negotiationAnalysis ?? sharedTransport
         self.conversationAnalysis = conversationAnalysis
@@ -464,6 +469,7 @@ final class AppEnvironment {
         self.diarizationProviderConfigurationStore = diarizationConfigurationStore
         self.openAICompatibleKeyStore = openAIKeyStore
         self.volcengineDiarizationKeyStore = volcengineDiarizationKeyStore
+        self.volcengineDiarizationAccessTokenStore = volcengineDiarizationAccessTokenStore
         self.aiProviderRegistry = providerRegistry
         self.externalMCPConfigurationStore = externalMCPConfigurationStore
             ?? ExternalMCPConfigurationStore()
@@ -633,7 +639,8 @@ final class AppEnvironment {
         return DiarizationServiceFactory.make(
             configuration: configuration,
             keyStore: keyStore(for: .diarization),
-            volcengineKeyStore: volcengineDiarizationKeyStore
+            volcengineKeyStore: volcengineDiarizationKeyStore,
+            volcengineAccessTokenStore: volcengineDiarizationAccessTokenStore
         )
     }
 

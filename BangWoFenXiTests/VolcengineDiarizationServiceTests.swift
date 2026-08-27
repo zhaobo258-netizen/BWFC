@@ -6,6 +6,7 @@ import Testing
 final class VolcengineDiarizationServiceTests {
     let session: URLSession
     let keyStore: CloudAPIKeyStore
+    let accessTokenStore: CloudAPIKeyStore
     let service: VolcengineDiarizationService
     let keychainServiceName = "com.zhaobo.BangWoFenXi.tests.volcengine.\(UUID().uuidString)"
 
@@ -18,11 +19,45 @@ final class VolcengineDiarizationServiceTests {
             service: keychainServiceName,
             account: VolcengineDiarizationService.keychainAccount
         )
-        service = VolcengineDiarizationService(session: session, apiKeyStore: keyStore)
+        accessTokenStore = CloudAPIKeyStore(
+            service: keychainServiceName,
+            account: VolcengineDiarizationService.accessTokenKeychainAccount
+        )
+        service = VolcengineDiarizationService(
+            session: session,
+            apiKeyStore: keyStore,
+            accessTokenStore: accessTokenStore
+        )
     }
 
     deinit {
         try? keyStore.deleteKey()
+        try? accessTokenStore.deleteKey()
+    }
+
+    @Test("服务接口双凭据使用 App Key 与 Access Key 请求头")
+    func serviceCredentialsRequest() async throws {
+        try keyStore.saveKey("test-app-key")
+        try accessTokenStore.saveKey("test-access-token")
+        storage.requestHandler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: ["X-Api-Status-Code": "20000003"]
+            )!
+            return (response, Data())
+        }
+
+        #expect(try await service.testConnection())
+        let request = try #require(storage.capturedRequests.first)
+        #expect(request.value(forHTTPHeaderField: "X-Api-Key") == nil)
+        #expect(request.value(forHTTPHeaderField: "X-Api-App-Key") == "test-app-key")
+        #expect(request.value(forHTTPHeaderField: "X-Api-Access-Key") == "test-access-token")
+        let body = try #require(mockRequestBodyData(of: request))
+        let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let user = try #require(json["user"] as? [String: Any])
+        #expect(user["uid"] as? String == "test-app-key")
     }
 
     @Test("新版控制台单 Key 请求正确且解析匿名说话人")
@@ -64,13 +99,14 @@ final class VolcengineDiarizationServiceTests {
 
         let body = try #require(mockRequestBodyData(of: request))
         let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let user = try #require(json["user"] as? [String: Any])
         let audio = try #require(json["audio"] as? [String: Any])
         let recognition = try #require(json["request"] as? [String: Any])
+        #expect(user["uid"] as? String == "test-api-key")
         #expect((audio["data"] as? String)?.isEmpty == false)
         #expect(recognition["model_name"] as? String == "bigmodel")
         #expect(recognition["enable_speaker_info"] as? Bool == true)
         #expect(recognition["show_utterances"] as? Bool == true)
-        #expect(!String(decoding: body, as: UTF8.self).contains("test-api-key"))
     }
 
     @Test("静音状态码可用于零业务数据连接测试")

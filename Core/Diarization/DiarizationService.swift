@@ -453,6 +453,10 @@ enum DiarizationServiceFactory {
             service: CloudAPIKeyStore.defaultService,
             account: VolcengineDiarizationService.keychainAccount
         ),
+        volcengineAccessTokenStore: CloudAPIKeyStore = CloudAPIKeyStore(
+            service: CloudAPIKeyStore.defaultService,
+            account: VolcengineDiarizationService.accessTokenKeychainAccount
+        ),
         session: URLSession = .shared
     ) -> any DiarizationServicing {
         switch configuration.selectedProvider {
@@ -476,6 +480,7 @@ enum DiarizationServiceFactory {
             return VolcengineDiarizationService(
                 session: session,
                 apiKeyStore: volcengineKeyStore,
+                accessTokenStore: volcengineAccessTokenStore,
                 resourceID: configuration.normalizedVolcengineResourceID
             )
         }

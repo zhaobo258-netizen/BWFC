@@ -30,6 +30,7 @@ struct SettingsView: View {
     @State private var analysisKeyInput = ""
     @State private var diarizationKeyInput = ""
     @State private var volcengineKeyInput = ""
+    @State private var volcengineAccessTokenInput = ""
     @State private var diarizationConfiguration = DiarizationProviderConfiguration()
     @State private var diarizationMessage: String?
     @State private var volcengineTestResult: (ok: Bool, text: String)?
@@ -252,6 +253,7 @@ struct SettingsView: View {
     private var diarizationVolcengineConfigurationSection: some View {
         let keyStore = environment.volcengineDiarizationKeyStore
         let hasSavedKey = keyStore.hasConfiguredKey
+        let hasSavedAccessToken = environment.volcengineDiarizationAccessTokenStore.hasConfiguredKey
         return Section("火山引擎录音文件极速识别") {
             TextField(
                 "Resource ID",
@@ -261,9 +263,16 @@ struct SettingsView: View {
             .disabled(true)
             SecureField(
                 hasSavedKey
-                    ? "API Key 已安全保存；粘贴新 Key 可替换"
-                    : "粘贴新控制台 API Key",
+                    ? "API Key / App Key 已保存；粘贴可替换"
+                    : "粘贴 API Key / App Key",
                 text: $volcengineKeyInput
+            )
+            .textFieldStyle(.roundedBorder)
+            SecureField(
+                hasSavedAccessToken
+                    ? "Access Token 已保存；粘贴可替换"
+                    : "粘贴 Access Token（服务接口认证）",
+                text: $volcengineAccessTokenInput
             )
             .textFieldStyle(.roundedBorder)
             HStack {
@@ -278,10 +287,10 @@ struct SettingsView: View {
                         || (!hasSavedKey
                             && volcengineKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 )
-                Button("删除已保存的 Key", role: .destructive) {
+                Button("删除已保存的凭据", role: .destructive) {
                     deleteVolcengineKey()
                 }
-                .disabled(!hasSavedKey)
+                .disabled(!hasSavedKey && !hasSavedAccessToken)
                 Spacer()
                 configurationBadge(
                     configured: diarizationConfiguration.isValid && hasSavedKey
@@ -289,7 +298,9 @@ struct SettingsView: View {
             }
             if hasSavedKey {
                 Label(
-                    "API Key 已保存在本机 Keychain，此处不会回显。",
+                    hasSavedAccessToken
+                        ? "API Key 与 Access Token 已保存在本机 Keychain，此处不会回显。"
+                        : "API Key 已保存在本机 Keychain，此处不会回显。",
                     systemImage: "checkmark.shield"
                 )
                 .font(.footnote)
@@ -298,7 +309,7 @@ struct SettingsView: View {
             if let result = volcengineTestResult {
                 statusText(result.text)
             }
-            Text("使用新版控制台单 X-Api-Key 鉴权，Resource ID 固定为极速版。连接测试只发送约 0.1 秒合成静音，不发送项目、录音或逐字稿。火山阶段只返回匿名说话人标签，真实姓名仍由本地映射。")
+            Text("支持新版单 API Key 鉴权；填写 Access Token 后自动使用服务接口双凭据鉴权。Secret Key 不用于此接口。Resource ID 固定为极速版。连接测试只发送约 0.1 秒合成静音，不发送项目、录音或逐字稿。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -1177,6 +1188,11 @@ struct SettingsView: View {
                 try environment.volcengineDiarizationKeyStore.saveKey(key)
                 volcengineKeyInput = ""
             }
+            let accessToken = volcengineAccessTokenInput.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !accessToken.isEmpty {
+                try environment.volcengineDiarizationAccessTokenStore.saveKey(accessToken)
+                volcengineAccessTokenInput = ""
+            }
             environment.refreshCloudConfiguration()
             volcengineTestResult = (true, "已保存；从下一次会议开始生效。")
         } catch {
@@ -1187,8 +1203,9 @@ struct SettingsView: View {
     private func deleteVolcengineKey() {
         do {
             try environment.volcengineDiarizationKeyStore.deleteKey()
+            try environment.volcengineDiarizationAccessTokenStore.deleteKey()
             environment.refreshCloudConfiguration()
-            volcengineTestResult = (true, "已删除火山引擎 API Key。")
+            volcengineTestResult = (true, "已删除火山引擎认证凭据。")
         } catch {
             volcengineTestResult = (false, "删除失败：\(error.localizedDescription)")
         }

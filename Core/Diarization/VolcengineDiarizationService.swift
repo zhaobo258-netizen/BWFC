@@ -6,20 +6,27 @@ struct VolcengineDiarizationService: DiarizationServicing {
     )!
     static let resourceID = "volc.bigasr.auc_turbo"
     static let keychainAccount = "diarization-volcengine"
+    static let accessTokenKeychainAccount = "diarization-volcengine-access-token"
 
     private let session: URLSession
     private let apiKeyStore: CloudAPIKeyStore
+    private let accessTokenStore: CloudAPIKeyStore
     private let configuredResourceID: String
     private let endpointURL: URL
 
     init(
         session: URLSession = .shared,
         apiKeyStore: CloudAPIKeyStore,
+        accessTokenStore: CloudAPIKeyStore? = nil,
         resourceID: String = resourceID,
         endpointURL: URL = endpoint
     ) {
         self.session = session
         self.apiKeyStore = apiKeyStore
+        self.accessTokenStore = accessTokenStore ?? CloudAPIKeyStore(
+            service: CloudAPIKeyStore.defaultService,
+            account: Self.accessTokenKeychainAccount
+        )
         self.configuredResourceID = resourceID
         self.endpointURL = endpointURL
     }
@@ -53,9 +60,17 @@ struct VolcengineDiarizationService: DiarizationServicing {
             throw DiarizationAPIError.missingAPIKey
         }
         guard let apiKey, !apiKey.isEmpty else { throw DiarizationAPIError.missingAPIKey }
+        let accessToken: String?
+        do {
+            accessToken = try accessTokenStore.readKey()
+        } catch KeychainError.interactionNotAllowed {
+            throw DiarizationAPIError.credentialAccessRequired
+        } catch {
+            accessToken = nil
+        }
 
         let requestBody = RequestDTO(
-            user: .init(uid: UUID().uuidString),
+            user: .init(uid: apiKey),
             audio: .init(data: wavData.base64EncodedString()),
             request: .init()
         )
@@ -63,7 +78,12 @@ struct VolcengineDiarizationService: DiarizationServicing {
         request.httpMethod = "POST"
         request.timeoutInterval = 60
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(apiKey, forHTTPHeaderField: "X-Api-Key")
+        if let accessToken, !accessToken.isEmpty {
+            request.setValue(apiKey, forHTTPHeaderField: "X-Api-App-Key")
+            request.setValue(accessToken, forHTTPHeaderField: "X-Api-Access-Key")
+        } else {
+            request.setValue(apiKey, forHTTPHeaderField: "X-Api-Key")
+        }
         request.setValue(configuredResourceID, forHTTPHeaderField: "X-Api-Resource-Id")
         request.setValue(UUID().uuidString, forHTTPHeaderField: "X-Api-Request-Id")
         request.setValue("-1", forHTTPHeaderField: "X-Api-Sequence")
