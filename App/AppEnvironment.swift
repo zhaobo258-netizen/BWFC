@@ -313,6 +313,7 @@ final class AppEnvironment {
     let aiProviderConfigurationStore: AIProviderConfigurationStore
     let diarizationProviderConfigurationStore: DiarizationProviderConfigurationStore
     let openAICompatibleKeyStore: CloudAPIKeyStore
+    let volcengineDiarizationKeyStore: CloudAPIKeyStore
     let aiProviderRegistry: AIProviderRegistry
     /// 外部知识 MCP 的非敏感连接配置与独立 Keychain Token
     let externalMCPConfigurationStore: ExternalMCPConfigurationStore
@@ -428,16 +429,11 @@ final class AppEnvironment {
         }
         let diarizationStore = stores[.diarization]
             ?? CloudAPIKeyStore.store(for: .diarization, service: keychainServiceName)
+        let volcengineDiarizationKeyStore = CloudAPIKeyStore(
+            service: keychainServiceName,
+            account: VolcengineDiarizationService.keychainAccount
+        )
         self.diarizationServiceOverride = diarization
-        if !diarizationConfiguration.selectedProvider.isImplemented {
-            AppLog.logWarning(
-                AppLog.diarization,
-                LogSanitizer.formatEvent(
-                    "diarization_provider_not_ready",
-                    error: "provider=\(diarizationConfiguration.selectedProvider.rawValue)"
-                )
-            )
-        }
         self.negotiationAnalysis = negotiationAnalysis ?? sharedTransport
         self.conversationAnalysis = conversationAnalysis
             ?? KimiConversationAnalysisService(generationService: providerRegistry)
@@ -467,6 +463,7 @@ final class AppEnvironment {
         self.aiProviderConfigurationStore = aiConfigurationStore
         self.diarizationProviderConfigurationStore = diarizationConfigurationStore
         self.openAICompatibleKeyStore = openAIKeyStore
+        self.volcengineDiarizationKeyStore = volcengineDiarizationKeyStore
         self.aiProviderRegistry = providerRegistry
         self.externalMCPConfigurationStore = externalMCPConfigurationStore
             ?? ExternalMCPConfigurationStore()
@@ -474,7 +471,9 @@ final class AppEnvironment {
         self.isKimiAccountConnected = hasStoredOAuthTokens
         self.isDiarizationConfigured = Self.isDiarizationConfigured(
             configuration: diarizationConfiguration,
-            keyStore: diarizationStore
+            keyStore: diarizationConfiguration.selectedProvider == .volcengine
+                ? volcengineDiarizationKeyStore
+                : diarizationStore
         )
     }
 
@@ -633,8 +632,17 @@ final class AppEnvironment {
         }
         return DiarizationServiceFactory.make(
             configuration: configuration,
-            keyStore: keyStore(for: .diarization)
+            keyStore: keyStore(for: .diarization),
+            volcengineKeyStore: volcengineDiarizationKeyStore
         )
+    }
+
+    func diarizationKeyStore(
+        for configuration: DiarizationProviderConfiguration
+    ) -> CloudAPIKeyStore {
+        configuration.selectedProvider == .volcengine
+            ? volcengineDiarizationKeyStore
+            : keyStore(for: .diarization)
     }
 
     func diarizationConfigurationSnapshot() -> DiarizationProviderConfiguration {
@@ -646,7 +654,9 @@ final class AppEnvironment {
         isKimiAccountConnected = kimiOAuthTokenStore.hasStoredTokens
         isDiarizationConfigured = Self.isDiarizationConfigured(
             configuration: diarizationProviderConfigurationStore.load(),
-            keyStore: keyStore(for: .diarization)
+            keyStore: diarizationKeyStore(
+                for: diarizationProviderConfigurationStore.load()
+            )
         )
         cloudConfigurationRevision += 1
     }
@@ -661,7 +671,7 @@ final class AppEnvironment {
         case .openAICompatible:
             return configuration.isValid && keyStore.hasConfiguredKey
         case .volcengine:
-            return false
+            return configuration.isValid && keyStore.hasConfiguredKey
         }
     }
 

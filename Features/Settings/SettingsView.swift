@@ -29,8 +29,11 @@ struct SettingsView: View {
     @State private var selectedSection: SettingsSection? = .ai
     @State private var analysisKeyInput = ""
     @State private var diarizationKeyInput = ""
+    @State private var volcengineKeyInput = ""
     @State private var diarizationConfiguration = DiarizationProviderConfiguration()
     @State private var diarizationMessage: String?
+    @State private var volcengineTestResult: (ok: Bool, text: String)?
+    @State private var isTestingVolcengine = false
     @State private var testResults: [CloudProvider: (ok: Bool, text: String)] = [:]
     @State private var testingProvider: CloudProvider?
     @State private var login: KimiLoginController?
@@ -183,6 +186,8 @@ struct SettingsView: View {
                         input: $diarizationKeyInput,
                         footnote: "凭证只供当前分人 provider 使用，不会借给 Kimi 或其他服务。"
                     )
+                } else if diarizationConfiguration.selectedProvider == .volcengine {
+                    diarizationVolcengineConfigurationSection
                 }
                 Section("当前能力") {
                     LabeledContent("本地实时转写", value: "Apple Speech · 始终启用")
@@ -209,24 +214,18 @@ struct SettingsView: View {
         Section("云端高精度转写与分人") {
             Picker("Provider", selection: $diarizationConfiguration.selectedProvider) {
                 ForEach(DiarizationProvider.allCases, id: \.self) { provider in
-                    Text(provider == .volcengine ? "火山引擎（待探针）" : provider.displayName)
+                    Text(provider.displayName)
                         .tag(provider)
-                        .disabled(!provider.isImplemented)
                 }
             }
             .pickerStyle(.segmented)
-            .onChange(of: diarizationConfiguration.selectedProvider) { _, provider in
-                guard provider == .volcengine else { return }
-                diarizationConfiguration = environment.diarizationProviderConfigurationStore.load()
-                diarizationMessage = "火山引擎尚未完成官方接口与账号探针，当前不能设为会议 Provider。"
-            }
             Button("保存默认 Provider") {
                 saveDiarizationConfiguration()
             }
             if let diarizationMessage {
                 statusText(diarizationMessage)
             }
-            Text("关闭云端增强不会关闭本地录音和 Apple Speech。火山引擎需先完成官方接口、账号鉴权和 Resource ID 探针，当前不会伪装成可用。")
+            Text("关闭云端增强不会关闭本地录音和 Apple Speech。Provider 变更只影响下一次会议，待处理分片不会静默改投其他服务。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -245,6 +244,60 @@ struct SettingsView: View {
                 saveDiarizationConfiguration()
             }
             Text("仅允许 HTTPS；本机服务可使用 localhost。音频分片会发送到该服务，高精度结果用于校正文稿和匿名说话人分离。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var diarizationVolcengineConfigurationSection: some View {
+        let keyStore = environment.volcengineDiarizationKeyStore
+        let hasSavedKey = keyStore.hasConfiguredKey
+        return Section("火山引擎 Seed ASR") {
+            TextField(
+                "Resource ID",
+                text: $diarizationConfiguration.volcengineResourceID
+            )
+            .textFieldStyle(.roundedBorder)
+            SecureField(
+                hasSavedKey
+                    ? "API Key 已安全保存；粘贴新 Key 可替换"
+                    : "粘贴新控制台 API Key",
+                text: $volcengineKeyInput
+            )
+            .textFieldStyle(.roundedBorder)
+            HStack {
+                Button("保存") {
+                    saveVolcengineConfiguration()
+                }
+                Button(isTestingVolcengine ? "测试中…" : "保存并测试") {
+                    saveAndTestVolcengine()
+                }
+                .disabled(
+                    isTestingVolcengine
+                        || (!hasSavedKey
+                            && volcengineKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                )
+                Button("删除已保存的 Key", role: .destructive) {
+                    deleteVolcengineKey()
+                }
+                .disabled(!hasSavedKey)
+                Spacer()
+                configurationBadge(
+                    configured: diarizationConfiguration.isValid && hasSavedKey
+                )
+            }
+            if hasSavedKey {
+                Label(
+                    "API Key 已保存在本机 Keychain，此处不会回显。",
+                    systemImage: "checkmark.shield"
+                )
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            }
+            if let result = volcengineTestResult {
+                statusText(result.text)
+            }
+            Text("使用新控制台 X-Api-Key 鉴权。默认 Resource ID 为 Seed ASR 2.0 小时版；连接测试只发送约 0.1 秒合成静音，不发送项目、录音或逐字稿。火山阶段只返回匿名说话人标签，真实姓名仍由本地映射。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -1112,6 +1165,53 @@ struct SettingsView: View {
         } catch {
             diarizationMessage = "保存失败：\(error.localizedDescription)"
             diarizationConfiguration = environment.diarizationProviderConfigurationStore.load()
+        }
+    }
+
+    private func saveVolcengineConfiguration() {
+        do {
+            try environment.diarizationProviderConfigurationStore.save(diarizationConfiguration)
+            let key = volcengineKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !key.isEmpty {
+                try environment.volcengineDiarizationKeyStore.saveKey(key)
+                volcengineKeyInput = ""
+            }
+            environment.refreshCloudConfiguration()
+            volcengineTestResult = (true, "已保存；从下一次会议开始生效。")
+        } catch {
+            volcengineTestResult = (false, "保存失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func deleteVolcengineKey() {
+        do {
+            try environment.volcengineDiarizationKeyStore.deleteKey()
+            environment.refreshCloudConfiguration()
+            volcengineTestResult = (true, "已删除火山引擎 API Key。")
+        } catch {
+            volcengineTestResult = (false, "删除失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func saveAndTestVolcengine() {
+        guard !isTestingVolcengine else { return }
+        saveVolcengineConfiguration()
+        guard diarizationConfiguration.isValid,
+              environment.volcengineDiarizationKeyStore.hasConfiguredKey else { return }
+        isTestingVolcengine = true
+        volcengineTestResult = nil
+        Task { @MainActor in
+            defer { isTestingVolcengine = false }
+            do {
+                let ok = try await environment.makeDiarizationService(
+                    for: diarizationConfiguration
+                ).testConnection()
+                volcengineTestResult = ok
+                    ? (true, "连接正常（火山引擎可用）")
+                    : (false, "连接失败")
+            } catch {
+                volcengineTestResult = (false, "不可用：\(error.localizedDescription)")
+            }
         }
     }
 

@@ -90,8 +90,13 @@ final class ChunkQueueAndExtractorTests {
         var changed = configuration
         changed.openAIModelID = "gpt-test-2"
         #expect(changed.fingerprint != configuration.fingerprint)
+        let volcengine = DiarizationProviderConfiguration(selectedProvider: .volcengine)
+        try store.save(volcengine)
+        #expect(store.load() == volcengine)
+        var invalidVolcengine = volcengine
+        invalidVolcengine.volcengineResourceID = "recording-file-product"
         #expect(throws: DiarizationProviderConfigurationError.self) {
-            try store.save(DiarizationProviderConfiguration(selectedProvider: .volcengine))
+            try store.save(invalidVolcengine)
         }
     }
 

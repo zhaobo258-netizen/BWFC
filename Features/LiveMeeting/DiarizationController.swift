@@ -585,7 +585,7 @@ final class DiarizationController {
         case .openAICompatible:
             return configurationSnapshot.isValid && keyStore.hasConfiguredKey
         case .volcengine:
-            return false
+            return configurationSnapshot.isValid && keyStore.hasConfiguredKey
         }
     }
 

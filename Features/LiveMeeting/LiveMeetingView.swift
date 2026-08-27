@@ -498,7 +498,7 @@ struct LiveMeetingView: View {
             diarization: environment.makeDiarizationService(for: diarizationConfiguration),
             fileStore: environment.fileStore,
             transcriptController: controller,
-            keyStore: environment.keyStore(for: .diarization),
+            keyStore: environment.diarizationKeyStore(for: diarizationConfiguration),
             configurationSnapshot: diarizationConfiguration
         )
         let analysisController = NegotiationAnalysisController(service: environment.negotiationAnalysis)

@@ -13,9 +13,6 @@ enum DiarizationProvider: String, Codable, Sendable, CaseIterable {
         }
     }
 
-    var isImplemented: Bool {
-        self != .volcengine
-    }
 }
 
 struct DiarizationProviderConfiguration: Codable, Equatable, Sendable {
@@ -28,7 +25,7 @@ struct DiarizationProviderConfiguration: Codable, Equatable, Sendable {
         selectedProvider: DiarizationProvider = .openAICompatible,
         openAIBaseURL: String = CloudModelConfig.apiBaseURL.absoluteString,
         openAIModelID: String = CloudModelConfig.diarizationModelID,
-        volcengineResourceID: String = ""
+        volcengineResourceID: String = "volc.seedasr.sauc.duration"
     ) {
         self.selectedProvider = selectedProvider
         self.openAIBaseURL = openAIBaseURL
@@ -53,7 +50,7 @@ struct DiarizationProviderConfiguration: Codable, Equatable, Sendable {
         volcengineResourceID = try container.decodeIfPresent(
             String.self,
             forKey: .volcengineResourceID
-        ) ?? ""
+        ) ?? "volc.seedasr.sauc.duration"
     }
 
     var validatedOpenAIBaseURL: URL? {
@@ -64,6 +61,10 @@ struct DiarizationProviderConfiguration: Codable, Equatable, Sendable {
         openAIModelID.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    var normalizedVolcengineResourceID: String {
+        volcengineResourceID.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     var isValid: Bool {
         switch selectedProvider {
         case .disabled:
@@ -71,8 +72,8 @@ struct DiarizationProviderConfiguration: Codable, Equatable, Sendable {
         case .openAICompatible:
             return validatedOpenAIBaseURL != nil && !normalizedOpenAIModelID.isEmpty
         case .volcengine:
-            // 阶段 0 尚未确认账号鉴权合同和 Resource ID，不允许伪装为可用配置。
-            return false
+            return normalizedVolcengineResourceID.hasPrefix("volc.")
+                && normalizedVolcengineResourceID.contains(".sauc.")
         }
     }
 
@@ -443,6 +444,10 @@ enum DiarizationServiceFactory {
     static func make(
         configuration: DiarizationProviderConfiguration,
         keyStore: CloudAPIKeyStore = CloudAPIKeyStore.store(for: .diarization),
+        volcengineKeyStore: CloudAPIKeyStore = CloudAPIKeyStore(
+            service: CloudAPIKeyStore.defaultService,
+            account: VolcengineDiarizationService.keychainAccount
+        ),
         session: URLSession = .shared
     ) -> any DiarizationServicing {
         switch configuration.selectedProvider {
@@ -460,7 +465,14 @@ enum DiarizationServiceFactory {
                 modelID: configuration.normalizedOpenAIModelID
             )
         case .volcengine:
-            return DisabledDiarizationService()
+            guard configuration.isValid else {
+                return DisabledDiarizationService()
+            }
+            return VolcengineDiarizationService(
+                apiKeyStore: volcengineKeyStore,
+                resourceID: configuration.normalizedVolcengineResourceID,
+                transport: URLSessionVolcengineWebSocketTransport(session: session)
+            )
         }
     }
 }
