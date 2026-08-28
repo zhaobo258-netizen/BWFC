@@ -1,6 +1,17 @@
 import SwiftUI
 import AppKit
 
+enum ProjectAssetBannerPolicy {
+    static func shouldShow(project: Project) -> Bool {
+        switch project.status {
+        case .creating, .recording, .paused, .processing:
+            return true
+        case .ready, .readyWithWarnings, .failed:
+            return !project.segments.contains { $0.state == .final || $0.state == .edited }
+        }
+    }
+}
+
 /// 项目工作台（阶段 B，方案 3「知识花园」三栏骨架，03 文档 §6.3）：
 /// 左栏录音文稿 / 中栏 AI 工作区 / 右栏 AI 共创笔记。
 ///
@@ -38,6 +49,7 @@ struct ProjectWorkspaceView: View {
     @State private var isFinishing = false
     @State private var showBackConfirmation = false
     @State private var showSpeakerPanel = false
+    @State private var showExportSheet = false
     /// 说话人指认弹层的锚点（09 号计划需求 2；总结条目或转写行进入）
     @State private var speakerAssignRequest: SpeakerAssignRequest?
     @State private var newDeviceID: String?
@@ -149,6 +161,14 @@ struct ProjectWorkspaceView: View {
                 .environment(environment)
             }
         }
+        .sheet(isPresented: $showExportSheet) {
+            if let project {
+                ProjectExportSheet(
+                    project: project,
+                    recordingURL: exportRecordingURL(for: project)
+                )
+            }
+        }
         .sheet(item: $speakerAssignRequest) { request in
             if let project {
                 SpeakerAssignSheet(
@@ -245,8 +265,9 @@ struct ProjectWorkspaceView: View {
                     } else if recorder?.deviceInterrupted == true {
                         deviceInterruptedBanner(meeting: meeting)
                     }
-                    if transcription?.availability?.assetState == .supportedNotInstalled
-                        || transcription?.assetDownloadProgress != nil {
+                    if ProjectAssetBannerPolicy.shouldShow(project: project),
+                       (transcription?.availability?.assetState == .supportedNotInstalled
+                        || transcription?.assetDownloadProgress != nil) {
                         assetDownloadBanner
                     }
                     if case .suspended(let reason) = diarization?.cloudState {
@@ -712,6 +733,23 @@ struct ProjectWorkspaceView: View {
             }
             .help("管理说话人与声纹样本")
             .accessibilityLabel("管理说话人")
+
+            Button {
+                showExportSheet = true
+            } label: {
+                if mode == .narrow {
+                    Image(systemName: "square.and.arrow.up")
+                } else {
+                    Label("导出", systemImage: "square.and.arrow.up")
+                }
+            }
+            .help("选择并导出录音、转写和分析资料")
+            .accessibilityLabel("导出项目资料")
+            .disabled(
+                meeting.status == .recording
+                    || meeting.status == .paused
+                    || isFinishing
+            )
 
             // 技术状态收进处理详情弹层
             ProcessingDetailsButton(
@@ -2203,6 +2241,12 @@ struct ProjectWorkspaceView: View {
         analysis?.attach(to: project)
         knowledgeGarden?.refreshCandidates()
         reloadSidebarProjects()
+    }
+
+    private func exportRecordingURL(for project: Project) -> URL? {
+        let relativePath = project.runtimeAssetRelativePath
+            ?? environment.fileStore.relativeAudioPath(for: project.id)
+        return try? environment.fileStore.absoluteURL(forRelativePath: relativePath)
     }
 
     /// 执行可失败操作并把错误转为界面提示

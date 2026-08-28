@@ -203,6 +203,7 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
         guard let request = try await AssetInventory.assetInstallationRequest(supporting: [probe]) else {
             // 无需安装（可能已就绪）
             onProgress(1)
+            invalidateAvailabilityCache()
             return
         }
 
