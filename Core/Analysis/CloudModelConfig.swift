@@ -29,6 +29,10 @@ enum CloudModelConfig {
     static let analysisBaseURL = URL(string: "https://api.kimi.com/coding/")!
     /// messages 接口路径（相对基础地址）
     static let analysisMessagesPath = "v1/messages"
+    /// Kimi Code 托管网页搜索服务；与模型消息共用 OAuth 登录凭证。
+    static let kimiWebSearchURL = URL(
+        string: "https://api.kimi.com/coding/v1/search"
+    )!
     /// K3 始终思考；为思考与结构化正文共同预留预算。
     static let analysisMaxTokens = 32768
     /// 分析请求超时（秒；thinking 模型在长上下文下响应较慢）

@@ -132,6 +132,14 @@ final class KnowledgeMCPMockURLProtocol: MockURLProtocolBase, @unchecked Sendabl
     override class var sharedStorage: MockURLProtocolStorage { storage }
 }
 
+private struct FixedKnowledgeKimiCredentials: KimiCredentialProviding {
+    var value: String
+
+    func validCredential() async throws -> String {
+        value
+    }
+}
+
 @Suite("知识开花", .serialized)
 struct KnowledgeGardenTests {
     @Test("Project 新旧 JSON 均兼容知识种子")
@@ -587,6 +595,116 @@ struct KnowledgeGardenTests {
         let results = try await provider.search("库存管理", limit: 3)
         #expect(results.count == 1)
         #expect(results.first?.provider == .internet)
+        #expect(results.first?.sourceLocation.contains("wikipedia.org") == true)
+    }
+
+    @Test("Kimi 通用网页搜索使用同一登录凭证并保留真实来源")
+    func internetProviderUsesKimiWebSearch() async throws {
+        KnowledgeInternetMockURLProtocol.storage.reset()
+        KnowledgeInternetMockURLProtocol.storage.requestHandler = { request in
+            #expect(request.httpMethod == "POST")
+            #expect(request.url?.path == "/coding/v1/search")
+            #expect(
+                request.value(forHTTPHeaderField: "Authorization")
+                    == "Bearer test-kimi-credential"
+            )
+            let body = try #require(mockRequestBodyData(of: request))
+            let object = try #require(
+                try JSONSerialization.jsonObject(with: body) as? [String: Any]
+            )
+            #expect(object["text_query"] as? String == "Kimi K3 最新能力")
+            let data = Data("""
+            {
+              "search_results": [
+                {
+                  "site_name": "Kimi 官方",
+                  "title": "Kimi K3 产品说明",
+                  "url": "https://www.kimi.com/k3",
+                  "snippet": "Kimi K3 的官方能力说明。",
+                  "date": "2026-09-01"
+                }
+              ]
+            }
+            """.utf8)
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )!,
+                data
+            )
+        }
+        let provider = InternetKnowledgeProvider(
+            session: KnowledgeInternetMockURLProtocol.makeSession(),
+            credentials: FixedKnowledgeKimiCredentials(
+                value: "test-kimi-credential"
+            )
+        )
+
+        let results = try await provider.search("Kimi K3 最新能力", limit: 3)
+
+        #expect(results.count == 1)
+        #expect(results.first?.providerId == "internet:kimi-web-search")
+        #expect(results.first?.providerName == "互联网 · Kimi 官方")
+        #expect(results.first?.sourceLocation == "https://www.kimi.com/k3")
+        #expect(
+            results.first?.excerpt
+                == "2026-09-01 · Kimi K3 的官方能力说明。"
+        )
+    }
+
+    @Test("Kimi 搜索异常时回退中文维基百科")
+    func internetProviderFallsBackToWikipedia() async throws {
+        KnowledgeInternetMockURLProtocol.storage.reset()
+        KnowledgeInternetMockURLProtocol.storage.requestHandler = { request in
+            if request.httpMethod == "POST" {
+                return (
+                    HTTPURLResponse(
+                        url: request.url!,
+                        statusCode: 503,
+                        httpVersion: nil,
+                        headerFields: nil
+                    )!,
+                    Data()
+                )
+            }
+            #expect(request.url?.host == "zh.wikipedia.org")
+            let data = Data("""
+            {
+              "query": {
+                "pages": [
+                  {
+                    "pageid": 7,
+                    "title": "品牌叙事",
+                    "extract": "品牌叙事是品牌传播的方法。",
+                    "fullurl": "https://zh.wikipedia.org/wiki/品牌叙事"
+                  }
+                ]
+              }
+            }
+            """.utf8)
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )!,
+                data
+            )
+        }
+        let provider = InternetKnowledgeProvider(
+            session: KnowledgeInternetMockURLProtocol.makeSession(),
+            credentials: FixedKnowledgeKimiCredentials(
+                value: "test-kimi-credential"
+            )
+        )
+
+        let results = try await provider.search("品牌叙事", limit: 3)
+
+        #expect(results.first?.providerId == "internet:wikipedia-zh")
         #expect(results.first?.sourceLocation.contains("wikipedia.org") == true)
     }
 

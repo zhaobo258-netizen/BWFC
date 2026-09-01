@@ -17,7 +17,7 @@
 ```bash
 cd /Users/zhaobo/系统软件开发/帮我分析-同声翻译/帮我分析
 swift build                 # 编译，要求 0 警告（Swift 6 严格并发）
-Scripts/run_tests.sh        # 全部测试（当前 482 例 69 套件，必须全绿；BWFX_IT_MEDIA=1 加真实媒体探针）
+Scripts/run_tests.sh        # 全部测试（当前 622 例 77 套件，必须全绿；BWFX_IT_MEDIA=1 加真实媒体探针）
 Scripts/make_app.sh         # 产出带版本后缀的 build/帮我分析-v<版本>.app（稳定本机身份签名）
 Scripts/soak_test.sh 3600 1 # 60 分钟录音稳定性（尚未完整跑过）
 ```
@@ -82,6 +82,7 @@ Core/
 - 本机可安装包必须使用 `BangWoFenXi Local Code Signing` 或显式提供的稳定签名身份；ad-hoc 只允许临时测试，禁止覆盖用户正在使用的安装包。稳定签名身份只保存在本机登录 Keychain，不得导出或提交。
 - `PromptRegistry` 是共享安全红线、场景规则、任务 Prompt、固定 JSON 合同与 Prompt Version 的唯一入口；普通设置页不开放原始 Prompt。
 - 项目对话中只有用户消息会作为后续实时分析/开花的背景，不能充当逐字稿证据。仅当用户本轮明确给出错词和正词、模型返回包含该错词的真实片段 ID，且 App 在当前逐字稿再次核验通过时，才可复用全局纠错链路修改逐字稿并加入后续转写规则；普通讨论、背景补充或 AI 猜测不得改写原稿。
+- 项目对话的联网搜索默认开启，每轮最多向搜索 Provider 发送两条、每条不超过 24 字的短检索词；逐字稿、笔记、引用文档和历史对话不得发送给搜索 Provider。网页摘要一律标记为不可信数据，回答只能引用当轮真实存在的 `web_N` 来源 ID。
 - 用户笔记默认不上云。`noteAIContextEnabled` 按项目授权后，项目对话、开花与完整总结在请求开始时读取编辑器最新文本（最多 20,000 字符）；不逐键上传，外部 MCP 仍只收最长 24 字短检索词。
 - 完整总结以完整逐字稿和分析证据账本为事实来源；用户主动发送的项目对话、AI 反馈和获授权的旧笔记只能进入独立的 `collaborationSummary`，必须标明不是录音事实，也不得查询互联网/MCP。
 - 所有耗时纯逻辑（分片规划、退避、合并去重、触发器、时间轴换算、Job 编排）都是可单测的值类型；AVFoundation/Speech 只做薄壳。
@@ -91,6 +92,7 @@ Core/
 | 用途 | Provider | 端点 | 凭证 |
 |---|---|---|---|
 | 实时分析/完整总结/项目对话/开花 | Kimi | `https://api.kimi.com/coding/v1/messages`（Kimi Code Anthropic 协议；默认 `k3-256k`，可选 `k3` / `kimi-for-coding`；K3 保持 thinking，max_tokens 32768，超时 240s） | **Kimi 账号登录（OAuth，推荐）**：Keychain account `kimi-oauth`；后备静态 API Key：account `kimi` |
+| 项目对话联网搜索 | Kimi Code Managed Search | `https://api.kimi.com/coding/v1/search`（`text_query`；仅短检索词）；失败时回退中文维基百科 | 复用 Kimi 账号登录凭证；不新增 Keychain 条目 |
 | 当前统一分析模型（可选） | OpenAI-compatible | 用户配置的 HTTPS 或 localhost Base URL + `/chat/completions`，模型 ID 由用户填写 | 独立 Keychain account `analysis-openai-compatible` |
 | 说话人识别 | OpenAI 兼容 | `POST /v1/audio/transcriptions`，`gpt-4o-transcribe-diarize` | `diarization`（当前**未配置**，灰态零请求） |
 | 外部知识来源 | 多个只读 Streamable HTTP MCP | 每个连接独立 Endpoint；先 `initialize` + `tools/list`，仅启用明确搜索/读取工具 | 每个连接独立 `knowledge-mcp.<UUID>`；旧单连接保留 `knowledge-mcp` |
@@ -138,7 +140,7 @@ Core/
 
 ## 7. 当前未决事项（接手先看）
 
-1. 项目对话、笔记按项目授权上传、Kimi K3 优先选择与稳定凭证修复已纳入当前分支本地存档，**尚未 push**。本轮 482 例/69 套件全绿，调试 App 已用稳定本机身份打包、通过签名校验并覆盖安装；原生界面已验证 1254×754 宽屏、961×673 窗口（约 960×640 内容最小尺寸），以及稳定签名版本启动、进入旧项目和打开 AI 设置均不再出现 SecurityAgent 密码框。项目对话、笔记 Inspector 与 K3 设置均可达。
+1. `v0.1.1` 稳定凭证与代理适配基线已推送。`v0.2.0 (3)` 新增项目对话按需联网、Kimi 通用网页搜索、维基百科回退与来源卡片；622 例/77 套件全绿，Release 候选包已用稳定本机身份签名并通过严格校验。覆盖安装和旧 App 清理必须等当前实时录音结束，不得为发布强制中断录音。
 2. 用户 7/21 存的旧静态分析 Key 属 agent-gw 遗留通道，在新网关大概率 401——登录账号后它只是无害的后备条目，可在设置页删除。
 3. 说话人识别 provider 决策：OpenAI Key / 讯飞 / 火山 / 维持手动标注（Kimi 无音频接口）。
 4. 真实得到大脑/其他 MCP 端点与凭证尚未现场验证；Mock 握手通过不能写成“得到大脑已接通”。

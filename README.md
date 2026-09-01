@@ -45,10 +45,10 @@
 
 ```bash
 swift build                    # 编译（0 警告基线）
-Scripts/make_app.sh            # Debug .app（当前产出 build/帮我分析-v0.1.1.app）
+Scripts/make_app.sh            # Debug .app（当前产出 build/帮我分析-v0.2.0.app）
 Scripts/make_app.sh release    # Release .app（稳定本机签名 + Sandbox/麦克风/网络 entitlements）
-open "build/帮我分析-v0.1.1.app" # 启动
-Scripts/run_tests.sh           # 全部 482 个自动化用例
+open "build/帮我分析-v0.2.0.app" # 启动
+Scripts/run_tests.sh           # 全部 622 个自动化用例（77 套件）
 Scripts/soak_test.sh           # 稳定性缩短版（180s/4x）
 Scripts/soak_test.sh 3600 1    # 60 分钟完整稳定性（人工验收）
 ```
@@ -148,6 +148,11 @@ swift test                  # 可完成构建；本机执行阶段静默失效�
   或说话人身份。说话人识别使用独立 Key。
 - 用户笔记默认不上传；按项目开启授权后，只在项目对话、开花或完整总结请求发起时
   读取当时最新文本，不逐键上传。外部 MCP 不接收笔记。
+- 项目对话默认开启“联网搜索”：明确要求搜索时直接生成短检索词，
+  其他消息由 AI 判断是否需要外部资料。每轮最多发送两条、每条不超过 24 字的
+  检索词给 Kimi 通用网页搜索；逐字稿、笔记、历史对话和引用文档不发送给搜索源。
+  回答保留可点开的真实来源；Kimi 搜索异常时回退中文维基百科，两者都失败时明确说明
+  本轮没有取得联网来源。
 
 ## 当前工作台补充能力
 

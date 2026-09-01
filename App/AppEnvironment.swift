@@ -448,7 +448,12 @@ final class AppEnvironment {
         self.knowledgeExpansion = knowledgeExpansion
             ?? KimiKnowledgeExpansionService(generationService: providerRegistry)
         self.projectAIChat = projectAIChat
-            ?? ProjectAIChatAgent(generationService: providerRegistry)
+            ?? ProjectAIChatAgent(
+                generationService: providerRegistry,
+                webSearchProvider: InternetKnowledgeProvider(
+                    credentials: sharedCredentials
+                )
+            )
         self.finalReportGenerator = finalReportGenerator
             ?? ProjectAIOrchestrator(
                 finalReportAgent: FinalReportAgent(

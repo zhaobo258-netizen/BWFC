@@ -28,6 +28,14 @@ struct ProjectAIChatAttachment: Identifiable, Codable, Sendable, Equatable {
     }
 }
 
+struct ProjectAIChatSource: Identifiable, Codable, Sendable, Equatable {
+    var id: String
+    var providerName: String
+    var title: String
+    var excerpt: String
+    var sourceLocation: String
+}
+
 enum ProjectAIChatAttachmentPolicy {
     static let maximumCount = 4
     static let maximumPerDocumentCharacters = 16_000
@@ -76,6 +84,7 @@ struct ProjectAIChatMessage: Identifiable, Codable, Sendable, Equatable {
     var providerName: String?
     var modelID: String?
     var attachments: [ProjectAIChatAttachment]
+    var sources: [ProjectAIChatSource]
 
     init(
         id: UUID = UUID(),
@@ -84,7 +93,8 @@ struct ProjectAIChatMessage: Identifiable, Codable, Sendable, Equatable {
         createdAt: Date = Date(),
         providerName: String? = nil,
         modelID: String? = nil,
-        attachments: [ProjectAIChatAttachment] = []
+        attachments: [ProjectAIChatAttachment] = [],
+        sources: [ProjectAIChatSource] = []
     ) {
         self.id = id
         self.role = role
@@ -93,10 +103,12 @@ struct ProjectAIChatMessage: Identifiable, Codable, Sendable, Equatable {
         self.providerName = providerName
         self.modelID = modelID
         self.attachments = attachments
+        self.sources = sources
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, role, text, createdAt, providerName, modelID, attachments
+        case id, role, text, createdAt, providerName, modelID, attachments,
+             sources
     }
 
     init(from decoder: any Decoder) throws {
@@ -113,6 +125,10 @@ struct ProjectAIChatMessage: Identifiable, Codable, Sendable, Equatable {
         attachments = try container.decodeIfPresent(
             [ProjectAIChatAttachment].self,
             forKey: .attachments
+        ) ?? []
+        sources = try container.decodeIfPresent(
+            [ProjectAIChatSource].self,
+            forKey: .sources
         ) ?? []
     }
 }

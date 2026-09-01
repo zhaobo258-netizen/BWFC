@@ -30,21 +30,26 @@ private actor ProjectAIChatMockService: ProjectAIChatServing {
 }
 
 private actor ProjectAIChatGenerationService: AITextGenerationServing {
-    private(set) var request: AITextGenerationRequest?
-    private let responseText: String
+    private var requests: [AITextGenerationRequest] = []
+    private let responseTexts: [String]
 
     init(
         responseText: String = #"{"reply":"已结合逐字稿与笔记回答。"}"#
     ) {
-        self.responseText = responseText
+        self.responseTexts = [responseText]
+    }
+
+    init(responseTexts: [String]) {
+        self.responseTexts = responseTexts
     }
 
     func generate(
         _ request: AITextGenerationRequest
     ) async throws -> AITextGenerationResponse {
-        self.request = request
+        requests.append(request)
+        let index = min(requests.count - 1, responseTexts.count - 1)
         return AITextGenerationResponse(
-            text: responseText,
+            text: responseTexts[index],
             provider: AIProviderDescriptor(
                 id: "mock",
                 displayName: "测试模型",
@@ -62,7 +67,41 @@ private actor ProjectAIChatGenerationService: AITextGenerationServing {
     }
 
     func capturedRequest() -> AITextGenerationRequest? {
-        request
+        requests.last
+    }
+
+    func capturedRequests() -> [AITextGenerationRequest] {
+        requests
+    }
+}
+
+private actor ProjectAIChatWebSearchRecorder {
+    private var queries: [String] = []
+
+    func record(_ query: String) {
+        queries.append(query)
+    }
+
+    func capturedQueries() -> [String] {
+        queries
+    }
+}
+
+private struct ProjectAIChatWebSearchProvider: KnowledgeProvider {
+    let kind: KnowledgeProviderKind = .internet
+    let providerID = "internet:test"
+    let displayName = "测试互联网"
+    let recorder: ProjectAIChatWebSearchRecorder
+    let results: [KnowledgeConnection]
+
+    func healthCheck() async -> KnowledgeProviderHealth {
+        KnowledgeProviderHealth(isAvailable: true, message: "可用")
+    }
+
+    func search(_ query: String, limit: Int) async throws
+        -> [KnowledgeConnection] {
+        await recorder.record(query)
+        return Array(results.prefix(limit))
     }
 }
 
@@ -72,7 +111,7 @@ private enum ProjectAIChatTestError: Error {
 
 @Suite("项目 AI 对话")
 struct ProjectAIChatTests {
-    @Test("旧对话消息缺少引用文档字段时安全回退")
+    @Test("旧对话消息缺少引用文档和联网来源字段时安全回退")
     func messageAttachmentCompatibility() throws {
         let message = ProjectAIChatMessage(
             role: .user,
@@ -83,12 +122,14 @@ struct ProjectAIChatTests {
             try JSONSerialization.jsonObject(with: data) as? [String: Any]
         )
         object.removeValue(forKey: "attachments")
+        object.removeValue(forKey: "sources")
         let legacyData = try JSONSerialization.data(withJSONObject: object)
         let restored = try JSONDecoder().decode(
             ProjectAIChatMessage.self,
             from: legacyData
         )
         #expect(restored.attachments.isEmpty)
+        #expect(restored.sources.isEmpty)
     }
 
     @Test("旧 Project 缺少对话、共创草稿与笔记授权字段时安全回退")
@@ -279,10 +320,155 @@ struct ProjectAIChatTests {
         ])
     }
 
+    @Test("Agent 只发送模型生成的短检索词，并用真实联网来源二次回答")
+    func agentPerformsGroundedWebSearch() async throws {
+        let recorder = ProjectAIChatWebSearchRecorder()
+        let provider = ProjectAIChatWebSearchProvider(
+            recorder: recorder,
+            results: [
+                KnowledgeConnection(
+                    provider: .internet,
+                    providerId: "internet:test",
+                    providerName: "测试互联网",
+                    sourceId: "kimi-k3",
+                    title: "Kimi K3 产品说明",
+                    excerpt: "Kimi K3 是面向长上下文任务的模型。",
+                    sourceLocation: "https://example.com/kimi-k3"
+                )
+            ]
+        )
+        let generation = ProjectAIChatGenerationService(responseTexts: [
+            """
+            {
+              "reply":"需要先检索最新资料。",
+              "search_queries":["Kimi K3 最新能力与发布信息"]
+            }
+            """,
+            """
+            {
+              "reply":"根据联网资料，Kimi K3 适合长上下文任务【web_1】。",
+              "web_search_queries":[],
+              "source_ids":["web_1"]
+            }
+            """
+        ])
+        let agent = ProjectAIChatAgent(
+            generationService: generation,
+            webSearchProvider: provider
+        )
+        let request = ProjectAIChatRequest(
+            scenario: "freeform",
+            speakers: [],
+            transcript: [
+                .init(
+                    id: UUID().uuidString,
+                    speakerId: nil,
+                    startMs: 0,
+                    text: "不得发送给互联网的逐字稿内容"
+                )
+            ],
+            analysisHeadline: nil,
+            analysisItems: [],
+            conversationHistory: [],
+            currentRequest: "Kimi K3 适合哪些公开业务场景？",
+            noteMarkdown: "不得发送给互联网的用户笔记",
+            webSearchEnabled: true
+        )
+
+        let response = try await agent.reply(to: request)
+
+        #expect(response.sources.count == 1)
+        #expect(response.sources.first?.id == "web_1")
+        #expect(
+            response.sources.first?.sourceLocation
+                == "https://example.com/kimi-k3"
+        )
+        let queries = await recorder.capturedQueries()
+        #expect(queries == ["Kimi K3 最新能力与发布信息"])
+        #expect(queries.allSatisfy { $0.count <= 24 })
+        #expect(!queries.joined().contains("逐字稿"))
+        #expect(!queries.joined().contains("用户笔记"))
+        let requests = await generation.capturedRequests()
+        #expect(requests.count == 2)
+        #expect(requests[0].input.contains("Kimi K3 适合哪些公开业务场景"))
+        #expect(!requests[0].input.contains("逐字稿内容"))
+        #expect(!requests[0].input.contains("用户笔记"))
+        #expect(requests[1].input.contains("untrusted_web_sources"))
+        let finalInputData = try #require(
+            requests[1].input.data(using: .utf8)
+        )
+        let finalInput = try #require(
+            try JSONSerialization.jsonObject(with: finalInputData)
+                as? [String: Any]
+        )
+        let webContainer = try #require(
+            finalInput["untrusted_web_sources"] as? [String: Any]
+        )
+        let webSources = try #require(
+            webContainer["sources"] as? [[String: Any]]
+        )
+        #expect(
+            webSources.first?["sourceLocation"] as? String
+                == "https://example.com/kimi-k3"
+        )
+    }
+
+    @Test("关闭联网后不规划检索，也不向互联网 Provider 发送内容")
+    func agentRespectsDisabledWebSearch() async throws {
+        let recorder = ProjectAIChatWebSearchRecorder()
+        let provider = ProjectAIChatWebSearchProvider(
+            recorder: recorder,
+            results: []
+        )
+        let generation = ProjectAIChatGenerationService(
+            responseText: #"{"reply":"仅依据项目内容回答。"}"#
+        )
+        let agent = ProjectAIChatAgent(
+            generationService: generation,
+            webSearchProvider: provider
+        )
+        let request = ProjectAIChatRequest(
+            scenario: "freeform",
+            speakers: [],
+            transcript: [],
+            analysisHeadline: nil,
+            analysisItems: [],
+            conversationHistory: [],
+            currentRequest: "请联网查一下最新消息",
+            noteMarkdown: nil,
+            webSearchEnabled: false
+        )
+
+        let response = try await agent.reply(to: request)
+
+        #expect(response.reply == "仅依据项目内容回答。")
+        #expect(response.sources.isEmpty)
+        #expect(await recorder.capturedQueries().isEmpty)
+        #expect(await generation.capturedRequests().count == 1)
+    }
+
     @Test("控制器保存用户补充、引用文档与 AI 回应，并读取尚未自动保存的最新笔记")
     @MainActor
     func controllerPersistsConversation() async throws {
-        let service = ProjectAIChatMockService()
+        let service = ProjectAIChatMockService(
+            response: ProjectAIChatResponse(
+                reply: "已结合项目内容与联网资料回答。",
+                provider: AIProviderDescriptor(
+                    id: "mock",
+                    displayName: "测试 AI",
+                    modelID: "test-model"
+                ),
+                sources: [
+                    ProjectAIChatSource(
+                        id: "web_1",
+                        providerName: "测试互联网",
+                        title: "行业资料",
+                        excerpt: "行业资料摘要",
+                        sourceLocation: "https://example.com/industry"
+                    )
+                ]
+            )
+        )
         let project = Project(
             title: "项目对话",
             sourceType: .liveRecording,
@@ -325,6 +511,7 @@ struct ProjectAIChatTests {
         #expect(controller.pendingAttachments.isEmpty)
         #expect(project.aiChatDraft.isEmpty)
         #expect(controller.messages.last?.modelID == "test-model")
+        #expect(controller.messages.last?.sources.map(\.id) == ["web_1"])
         #expect(conversationUpdateCount == 1)
         let captured = try #require(
             await service.capturedRequests().first

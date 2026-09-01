@@ -26,6 +26,7 @@ final class ProjectAIChatController {
     private(set) var errorMessage: String?
     private(set) var lastDraftSavedAt: Date?
     private(set) var draftSaveError: String?
+    var isWebSearchEnabled = true
     var noteContextProvider: () -> String? = { nil }
     var prepareRequestContext: (() -> Bool)?
     var onConversationUpdated: () -> Void = {}
@@ -132,7 +133,8 @@ final class ProjectAIChatController {
             project: project,
             currentRequest: text,
             noteMarkdown: noteContextProvider(),
-            currentAttachments: attachments
+            currentAttachments: attachments,
+            webSearchEnabled: isWebSearchEnabled
         )
         let previousMessages = project.aiChatMessages
         let previousDraft = project.aiChatDraft
@@ -170,7 +172,8 @@ final class ProjectAIChatController {
                 role: .assistant,
                 text: reply,
                 providerName: response.provider.displayName,
-                modelID: response.provider.modelID
+                modelID: response.provider.modelID,
+                sources: response.sources
             ))
             project.aiChatMessages = ProjectAIChatRetention.keepingMostRecent(
                 project.aiChatMessages

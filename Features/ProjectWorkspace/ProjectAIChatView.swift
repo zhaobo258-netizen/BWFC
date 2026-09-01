@@ -142,6 +142,14 @@ struct ProjectAIChatView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "globe")
+                    .foregroundStyle(.secondary)
+                Text("开启“联网搜索”后，AI 会按需检索并在回答下方保留可打开的真实来源。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             Spacer(minLength: 0)
         }
         .padding(12)
@@ -166,7 +174,11 @@ struct ProjectAIChatView: View {
                     if controller.isSending {
                         HStack(spacing: 6) {
                             ProgressView().controlSize(.mini)
-                            Text("AI 正在结合录音和共创内容回应…")
+                            Text(
+                                controller.isWebSearchEnabled
+                                    ? "AI 正在判断是否需要联网并结合项目内容回应…"
+                                    : "AI 正在结合录音和共创内容回应…"
+                            )
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -215,6 +227,9 @@ struct ProjectAIChatView: View {
                         }
                     }
                 }
+                if !message.sources.isEmpty {
+                    sourceList(message.sources)
+                }
                 if message.role == .assistant,
                    let providerName = message.providerName,
                    let modelID = message.modelID {
@@ -235,6 +250,48 @@ struct ProjectAIChatView: View {
             }
         }
         .frame(maxWidth: .infinity)
+    }
+
+    private func sourceList(_ sources: [ProjectAIChatSource]) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label("联网来源", systemImage: "globe")
+                .font(.caption2)
+                .fontWeight(.semibold)
+                .foregroundStyle(.secondary)
+            ForEach(sources) { source in
+                if let url = URL(string: source.sourceLocation),
+                   url.scheme == "https" || url.scheme == "http" {
+                    Link(destination: url) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 4) {
+                                Text("【\(source.id)】")
+                                Text(source.title)
+                                    .lineLimit(1)
+                                Image(systemName: "arrow.up.right.square")
+                            }
+                            .font(.caption2)
+                            .fontWeight(.medium)
+                            Text(source.excerpt)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                            Text(source.providerName)
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.plain)
+                    .help("打开来源：\(source.title)")
+                    .accessibilityLabel("联网来源 \(source.title)")
+                }
+            }
+        }
+        .padding(7)
+        .background(
+            Color.secondary.opacity(0.06),
+            in: RoundedRectangle(cornerRadius: 7)
+        )
     }
 
     private func legacyNoteCard(_ note: String) -> some View {
@@ -320,6 +377,27 @@ struct ProjectAIChatView: View {
                     }
                     .padding(.vertical, 1)
                 }
+            }
+
+            HStack(spacing: 7) {
+                Toggle(
+                    isOn: $controller.isWebSearchEnabled
+                ) {
+                    Label("联网搜索", systemImage: "globe")
+                }
+                .toggleStyle(.button)
+                .controlSize(.small)
+                .help("开启后，AI 只向互联网发送最多两条、每条不超过 24 字的检索词；逐字稿和笔记不会发送给搜索源")
+                .accessibilityHint("控制本次及后续项目对话是否允许联网检索")
+                Text(
+                    controller.isWebSearchEnabled
+                        ? "按需检索；逐字稿和笔记不发送给搜索源"
+                        : "仅使用项目内容和模型已有知识"
+                )
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
             }
 
             HStack(alignment: .bottom, spacing: 8) {
