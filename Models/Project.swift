@@ -5,6 +5,27 @@ enum ProjectSourceType: String, Codable, Sendable, CaseIterable {
     case liveRecording  // 实时录音
     case importedAudio  // 导入音频
     case importedVideo  // 导入视频
+    case combinedRecordings // 由多段录音派生的跨录音分析
+
+    var isImportedMedia: Bool {
+        self == .importedAudio || self == .importedVideo
+    }
+
+    var isCombinedAnalysis: Bool {
+        self == .combinedRecordings
+    }
+}
+
+/// 合并分析中的原始录音引用。时间偏移让汇总文稿保持先后顺序，
+/// 同时可以还原到每段录音内的原始时间戳。
+struct SourceRecordingReference: Identifiable, Codable, Sendable, Hashable {
+    var projectID: UUID
+    var title: String
+    var recordedAt: Date
+    var timelineOffsetMs: Int64
+    var durationMs: Int64
+
+    var id: UUID { projectID }
 }
 
 /// 项目场景（产品文档 03 号 §8.1）
@@ -96,8 +117,12 @@ final class Project: Identifiable, Codable {
     var id: UUID
     /// 项目标题
     var title: String
+    /// 业务项目/业务范畴。nil 表示尚未分组。
+    var businessCategory: String?
     /// 来源类型
     var sourceType: ProjectSourceType
+    /// 跨录音合并分析的原始录音。普通录音/导入项目为空。
+    var sourceRecordings: [SourceRecordingReference]
     /// 场景（未识别或未选择时为 nil）
     var scenario: ProjectScenario?
     /// 场景是否为用户手工选择（区别于自动推断）
@@ -158,7 +183,9 @@ final class Project: Identifiable, Codable {
         schemaVersion: Int = 2,
         id: UUID = UUID(),
         title: String,
+        businessCategory: String? = nil,
         sourceType: ProjectSourceType,
+        sourceRecordings: [SourceRecordingReference] = [],
         scenario: ProjectScenario? = nil,
         scenarioWasUserSelected: Bool = false,
         status: ProjectStatus = .creating,
@@ -190,7 +217,9 @@ final class Project: Identifiable, Codable {
         self.schemaVersion = schemaVersion
         self.id = id
         self.title = title
+        self.businessCategory = businessCategory
         self.sourceType = sourceType
+        self.sourceRecordings = sourceRecordings
         self.scenario = scenario
         self.scenarioWasUserSelected = scenarioWasUserSelected
         self.status = status
@@ -226,7 +255,12 @@ final class Project: Identifiable, Codable {
         schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 2
         id = try container.decode(UUID.self, forKey: .id)
         title = try container.decode(String.self, forKey: .title)
+        businessCategory = try container.decodeIfPresent(String.self, forKey: .businessCategory)
         sourceType = try container.decode(ProjectSourceType.self, forKey: .sourceType)
+        sourceRecordings = try container.decodeIfPresent(
+            [SourceRecordingReference].self,
+            forKey: .sourceRecordings
+        ) ?? []
         scenario = try container.decodeIfPresent(ProjectScenario.self, forKey: .scenario)
         scenarioWasUserSelected = try container.decodeIfPresent(Bool.self, forKey: .scenarioWasUserSelected) ?? false
         status = try container.decode(ProjectStatus.self, forKey: .status)

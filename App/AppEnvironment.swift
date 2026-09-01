@@ -8,6 +8,7 @@ enum ProjectFieldOwnership: Sendable, Equatable {
     case all
     case note
     case title
+    case businessGrouping
     case userScenario
     case speakers
     case manualSegments
@@ -32,7 +33,9 @@ enum ProjectPersistence {
         "schemaVersion": .identity,
         "id": .identity,
         "title": .workspace,
+        "businessCategory": .workspace,
         "sourceType": .identity,
+        "sourceRecordings": .identity,
         "scenario": .shared,
         "scenarioWasUserSelected": .shared,
         "status": .runtime,
@@ -84,6 +87,9 @@ enum ProjectPersistence {
             stored.note = incoming.note
         case .title:
             stored.title = incoming.title
+            stored.lastActivityAt = incoming.lastActivityAt
+        case .businessGrouping:
+            stored.businessCategory = incoming.businessCategory
             stored.lastActivityAt = incoming.lastActivityAt
         case .userScenario:
             stored.scenario = incoming.scenario
@@ -308,9 +314,9 @@ final class AppEnvironment {
     private(set) var correctionRules: [CorrectionRule] = []
     private(set) var lexiconRevision = 0
 
-    /// 各 provider 的 Keychain 存储（Key 分家，互不外借）
+    /// 各 provider 的本机凭证存储（Key 分家，互不外借）
     private let keyStores: [CloudProvider: CloudAPIKeyStore]
-    private let keychainServiceName: String
+    private let credentialServiceName: String
     /// Kimi 账号 OAuth 凭证存储（设备码登录；与静态分析 Key 独立条目）
     let kimiOAuthTokenStore: KimiOAuthTokenStore
     let aiProviderConfigurationStore: AIProviderConfigurationStore
@@ -319,17 +325,17 @@ final class AppEnvironment {
     let volcengineDiarizationKeyStore: CloudAPIKeyStore
     let volcengineDiarizationAccessTokenStore: CloudAPIKeyStore
     let aiProviderRegistry: AIProviderRegistry
-    /// 外部知识 MCP 的非敏感连接配置与独立 Keychain Token
+    /// 外部知识 MCP 的非敏感连接配置与独立本机 Token
     let externalMCPConfigurationStore: ExternalMCPConfigurationStore
     private(set) var cloudConfigurationRevision = 0
-    /// Kimi OAuth 凭证条目是否存在；启动状态检查不解密凭证，避免阻塞主线程。
+    /// Kimi OAuth 凭证条目是否存在。
     private(set) var isKimiAccountConnected: Bool
     /// 分人（OpenAI 兼容）Key 是否已配置
     private(set) var isDiarizationConfigured: Bool
 
     var externalMCPTokenStore: CloudAPIKeyStore {
         CloudAPIKeyStore(
-            service: keychainServiceName,
+            service: credentialServiceName,
             account: ExternalMCPConfigurationStore.legacyTokenAccount
         )
     }
@@ -338,7 +344,7 @@ final class AppEnvironment {
         for configuration: ExternalMCPConfiguration
     ) -> CloudAPIKeyStore {
         CloudAPIKeyStore(
-            service: keychainServiceName,
+            service: credentialServiceName,
             account: configuration.credentialAccount
         )
     }
@@ -383,7 +389,7 @@ final class AppEnvironment {
         exporter: (any MeetingExportServicing)? = nil,
         audioImport: (any AudioImportServicing)? = nil,
         makeImportTranscriptionService: (() -> any LocalTranscriptionServicing)? = nil,
-        keychainServiceName: String = CloudAPIKeyStore.defaultService,
+        credentialServiceName: String = CloudAPIKeyStore.defaultService,
         aiProviderConfigurationStore: AIProviderConfigurationStore? = nil,
         diarizationProviderConfigurationStore: DiarizationProviderConfigurationStore? = nil,
         externalMCPConfigurationStore: ExternalMCPConfigurationStore? = nil,
@@ -391,11 +397,11 @@ final class AppEnvironment {
     ) {
         var stores: [CloudProvider: CloudAPIKeyStore] = [:]
         for provider in CloudProvider.allCases {
-            stores[provider] = CloudAPIKeyStore.store(for: provider, service: keychainServiceName)
+            stores[provider] = CloudAPIKeyStore.store(for: provider, service: credentialServiceName)
         }
-        let oauthStore = KimiOAuthTokenStore(service: keychainServiceName)
+        let oauthStore = KimiOAuthTokenStore(service: credentialServiceName)
         let analysisKeyStore = stores[.analysis]
-            ?? CloudAPIKeyStore.store(for: .analysis, service: keychainServiceName)
+            ?? CloudAPIKeyStore.store(for: .analysis, service: credentialServiceName)
         let sharedCredentials = kimiCredentials ?? KimiCredentialProvider(
             tokenStore: oauthStore,
             staticKeyStore: analysisKeyStore
@@ -409,8 +415,8 @@ final class AppEnvironment {
         let diarizationConfigurationStore = diarizationProviderConfigurationStore
             ?? DiarizationProviderConfigurationStore()
         let openAIKeyStore = CloudAPIKeyStore(
-            service: keychainServiceName,
-            account: AIProviderConfigurationStore.openAIKeychainAccount
+            service: credentialServiceName,
+            account: AIProviderConfigurationStore.openAICredentialAccount
         )
         let providerRegistry = AIProviderRegistry(
             configurationStore: aiConfigurationStore,
@@ -432,14 +438,14 @@ final class AppEnvironment {
             diarizationConfiguration.selectedProvider = diarizationProvider
         }
         let diarizationStore = stores[.diarization]
-            ?? CloudAPIKeyStore.store(for: .diarization, service: keychainServiceName)
+            ?? CloudAPIKeyStore.store(for: .diarization, service: credentialServiceName)
         let volcengineDiarizationKeyStore = CloudAPIKeyStore(
-            service: keychainServiceName,
-            account: VolcengineDiarizationService.keychainAccount
+            service: credentialServiceName,
+            account: VolcengineDiarizationService.credentialAccount
         )
         let volcengineDiarizationAccessTokenStore = CloudAPIKeyStore(
-            service: keychainServiceName,
-            account: VolcengineDiarizationService.accessTokenKeychainAccount
+            service: credentialServiceName,
+            account: VolcengineDiarizationService.accessTokenCredentialAccount
         )
         self.diarizationServiceOverride = diarization
         self.negotiationAnalysis = negotiationAnalysis ?? sharedTransport
@@ -471,7 +477,7 @@ final class AppEnvironment {
         self.correctionRules = loaded.corrections
 
         self.keyStores = stores
-        self.keychainServiceName = keychainServiceName
+        self.credentialServiceName = credentialServiceName
         self.kimiOAuthTokenStore = oauthStore
         self.aiProviderConfigurationStore = aiConfigurationStore
         self.diarizationProviderConfigurationStore = diarizationConfigurationStore
@@ -625,7 +631,7 @@ final class AppEnvironment {
         lexiconRevision += 1
     }
 
-    /// 指定 provider 的 Keychain 存储（视图层读写 Key 的唯一入口）
+    /// 指定 provider 的本机凭证存储（视图层读写 Key 的唯一入口）
     func keyStore(for provider: CloudProvider) -> CloudAPIKeyStore {
         guard let store = keyStores[provider] else {
             return CloudAPIKeyStore.store(for: provider)
@@ -818,7 +824,6 @@ final class AppEnvironment {
                 storageWarning: storage.warning,
                 securityScopedStorageAccess: storage.securityScopedAccess
             )
-            scheduleLegacyKeyMigration(refreshing: environment)
             return environment
         } catch {
             // 持久化初始化失败：降级为内存库，保证界面可用；
@@ -830,23 +835,7 @@ final class AppEnvironment {
                 projectStore: InMemoryProjectStore(),
                 isPersistentStorageUnavailable: true
             )
-            scheduleLegacyKeyMigration(refreshing: environment)
             return environment
-        }
-    }
-
-    /// 旧版 Keychain 条目迁移：先跨 service（ad-hoc 时代 → 当前 v2），
-    /// 再在当前 service 内做 account=openai → 分析 kimi 的旧版迁移。
-    /// 顺序不可颠倒：跨 service 迁移要先把旧值搬进来，account 迁移才有东西可搬。
-    /// 迁移使用禁止交互的 Keychain 读取；ACL 不匹配时立即跳过，不弹密码框。
-    /// 仍放在 utility task，避免启动首帧等待安全存储 I/O。
-    private static func scheduleLegacyKeyMigration(refreshing environment: AppEnvironment) {
-        Task.detached(priority: .utility) {
-            CloudAPIKeyStore.migrateAdHocServiceCredentialsIfNeeded()
-            CloudAPIKeyStore.migrateLegacyKeyIfNeeded()
-            await MainActor.run {
-                environment.refreshCloudConfiguration()
-            }
         }
     }
 }

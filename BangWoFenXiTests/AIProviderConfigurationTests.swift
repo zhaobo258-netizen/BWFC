@@ -116,7 +116,7 @@ struct AIProviderConfigurationTests {
         )
         let custom = CloudAPIKeyStore(
             service: serviceName,
-            account: AIProviderConfigurationStore.openAIKeychainAccount
+            account: AIProviderConfigurationStore.openAICredentialAccount
         )
         let registry = AIProviderRegistry(
             configurationStore: store,
@@ -152,11 +152,11 @@ struct AIProviderConfigurationTests {
         let serviceName = "com.zhaobo.BangWoFenXi.tests.ai.\(UUID().uuidString)"
         let openAIKeyStore = CloudAPIKeyStore(
             service: serviceName,
-            account: AIProviderConfigurationStore.openAIKeychainAccount
+            account: AIProviderConfigurationStore.openAICredentialAccount
         )
         defer {
             try? openAIKeyStore.deleteKey()
-            try? KeychainService(service: serviceName).delete(account: "kimi")
+            try? LocalCredentialStore(service: serviceName).delete(account: "kimi")
         }
         try openAIKeyStore.saveKey("openai-compatible-key")
         try store.save(AIProviderConfiguration(
@@ -229,7 +229,7 @@ struct AIProviderConfigurationTests {
         let serviceName = "com.zhaobo.BangWoFenXi.tests.ai.\(UUID().uuidString)"
         let custom = CloudAPIKeyStore(
             service: serviceName,
-            account: AIProviderConfigurationStore.openAIKeychainAccount
+            account: AIProviderConfigurationStore.openAICredentialAccount
         )
         let kimi = CloudAPIKeyStore.store(for: .analysis, service: serviceName)
         defer {

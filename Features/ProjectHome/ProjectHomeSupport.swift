@@ -3,6 +3,37 @@ import UniformTypeIdentifiers
 
 /// 首页列表的纯逻辑（可单测）：排序与一行摘要。
 enum ProjectHomeSupport {
+    struct DisplayGroup: Identifiable {
+        let businessCategory: String?
+        let projects: [Project]
+
+        var id: String { businessCategory ?? "__ungrouped__" }
+        var title: String { businessCategory ?? "未分组录音" }
+    }
+
+    enum RecordingMergeError: LocalizedError, Equatable {
+        case notEnoughRecordings
+        case containsDerivedAnalysis
+        case recordingNotReady(String)
+        case recordingHasNoTranscript(String)
+        case spansBusinessCategories
+
+        var errorDescription: String? {
+            switch self {
+            case .notEnoughRecordings:
+                return "至少选择 2 段录音才能合并分析。"
+            case .containsDerivedAnalysis:
+                return "已生成的合并分析不能再当作原始录音合并。"
+            case .recordingNotReady(let title):
+                return "「\(title)」还没有处理完，暂时不能参与合并。"
+            case .recordingHasNoTranscript(let title):
+                return "「\(title)」还没有可用的最终文稿。"
+            case .spansBusinessCategories:
+                return "一次只能合并同一业务项目下的录音；请先完成归组。"
+            }
+        }
+    }
+
     static let recordingScenarioOrder: [ProjectScenario] = [
         .clientVisit,
         .internalMeeting,
@@ -33,6 +64,219 @@ enum ProjectHomeSupport {
     /// 最近项目按最近活动时间倒序
     static func sortedForDisplay(_ projects: [Project]) -> [Project] {
         projects.sorted { $0.lastActivityAt > $1.lastActivityAt }
+    }
+
+    /// 首页先按业务项目归类，组内仍按最近活动时间排序。
+    /// 已分组项目按各组最近活动时间排在前面，未分组收在最后。
+    static func groupedForDisplay(_ projects: [Project]) -> [DisplayGroup] {
+        let grouped = Dictionary(grouping: projects) {
+            normalizedBusinessCategory($0.businessCategory)
+        }
+        let named = grouped.compactMap { key, values -> DisplayGroup? in
+            guard let key else { return nil }
+            return DisplayGroup(
+                businessCategory: key,
+                projects: sortedForDisplay(values)
+            )
+        }
+        .sorted {
+            let left = $0.projects.map(\.lastActivityAt).max() ?? .distantPast
+            let right = $1.projects.map(\.lastActivityAt).max() ?? .distantPast
+            return left == right ? $0.title < $1.title : left > right
+        }
+        guard let ungrouped = grouped[nil], !ungrouped.isEmpty else {
+            return named
+        }
+        return named + [DisplayGroup(
+            businessCategory: nil,
+            projects: sortedForDisplay(ungrouped)
+        )]
+    }
+
+    static func normalizedBusinessCategory(_ raw: String?) -> String? {
+        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (trimmed?.isEmpty ?? true) ? nil : trimmed
+    }
+
+    static func isEligibleForMerge(_ project: Project) -> Bool {
+        guard !project.sourceType.isCombinedAnalysis,
+              project.status == .ready || project.status == .readyWithWarnings else {
+            return false
+        }
+        return project.segments.contains {
+            ($0.state == .final || $0.state == .edited)
+                && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    /// 用原始录音的最终/人工修订文稿生成一个自包含的派生项目。
+    /// 原始项目不被修改；每条片段用 sourceAssetId 保留来源录音。
+    static func makeCombinedAnalysisProject(
+        from candidates: [Project],
+        at date: Date = Date()
+    ) throws -> Project {
+        let unique = Dictionary(
+            candidates.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        ).values
+        let ordered = unique.sorted {
+            recordingDate($0) == recordingDate($1)
+                ? $0.id.uuidString < $1.id.uuidString
+                : recordingDate($0) < recordingDate($1)
+        }
+        guard ordered.count >= 2 else { throw RecordingMergeError.notEnoughRecordings }
+        guard ordered.allSatisfy({ !$0.sourceType.isCombinedAnalysis }) else {
+            throw RecordingMergeError.containsDerivedAnalysis
+        }
+        for project in ordered {
+            guard project.status == .ready || project.status == .readyWithWarnings else {
+                throw RecordingMergeError.recordingNotReady(project.title)
+            }
+            guard isEligibleForMerge(project) else {
+                throw RecordingMergeError.recordingHasNoTranscript(project.title)
+            }
+        }
+
+        let categories = Set(ordered.compactMap {
+            normalizedBusinessCategory($0.businessCategory)
+        })
+        let hasUngrouped = ordered.contains {
+            normalizedBusinessCategory($0.businessCategory) == nil
+        }
+        guard categories.count <= 1,
+              !(hasUngrouped && !categories.isEmpty) else {
+            throw RecordingMergeError.spansBusinessCategories
+        }
+        let businessCategory = categories.first
+
+        var references: [SourceRecordingReference] = []
+        var segments: [TranscriptSegment] = []
+        var speakerByID: [UUID: Speaker] = [:]
+        var timelineOffset: Int64 = 0
+        for source in ordered {
+            let accepted = source.segments.filter {
+                ($0.state == .final || $0.state == .edited)
+                    && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            let sourceDuration = max(
+                source.durationMs,
+                accepted.map(\.endMs).max() ?? 0
+            )
+            references.append(SourceRecordingReference(
+                projectID: source.id,
+                title: source.title,
+                recordedAt: recordingDate(source),
+                timelineOffsetMs: timelineOffset,
+                durationMs: sourceDuration
+            ))
+            for segment in accepted {
+                segments.append(copy(
+                    segment,
+                    sourceProjectID: source.id,
+                    timelineOffsetMs: timelineOffset
+                ))
+            }
+            for speaker in source.speakers where speakerByID[speaker.id] == nil {
+                speakerByID[speaker.id] = copy(speaker)
+            }
+            timelineOffset += sourceDuration + 1_000
+        }
+        let speakers = speakerByID.values
+            .sorted { $0.id.uuidString < $1.id.uuidString }
+        for (index, speaker) in speakers.enumerated() {
+            speaker.cloudAlias = String(format: "p_%02d", index + 1)
+        }
+
+        let commonScenario = Set(ordered.compactMap { $0.scenario?.rawValue }).count == 1
+            ? ordered.compactMap(\.scenario).first
+            : nil
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        let titlePrefix = businessCategory ?? "跨录音"
+        return Project(
+            title: "\(titlePrefix) · 合并分析 · \(formatter.string(from: date))",
+            businessCategory: businessCategory,
+            sourceType: .combinedRecordings,
+            sourceRecordings: references,
+            scenario: commonScenario,
+            scenarioWasUserSelected: false,
+            status: .ready,
+            createdAt: date,
+            startedAt: references.first?.recordedAt,
+            endedAt: references.last.map { $0.recordedAt.addingTimeInterval(Double($0.durationMs) / 1_000) },
+            lastActivityAt: date,
+            durationMs: max(0, timelineOffset - 1_000),
+            speakers: speakers,
+            segments: segments.sorted {
+                $0.startMs == $1.startMs
+                    ? $0.id.uuidString < $1.id.uuidString
+                    : $0.startMs < $1.startMs
+            }
+        )
+    }
+
+    static func sourceRecording(
+        for segment: TranscriptSegment,
+        in project: Project
+    ) -> SourceRecordingReference? {
+        guard let sourceID = segment.sourceAssetId else { return nil }
+        return project.sourceRecordings.first { $0.projectID == sourceID }
+    }
+
+    static func sourceRelativeStartMs(
+        for segment: TranscriptSegment,
+        in project: Project
+    ) -> Int64 {
+        guard let source = sourceRecording(for: segment, in: project) else {
+            return segment.startMs
+        }
+        return max(0, segment.startMs - source.timelineOffsetMs)
+    }
+
+    private static func recordingDate(_ project: Project) -> Date {
+        project.startedAt ?? project.createdAt
+    }
+
+    private static func copy(
+        _ segment: TranscriptSegment,
+        sourceProjectID: UUID,
+        timelineOffsetMs: Int64
+    ) -> TranscriptSegment {
+        TranscriptSegment(
+            id: segment.id,
+            startMs: timelineOffsetMs + segment.startMs,
+            endMs: timelineOffsetMs + segment.endMs,
+            text: segment.text,
+            participantId: segment.participantId,
+            remoteSpeakerLabel: segment.remoteSpeakerLabel,
+            source: segment.source,
+            state: segment.state,
+            isStarred: segment.isStarred,
+            createdAt: segment.createdAt,
+            updatedAt: segment.updatedAt,
+            speakerConfidence: segment.speakerConfidence,
+            languageCode: segment.languageCode,
+            sourceAssetId: sourceProjectID,
+            textWasUserEdited: segment.textWasUserEdited,
+            speakerWasUserConfirmed: segment.speakerWasUserConfirmed
+        )
+    }
+
+    private static func copy(_ speaker: Speaker) -> Speaker {
+        Speaker(
+            id: speaker.id,
+            cloudAlias: speaker.cloudAlias,
+            displayName: speaker.displayName,
+            role: speaker.role,
+            colorToken: speaker.colorToken,
+            isUserConfirmed: speaker.isUserConfirmed,
+            legacySide: speaker.legacySide,
+            legacyVoiceReferencePath: speaker.legacyVoiceReferencePath,
+            legacyVoiceReferenceDurationMs: speaker.legacyVoiceReferenceDurationMs,
+            voiceSamplePath: speaker.voiceSamplePath,
+            voiceSampleDurationMs: speaker.voiceSampleDurationMs,
+            voiceProfileId: speaker.voiceProfileId
+        )
     }
 
     /// 一行摘要：优先最新分析快照的当前议题，其次最近一条已确认片段正文；
@@ -102,6 +346,7 @@ enum ProjectHomeSupport {
         case .liveRecording: return "现场录音"
         case .importedAudio: return "导入音频"
         case .importedVideo: return "导入视频"
+        case .combinedRecordings: return "跨录音分析"
         }
     }
 
@@ -209,9 +454,12 @@ enum ProjectHomeSupport {
                 + "\(project.finalReportSnapshots.count) 版完整总结",
             "· 项目笔记与 \(project.aiChatMessages.count) 条共创记录"
         ]
-        if project.sourceType != .liveRecording {
+        if project.sourceType.isImportedMedia {
             // 留档的原始导入文件也在项目目录里，一起没了；用户自己选的那份原件不受影响。
             lines.append("· 导入时留档的原始文件副本（你自己磁盘上的原件不受影响）")
+        }
+        if project.sourceType.isCombinedAnalysis {
+            lines.append("· 涉及 \(project.sourceRecordings.count) 段录音的汇总文稿（原始录音不受影响）")
         }
         return """
         将永久删除「\(project.title)」的以下全部内容，且不可恢复：

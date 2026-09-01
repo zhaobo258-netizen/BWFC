@@ -262,7 +262,7 @@ struct TranscriptReviewTests {
         let environment = AppEnvironment(
             meetingStore: InMemoryMeetingStore(),
             fileStore: MeetingFileStore(baseDirectory: directory),
-            keychainServiceName: "com.zhaobo.BangWoFenXi.tests.review.\(UUID().uuidString)",
+            credentialServiceName: "com.zhaobo.BangWoFenXi.tests.review.\(UUID().uuidString)",
             aiProviderConfigurationStore: AIProviderConfigurationStore(defaults: defaults),
             externalMCPConfigurationStore: ExternalMCPConfigurationStore(defaults: defaults)
         )
@@ -298,7 +298,7 @@ struct TranscriptReviewTests {
         let environment = AppEnvironment(
             meetingStore: InMemoryMeetingStore(),
             fileStore: MeetingFileStore(baseDirectory: directory),
-            keychainServiceName: "com.zhaobo.BangWoFenXi.tests.review.double.\(UUID().uuidString)",
+            credentialServiceName: "com.zhaobo.BangWoFenXi.tests.review.double.\(UUID().uuidString)",
             aiProviderConfigurationStore: AIProviderConfigurationStore(defaults: defaults),
             externalMCPConfigurationStore: ExternalMCPConfigurationStore(defaults: defaults)
         )

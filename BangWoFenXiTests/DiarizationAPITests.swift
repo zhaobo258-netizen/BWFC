@@ -8,7 +8,7 @@ import Testing
 final class DiarizationAPITests {
     let session: URLSession
     let service: OpenAIDiarizationService
-    let keychainServiceName = "com.zhaobo.BangWoFenXi.tests.\(UUID().uuidString)"
+    let credentialServiceName = "com.zhaobo.BangWoFenXi.tests.\(UUID().uuidString)"
 
     private var storage: MockURLProtocolStorage { DiarizationMockURLProtocol.storage }
 
@@ -17,17 +17,17 @@ final class DiarizationAPITests {
         session = DiarizationMockURLProtocol.makeSession()
         service = OpenAIDiarizationService(
             session: session,
-            apiKeyStore: CloudAPIKeyStore(service: keychainServiceName, account: "test-key")
+            apiKeyStore: CloudAPIKeyStore(service: credentialServiceName, account: "test-key")
         )
     }
 
     deinit {
         // 不重置 protocol 存储（同 AnalysisAPITests 的释放环考虑）
-        try? KeychainService(service: keychainServiceName).delete(account: "test-key")
+        try? LocalCredentialStore(service: credentialServiceName).delete(account: "test-key")
     }
 
     private func saveTestKey() throws {
-        try KeychainService(service: keychainServiceName).save("sk-test-fake-key", account: "test-key")
+        try LocalCredentialStore(service: credentialServiceName).save("sk-test-fake-key", account: "test-key")
     }
 
     /// 造一个临时音频文件

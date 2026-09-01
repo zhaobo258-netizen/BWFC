@@ -7,7 +7,7 @@ import Testing
 @Suite("谈判分析接口", .serialized)
 final class AnalysisAPITests {
     let service: OpenAIAnalysisService
-    let keychainServiceName = "com.zhaobo.BangWoFenXi.tests.\(UUID().uuidString)"
+    let credentialServiceName = "com.zhaobo.BangWoFenXi.tests.\(UUID().uuidString)"
 
     private var storage: MockURLProtocolStorage { AnalysisMockURLProtocol.storage }
 
@@ -15,18 +15,18 @@ final class AnalysisAPITests {
         AnalysisMockURLProtocol.storage.reset()
         service = OpenAIAnalysisService(
             session: AnalysisMockURLProtocol.makeSession(),
-            apiKeyStore: CloudAPIKeyStore(service: keychainServiceName, account: "test-key")
+            apiKeyStore: CloudAPIKeyStore(service: credentialServiceName, account: "test-key")
         )
     }
 
     deinit {
         // 不重置 protocol 存储：handler 可能仍在被 URLSession 使用，
         // 此处释放闭包（其捕获了 self）会形成释放环；下个用例 init 时会重置。
-        try? KeychainService(service: keychainServiceName).delete(account: "test-key")
+        try? LocalCredentialStore(service: credentialServiceName).delete(account: "test-key")
     }
 
     private func saveTestKey() throws {
-        try KeychainService(service: keychainServiceName).save("sk-test-fake-key", account: "test-key")
+        try LocalCredentialStore(service: credentialServiceName).save("sk-test-fake-key", account: "test-key")
     }
 
     /// 合法的结构化输出（静态：handler 不得捕获 self，避免 deinit 释放环）

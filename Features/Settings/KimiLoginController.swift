@@ -1,8 +1,8 @@
 import Foundation
 
 /// Kimi 账号设备码登录控制器（设置页使用）：
-/// 发起设备授权 → 打开浏览器让用户确认 → 轮询换 token → 存 Keychain。
-/// 凭证只进 Keychain；user_code 本身不含身份信息，可展示与记录。
+/// 发起设备授权 → 打开浏览器让用户确认 → 轮询换 token → 存入本机配置。
+/// user_code 本身不含身份信息，可展示与记录。
 @MainActor
 @Observable
 final class KimiLoginController {

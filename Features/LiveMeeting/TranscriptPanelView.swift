@@ -11,6 +11,7 @@ struct TranscriptRowData: Equatable, Identifiable {
     var isStarred: Bool
     var speakerName: String
     var speakerColorToken: String?
+    var sourceRecordingTitle: String?
     var isHighlighted: Bool
 
     /// 由片段映射（纯函数，可单测）
@@ -18,20 +19,23 @@ struct TranscriptRowData: Equatable, Identifiable {
         from segment: TranscriptSegment,
         participants: [Participant],
         unknownDisplay: String?,
-        highlightedID: UUID?
+        highlightedID: UUID?,
+        sourceRecordingTitle: String? = nil,
+        displayStartMs: Int64? = nil
     ) -> TranscriptRowData {
         let participant = segment.participantId.flatMap { id in
             participants.first(where: { $0.id == id })
         }
         return TranscriptRowData(
             id: segment.id,
-            startMs: segment.startMs,
+            startMs: displayStartMs ?? segment.startMs,
             text: segment.text,
             state: segment.state,
             source: segment.source,
             isStarred: segment.isStarred,
             speakerName: participant?.displayName ?? (unknownDisplay ?? "识别中"),
             speakerColorToken: participant?.colorToken,
+            sourceRecordingTitle: sourceRecordingTitle,
             isHighlighted: segment.id == highlightedID
         )
     }
@@ -86,6 +90,9 @@ struct TranscriptPanelView: View {
     var onGlobalCorrect: ((String, String) -> Int)?
     /// 新建说话人并指认（09 号计划需求 2：工作台弹层编排回填+自动声纹；nil 时菜单不显示）
     var onRequestNewSpeaker: ((TranscriptSegment) -> Void)?
+    /// 合并分析项目用：展示该片段来自哪段原始录音及其原始时间戳。
+    var sourceRecordingTitle: ((TranscriptSegment) -> String?)? = nil
+    var sourceRecordingStartMs: ((TranscriptSegment) -> Int64)? = nil
 
     /// 是否贴底自动滚动
     @State private var pinnedToBottom = true
@@ -250,7 +257,9 @@ struct TranscriptPanelView: View {
                 from: segment,
                 participants: participants,
                 unknownDisplay: unknownSpeakerDisplay?(segment),
-                highlightedID: highlightedSegmentID
+                highlightedID: highlightedSegmentID,
+                sourceRecordingTitle: sourceRecordingTitle?(segment),
+                displayStartMs: sourceRecordingStartMs?(segment)
             )
         }
     }
@@ -352,6 +361,12 @@ struct TranscriptRowView: View, Equatable {
                         .font(.caption2)
                         .monospacedDigit()
                         .foregroundStyle(.tertiary)
+                    if let sourceRecordingTitle = row.sourceRecordingTitle {
+                        Text(sourceRecordingTitle)
+                            .font(.caption2)
+                            .foregroundStyle(BWTheme.accent.opacity(0.8))
+                            .lineLimit(1)
+                    }
                     if row.isStarred {
                         Image(systemName: "star.fill")
                             .font(.caption2)

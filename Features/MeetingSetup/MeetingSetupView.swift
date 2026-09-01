@@ -241,7 +241,7 @@ struct MeetingSetupView: View {
                         .font(.callout)
                 }
                 .toggleStyle(.checkbox)
-                Text("完整录音文件只保存在本机；API Key 仅保存在 Keychain。")
+                Text("完整录音文件只保存在本机；API Key 明文保存在本机配置中。")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }

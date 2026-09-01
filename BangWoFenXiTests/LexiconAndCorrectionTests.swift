@@ -67,7 +67,7 @@ struct LexiconStoreTests {
         let environment = AppEnvironment(
             meetingStore: InMemoryMeetingStore(),
             fileStore: MeetingFileStore(baseDirectory: directory),
-            keychainServiceName: "com.zhaobo.BangWoFenXi.tests.lexicon.\(UUID().uuidString)",
+            credentialServiceName: "com.zhaobo.BangWoFenXi.tests.lexicon.\(UUID().uuidString)",
             aiProviderConfigurationStore: AIProviderConfigurationStore(
                 defaults: defaults
             ),
@@ -111,7 +111,7 @@ struct LexiconStoreTests {
         let environment = AppEnvironment(
             meetingStore: InMemoryMeetingStore(),
             fileStore: MeetingFileStore(baseDirectory: directory),
-            keychainServiceName: "com.zhaobo.BangWoFenXi.tests.lexicon.\(UUID().uuidString)",
+            credentialServiceName: "com.zhaobo.BangWoFenXi.tests.lexicon.\(UUID().uuidString)",
             aiProviderConfigurationStore: AIProviderConfigurationStore(defaults: defaults),
             externalMCPConfigurationStore: ExternalMCPConfigurationStore(defaults: defaults)
         )

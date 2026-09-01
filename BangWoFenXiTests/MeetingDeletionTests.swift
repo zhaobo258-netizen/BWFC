@@ -17,8 +17,8 @@ final class MeetingDeletionTests {
         environment = AppEnvironment(
             meetingStore: InMemoryMeetingStore(),
             fileStore: fileStore,
-            // 独立 Keychain service：不触碰生产条目，避免授权弹窗（与 Key 分家测试同一模式）
-            keychainServiceName: "com.zhaobo.BangWoFenXi.tests.meeting-deletion"
+            // 独立凭证 service：不触碰生产条目，避免授权弹窗（与 Key 分家测试同一模式）
+            credentialServiceName: "com.zhaobo.BangWoFenXi.tests.meeting-deletion"
         )
     }
 

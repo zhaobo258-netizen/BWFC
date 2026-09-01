@@ -26,7 +26,7 @@ private final class KimiTestSessionFactory: @unchecked Sendable {
 @Suite("Kimi 分析接口", .serialized)
 final class KimiAnalysisAPITests {
     let service: KimiAnalysisService
-    let keychainServiceName = "com.zhaobo.BangWoFenXi.tests.\(UUID().uuidString)"
+    let credentialServiceName = "com.zhaobo.BangWoFenXi.tests.\(UUID().uuidString)"
     let oauthClient = MockKimiOAuthClient()
 
     private var storage: MockURLProtocolStorage { KimiMockURLProtocol.storage }
@@ -34,12 +34,12 @@ final class KimiAnalysisAPITests {
     init() {
         KimiMockURLProtocol.storage.reset()
         // 凭证提供者与静态 Key 存储全部隔离到测试 service（血泪教训 9：不触碰生产条目）
-        let staticStore = CloudAPIKeyStore(service: keychainServiceName, account: "test-key")
+        let staticStore = CloudAPIKeyStore(service: credentialServiceName, account: "test-key")
         service = KimiAnalysisService(
             session: KimiMockURLProtocol.makeSession(),
             apiKeyStore: staticStore,
             credentials: KimiCredentialProvider(
-                tokenStore: KimiOAuthTokenStore(service: keychainServiceName),
+                tokenStore: KimiOAuthTokenStore(service: credentialServiceName),
                 staticKeyStore: staticStore,
                 client: oauthClient
             )
@@ -48,12 +48,12 @@ final class KimiAnalysisAPITests {
 
     deinit {
         // 不重置 protocol 存储（避免释放环；下个用例 init 时重置）
-        try? KeychainService(service: keychainServiceName).delete(account: "test-key")
-        try? KeychainService(service: keychainServiceName).delete(account: KimiOAuthTokenStore.account)
+        try? LocalCredentialStore(service: credentialServiceName).delete(account: "test-key")
+        try? LocalCredentialStore(service: credentialServiceName).delete(account: KimiOAuthTokenStore.account)
     }
 
     private func saveTestKey() throws {
-        try KeychainService(service: keychainServiceName).save("sk-test-fake-key", account: "test-key")
+        try LocalCredentialStore(service: credentialServiceName).save("sk-test-fake-key", account: "test-key")
     }
 
     /// 合法的分析输出 JSON
@@ -230,7 +230,7 @@ final class KimiAnalysisAPITests {
             )
         }
         let staticStore = CloudAPIKeyStore(
-            service: keychainServiceName,
+            service: credentialServiceName,
             account: "test-key"
         )
         let sessionFactory = KimiTestSessionFactory()
@@ -239,7 +239,7 @@ final class KimiAnalysisAPITests {
             apiKeyStore: staticStore,
             credentials: KimiCredentialProvider(
                 tokenStore: KimiOAuthTokenStore(
-                    service: keychainServiceName
+                    service: credentialServiceName
                 ),
                 staticKeyStore: staticStore,
                 client: oauthClient
@@ -285,7 +285,7 @@ final class KimiAnalysisAPITests {
     @Test("已登录：x-api-key 使用 OAuth access_token，优先于静态 Key")
     func oauthTokenUsedWhenLoggedIn() async throws {
         try saveTestKey()
-        try KimiOAuthTokenStore(service: keychainServiceName).save(KimiOAuthTokens(
+        try KimiOAuthTokenStore(service: credentialServiceName).save(KimiOAuthTokens(
             accessToken: "oauth-access-token", refreshToken: "rt-x",
             expiresAt: Date().addingTimeInterval(900)
         ))
@@ -302,7 +302,7 @@ final class KimiAnalysisAPITests {
 
     @Test("已登录但临期：先刷新再请求，请求头用新 token，轮换凭证已落库")
     func oauthTokenRefreshedBeforeRequest() async throws {
-        let store = KimiOAuthTokenStore(service: keychainServiceName)
+        let store = KimiOAuthTokenStore(service: credentialServiceName)
         try store.save(KimiOAuthTokens(
             accessToken: "stale-token", refreshToken: "rt-old",
             expiresAt: Date().addingTimeInterval(30)
@@ -326,7 +326,7 @@ final class KimiAnalysisAPITests {
 
     @Test("已登录但刷新被拒 → unauthorized，不发分析请求")
     func oauthRefreshRejectedNoRequest() async throws {
-        try KimiOAuthTokenStore(service: keychainServiceName).save(KimiOAuthTokens(
+        try KimiOAuthTokenStore(service: credentialServiceName).save(KimiOAuthTokens(
             accessToken: "stale-token", refreshToken: "rt-dead",
             expiresAt: Date().addingTimeInterval(30)
         ))

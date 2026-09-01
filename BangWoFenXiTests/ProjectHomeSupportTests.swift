@@ -53,11 +53,94 @@ final class ProjectHomeSupportTests {
         #expect(ProjectHomeSupport.summary(for: project).count == 60)
     }
 
-    @Test("来源标签三分支")
+    @Test("来源标签四分支")
     func sourceLabels() {
         #expect(ProjectHomeSupport.sourceLabel(for: .liveRecording) == "现场录音")
         #expect(ProjectHomeSupport.sourceLabel(for: .importedAudio) == "导入音频")
         #expect(ProjectHomeSupport.sourceLabel(for: .importedVideo) == "导入视频")
+        #expect(ProjectHomeSupport.sourceLabel(for: .combinedRecordings) == "跨录音分析")
+    }
+
+    @Test("业务项目归组：同名归一组，未分组收在最后")
+    func businessGrouping() {
+        let a1 = makeProject(title: "A1", lastActivityAt: Date(timeIntervalSince1970: 100))
+        a1.businessCategory = "  河北文旅  "
+        let a2 = makeProject(title: "A2", lastActivityAt: Date(timeIntervalSince1970: 300))
+        a2.businessCategory = "河北文旅"
+        let b = makeProject(title: "B", lastActivityAt: Date(timeIntervalSince1970: 200))
+        b.businessCategory = "经销商培训"
+        let loose = makeProject(title: "未分组", lastActivityAt: Date(timeIntervalSince1970: 400))
+
+        let groups = ProjectHomeSupport.groupedForDisplay([a1, loose, b, a2])
+
+        #expect(groups.map(\.title) == ["河北文旅", "经销商培训", "未分组录音"])
+        #expect(groups[0].projects.map(\.title) == ["A2", "A1"])
+        #expect(ProjectHomeSupport.normalizedBusinessCategory("  ") == nil)
+    }
+
+    @Test("跨录音合并保持顺序、来源、原始时间戳与独立副本")
+    func combinedAnalysisKeepsProvenance() throws {
+        let firstDate = Date(timeIntervalSince1970: 1_000)
+        let secondDate = Date(timeIntervalSince1970: 2_000)
+        let first = makeProject(title: "下午第一段", lastActivityAt: firstDate)
+        first.businessCategory = "客户 A"
+        first.startedAt = firstDate
+        first.durationMs = 10_000
+        first.segments = [TranscriptSegment(
+            startMs: 2_000,
+            endMs: 4_000,
+            text: "第一段内容",
+            source: .local,
+            state: .final
+        )]
+        let second = makeProject(title: "下午第二段", lastActivityAt: secondDate)
+        second.businessCategory = "客户 A"
+        second.startedAt = secondDate
+        second.durationMs = 8_000
+        second.segments = [TranscriptSegment(
+            startMs: 500,
+            endMs: 2_000,
+            text: "第二段内容",
+            source: .local,
+            state: .edited
+        )]
+
+        let combined = try ProjectHomeSupport.makeCombinedAnalysisProject(
+            from: [second, first],
+            at: Date(timeIntervalSince1970: 3_000)
+        )
+
+        #expect(combined.sourceType == .combinedRecordings)
+        #expect(combined.businessCategory == "客户 A")
+        #expect(combined.sourceRecordings.map(\.projectID) == [first.id, second.id])
+        #expect(combined.segments.map(\.text) == ["第一段内容", "第二段内容"])
+        #expect(combined.segments[0].sourceAssetId == first.id)
+        #expect(combined.segments[1].sourceAssetId == second.id)
+        #expect(ProjectHomeSupport.sourceRelativeStartMs(
+            for: combined.segments[1],
+            in: combined
+        ) == 500)
+
+        combined.segments[0].text = "汇总副本修改"
+        #expect(first.segments[0].text == "第一段内容")
+    }
+
+    @Test("跨业务项目的录音拒绝合并")
+    func combinedAnalysisRejectsMixedCategories() {
+        let a = makeProject(title: "A", lastActivityAt: Date())
+        a.businessCategory = "业务 A"
+        a.segments = [TranscriptSegment(
+            startMs: 0, endMs: 1_000, text: "A", source: .local, state: .final
+        )]
+        let b = makeProject(title: "B", lastActivityAt: Date())
+        b.businessCategory = "业务 B"
+        b.segments = [TranscriptSegment(
+            startMs: 0, endMs: 1_000, text: "B", source: .local, state: .final
+        )]
+
+        #expect(throws: ProjectHomeSupport.RecordingMergeError.spansBusinessCategories) {
+            try ProjectHomeSupport.makeCombinedAnalysisProject(from: [a, b])
+        }
     }
 
     @Test("录音场景按产品顺序展示")

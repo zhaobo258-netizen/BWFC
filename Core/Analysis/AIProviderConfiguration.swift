@@ -108,7 +108,7 @@ struct AIProviderConfiguration: Codable, Sendable, Equatable {
 
 struct AIProviderConfigurationStore: @unchecked Sendable {
     static let defaultsKey = "bwfx.ai.provider.configuration"
-    static let openAIKeychainAccount = "analysis-openai-compatible"
+    static let openAICredentialAccount = "analysis-openai-compatible"
 
     private let defaults: UserDefaults
 
@@ -294,12 +294,7 @@ actor AIProviderRegistry: AITextGenerationServing {
               !configuration.normalizedOpenAIModelID.isEmpty else {
             throw AIProviderConfigurationError.invalidOpenAIConfiguration
         }
-        let apiKey: String?
-        do {
-            apiKey = try openAIKeyStore.readKey()
-        } catch KeychainError.interactionNotAllowed {
-            throw AnalysisAPIError.credentialAccessRequired
-        }
+        let apiKey = try openAIKeyStore.readKey()
         guard let apiKey, !apiKey.isEmpty else {
             throw AnalysisAPIError.missingAPIKey
         }

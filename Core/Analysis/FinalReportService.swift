@@ -40,12 +40,16 @@ struct ProjectAIContext: Sendable {
         var id: String
         var speakerId: String?
         var startMs: Int64
+        var sourceRecording: String?
+        var sourceStartMs: Int64?
         var text: String
 
         enum CodingKeys: String, CodingKey {
             case id, text
             case speakerId = "speaker_id"
             case startMs = "start_ms"
+            case sourceRecording = "source_recording"
+            case sourceStartMs = "source_start_ms"
         }
     }
 
@@ -125,6 +129,16 @@ enum ProjectAIContextBuilder {
                         id: $0.id.uuidString,
                         speakerId: $0.participantId.flatMap { aliasBySpeakerID[$0] },
                         startMs: $0.startMs,
+                        sourceRecording: ProjectHomeSupport.sourceRecording(
+                            for: $0,
+                            in: project
+                        )?.title,
+                        sourceStartMs: $0.sourceAssetId == nil
+                            ? nil
+                            : ProjectHomeSupport.sourceRelativeStartMs(
+                                for: $0,
+                                in: project
+                            ),
                         text: $0.text
                     )
             },
@@ -547,7 +561,12 @@ enum FinalReportMarkdownRenderer {
                 if category == .chapter,
                    let firstEvidence = item.evidenceSegmentIds.first,
                    let segment = segments[firstEvidence] {
-                    timePrefix = "[\(timeString(segment.startMs))] "
+                    let source = ProjectHomeSupport.sourceRecording(
+                        for: segment,
+                        in: project
+                    )
+                    let sourcePrefix = source.map { "\($0.title) · " } ?? ""
+                    timePrefix = "[\(sourcePrefix)\(timeString(ProjectHomeSupport.sourceRelativeStartMs(for: segment, in: project)))] "
                 } else {
                     timePrefix = ""
                 }
@@ -555,8 +574,13 @@ enum FinalReportMarkdownRenderer {
                 for evidenceID in item.evidenceSegmentIds {
                     guard let segment = segments[evidenceID] else { continue }
                     let speaker = segment.participantId.flatMap { speakerNames[$0] } ?? "待识别"
+                    let source = ProjectHomeSupport.sourceRecording(
+                        for: segment,
+                        in: project
+                    )
+                    let sourcePrefix = source.map { "\($0.title) · " } ?? ""
                     lines.append(
-                        "  - 证据 [\(timeString(segment.startMs)) \(speaker)]："
+                        "  - 证据 [\(sourcePrefix)\(timeString(ProjectHomeSupport.sourceRelativeStartMs(for: segment, in: project))) \(speaker)]："
                             + "\(segment.text) `\(evidenceID.uuidString)`"
                     )
                 }

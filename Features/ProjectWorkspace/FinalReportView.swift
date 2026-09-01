@@ -311,10 +311,20 @@ struct FinalReportView: View {
         VStack(alignment: .leading, spacing: 7) {
             if item.category == .chapter,
                let firstEvidenceID = item.evidenceSegmentIds.first,
-               let startMs = project.segments.first(where: {
+               let segment = project.segments.first(where: {
                    $0.id == firstEvidenceID
-               })?.startMs {
-                Text(timeString(startMs))
+               }) {
+                let source = ProjectHomeSupport.sourceRecording(
+                    for: segment,
+                    in: project
+                )
+                Text([
+                    source?.title,
+                    timeString(ProjectHomeSupport.sourceRelativeStartMs(
+                        for: segment,
+                        in: project
+                    ))
+                ].compactMap { $0 }.joined(separator: " · "))
                     .font(.caption)
                     .fontWeight(.semibold)
                     .foregroundStyle(BWTheme.accent)
@@ -343,6 +353,8 @@ struct FinalReportView: View {
                 }
                 Spacer()
                 ForEach(Array(item.evidenceSegmentIds.prefix(4)), id: \.self) { id in
+                    let sourceTitle = project.segments.first(where: { $0.id == id })
+                        .flatMap { ProjectHomeSupport.sourceRecording(for: $0, in: project)?.title }
                     Button {
                         onEvidenceTap(id)
                     } label: {
@@ -351,7 +363,7 @@ struct FinalReportView: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(BWTheme.accent)
-                    .help("查看原话")
+                    .help(sourceTitle.map { "查看「\($0)」中的原话" } ?? "查看原话")
                     .accessibilityLabel("查看这条结论的原话证据")
                 }
             }

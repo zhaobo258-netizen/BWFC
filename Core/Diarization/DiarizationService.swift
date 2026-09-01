@@ -193,7 +193,7 @@ enum DiarizationAPIError: Error, Equatable {
     case invalidResponse
     /// 未配置 API Key
     case missingAPIKey
-    /// 当前 App 身份无法静默读取旧 Keychain 凭证
+    /// 本机凭证存储暂时不可读取
     case credentialAccessRequired
     /// 已知说话人超过 provider 单次请求容量，不得静默截断。
     case tooManyKnownSpeakers(maximum: Int, actual: Int)
@@ -244,7 +244,7 @@ protocol DiarizationServicing: Sendable {
 
 /// 基于 URLSession 的 OpenAI Audio Transcriptions 实现（阶段 3）。
 /// - model/language/response_format 来自 CloudModelConfig（模型 ID 集中配置）；
-/// - API Key 只从 Keychain 读取，不落盘、不进日志；
+/// - API Key 从本机配置读取，不进日志；
 /// - 只读取总时长、片段起止、文字与 speaker 标签。
 struct OpenAIDiarizationService: DiarizationServicing {
     private let session: URLSession
@@ -275,12 +275,7 @@ struct OpenAIDiarizationService: DiarizationServicing {
             )
         }
 
-        let apiKey: String?
-        do {
-            apiKey = try apiKeyStore.readKey()
-        } catch KeychainError.interactionNotAllowed {
-            throw DiarizationAPIError.credentialAccessRequired
-        }
+        let apiKey = try apiKeyStore.readKey()
         guard let apiKey, !apiKey.isEmpty else {
             throw DiarizationAPIError.missingAPIKey
         }
@@ -327,12 +322,7 @@ struct OpenAIDiarizationService: DiarizationServicing {
 
     /// 连接测试：只返回可用/不可用（实施计划 5.1）
     func testConnection() async throws -> Bool {
-        let apiKey: String?
-        do {
-            apiKey = try apiKeyStore.readKey()
-        } catch KeychainError.interactionNotAllowed {
-            throw DiarizationAPIError.credentialAccessRequired
-        }
+        let apiKey = try apiKeyStore.readKey()
         guard let apiKey, !apiKey.isEmpty else {
             throw DiarizationAPIError.missingAPIKey
         }
@@ -451,11 +441,11 @@ enum DiarizationServiceFactory {
         keyStore: CloudAPIKeyStore = CloudAPIKeyStore.store(for: .diarization),
         volcengineKeyStore: CloudAPIKeyStore = CloudAPIKeyStore(
             service: CloudAPIKeyStore.defaultService,
-            account: VolcengineDiarizationService.keychainAccount
+            account: VolcengineDiarizationService.credentialAccount
         ),
         volcengineAccessTokenStore: CloudAPIKeyStore = CloudAPIKeyStore(
             service: CloudAPIKeyStore.defaultService,
-            account: VolcengineDiarizationService.accessTokenKeychainAccount
+            account: VolcengineDiarizationService.accessTokenCredentialAccount
         ),
         session: URLSession = .shared
     ) -> any DiarizationServicing {

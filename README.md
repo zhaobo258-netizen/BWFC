@@ -5,7 +5,7 @@
 
 - 实施计划：`../01_帮我分析_Mac_MVP开发实施计划.md`
 - 平台：Apple Silicon Mac，macOS 26+，Swift 6（严格并发）
-- 无第三方依赖：网络层使用 URLSession，密钥仅存 Keychain
+- 无第三方依赖：网络层使用 URLSession，密钥明文存入本机 App 配置
 
 ## 阶段 1 已实现
 
@@ -45,10 +45,10 @@
 
 ```bash
 swift build                    # 编译（0 警告基线）
-Scripts/make_app.sh            # Debug .app（当前产出 build/帮我分析-v0.2.0.app）
+Scripts/make_app.sh            # Debug .app（当前产出 build/帮我分析-v0.2.1.app）
 Scripts/make_app.sh release    # Release .app（稳定本机签名 + Sandbox/麦克风/网络 entitlements）
-open "build/帮我分析-v0.2.0.app" # 启动
-Scripts/run_tests.sh           # 全部 622 个自动化用例（77 套件）
+open "build/帮我分析-v0.2.1.app" # 启动
+Scripts/run_tests.sh           # 全部 624 个自动化用例（77 套件）
 Scripts/soak_test.sh           # 稳定性缩短版（180s/4x）
 Scripts/soak_test.sh 3600 1    # 60 分钟完整稳定性（人工验收）
 ```
@@ -74,7 +74,7 @@ swift test                  # 可完成构建；本机执行阶段静默失效�
 
 ## 安全基线（实施计划第 0、12 节）
 
-- API Key 只进 Keychain（`Core/Security`），仓库中只允许占位符。
+- API Key 明文写入本机 App 配置（`Core/Security`），仓库中只允许占位符。
 - 日志统一走 `Core/Logging`：只记录时间、片段 ID、耗时、状态码与脱敏错误，
   严禁记录转写原文、会议背景、参会人姓名、Key 或音频路径。
 - 真实谈判录音、声纹样本不进入仓库与测试夹具。
@@ -89,7 +89,7 @@ swift test                  # 可完成构建；本机执行阶段静默失效�
   超上限进「待用户重试」；队列持久化到 chunks/queue.json，App 重启后补传恢复。
 - 云端调用：POST /v1/audio/transcriptions（URLSession + 手写 multipart，无第三方依赖）；
   known_speaker_names[] 只传 p_01…p_04 代号，样本以 data URL 传输；API Key 只从
-  Keychain 读取；响应只读取总时长、片段起止、文字与 speaker 标签。
+  本机配置读取；响应只读取总时长、片段起止、文字与 speaker 标签。
 - 合并：云端片段经 TranscriptReconciler 与本地片段合并（本地 provisional → cloud final
   就地更新、ID 稳定）；「人工已修订」片段不被云端覆盖；未知说话人显示「待识别 A/B」，
   右键可手动映射、改文字、加星标。

@@ -291,7 +291,7 @@ struct ProjectWorkspaceView: View {
                     if let reviewNotice {
                         noticeBanner(text: reviewNotice)
                     }
-                    if project.sourceType != .liveRecording {
+                    if project.sourceType.isImportedMedia {
                         importProgressSection(project: project)
                     }
                     workspaceColumns(mode: mode, meeting: meeting)
@@ -856,6 +856,20 @@ struct ProjectWorkspaceView: View {
                     speakerAssignRequest = SpeakerAssignRequest(
                         source: .transcript(segmentId: segment.id),
                         anchorText: String(segment.text.prefix(80))
+                    )
+                },
+                sourceRecordingTitle: { segment in
+                    guard let project else { return nil }
+                    return ProjectHomeSupport.sourceRecording(
+                        for: segment,
+                        in: project
+                    )?.title
+                },
+                sourceRecordingStartMs: { segment in
+                    guard let project else { return segment.startMs }
+                    return ProjectHomeSupport.sourceRelativeStartMs(
+                        for: segment,
+                        in: project
                     )
                 }
             )
@@ -1455,7 +1469,7 @@ struct ProjectWorkspaceView: View {
     /// 流水线阶段完成后，从存储刷新本视图的项目副本（字段级更新，不重建控制器；
     /// 笔记与标题归工作台所有，不从存储回灌，避免覆盖正在编辑的内容）
     private func reloadImportedProjectFromStore() {
-        guard let project, project.sourceType != .liveRecording,
+        guard let project, project.sourceType.isImportedMedia,
               let fresh = try? environment.allProjects().first(where: { $0.id == projectID }) else {
             return
         }
@@ -2197,7 +2211,7 @@ struct ProjectWorkspaceView: View {
             operationError = "请先结束录音，完成收尾后再生成完整总结。"
             return
         }
-        if project.sourceType != .liveRecording,
+        if project.sourceType.isImportedMedia,
            project.status == .processing,
            environment.importProcessing.activeProjectID == nil,
            project.processingJobs.contains(where: {
@@ -2207,7 +2221,7 @@ struct ProjectWorkspaceView: View {
             environment.importProcessing.resume(projectID: projectID)
             return
         }
-        if project.sourceType != .liveRecording,
+        if project.sourceType.isImportedMedia,
            project.status == .processing
             || environment.importProcessing.activeProjectID == projectID {
             operationError = "导入处理尚未结束，请等待当前流水线完成。"

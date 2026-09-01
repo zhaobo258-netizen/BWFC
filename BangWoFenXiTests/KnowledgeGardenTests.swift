@@ -985,7 +985,7 @@ struct KnowledgeGardenTests {
             meetingStore: InMemoryMeetingStore(),
             fileStore: MeetingFileStore(baseDirectory: FileManager.default.temporaryDirectory),
             obsidianVaultURL: vault,
-            keychainServiceName: "com.zhaobo.BangWoFenXi.tests.knowledge.\(UUID().uuidString)"
+            credentialServiceName: "com.zhaobo.BangWoFenXi.tests.knowledge.\(UUID().uuidString)"
         )
 
         let first = environment.makeKnowledgeProviders()

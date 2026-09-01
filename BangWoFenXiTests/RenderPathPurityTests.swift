@@ -12,27 +12,27 @@ final class RenderPathPurityTests {
     let fileStore: MeetingFileStore
     let controller: DiarizationController
     let transcriptController: LocalTranscriptionController
-    let keychainServiceName = "com.zhaobo.BangWoFenXi.tests.\(UUID().uuidString)"
+    let credentialServiceName = "com.zhaobo.BangWoFenXi.tests.\(UUID().uuidString)"
 
     init() throws {
         tempDirectory = FileManager.default.temporaryDirectory
             .appending(path: "BangWoFenXiTests-\(UUID().uuidString)", directoryHint: .isDirectory)
         fileStore = MeetingFileStore(baseDirectory: tempDirectory)
         transcriptController = LocalTranscriptionController(service: MockLocalTranscriptionService())
-        // 注入测试专用已配置 Key，避免依赖宿主 Keychain 状态
-        try CloudAPIKeyStore.store(for: .diarization, service: keychainServiceName)
+        // 注入测试专用已配置 Key，避免依赖宿主凭证状态
+        try CloudAPIKeyStore.store(for: .diarization, service: credentialServiceName)
             .saveKey("test-key")
         controller = DiarizationController(
             diarization: MockDiarizationService(),
             fileStore: fileStore,
             transcriptController: transcriptController,
-            keyStore: CloudAPIKeyStore.store(for: .diarization, service: keychainServiceName)
+            keyStore: CloudAPIKeyStore.store(for: .diarization, service: credentialServiceName)
         )
     }
 
     deinit {
         try? FileManager.default.removeItem(at: tempDirectory)
-        try? CloudAPIKeyStore.store(for: .diarization, service: keychainServiceName).deleteKey()
+        try? CloudAPIKeyStore.store(for: .diarization, service: credentialServiceName).deleteKey()
     }
 
     @Test("displayName 反复调用：未知标签计数不变（渲染路径零写入）")

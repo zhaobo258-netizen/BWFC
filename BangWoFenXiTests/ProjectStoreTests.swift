@@ -375,8 +375,8 @@ final class ProjectStoreTests {
         let environment = AppEnvironment(
             meetingStore: InMemoryMeetingStore(),
             fileStore: fileStore,
-            // 独立 Keychain service：不触碰生产条目，避免授权弹窗（与 Key 分家测试同一模式）
-            keychainServiceName: "com.zhaobo.BangWoFenXi.tests.project-store"
+            // 独立凭证 service：不触碰生产条目，避免授权弹窗（与 Key 分家测试同一模式）
+            credentialServiceName: "com.zhaobo.BangWoFenXi.tests.project-store"
         )
 
         #expect(try environment.allProjects().isEmpty)
@@ -486,7 +486,7 @@ final class ProjectStoreTests {
             meetingStore: InMemoryMeetingStore(),
             fileStore: MeetingFileStore(baseDirectory: directory.appending(path: "files")),
             projectStore: store,
-            keychainServiceName: "com.zhaobo.BangWoFenXi.tests.field-merge.\(UUID().uuidString)"
+            credentialServiceName: "com.zhaobo.BangWoFenXi.tests.field-merge.\(UUID().uuidString)"
         )
         let initial = Project(
             title: "并发导入",
@@ -744,7 +744,7 @@ final class ProjectStoreTests {
             meetingStore: InMemoryMeetingStore(),
             fileStore: fileStore,
             projectStore: try JSONProjectStore(directory: base),
-            keychainServiceName: "com.zhaobo.BangWoFenXi.tests.delete-project-\(UUID().uuidString)"
+            credentialServiceName: "com.zhaobo.BangWoFenXi.tests.delete-project-\(UUID().uuidString)"
         )
 
         let doomed = Project(title: "待删", sourceType: .liveRecording, status: .ready)
@@ -775,7 +775,7 @@ final class ProjectStoreTests {
             meetingStore: InMemoryMeetingStore(),
             fileStore: MeetingFileStore(baseDirectory: base),
             projectStore: try JSONProjectStore(directory: base),
-            keychainServiceName: "com.zhaobo.BangWoFenXi.tests.delete-project-\(UUID().uuidString)"
+            credentialServiceName: "com.zhaobo.BangWoFenXi.tests.delete-project-\(UUID().uuidString)"
         )
         let project = Project(title: "刚建就删", sourceType: .liveRecording, status: .creating)
         try environment.persist(project)

@@ -11,7 +11,7 @@ final class OAuthMockURLProtocol: MockURLProtocolBase, @unchecked Sendable {
 /// Kimi 账号 OAuth：客户端协议形态、凭证存储、凭证提供者（刷新/回退/失效）
 @Suite("Kimi OAuth", .serialized)
 final class KimiOAuthTests {
-    let keychainServiceName = "com.zhaobo.BangWoFenXi.tests.\(UUID().uuidString)"
+    let credentialServiceName = "com.zhaobo.BangWoFenXi.tests.\(UUID().uuidString)"
     private var storage: MockURLProtocolStorage { OAuthMockURLProtocol.storage }
 
     init() {
@@ -19,8 +19,8 @@ final class KimiOAuthTests {
     }
 
     deinit {
-        try? KeychainService(service: keychainServiceName).delete(account: KimiOAuthTokenStore.account)
-        try? KeychainService(service: keychainServiceName).delete(account: "kimi")
+        try? LocalCredentialStore(service: credentialServiceName).delete(account: KimiOAuthTokenStore.account)
+        try? LocalCredentialStore(service: credentialServiceName).delete(account: "kimi")
     }
 
     private func makeClient(now: Date = Date(timeIntervalSince1970: 1_000_000)) -> KimiOAuthClient {
@@ -188,7 +188,7 @@ final class KimiOAuthTests {
 
     @Test("凭证存储：往返一致、覆盖更新、删除幂等、损坏数据视为未登录")
     func tokenStoreRoundTrip() throws {
-        let store = KimiOAuthTokenStore(service: keychainServiceName)
+        let store = KimiOAuthTokenStore(service: credentialServiceName)
         #expect(!store.hasTokens)
         #expect(try store.read() == nil)
 
@@ -206,7 +206,7 @@ final class KimiOAuthTests {
         try store.delete() // 幂等
 
         // 损坏数据：如实视为未登录，不猜测修复
-        try KeychainService(service: keychainServiceName)
+        try LocalCredentialStore(service: credentialServiceName)
             .save("not-json", account: KimiOAuthTokenStore.account)
         #expect(try store.read() == nil)
         #expect(!store.hasTokens)
@@ -218,8 +218,8 @@ final class KimiOAuthTests {
         client: MockKimiOAuthClient,
         now: Date = Date(timeIntervalSince1970: 1_000_000)
     ) -> (KimiCredentialProvider, KimiOAuthTokenStore, CloudAPIKeyStore) {
-        let tokenStore = KimiOAuthTokenStore(service: keychainServiceName)
-        let staticStore = CloudAPIKeyStore(service: keychainServiceName, account: "kimi")
+        let tokenStore = KimiOAuthTokenStore(service: credentialServiceName)
+        let staticStore = CloudAPIKeyStore(service: credentialServiceName, account: "kimi")
         let provider = KimiCredentialProvider(
             tokenStore: tokenStore, staticKeyStore: staticStore,
             client: client, now: { now }, refreshLeeway: 300
@@ -251,7 +251,7 @@ final class KimiOAuthTests {
         #expect(try await provider.validCredential() == "at-2")
         #expect(client.refreshCalls == ["rt-1"])
         #expect(try store.read() == rotated,
-                "refresh_token 轮换语义：新凭证必须立即写回 Keychain")
+                "refresh_token 轮换语义：新凭证必须立即写回本机凭证存储")
     }
 
     @Test("凭证提供者：并发临期请求共享一次刷新与同一轮换凭证")
@@ -359,7 +359,7 @@ final class KimiOAuthTests {
             meetingStore: InMemoryMeetingStore(),
             fileStore: MeetingFileStore(baseDirectory: directory),
             kimiCredentials: credentials,
-            keychainServiceName: keychainServiceName,
+            credentialServiceName: credentialServiceName,
             aiProviderConfigurationStore: AIProviderConfigurationStore(
                 defaults: defaults
             )
@@ -387,7 +387,7 @@ final class KimiOAuthTests {
     private func makeLogin(
         client: MockKimiOAuthClient
     ) -> (KimiLoginController, KimiOAuthTokenStore, OpenedURLBox) {
-        let store = KimiOAuthTokenStore(service: keychainServiceName)
+        let store = KimiOAuthTokenStore(service: credentialServiceName)
         let opened = OpenedURLBox()
         let controller = KimiLoginController(
             client: client, tokenStore: store,
@@ -397,7 +397,7 @@ final class KimiOAuthTests {
         return (controller, store, opened)
     }
 
-    @Test("登录控制器：授权→打开浏览器→轮询 pending→成功→凭证落 Keychain")
+    @Test("登录控制器：授权→打开浏览器→轮询 pending→成功→凭证落本机存储")
     @MainActor
     func loginHappyPath() async throws {
         let client = MockKimiOAuthClient()

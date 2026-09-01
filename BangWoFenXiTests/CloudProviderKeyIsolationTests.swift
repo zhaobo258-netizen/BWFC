@@ -18,7 +18,7 @@ final class CloudProviderKeyIsolationTests {
 
     deinit {
         for account in ["kimi", "diarization", CloudProvider.legacyAccount, KimiOAuthTokenStore.account] {
-            try? KeychainService(service: serviceName).delete(account: account)
+            try? LocalCredentialStore(service: serviceName).delete(account: account)
         }
     }
 
@@ -124,15 +124,15 @@ final class CloudProviderKeyIsolationTests {
     @Test("跨 service 迁移：搬来分析 Key 与登录凭证，且旧条目必须原样保留")
     func adHocServiceMigrationCopiesAndPreservesLegacy() throws {
         let oldService = "\(serviceName).adhoc"
-        let oldKeychain = KeychainService(service: oldService)
+        let oldStore = LocalCredentialStore(service: oldService)
         defer {
             for account in ["kimi", "diarization", CloudProvider.legacyAccount,
                             KimiOAuthTokenStore.account] {
-                try? oldKeychain.delete(account: account)
+                try? oldStore.delete(account: account)
             }
         }
-        try oldKeychain.save("adhoc-kimi-key", account: CloudProvider.analysis.account)
-        try oldKeychain.save("{\"access_token\":\"a\"}", account: KimiOAuthTokenStore.account)
+        try oldStore.save("adhoc-kimi-key", account: CloudProvider.analysis.account)
+        try oldStore.save("{\"access_token\":\"a\"}", account: KimiOAuthTokenStore.account)
 
         CloudAPIKeyStore.migrateAdHocServiceCredentialsIfNeeded(
             from: oldService, to: serviceName
@@ -140,13 +140,13 @@ final class CloudProviderKeyIsolationTests {
 
         #expect(try store(for: .analysis).readKey() == "adhoc-kimi-key")
         #expect(
-            try KeychainService(service: serviceName)
+            try LocalCredentialStore(service: serviceName)
                 .read(account: KimiOAuthTokenStore.account) == "{\"access_token\":\"a\"}"
         )
         // 旧条目是老板仅有的凭证副本，删除有风险；迁移只读不删
-        #expect(try oldKeychain.read(account: CloudProvider.analysis.account) == "adhoc-kimi-key",
+        #expect(try oldStore.read(account: CloudProvider.analysis.account) == "adhoc-kimi-key",
                 "旧 service 的分析条目必须原样保留")
-        #expect(try oldKeychain.read(account: KimiOAuthTokenStore.account) != nil,
+        #expect(try oldStore.read(account: KimiOAuthTokenStore.account) != nil,
                 "旧 service 的登录凭证必须原样保留")
         #expect(!store(for: .diarization).hasConfiguredKey, "旧 service 没有分人条目时不得凭空创建")
     }
@@ -154,9 +154,9 @@ final class CloudProviderKeyIsolationTests {
     @Test("跨 service 迁移：当前 service 已有值时不覆盖；同名 service 直接跳过")
     func adHocServiceMigrationSkipsWhenPresent() throws {
         let oldService = "\(serviceName).adhoc"
-        let oldKeychain = KeychainService(service: oldService)
-        defer { try? oldKeychain.delete(account: CloudProvider.analysis.account) }
-        try oldKeychain.save("adhoc-kimi-key", account: CloudProvider.analysis.account)
+        let oldStore = LocalCredentialStore(service: oldService)
+        defer { try? oldStore.delete(account: CloudProvider.analysis.account) }
+        try oldStore.save("adhoc-kimi-key", account: CloudProvider.analysis.account)
         try store(for: .analysis).saveKey("current-kimi-key")
 
         CloudAPIKeyStore.migrateAdHocServiceCredentialsIfNeeded(
@@ -178,23 +178,23 @@ final class CloudProviderKeyIsolationTests {
     @Test("跨 service 迁移：目标齐全时完全不触碰旧 service")
     func adHocServiceMigrationSkipsLegacyWhenComplete() throws {
         let oldService = "\(serviceName).adhoc"
-        let oldKeychain = KeychainService(service: oldService)
+        let oldStore = LocalCredentialStore(service: oldService)
         defer {
-            try? oldKeychain.delete(account: CloudProvider.analysis.account)
-            try? oldKeychain.delete(account: CloudProvider.diarization.account)
-            try? oldKeychain.delete(account: KimiOAuthTokenStore.account)
-            try? oldKeychain.delete(account: CloudProvider.legacyAccount)
+            try? oldStore.delete(account: CloudProvider.analysis.account)
+            try? oldStore.delete(account: CloudProvider.diarization.account)
+            try? oldStore.delete(account: KimiOAuthTokenStore.account)
+            try? oldStore.delete(account: CloudProvider.legacyAccount)
         }
         // 旧 service 每个源条目都放一个「毒药」值
-        try oldKeychain.save("STALE-analysis", account: CloudProvider.analysis.account)
-        try oldKeychain.save("STALE-diarization", account: CloudProvider.diarization.account)
-        try oldKeychain.save("STALE-oauth", account: KimiOAuthTokenStore.account)
-        try oldKeychain.save("STALE-openai", account: CloudProvider.legacyAccount)
+        try oldStore.save("STALE-analysis", account: CloudProvider.analysis.account)
+        try oldStore.save("STALE-diarization", account: CloudProvider.diarization.account)
+        try oldStore.save("STALE-oauth", account: KimiOAuthTokenStore.account)
+        try oldStore.save("STALE-openai", account: CloudProvider.legacyAccount)
 
         // 当前 service 所有目标条目都已就位
         try store(for: .analysis).saveKey("fresh-analysis")
         try store(for: .diarization).saveKey("fresh-diarization")
-        try KeychainService(service: serviceName)
+        try LocalCredentialStore(service: serviceName)
             .save("fresh-oauth", account: KimiOAuthTokenStore.account)
 
         CloudAPIKeyStore.migrateAdHocServiceCredentialsIfNeeded(
@@ -203,9 +203,9 @@ final class CloudProviderKeyIsolationTests {
 
         #expect(try store(for: .analysis).readKey() == "fresh-analysis")
         #expect(try store(for: .diarization).readKey() == "fresh-diarization")
-        #expect(try KeychainService(service: serviceName)
+        #expect(try LocalCredentialStore(service: serviceName)
             .read(account: KimiOAuthTokenStore.account) == "fresh-oauth")
-        #expect(!KeychainService(service: serviceName)
+        #expect(!LocalCredentialStore(service: serviceName)
             .contains(account: CloudProvider.legacyAccount),
                 "openai 兜底不得凭空创建目标条目")
     }
@@ -213,25 +213,25 @@ final class CloudProviderKeyIsolationTests {
     @Test("跨 service 迁移：旧 service 只有 openai 条目时兜底填入分析条目")
     func adHocServiceMigrationFallsBackToLegacyAccount() throws {
         let oldService = "\(serviceName).adhoc"
-        let oldKeychain = KeychainService(service: oldService)
-        defer { try? oldKeychain.delete(account: CloudProvider.legacyAccount) }
-        try oldKeychain.save("adhoc-openai-key", account: CloudProvider.legacyAccount)
+        let oldStore = LocalCredentialStore(service: oldService)
+        defer { try? oldStore.delete(account: CloudProvider.legacyAccount) }
+        try oldStore.save("adhoc-openai-key", account: CloudProvider.legacyAccount)
 
         CloudAPIKeyStore.migrateAdHocServiceCredentialsIfNeeded(
             from: oldService, to: serviceName
         )
 
         #expect(try store(for: .analysis).readKey() == "adhoc-openai-key")
-        #expect(try oldKeychain.read(account: CloudProvider.legacyAccount) == "adhoc-openai-key",
+        #expect(try oldStore.read(account: CloudProvider.legacyAccount) == "adhoc-openai-key",
                 "旧条目必须原样保留")
     }
 
     @Test("跨 service 迁移幂等：连续两次执行结果一致")
     func adHocServiceMigrationIdempotent() throws {
         let oldService = "\(serviceName).adhoc"
-        let oldKeychain = KeychainService(service: oldService)
-        defer { try? oldKeychain.delete(account: CloudProvider.analysis.account) }
-        try oldKeychain.save("adhoc-kimi-key", account: CloudProvider.analysis.account)
+        let oldStore = LocalCredentialStore(service: oldService)
+        defer { try? oldStore.delete(account: CloudProvider.analysis.account) }
+        try oldStore.save("adhoc-kimi-key", account: CloudProvider.analysis.account)
 
         CloudAPIKeyStore.migrateAdHocServiceCredentialsIfNeeded(
             from: oldService, to: serviceName
@@ -240,7 +240,7 @@ final class CloudProviderKeyIsolationTests {
             from: oldService, to: serviceName
         )
         #expect(try store(for: .analysis).readKey() == "adhoc-kimi-key")
-        #expect(try oldKeychain.read(account: CloudProvider.analysis.account) == "adhoc-kimi-key")
+        #expect(try oldStore.read(account: CloudProvider.analysis.account) == "adhoc-kimi-key")
     }
 
     @Test("跨 service 迁移后 OAuth 凭证可正常解码")
@@ -274,7 +274,7 @@ final class CloudProviderKeyIsolationTests {
         let env = AppEnvironment(
             meetingStore: InMemoryMeetingStore(),
             fileStore: MeetingFileStore(baseDirectory: FileManager.default.temporaryDirectory),
-            keychainServiceName: serviceName,
+            credentialServiceName: serviceName,
             aiProviderConfigurationStore: AIProviderConfigurationStore(
                 defaults: defaults
             )
@@ -312,7 +312,7 @@ final class CloudProviderKeyIsolationTests {
 final class DiarizationUnconfiguredTests {
     let tempDirectory: URL
     let fileStore: MeetingFileStore
-    let keychainServiceName = "com.zhaobo.BangWoFenXi.tests.\(UUID().uuidString)"
+    let credentialServiceName = "com.zhaobo.BangWoFenXi.tests.\(UUID().uuidString)"
 
     init() {
         tempDirectory = FileManager.default.temporaryDirectory
@@ -322,11 +322,11 @@ final class DiarizationUnconfiguredTests {
 
     deinit {
         try? FileManager.default.removeItem(at: tempDirectory)
-        try? KeychainService(service: keychainServiceName).delete(account: "diarization")
+        try? LocalCredentialStore(service: credentialServiceName).delete(account: "diarization")
     }
 
     private var keyStore: CloudAPIKeyStore {
-        CloudAPIKeyStore.store(for: .diarization, service: keychainServiceName)
+        CloudAPIKeyStore.store(for: .diarization, service: credentialServiceName)
     }
 
     @Test("未配置分人 Key：start 绑定上下文但 poll/收尾不切盘；配置后可恢复")

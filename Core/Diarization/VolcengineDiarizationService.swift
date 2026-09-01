@@ -5,8 +5,8 @@ struct VolcengineDiarizationService: DiarizationServicing {
         string: "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash"
     )!
     static let resourceID = "volc.bigasr.auc_turbo"
-    static let keychainAccount = "diarization-volcengine"
-    static let accessTokenKeychainAccount = "diarization-volcengine-access-token"
+    static let credentialAccount = "diarization-volcengine"
+    static let accessTokenCredentialAccount = "diarization-volcengine-access-token"
 
     private let session: URLSession
     private let apiKeyStore: CloudAPIKeyStore
@@ -25,7 +25,7 @@ struct VolcengineDiarizationService: DiarizationServicing {
         self.apiKeyStore = apiKeyStore
         self.accessTokenStore = accessTokenStore ?? CloudAPIKeyStore(
             service: CloudAPIKeyStore.defaultService,
-            account: Self.accessTokenKeychainAccount
+            account: Self.accessTokenCredentialAccount
         )
         self.configuredResourceID = resourceID
         self.endpointURL = endpointURL
@@ -54,8 +54,6 @@ struct VolcengineDiarizationService: DiarizationServicing {
         let apiKey: String?
         do {
             apiKey = try apiKeyStore.readKey()
-        } catch KeychainError.interactionNotAllowed {
-            throw DiarizationAPIError.credentialAccessRequired
         } catch {
             throw DiarizationAPIError.missingAPIKey
         }
@@ -63,8 +61,6 @@ struct VolcengineDiarizationService: DiarizationServicing {
         let accessToken: String?
         do {
             accessToken = try accessTokenStore.readKey()
-        } catch KeychainError.interactionNotAllowed {
-            throw DiarizationAPIError.credentialAccessRequired
         } catch {
             accessToken = nil
         }

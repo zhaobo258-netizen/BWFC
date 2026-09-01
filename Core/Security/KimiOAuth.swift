@@ -9,7 +9,7 @@ struct KimiOAuthTokens: Codable, Equatable, Sendable {
     let accessToken: String
     let refreshToken: String
     /// 过期时刻（由响应 expires_in 本地换算；实际有效期约 900 秒。
-    /// 归一化为整秒：亚秒精度无业务意义，且保证 Keychain JSON 往返逐位一致）
+    /// 归一化为整秒：亚秒精度无业务意义，且保证本机存储 JSON 往返逐位一致）
     let expiresAt: Date
 
     init(accessToken: String, refreshToken: String, expiresAt: Date) {
@@ -25,18 +25,18 @@ struct KimiOAuthTokens: Codable, Equatable, Sendable {
     }
 }
 
-// MARK: - Keychain 存储
+// MARK: - 本机存储
 
-/// OAuth 凭证的 Keychain 存储（整组凭证 JSON 序列化后存单条目；
+/// OAuth 凭证的本机明文存储（整组凭证 JSON 序列化后存单条目；
 /// 与静态分析 Key 同 service、独立 account，互不影响）。
 struct KimiOAuthTokenStore: Sendable {
-    /// Keychain account 名（静态 Key 为 "kimi"，本条目为登录凭证）
+    /// account 名（静态 Key 为 "kimi"，本条目为登录凭证）
     static let account = "kimi-oauth"
 
-    private let keychain: KeychainService
+    private let localStore: LocalCredentialStore
 
     init(service: String = CloudAPIKeyStore.defaultService) {
-        self.keychain = KeychainService(service: service)
+        self.localStore = LocalCredentialStore(service: service)
     }
 
     /// 是否已登录（存在可解码的凭证）
@@ -45,12 +45,12 @@ struct KimiOAuthTokenStore: Sendable {
     }
 
     var hasStoredTokens: Bool {
-        keychain.contains(account: Self.account)
+        localStore.contains(account: Self.account)
     }
 
     /// 读取凭证；不存在或数据损坏返回 nil（损坏视为未登录，不猜测修复）
     func read() throws -> KimiOAuthTokens? {
-        guard let raw = try keychain.read(account: Self.account) else {
+        guard let raw = try localStore.read(account: Self.account) else {
             return nil
         }
         guard let data = raw.data(using: .utf8) else {
@@ -76,12 +76,12 @@ struct KimiOAuthTokenStore: Sendable {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .secondsSince1970
         let data = try encoder.encode(tokens)
-        try keychain.save(String(decoding: data, as: UTF8.self), account: Self.account)
+        try localStore.save(String(decoding: data, as: UTF8.self), account: Self.account)
     }
 
     /// 删除凭证（退出登录；幂等）
     func delete() throws {
-        try keychain.delete(account: Self.account)
+        try localStore.delete(account: Self.account)
     }
 }
 
@@ -320,14 +320,7 @@ actor KimiCredentialProvider: KimiCredentialProviding {
     }
 
     func validCredential() async throws -> String {
-        let storedTokens: KimiOAuthTokens?
-        do {
-            storedTokens = try tokenStore.read()
-        } catch KeychainError.interactionNotAllowed {
-            throw AnalysisAPIError.credentialAccessRequired
-        } catch {
-            storedTokens = nil
-        }
+        let storedTokens = (try? tokenStore.read()) ?? nil
         if let tokens = storedTokens {
             if tokens.expiresAt.timeIntervalSince(now()) > refreshLeeway {
                 return tokens.accessToken
@@ -373,14 +366,7 @@ actor KimiCredentialProvider: KimiCredentialProviding {
                 throw AnalysisAPIError.network
             }
         }
-        let staticKey: String?
-        do {
-            staticKey = try staticKeyStore.readKey()
-        } catch KeychainError.interactionNotAllowed {
-            throw AnalysisAPIError.credentialAccessRequired
-        } catch {
-            staticKey = nil
-        }
+        let staticKey = (try? staticKeyStore.readKey()) ?? nil
         if let key = staticKey, !key.isEmpty {
             return key
         }

@@ -8,7 +8,7 @@ final class VolcengineDiarizationServiceTests {
     let keyStore: CloudAPIKeyStore
     let accessTokenStore: CloudAPIKeyStore
     let service: VolcengineDiarizationService
-    let keychainServiceName = "com.zhaobo.BangWoFenXi.tests.volcengine.\(UUID().uuidString)"
+    let credentialServiceName = "com.zhaobo.BangWoFenXi.tests.volcengine.\(UUID().uuidString)"
 
     private var storage: MockURLProtocolStorage { VolcengineMockURLProtocol.storage }
 
@@ -16,12 +16,12 @@ final class VolcengineDiarizationServiceTests {
         VolcengineMockURLProtocol.storage.reset()
         session = VolcengineMockURLProtocol.makeSession()
         keyStore = CloudAPIKeyStore(
-            service: keychainServiceName,
-            account: VolcengineDiarizationService.keychainAccount
+            service: credentialServiceName,
+            account: VolcengineDiarizationService.credentialAccount
         )
         accessTokenStore = CloudAPIKeyStore(
-            service: keychainServiceName,
-            account: VolcengineDiarizationService.accessTokenKeychainAccount
+            service: credentialServiceName,
+            account: VolcengineDiarizationService.accessTokenCredentialAccount
         )
         service = VolcengineDiarizationService(
             session: session,

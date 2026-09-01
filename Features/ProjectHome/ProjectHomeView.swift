@@ -19,6 +19,10 @@ struct ProjectHomeView: View {
     @State private var isResolvingLeftover = false
     @State private var renameTarget: Project?
     @State private var renameDraft = ""
+    @State private var groupingTarget: Project?
+    @State private var groupingDraft = ""
+    @State private var isSelectingForMerge = false
+    @State private var selectedMergeProjectIDs: Set<UUID> = []
     @State private var deleteTarget: Project?
     /// 删除等操作的失败原因。不复用 loadError：那条带死板的「项目读取失败：」前缀，
     /// 拿它显示「正在录音，先结束再删」会变成一句读不通的假错误。
@@ -66,7 +70,7 @@ struct ProjectHomeView: View {
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("请确认参与者已知晓本次录音。\n录音、文稿与笔记默认只保存在本机；配置云端分析或说话人识别服务后，仅对应内容按需发送给对应服务，API Key 仅存于系统钥匙串。")
+            Text("请确认参与者已知晓本次录音。\n录音、文稿与笔记默认只保存在本机；配置云端分析或说话人识别服务后，仅对应内容按需发送给对应服务，API Key 明文保存在本机配置中。")
         }
         .alert("无法导入", isPresented: Binding(
             get: { importErrorMessage != nil },
@@ -85,6 +89,16 @@ struct ProjectHomeView: View {
             Button("取消", role: .cancel) { renameTarget = nil }
         } message: {
             Text("只改标题，不影响录音文件与已生成的分析。")
+        }
+        .alert("归入业务项目", isPresented: Binding(
+            get: { groupingTarget != nil },
+            set: { if !$0 { groupingTarget = nil } }
+        )) {
+            TextField("业务项目或业务范畴名称", text: $groupingDraft)
+            Button("保存") { commitBusinessGrouping() }
+            Button("取消", role: .cancel) { groupingTarget = nil }
+        } message: {
+            Text("输入已有名称可归入同一组；输入新名称会创建新的业务项目。")
         }
         .confirmationDialog(
             "删除这个项目？",
@@ -347,35 +361,88 @@ struct ProjectHomeView: View {
 
     private var recentSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("最近项目")
-                .font(.headline)
+            HStack {
+                Text("业务项目与录音")
+                    .font(.headline)
+                Spacer()
+                if isSelectingForMerge {
+                    Text("已选 \(selectedMergeProjectIDs.count) 段")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("取消") { cancelMergeSelection() }
+                        .controlSize(.small)
+                    Button("生成合并分析") { createCombinedAnalysis() }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .disabled(selectedMergeProjectIDs.count < 2)
+                } else {
+                    Button {
+                        operationError = nil
+                        isSelectingForMerge = true
+                    } label: {
+                        Label("跨录音合并", systemImage: "square.stack.3d.up")
+                    }
+                    .controlSize(.small)
+                    .disabled(projects.filter(ProjectHomeSupport.isEligibleForMerge).count < 2)
+                }
+            }
             if projects.isEmpty && loadError == nil {
-                Text("还没有项目。点击「开始录音」创建第一个项目。")
+                Text("还没有录音。点击「开始录音」创建第一段记录。")
                     .font(.callout)
                     .foregroundStyle(.tertiary)
                     .padding(.vertical, 24)
             }
-            ForEach(ProjectHomeSupport.sortedForDisplay(projects)) { project in
-                ProjectHomeRow(
-                    project: project,
-                    display: ProjectHomeSupport.displayStatus(
-                        for: project,
-                        liveProjectIDs: environment.liveRecordingProjectIDs
-                    ),
-                    onOpen: {
-                        router.showProjectWorkspace(project.id, autoStart: false)
-                    },
-                    onRename: {
-                        renameTarget = project
-                        renameDraft = project.title
-                    },
-                    onRevealInFinder: {
-                        revealInFinder(project)
-                    },
-                    onDelete: {
-                        requestDelete(project)
+            ForEach(ProjectHomeSupport.groupedForDisplay(projects)) { group in
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack(spacing: 7) {
+                        Image(systemName: group.businessCategory == nil ? "tray" : "folder.fill")
+                            .foregroundStyle(group.businessCategory == nil ? .secondary : BWTheme.accent)
+                        Text(group.title)
+                            .font(.callout)
+                            .fontWeight(.semibold)
+                        Text("\(group.projects.count)")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
                     }
-                )
+                    .padding(.top, 5)
+
+                    ForEach(group.projects) { project in
+                        ProjectHomeRow(
+                            project: project,
+                            display: ProjectHomeSupport.displayStatus(
+                                for: project,
+                                liveProjectIDs: environment.liveRecordingProjectIDs
+                            ),
+                            isMergeSelectionMode: isSelectingForMerge,
+                            isSelectedForMerge: selectedMergeProjectIDs.contains(project.id),
+                            isEligibleForMerge: ProjectHomeSupport.isEligibleForMerge(project),
+                            onOpen: {
+                                if isSelectingForMerge {
+                                    toggleMergeSelection(project)
+                                } else {
+                                    router.showProjectWorkspace(project.id, autoStart: false)
+                                }
+                            },
+                            onRename: {
+                                renameTarget = project
+                                renameDraft = project.title
+                            },
+                            onGroup: {
+                                groupingTarget = project
+                                groupingDraft = project.businessCategory ?? ""
+                            },
+                            onRemoveFromGroup: project.businessCategory == nil ? nil : {
+                                removeFromBusinessGrouping(project)
+                            },
+                            onRevealInFinder: {
+                                revealInFinder(project)
+                            },
+                            onDelete: {
+                                requestDelete(project)
+                            }
+                        )
+                    }
+                }
             }
         }
     }
@@ -436,6 +503,65 @@ struct ProjectHomeView: View {
             loadError = "重命名保存失败（\(String(describing: type(of: error)))）"
         }
         reload()
+    }
+
+    private func commitBusinessGrouping() {
+        guard let project = groupingTarget else { return }
+        groupingTarget = nil
+        let category = ProjectHomeSupport.normalizedBusinessCategory(groupingDraft)
+        guard category != project.businessCategory else { return }
+        project.businessCategory = category
+        project.lastActivityAt = Date()
+        do {
+            try environment.persist(project, fields: .businessGrouping)
+            operationError = nil
+        } catch {
+            operationError = "业务项目归组保存失败（\(String(describing: type(of: error)))）"
+        }
+        reload()
+    }
+
+    private func removeFromBusinessGrouping(_ project: Project) {
+        project.businessCategory = nil
+        project.lastActivityAt = Date()
+        do {
+            try environment.persist(project, fields: .businessGrouping)
+            operationError = nil
+        } catch {
+            operationError = "移出业务项目失败（\(String(describing: type(of: error)))）"
+        }
+        reload()
+    }
+
+    private func toggleMergeSelection(_ project: Project) {
+        guard ProjectHomeSupport.isEligibleForMerge(project) else { return }
+        if selectedMergeProjectIDs.contains(project.id) {
+            selectedMergeProjectIDs.remove(project.id)
+        } else {
+            selectedMergeProjectIDs.insert(project.id)
+        }
+    }
+
+    private func cancelMergeSelection() {
+        isSelectingForMerge = false
+        selectedMergeProjectIDs.removeAll()
+        operationError = nil
+    }
+
+    private func createCombinedAnalysis() {
+        do {
+            let selected = projects.filter { selectedMergeProjectIDs.contains($0.id) }
+            let combined = try ProjectHomeSupport.makeCombinedAnalysisProject(from: selected)
+            try environment.persist(combined)
+            cancelMergeSelection()
+            reload()
+            if environment.isAnalysisConfigured {
+                environment.finalReportCoordinator.start(projectID: combined.id)
+            }
+            router.showProjectFinalReport(combined.id)
+        } catch {
+            operationError = error.localizedDescription
+        }
     }
 
     private func revealInFinder(_ project: Project) {
@@ -558,8 +684,13 @@ struct ProjectHomeView: View {
 private struct ProjectHomeRow: View {
     let project: Project
     let display: ProjectHomeSupport.DisplayStatus
+    let isMergeSelectionMode: Bool
+    let isSelectedForMerge: Bool
+    let isEligibleForMerge: Bool
     let onOpen: () -> Void
     let onRename: () -> Void
+    let onGroup: () -> Void
+    let onRemoveFromGroup: (() -> Void)?
     let onRevealInFinder: () -> Void
     let onDelete: () -> Void
 
@@ -568,6 +699,12 @@ private struct ProjectHomeRow: View {
     var body: some View {
         Button(action: onOpen) {
             HStack(spacing: 12) {
+                if isMergeSelectionMode {
+                    Image(systemName: isSelectedForMerge ? "checkmark.circle.fill" : "circle")
+                        .font(.title3)
+                        .foregroundStyle(isSelectedForMerge ? BWTheme.accent : .secondary)
+                        .opacity(isEligibleForMerge ? 1 : 0.35)
+                }
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 8) {
                         Text(project.title)
@@ -611,12 +748,17 @@ private struct ProjectHomeRow: View {
             .contentShape(RoundedRectangle(cornerRadius: 12))
         }
         .buttonStyle(.plain)
+        .disabled(isMergeSelectionMode && !isEligibleForMerge)
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.12)) { isHovering = hovering }
         }
         .contextMenu {
             Button("打开") { onOpen() }
             Button("重命名…") { onRename() }
+            Button("归入业务项目…") { onGroup() }
+            if let onRemoveFromGroup {
+                Button("移出当前业务项目") { onRemoveFromGroup() }
+            }
             Button("在 Finder 中显示") { onRevealInFinder() }
             Divider()
             Button("删除项目…", role: .destructive) { onDelete() }
@@ -630,6 +772,7 @@ private struct ProjectHomeRow: View {
         case .liveRecording: return "mic"
         case .importedAudio: return "waveform"
         case .importedVideo: return "film"
+        case .combinedRecordings: return "square.stack.3d.up"
         }
     }
 

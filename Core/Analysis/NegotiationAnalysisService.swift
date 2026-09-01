@@ -20,7 +20,7 @@ enum AnalysisAPIError: Error, Equatable, Sendable {
     case invalidResponse
     /// 未配置 API Key
     case missingAPIKey
-    /// 当前 App 身份无法静默读取旧 Keychain 凭证
+    /// 本机凭证存储暂时不可读取
     case credentialAccessRequired
 }
 
@@ -59,7 +59,7 @@ protocol NegotiationAnalysisServicing: Sendable {
 /// 基于 URLSession 的 OpenAI Responses API 实现（阶段 4）。
 /// - store: false；严格 JSON Schema 的 Structured Outputs，不解析自由文本；
 /// - 模型 ID 来自 CloudModelConfig 集中配置；
-/// - API Key 只从 Keychain 读取，不落盘、不进日志。
+/// - API Key 从本机配置读取，不进日志。
 struct OpenAIAnalysisService: NegotiationAnalysisServicing {
     private let session: URLSession
     private let apiKeyStore: CloudAPIKeyStore
@@ -79,12 +79,7 @@ struct OpenAIAnalysisService: NegotiationAnalysisServicing {
     }
 
     func analyze(instructions: String, inputJSON: String) async throws -> AnalysisOutputDTO {
-        let apiKey: String?
-        do {
-            apiKey = try apiKeyStore.readKey()
-        } catch KeychainError.interactionNotAllowed {
-            throw AnalysisAPIError.credentialAccessRequired
-        }
+        let apiKey = try apiKeyStore.readKey()
         guard let apiKey, !apiKey.isEmpty else {
             throw AnalysisAPIError.missingAPIKey
         }
@@ -126,12 +121,7 @@ struct OpenAIAnalysisService: NegotiationAnalysisServicing {
 
     /// 连接测试（OpenAI 兼容形态：GET /models）
     func testConnection() async throws -> Bool {
-        let apiKey: String?
-        do {
-            apiKey = try apiKeyStore.readKey()
-        } catch KeychainError.interactionNotAllowed {
-            throw AnalysisAPIError.credentialAccessRequired
-        }
+        let apiKey = try apiKeyStore.readKey()
         guard let apiKey, !apiKey.isEmpty else {
             throw AnalysisAPIError.missingAPIKey
         }

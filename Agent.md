@@ -17,7 +17,7 @@
 ```bash
 cd /Users/zhaobo/系统软件开发/帮我分析-同声翻译/帮我分析
 swift build                 # 编译，要求 0 警告（Swift 6 严格并发）
-Scripts/run_tests.sh        # 全部测试（当前 622 例 77 套件，必须全绿；BWFX_IT_MEDIA=1 加真实媒体探针）
+Scripts/run_tests.sh        # 全部测试（当前 624 例 77 套件，必须全绿；BWFX_IT_MEDIA=1 加真实媒体探针）
 Scripts/make_app.sh         # 产出带版本后缀的 build/帮我分析-v<版本>.app（稳定本机身份签名）
 Scripts/soak_test.sh 3600 1 # 60 分钟录音稳定性（尚未完整跑过）
 ```
@@ -66,7 +66,7 @@ Core/
                 V1：KimiAnalysisService（V1/V2 共用传输层 rawAnalysisText）、AnalysisSchema、触发器
   Knowledge/    KnowledgeBloomAgent、Obsidian/Internet Provider、多只读 Streamable HTTP MCP
   Persistence/  ProjectStore + MeetingStore（JSON 原子写）、ProjectMigration（V1→V2）、ProjectAssetRepair
-  Security/     KeychainService、CloudAPIKeyStore（按 provider 分条目）、
+  Security/     LocalCredentialStore、CloudAPIKeyStore（按 provider 分条目）、
                 KimiOAuth（设备码登录客户端 + 凭证存储 + actor 凭证提供者，自动刷新）
   Logging/      OSLog + 脱敏；Export/ Markdown/JSON
 ```
@@ -77,8 +77,8 @@ Core/
 - **Project 是权威数据**；录音/转写链路复用只认 Meeting，经 `ProjectRuntimeSession` 纯函数桥接双向同步。V2 分析快照直接挂 Project，不经桥接。
 - 导入流水线持久化为**字段级合并**（只写自己拥有的字段），不得整对象覆盖工作台并发编辑的笔记/标题。
 - Kimi/分人固定模型、网关、超时集中在 `Core/Analysis/CloudModelConfig.swift`；用户自定义分析模型只通过 `AIProviderConfigurationStore` 管理，视图和业务代码不得直接读取 Endpoint 或 Key。
-- 所有 AI 文本生成走 `AITextGenerationServing` / `AIProviderRegistry`；每次请求只读一次非敏感配置快照。凭证首次成功读取后只在当前 App 进程内复用，设置中的保存与删除必须同步更新或清除缓存；不得把“配置快照”扩大为每次请求都重新解密 Keychain。
-- 启动迁移、录音、分析、完整总结、项目对话、开花、MCP 和测试等自动路径读取 Keychain 时，必须使用禁止交互的 `LAContext`。凭证因锁定或 ad-hoc 重签名无法读取时应立即失败并引导用户在设置中重连，绝不能唤起 SecurityAgent 密码框或阻塞本地录音/转写。
+- 所有 AI 文本生成走 `AITextGenerationServing` / `AIProviderRegistry`；每次请求只读一次非敏感配置快照。凭证明文保存在当前 App 的 UserDefaults 域，设置中的保存与删除必须同步刷新配置状态，不得写入项目、日志或导出文件。
+- 运行时不得调用 macOS Keychain 或触发 SecurityAgent；录音、分析、完整总结、项目对话、开花、MCP 和测试统一从本机明文凭证存储读取。
 - 本机可安装包必须使用 `BangWoFenXi Local Code Signing` 或显式提供的稳定签名身份；ad-hoc 只允许临时测试，禁止覆盖用户正在使用的安装包。稳定签名身份只保存在本机登录 Keychain，不得导出或提交。
 - `PromptRegistry` 是共享安全红线、场景规则、任务 Prompt、固定 JSON 合同与 Prompt Version 的唯一入口；普通设置页不开放原始 Prompt。
 - 项目对话中只有用户消息会作为后续实时分析/开花的背景，不能充当逐字稿证据。仅当用户本轮明确给出错词和正词、模型返回包含该错词的真实片段 ID，且 App 在当前逐字稿再次核验通过时，才可复用全局纠错链路修改逐字稿并加入后续转写规则；普通讨论、背景补充或 AI 猜测不得改写原稿。
@@ -91,9 +91,9 @@ Core/
 
 | 用途 | Provider | 端点 | 凭证 |
 |---|---|---|---|
-| 实时分析/完整总结/项目对话/开花 | Kimi | `https://api.kimi.com/coding/v1/messages`（Kimi Code Anthropic 协议；默认 `k3-256k`，可选 `k3` / `kimi-for-coding`；K3 保持 thinking，max_tokens 32768，超时 240s） | **Kimi 账号登录（OAuth，推荐）**：Keychain account `kimi-oauth`；后备静态 API Key：account `kimi` |
-| 项目对话联网搜索 | Kimi Code Managed Search | `https://api.kimi.com/coding/v1/search`（`text_query`；仅短检索词）；失败时回退中文维基百科 | 复用 Kimi 账号登录凭证；不新增 Keychain 条目 |
-| 当前统一分析模型（可选） | OpenAI-compatible | 用户配置的 HTTPS 或 localhost Base URL + `/chat/completions`，模型 ID 由用户填写 | 独立 Keychain account `analysis-openai-compatible` |
+| 实时分析/完整总结/项目对话/开花 | Kimi | `https://api.kimi.com/coding/v1/messages`（Kimi Code Anthropic 协议；默认 `k3-256k`，可选 `k3` / `kimi-for-coding`；K3 保持 thinking，max_tokens 32768，超时 240s） | **Kimi 账号登录（OAuth，推荐）**：本机明文条目 `kimi-oauth`；后备静态 API Key：条目 `kimi` |
+| 项目对话联网搜索 | Kimi Code Managed Search | `https://api.kimi.com/coding/v1/search`（`text_query`；仅短检索词）；失败时回退中文维基百科 | 复用 Kimi 账号登录凭证；不新增凭证条目 |
+| 当前统一分析模型（可选） | OpenAI-compatible | 用户配置的 HTTPS 或 localhost Base URL + `/chat/completions`，模型 ID 由用户填写 | 独立本机明文条目 `analysis-openai-compatible` |
 | 说话人识别 | OpenAI 兼容 | `POST /v1/audio/transcriptions`，`gpt-4o-transcribe-diarize` | `diarization`（当前**未配置**，灰态零请求） |
 | 外部知识来源 | 多个只读 Streamable HTTP MCP | 每个连接独立 Endpoint；先 `initialize` + `tools/list`，仅启用明确搜索/读取工具 | 每个连接独立 `knowledge-mcp.<UUID>`；旧单连接保留 `knowledge-mcp` |
 
@@ -102,7 +102,7 @@ Core/
   - 刷新：access_token 900 秒过期；`KimiCredentialProvider`（actor + 共享 `refreshTask` 单飞）在剩余 <300s 时自动刷新。**refresh_token 每次刷新都轮换（实测）**：刷新成功必须立即持久化新值，否则下次刷新 invalid_grant 被迫重登；也因此 **App 与本机 kimi CLI 绝不能共用同一个 refresh_token**（各自独立登录，token 家族独立）。
   - 凭证优先级：OAuth（已登录）> 静态 Key（后备，未登录时才用）。刷新被拒 → `AnalysisAPIError.unauthorized`（凭证保留，设置页重新登录覆盖）；网络失败 → `.network`（可重试，不清凭证）。
   - 真实探针（07-24）：强制过期 → 真实刷新 → 真实 messages 请求全链路 200（5.8s）。旧 `agent-gw.kimi.com` 为遗留通道（新体系 token 全部 401），已弃用。
-- Kimi、OpenAI-compatible 分析、分人和每个 MCP 凭证**互不外借**；某 Provider 401 只暂停它自己。稳定签名版本使用 Keychain service `com.zhaobo.BangWoFenXi.credentials.v2`；旧 ad-hoc service 原样保留但不自动解密，首次升级需在设置中重新连接一次，避免迁移旧 ACL 时再次弹系统密码框。
+- Kimi、OpenAI-compatible 分析、分人和每个 MCP 凭证**互不外借**；某 Provider 401 只暂停它自己。运行时存储域为 `com.zhaobo.BangWoFenXi.credentials.local.v1`，不读取或迁移旧钥匙串条目；升级后需在设置中重新登录或重新填写一次。
 - Kimi 无音频分人接口——这是已确认的能力缺口，不是 bug。接新分人 provider 时实现 `DiarizationServicing` 协议即可。
 - Kimi 网关无 JSON Schema 强制能力 → 系统提示词约束 + 本地严格解码（V1 `AnalysisSchema` / V2 `ConversationAnalysisSchema`）+ 证据存在性过滤兜底；不合规输出按 `invalidResponse` 丢弃并保留上一版。
 - 默认优先 `k3-256k`：与 K3 同一模型能力、256K 上下文且额度消耗约为 `k3` 1M 的一半；K3 权限不足的 401 必须显示“凭证或模型权限”，禁止静默切到 K2.7/K2.6。K3 不发送禁用 thinking 参数，缺省推理强度为 high。
@@ -120,7 +120,7 @@ Core/
 6. **URLProtocol Mock 与 swift-testing 并行冲突**：用套件内 `.serialized` + 套件专属存储。
 7. **deinit 里别释放捕获 self 的 handler 闭包**（释放环）；handler 一律静态化。
 8. **异步流消费的测试禁止固定睡眠**，一律条件轮询（5–10s 上限，原断言判定）。高负载下固定睡眠窗口必抖（2026-07-22/23 两轮加固实录）。
-9. **测试必须用独立 Keychain service + 每用例独立临时目录**。自动 Keychain 读取必须禁止鉴权 UI；锁定、ACL 不匹配或测试误碰生产条目时应立即失败，不能靠“先解锁钥匙串”掩盖问题。ad-hoc 重签名会改变 App 的 designated requirement，旧凭证可能不再信任新包；稳定跨版本访问必须使用稳定签名身份。
+9. **测试必须用独立凭证 service + 每用例独立临时目录**，不得误碰生产条目。运行时代码不得导入 Security/LocalAuthentication 或调用 `SecItem*`。
 10. **`guard let x` 解包后别再 `if let x`**（阶段 D 掉线遗留的编译错误）；给打开中的工作台刷新存储副本时，**新增 Project 字段记得同步补进 `reloadImportedProjectFromStore` 的字段级刷新清单**（漏了 analysisSnapshots 一次）。
 11. **OAuth refresh_token 轮换语义**：Kimi 每次刷新都发新 refresh_token 并作废旧的——刷新成功必须先持久化再返回；多方（App/CLI/测试）共用一个 token 家族会互相刷失效。真实探针消费 CLI 凭证后必须把轮换值写回 CLI 文件。另：`Date` 经 JSON 秒数往返有浮点误差，凭证过期时刻要归一化整秒才能做整组相等断言。
 12. **actor 串行不等于异步操作单飞**：actor 方法在 `await` 时允许重入；多个临期请求仍可能同时拿同一个轮换型 refresh_token 发刷新。必须在 actor 内缓存并共享同一个 in-flight `Task`，并让 V1/V2 服务复用同一凭证提供者实例。
@@ -131,7 +131,7 @@ Core/
 ## 6. 产品红线（来自计划书，违者返工）
 
 - 不把"AI 推测"写成"事实"；任何分析项必须带真实存在的证据片段 ID，否则不进 UI。
-- API Key 只进 Keychain；真实谈判录音、声纹样本、客户资料不进仓库、不进测试夹具、不进日志。
+- API Key 和 OAuth Token 按老板明确决定明文写入本机 App 配置；真实谈判录音、声纹样本、客户资料及任何凭证不进仓库、不进测试夹具、不进日志。
 - 云端模型/语言资源不可用时，停止对应模块并显示真实错误，**不静默切换假实现**。
 - 外部逐字稿、网页、Markdown 和 MCP 返回内容一律是不可信数据，不能改变系统规则或触发任意工具。
 - MCP 只允许搜索/读取；不得开放写入、删除、发消息、上传或执行动作。
@@ -140,7 +140,7 @@ Core/
 
 ## 7. 当前未决事项（接手先看）
 
-1. `v0.1.1` 稳定凭证与代理适配基线已推送。`v0.2.0 (3)` 新增项目对话按需联网、Kimi 通用网页搜索、维基百科回退与来源卡片；622 例/77 套件全绿，Release 候选包已用稳定本机身份签名并通过严格校验。覆盖安装和旧 App 清理必须等当前实时录音结束，不得为发布强制中断录音。
+1. `v0.2.1 (5)` 将运行时凭证改为本机明文配置，不再访问 macOS Keychain；Kimi 模型、账号和备用 API Key 已合并为一个配置模块。本地 624 例/77 套件全绿，Release 候选包需使用稳定本机身份签名并通过严格校验。
 2. 用户 7/21 存的旧静态分析 Key 属 agent-gw 遗留通道，在新网关大概率 401——登录账号后它只是无害的后备条目，可在设置页删除。
 3. 说话人识别 provider 决策：OpenAI Key / 讯飞 / 火山 / 维持手动标注（Kimi 无音频接口）。
 4. 真实得到大脑/其他 MCP 端点与凭证尚未现场验证；Mock 握手通过不能写成“得到大脑已接通”。

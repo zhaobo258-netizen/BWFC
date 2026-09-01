@@ -38,6 +38,7 @@ struct SettingsView: View {
     @State private var testResults: [CloudProvider: (ok: Bool, text: String)] = [:]
     @State private var testingProvider: CloudProvider?
     @State private var login: KimiLoginController?
+    @State private var isShowingKimiFallbackKey = false
 
     @State private var aiConfiguration = AIProviderConfiguration()
     @State private var openAIKeyInput = ""
@@ -144,14 +145,7 @@ struct SettingsView: View {
             Form {
                 activeAIProviderSection
                 if aiConfiguration.selectedProvider == .kimi {
-                    kimiModelSection
-                    kimiAccountSection
-                    keySection(
-                        provider: .analysis,
-                        title: "Kimi API Key（账号登录的备用方式）",
-                        input: $analysisKeyInput,
-                        footnote: "它只用于实时分析、完整总结、项目对话和开花；不是“分析人”的身份，也不用于说话人识别。已登录 Kimi 账号时不会使用此备用 Key。"
-                    )
+                    kimiConfigurationSection
                 } else {
                     openAICompatibleSection
                 }
@@ -299,9 +293,9 @@ struct SettingsView: View {
             if hasSavedKey {
                 Label(
                     hasSavedAccessToken
-                        ? "API Key 与 Access Token 已保存在本机 Keychain，此处不会回显。"
-                        : "API Key 已保存在本机 Keychain，此处不会回显。",
-                    systemImage: "checkmark.shield"
+                        ? "API Key 与 Access Token 已明文保存在本机配置中，此处不会回显。"
+                        : "API Key 已明文保存在本机配置中，此处不会回显。",
+                    systemImage: "checkmark.circle"
                 )
                 .font(.footnote)
                 .foregroundStyle(.secondary)
@@ -347,8 +341,66 @@ struct SettingsView: View {
         }
     }
 
-    private var kimiModelSection: some View {
-        Section("Kimi 模型") {
+    private var kimiConfigurationSection: some View {
+        let hasFallbackKey = environment.isConfigured(.analysis)
+        return Section("Kimi 配置") {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Kimi 账号")
+                    Text(
+                        isKimiLoggedIn
+                            ? "登录成功，后续请求会自动刷新凭证。"
+                            : "登录后即可使用实时分析、完整总结、项目对话和开花。"
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                }
+                Spacer()
+                configurationBadge(
+                    configured: isKimiLoggedIn,
+                    configuredText: "已连接",
+                    unconfiguredText: "未连接"
+                )
+            }
+            switch login?.phase {
+            case .starting:
+                Text("正在发起授权…").foregroundStyle(.secondary)
+            case .waitingApproval(let userCode):
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("已在浏览器打开授权页，请确认后回到本页。")
+                    Text("确认码 \(userCode)")
+                        .font(.title3.monospaced().bold())
+                        .textSelection(.enabled)
+                }
+            case .failed(let message):
+                statusText(message)
+            default:
+                EmptyView()
+            }
+            HStack {
+                Button(isKimiLoggedIn ? "重新登录" : "登录 Kimi 账号") {
+                    ensureLoginController().begin()
+                }
+                if isKimiLoggedIn {
+                    Button("退出登录") {
+                        ensureLoginController().logout()
+                    }
+                }
+                Spacer()
+                Button(testingProvider == .analysis ? "测试中…" : "测试连接") {
+                    runConnectionTest(provider: .analysis)
+                }
+                .disabled(testingProvider != nil || !canTestConnection(.analysis))
+            }
+            if let result = testResults[.analysis] {
+                statusText(result.text)
+            }
+            Text("登录凭证保存在本机配置中，不再使用系统钥匙串。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            Divider()
+
             Picker(
                 "优先模型",
                 selection: $aiConfiguration.kimiModel
@@ -364,9 +416,63 @@ struct SettingsView: View {
                 "当前 Model ID",
                 value: aiConfiguration.kimiModel.modelID
             )
-            Text("默认使用 Kimi K3 256K；它与 K3 同属旗舰模型，官方建议日常任务优先使用且额度消耗更低。K3 需要相应会员权限，连接测试会如实提示，不会静默切换到其他模型。")
+            Text("默认使用 Kimi K3 256K；K3 需要相应会员权限，连接失败时不会静默切换模型。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
+
+            Divider()
+
+            DisclosureGroup(isExpanded: $isShowingKimiFallbackKey) {
+                VStack(alignment: .leading, spacing: 10) {
+                    SecureField(
+                        hasFallbackKey
+                            ? "Key 已保存；粘贴新 Key 可替换"
+                            : "粘贴 API Key（将明文保存在本机）",
+                        text: $analysisKeyInput
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    HStack {
+                        Button("保存到本机") {
+                            saveKey(provider: .analysis, rawValue: analysisKeyInput)
+                        }
+                        .disabled(
+                            analysisKeyInput
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                                .isEmpty
+                        )
+                        Button("删除已保存的 Key") {
+                            deleteKey(provider: .analysis)
+                        }
+                        .disabled(!hasFallbackKey)
+                    }
+                    if hasFallbackKey {
+                        Label(
+                            "已明文保存在本机配置中，重开 App 无需再次输入；此处不会回显原 Key。",
+                            systemImage: "checkmark.circle"
+                        )
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    }
+                    Text(
+                        isKimiLoggedIn
+                            ? "账号已连接，正常请求不会使用备用 Key。"
+                            : "账号授权不可用时，可以改用 API Key。"
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                }
+                .padding(.top, 6)
+            } label: {
+                HStack {
+                    Text("备用 API Key")
+                    Spacer()
+                    configurationBadge(
+                        configured: hasFallbackKey,
+                        configuredText: "已保存",
+                        unconfiguredText: "未设置"
+                    )
+                }
+            }
         }
     }
 
@@ -379,7 +485,7 @@ struct SettingsView: View {
                 .textFieldStyle(.roundedBorder)
             SecureField(
                 hasSavedKey
-                    ? "Key 已安全保存；粘贴新 Key 可替换"
+                    ? "Key 已保存；粘贴新 Key 可替换"
                     : "粘贴 API Key",
                 text: $openAIKeyInput
             )
@@ -403,8 +509,8 @@ struct SettingsView: View {
             }
             if hasSavedKey {
                 Label(
-                    "Key 已保存在本机 Keychain，重开 App 无需再次输入；为安全起见，此处不会回显原 Key。",
-                    systemImage: "checkmark.shield"
+                    "Key 已明文保存在本机配置中，重开 App 无需再次输入；此处不会回显原 Key。",
+                    systemImage: "checkmark.circle"
                 )
                 .font(.footnote)
                 .foregroundStyle(.secondary)
@@ -690,7 +796,7 @@ struct SettingsView: View {
         Section("隐私说明") {
             Text("录音前请确认参与者已知晓并同意。说话人识别会按需发送音频分片；AI 分析会发送转写文本。")
             Text("在项目中开启“允许上传笔记给 AI”后，项目对话和开花会把请求发起时的最新笔记交给当前分析模型；外部知识源只接收短检索词，完整总结仍不读取笔记。")
-            Text("登录凭证、模型 Key 和每个 MCP Token 分别保存在本机 Keychain，不写入项目、日志或 Markdown。")
+            Text("登录凭证、模型 Key 和每个 MCP Token 分别明文保存在本机配置中，不写入项目、日志或 Markdown；拥有当前 macOS 账户文件访问权限的人可能读取它们。")
             Text("MCP 只能调用已经验证的只读知识检索工具。")
         }
         .font(.footnote)
@@ -1050,46 +1156,6 @@ struct SettingsView: View {
         environment.isKimiAccountConnected
     }
 
-    private var kimiAccountSection: some View {
-        Section("Kimi 账号（推荐）") {
-            HStack {
-                Text("账号状态")
-                Spacer()
-                configurationBadge(configured: isKimiLoggedIn)
-            }
-            switch login?.phase {
-            case .starting:
-                Text("正在发起授权…").foregroundStyle(.secondary)
-            case .waitingApproval(let userCode):
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("已在浏览器打开授权页，请确认后回到本页。")
-                    Text("确认码 \(userCode)")
-                        .font(.title3.monospaced().bold())
-                        .textSelection(.enabled)
-                }
-            case .failed(let message):
-                statusText(message)
-            case .succeeded:
-                statusText("登录成功，后续请求会自动刷新凭证。")
-            default:
-                EmptyView()
-            }
-            HStack {
-                Button(isKimiLoggedIn ? "重新登录" : "登录 Kimi 账号") {
-                    ensureLoginController().begin()
-                }
-                if isKimiLoggedIn {
-                    Button("退出登录") {
-                        ensureLoginController().logout()
-                    }
-                }
-            }
-            Text("登录凭证只保存在本机 Keychain。")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-        }
-    }
-
     private func keySection(
         provider: CloudProvider,
         title: String,
@@ -1105,13 +1171,13 @@ struct SettingsView: View {
             }
             SecureField(
                 hasSavedKey
-                    ? "Key 已安全保存；粘贴新 Key 可替换"
-                    : "粘贴 API Key（不会明文保存）",
+                    ? "Key 已保存；粘贴新 Key 可替换"
+                    : "粘贴 API Key（将明文保存在本机）",
                 text: input
             )
                 .textFieldStyle(.roundedBorder)
             HStack {
-                Button("保存到 Keychain") {
+                Button("保存到本机") {
                     saveKey(provider: provider, rawValue: input.wrappedValue)
                 }
                 .disabled(input.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -1127,8 +1193,8 @@ struct SettingsView: View {
             }
             if hasSavedKey {
                 Label(
-                    "已保存在本机 Keychain，重开 App 无需再次输入；为安全起见，此处不会回显原 Key。",
-                    systemImage: "checkmark.shield"
+                    "已明文保存在本机配置中，重开 App 无需再次输入；此处不会回显原 Key。",
+                    systemImage: "checkmark.circle"
                 )
                 .font(.footnote)
                 .foregroundStyle(.secondary)
@@ -1142,8 +1208,12 @@ struct SettingsView: View {
         }
     }
 
-    private func configurationBadge(configured: Bool) -> some View {
-        Text(configured ? "已配置" : "未配置")
+    private func configurationBadge(
+        configured: Bool,
+        configuredText: String = "已配置",
+        unconfiguredText: String = "未配置"
+    ) -> some View {
+        Text(configured ? configuredText : unconfiguredText)
             .font(.caption)
             .fontWeight(.medium)
             .padding(.horizontal, 8)
@@ -1163,7 +1233,7 @@ struct SettingsView: View {
             case .analysis: analysisKeyInput = ""
             case .diarization: diarizationKeyInput = ""
             }
-            testResults[provider] = (true, "已保存到 Keychain。")
+            testResults[provider] = (true, "已保存到本机配置。")
         } catch {
             testResults[provider] = (false, "保存失败：\(error.localizedDescription)")
         }
