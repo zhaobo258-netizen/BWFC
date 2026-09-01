@@ -41,6 +41,9 @@ struct HistoricalSpeakerRelabeler: @unchecked Sendable {
         existingSegments: [SegmentSnapshot],
         speakerReferences: [SpeakerReference]
     ) async throws -> Result {
+        guard case .supported = diarization.knownSpeakerMatchingCapability else {
+            throw DiarizationAPIError.knownSpeakerMatchingUnsupported
+        }
         guard !speakerReferences.isEmpty,
               speakerReferences.count <= KnownSpeakerReference.maximumCount else {
             return Result(assignments: [:], processedChunkCount: 0)

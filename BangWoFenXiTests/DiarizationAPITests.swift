@@ -40,6 +40,15 @@ final class DiarizationAPITests {
 
     // MARK: - 请求组装
 
+    @Test("OpenAI 已知说话人容量明确为 4")
+    func knownSpeakerMatchingCapability() {
+        #expect(
+            service.knownSpeakerMatchingCapability
+                == .supported(maximumSpeakers: KnownSpeakerReference.maximumCount)
+        )
+        #expect(KnownSpeakerReference.maximumCount == 4)
+    }
+
     @Test("请求组装：模型/语言/格式/代号正确，不含真实姓名与明文样本")
     func requestAssembly() async throws {
         try saveTestKey()

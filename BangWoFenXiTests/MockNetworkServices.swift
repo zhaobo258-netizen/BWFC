@@ -105,6 +105,9 @@ func mockRequestBodyData(of request: URLRequest) -> Data? {
 
 /// Mock 云端识别服务：按脚本返回结果或错误序列。
 final class MockDiarizationService: DiarizationServicing, @unchecked Sendable {
+    var knownSpeakerMatchingCapability: KnownSpeakerMatchingCapability {
+        .supported(maximumSpeakers: KnownSpeakerReference.maximumCount)
+    }
     /// 依次返回的结果（队列消费完后返回空结果）
     var resultQueue: [DiarizationChunkResult] = []
     /// 依次抛出的错误（优先于结果）

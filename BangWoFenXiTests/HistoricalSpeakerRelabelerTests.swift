@@ -4,6 +4,37 @@ import Testing
 
 @Suite("历史发言声纹重标")
 struct HistoricalSpeakerRelabelerTests {
+    @Test("不支持历史声纹时在读取音频和联网前失败")
+    func unsupportedProviderFailsBeforeAudioOrNetwork() async {
+        let service = UnsupportedKnownSpeakerDiarizationService()
+        let relabeler = HistoricalSpeakerRelabeler(diarization: service)
+        let missingAudio = FileManager.default.temporaryDirectory
+            .appending(path: "missing-history-audio-\(UUID().uuidString).wav")
+        let missingSample = FileManager.default.temporaryDirectory
+            .appending(path: "missing-history-sample-\(UUID().uuidString).wav")
+
+        await #expect(throws: DiarizationAPIError.knownSpeakerMatchingUnsupported) {
+            try await relabeler.relabel(
+                audioURL: missingAudio,
+                pauseIntervals: [],
+                existingSegments: [
+                    .init(
+                        id: UUID(),
+                        startMs: 0,
+                        endMs: 3_000,
+                        text: "这段音频不应被读取。",
+                        participantId: nil,
+                        speakerWasUserConfirmed: false
+                    )
+                ],
+                speakerReferences: [
+                    .init(speakerID: UUID(), alias: "p_01", sampleURL: missingSample)
+                ]
+            )
+        }
+        #expect(service.transcribeCallCount == 0)
+    }
+
     @Test("已知声纹结果按时间与文本匹配历史片段，保护另一位人工确认")
     func matcherAppliesKnownAliasesOnly() {
         let target = UUID()
@@ -73,4 +104,18 @@ struct HistoricalSpeakerRelabelerTests {
             ).isEmpty
         )
     }
+}
+
+private final class UnsupportedKnownSpeakerDiarizationService: DiarizationServicing, @unchecked Sendable {
+    private(set) var transcribeCallCount = 0
+
+    func transcribeChunk(
+        at chunkURL: URL,
+        knownSpeakers: [KnownSpeakerReference]
+    ) async throws -> DiarizationChunkResult {
+        transcribeCallCount += 1
+        throw DiarizationAPIError.invalidResponse
+    }
+
+    func testConnection() async throws -> Bool { true }
 }

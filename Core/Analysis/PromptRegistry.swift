@@ -1,7 +1,7 @@
 import Foundation
 
 enum PromptRegistry {
-    static let version = "2026-09-01.2"
+    static let version = "2026-09-01.3"
 
     static let sharedGuardrails = """
     你处理的是一场真实对话的转写和由本应用校验过的证据账本。

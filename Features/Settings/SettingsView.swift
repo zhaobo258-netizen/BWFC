@@ -6,6 +6,7 @@ struct SettingsView: View {
         case ai = "大模型与 AI"
         case knowledge = "MCP 与知识源"
         case lexicon = "词库与纠错"
+        case people = "历史人物库"
         case recording = "录音与说话人"
         case storage = "存储与隐私"
 
@@ -16,6 +17,7 @@ struct SettingsView: View {
             case .ai: return "sparkles"
             case .knowledge: return "point.3.connected.trianglepath.dotted"
             case .lexicon: return "text.book.closed"
+            case .people: return "person.2.wave.2"
             case .recording: return "waveform.and.mic"
             case .storage: return "externaldrive"
             }
@@ -71,9 +73,16 @@ struct SettingsView: View {
 
     var body: some View {
         NavigationSplitView {
-            List(SettingsSection.allCases, selection: $selectedSection) { section in
-                Label(section.rawValue, systemImage: section.icon)
-                    .tag(section)
+            VStack(spacing: 0) {
+                List(SettingsSection.allCases, selection: $selectedSection) { section in
+                    Label(section.rawValue, systemImage: section.icon)
+                        .tag(section)
+                }
+                Divider()
+                Text(appVersionText)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .padding(.vertical, 10)
             }
             .navigationTitle("设置")
             .navigationSplitViewColumnWidth(min: 180, ideal: 210, max: 240)
@@ -138,6 +147,16 @@ struct SettingsView: View {
         }
     }
 
+    private var appVersionText: String {
+        let version = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? "—"
+        let build = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleVersion"
+        ) as? String ?? "—"
+        return "帮我分析 v\(version) (\(build))"
+    }
+
     @ViewBuilder
     private var detail: some View {
         switch selectedSection ?? .ai {
@@ -170,6 +189,8 @@ struct SettingsView: View {
                 correctionRulesSection
             }
             .formStyle(.grouped)
+        case .people:
+            HistoricalPeopleLibraryView()
         case .recording:
             Form {
                 diarizationProviderSection

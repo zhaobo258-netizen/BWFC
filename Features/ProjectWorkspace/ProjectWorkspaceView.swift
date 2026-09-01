@@ -49,6 +49,7 @@ struct ProjectWorkspaceView: View {
     @State private var isFinishing = false
     @State private var showBackConfirmation = false
     @State private var showSpeakerPanel = false
+    @State private var showPeopleLibrary = false
     @State private var showExportSheet = false
     /// 说话人指认弹层的锚点（09 号计划需求 2；总结条目或转写行进入）
     @State private var speakerAssignRequest: SpeakerAssignRequest?
@@ -161,6 +162,13 @@ struct ProjectWorkspaceView: View {
                 )
                 .environment(environment)
             }
+        }
+        .sheet(isPresented: $showPeopleLibrary) {
+            HistoricalPeopleLibraryView(
+                allowsProjectNavigation: false,
+                managementEnabled: !isRecordingActive
+            )
+                .frame(minWidth: 820, minHeight: 680)
         }
         .sheet(isPresented: $showExportSheet) {
             if let project {
@@ -702,6 +710,18 @@ struct ProjectWorkspaceView: View {
             }
 
             Spacer()
+
+            Button {
+                showPeopleLibrary = true
+            } label: {
+                if mode == .narrow {
+                    Image(systemName: "person.2.wave.2")
+                } else {
+                    Label("人物库", systemImage: "person.2.wave.2")
+                }
+            }
+            .help("查看历史人物、声纹、背景和表达画像")
+            .accessibilityLabel("打开历史人物库")
 
             if mode == .narrow {
                 Button {
@@ -1748,9 +1768,11 @@ struct ProjectWorkspaceView: View {
     }
 
     /// 人工编辑后持久化并刷新转写视图
-    private func persistAndRefresh(_ meeting: Meeting) {
-        syncAndPersist(meeting)
+    @discardableResult
+    private func persistAndRefresh(_ meeting: Meeting) -> Bool {
+        let didPersist = syncAndPersist(meeting)
         transcription?.refreshSegments()
+        return didPersist
     }
 
     /// 点击中栏证据：左栏滚动并高亮对应片段
@@ -1879,23 +1901,47 @@ struct ProjectWorkspaceView: View {
             pauseIntervals: meeting.pauseIntervals
         )
 
-        // 声纹：从这个人的发言里切 2–10 秒存为样本（已有样本时 plan 为 nil）
-        if let window = plan.sampleWindow {
-            _ = extractVoiceSample(window: window, for: speaker, meeting: meeting)
+        guard persistAndRefresh(meeting) else {
+            reviewNotice = "说话人标注未保存，未启动全场历史回查；请重试。"
+            return false
         }
 
-        // 标签级前向匹配：同会话后续分片同标签直接解析为该说话人
+        // 先把人工指认落盘，再学习声纹；声纹存储失败不能反过来让已保存的标注失效。
+        var canRelabelWithVoice = SpeakerPanelLogic.voiceReferencePath(for: speaker) != nil
+        if let window = plan.sampleWindow {
+            let previousProfileID = speaker.voiceProfileId
+            let previousSamplePath = speaker.voiceSamplePath
+            let previousSampleDurationMs = speaker.voiceSampleDurationMs
+            let previousBackground = speaker.backgroundContext
+            let previousCommunicationProfile = speaker.communicationProfile
+            if let profile = extractVoiceSample(window: window, for: speaker, meeting: meeting) {
+                if persistProject(fields: .speakers) {
+                    canRelabelWithVoice = true
+                } else {
+                    if previousProfileID == nil {
+                        try? environment.speakerVoiceProfileStore.delete(profileID: profile.id)
+                    }
+                    speaker.voiceProfileId = previousProfileID
+                    speaker.voiceSamplePath = previousSamplePath
+                    speaker.voiceSampleDurationMs = previousSampleDurationMs
+                    speaker.backgroundContext = previousBackground
+                    speaker.communicationProfile = previousCommunicationProfile
+                    reviewNotice = "说话人标注已保存，但声纹未完整关联；未启动全场历史回查，请稍后重新标注声纹。"
+                    canRelabelWithVoice = false
+                }
+            }
+        }
+
+        // 只在项目与会议均落盘后启用前向映射，避免保存失败后运行时继续按未保存归属标注。
         if let label = plan.remoteLabel {
             diarization?.assignRemoteLabel(label, to: speaker.id)
         }
-
-        // 说话人列表 → 运行时参会人 → 云端映射刷新（known_speaker_references 随分片携带）
         SpeakerPanelLogic.syncRuntimeParticipants(speakers: project.speakers, meeting: meeting)
         diarization?.refreshKnownSpeakers()
-        persistProject(fields: .speakers)
-        persistAndRefresh(meeting)
         analysis?.noteSpeakerContextChanged(segmentIDs: plan.changedSegmentIds)
-        startHistoricalSpeakerRelabel(project: project, meeting: meeting)
+        if canRelabelWithVoice {
+            startHistoricalSpeakerRelabel(project: project, meeting: meeting)
+        }
         return true
     }
 

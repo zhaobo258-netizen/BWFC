@@ -76,6 +76,16 @@ final class AppRouterTests {
         #expect(router.consumeFinalReportRequest(for: id))
         #expect(!router.consumeFinalReportRequest(for: id))
     }
+
+    @Test("历史人物库是独立一级路由")
+    @MainActor
+    func peopleLibraryRoute() {
+        let router = AppRouter()
+        router.showPeopleLibrary()
+        #expect(router.route == .peopleLibrary)
+        router.showProjectHome()
+        #expect(router.route == .projectHome)
+    }
 }
 
 /// 三栏联合约束：任何占比与拖动顺序下 left+center+right+handles == total

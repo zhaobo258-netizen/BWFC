@@ -8,6 +8,8 @@ enum AppRoute: Hashable {
     case projectHome
     /// 项目工作台（三栏）；autoStart=true 时进入即开始录音
     case projectWorkspace(UUID, autoStart: Bool)
+    /// 跨录音的历史人物、声纹、背景与表达画像
+    case peopleLibrary
     // 旧版路由（保留兼容，不再作为主流程入口）
     case meetingList
     /// 会议表单：nil = 新建；有 id = 编辑既有草稿
@@ -37,6 +39,11 @@ final class AppRouter {
     func showProjectFinalReport(_ id: UUID) {
         requestedFinalReportProjectID = id
         route = .projectWorkspace(id, autoStart: false)
+    }
+
+    func showPeopleLibrary() {
+        requestedFinalReportProjectID = nil
+        route = .peopleLibrary
     }
 
     func consumeFinalReportRequest(for id: UUID) -> Bool {

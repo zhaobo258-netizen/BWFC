@@ -35,6 +35,9 @@ struct VolcengineDiarizationService: DiarizationServicing {
         at chunkURL: URL,
         knownSpeakers: [KnownSpeakerReference]
     ) async throws -> DiarizationChunkResult {
+        guard knownSpeakers.isEmpty else {
+            throw DiarizationAPIError.knownSpeakerMatchingUnsupported
+        }
         let audioData: Data
         do {
             audioData = try Data(contentsOf: chunkURL)

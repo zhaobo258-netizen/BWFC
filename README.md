@@ -45,10 +45,10 @@
 
 ```bash
 swift build                    # 编译（0 警告基线）
-Scripts/make_app.sh            # Debug .app（当前产出 build/帮我分析-v0.2.2.app）
+Scripts/make_app.sh            # Debug .app（当前产出 build/帮我分析-v2.1.0.app）
 Scripts/make_app.sh release    # Release .app（稳定本机签名 + Sandbox/麦克风/网络 entitlements）
-open "build/帮我分析-v0.2.2.app" # 启动
-Scripts/run_tests.sh           # 全部 631 个自动化用例（79 套件）
+open "build/帮我分析-v2.1.0.app" # 启动
+Scripts/run_tests.sh           # 全部 638 个自动化用例（80 套件）
 Scripts/soak_test.sh           # 稳定性缩短版（180s/4x）
 Scripts/soak_test.sh 3600 1    # 60 分钟完整稳定性（人工验收）
 ```

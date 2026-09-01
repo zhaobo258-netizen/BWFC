@@ -354,7 +354,13 @@ final class DiarizationController {
         let chunkURL = fileStore.chunksDirectory(for: meeting.id)
             .appending(path: entry.fileName)
         var speakers: [KnownSpeakerReference] = []
-        for participant in meeting.participants {
+        let supportsKnownSpeakers: Bool
+        if case .supported = diarization.knownSpeakerMatchingCapability {
+            supportsKnownSpeakers = true
+        } else {
+            supportsKnownSpeakers = false
+        }
+        for participant in meeting.participants where supportsKnownSpeakers {
             guard let relativePath = participant.voiceReferencePath else { continue }
             let alias = participant.cloudAlias
             guard let durationMs = participant.voiceReferenceDurationMs,
@@ -480,6 +486,12 @@ final class DiarizationController {
             suspensionCause = .knownSpeakerConfiguration
             cloudState = .suspended(
                 reason: "声纹配置暂停：\(error.localizedDescription)。请修正或移除该样本，保存后将自动继续。"
+            )
+        case .knownSpeakerMatchingUnsupported:
+            queue[entryIndex].status = .pending
+            suspensionCause = .providerConfigurationMismatch
+            cloudState = .suspended(
+                reason: "当前分人服务不支持历史人物声纹匹配。本地录音与匿名分人继续可用，请切换支持已知说话人的服务后重试。"
             )
         case .rateLimited, .serverError, .network:
             queue[entryIndex].attemptCount += 1

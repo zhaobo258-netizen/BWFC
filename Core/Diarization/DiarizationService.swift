@@ -155,6 +155,11 @@ struct KnownSpeakerReference: Equatable, Sendable {
     var sampleURL: URL
 }
 
+enum KnownSpeakerMatchingCapability: Equatable, Sendable {
+    case unsupported
+    case supported(maximumSpeakers: Int)
+}
+
 enum KnownSpeakerSampleIssue: Equatable, Sendable {
     case invalidPath
     case fileMissingOrUnreadable
@@ -199,6 +204,8 @@ enum DiarizationAPIError: Error, Equatable {
     case tooManyKnownSpeakers(maximum: Int, actual: Int)
     /// 已配置声纹但样本无法安全上传，不得静默降级为未知说话人。
     case invalidKnownSpeakerSample(alias: String, issue: KnownSpeakerSampleIssue)
+    /// 当前 provider 只支持匿名分人，不支持已知人物声纹匹配。
+    case knownSpeakerMatchingUnsupported
 }
 
 extension DiarizationAPIError: LocalizedError {
@@ -227,6 +234,8 @@ extension DiarizationAPIError: LocalizedError {
                 }
                 return "说话人代号 \(alias) 的声纹样本缺少时长，必须在 2–10 秒之间"
             }
+        case .knownSpeakerMatchingUnsupported:
+            return "当前分人服务只支持匿名说话人，不支持历史声纹身份匹配"
         }
     }
 }
@@ -235,11 +244,16 @@ extension DiarizationAPIError: LocalizedError {
 /// 协议隔离网络实现，集成测试用 URLProtocol Mock 替换 URLSession，
 /// 编排测试用 Mock 服务替换整个协议。
 protocol DiarizationServicing: Sendable {
+    var knownSpeakerMatchingCapability: KnownSpeakerMatchingCapability { get }
     /// 上传一个音频分片并返回带说话人代号的确认片段（时间相对分片起点）
     func transcribeChunk(at chunkURL: URL,
                          knownSpeakers: [KnownSpeakerReference]) async throws -> DiarizationChunkResult
     /// 云端连接测试（设置页使用）：只返回可用/不可用与脱敏错误
     func testConnection() async throws -> Bool
+}
+
+extension DiarizationServicing {
+    var knownSpeakerMatchingCapability: KnownSpeakerMatchingCapability { .unsupported }
 }
 
 /// 基于 URLSession 的 OpenAI Audio Transcriptions 实现（阶段 3）。
@@ -251,6 +265,10 @@ struct OpenAIDiarizationService: DiarizationServicing {
     private let apiKeyStore: CloudAPIKeyStore
     private let baseURL: URL
     private let modelID: String
+
+    var knownSpeakerMatchingCapability: KnownSpeakerMatchingCapability {
+        .supported(maximumSpeakers: KnownSpeakerReference.maximumCount)
+    }
 
     init(
         session: URLSession = .shared,

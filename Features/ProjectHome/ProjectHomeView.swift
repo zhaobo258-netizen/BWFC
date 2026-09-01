@@ -132,6 +132,12 @@ struct ProjectHomeView: View {
             }
             Spacer()
             Button {
+                router.showPeopleLibrary()
+            } label: {
+                Label("历史人物库", systemImage: "person.2.wave.2")
+            }
+            .buttonStyle(.bordered)
+            Button {
                 router.showSettings()
             } label: {
                 Image(systemName: "gearshape")

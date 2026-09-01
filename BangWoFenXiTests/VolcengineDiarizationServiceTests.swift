@@ -176,4 +176,23 @@ final class VolcengineDiarizationServiceTests {
         }
         #expect(storage.capturedRequests.isEmpty)
     }
+
+    @Test("传入历史声纹时明确拒绝，不读音频也不发请求")
+    func knownSpeakerMatchingIsUnsupported() async {
+        let missingAudio = FileManager.default.temporaryDirectory
+            .appending(path: "missing-volc-audio-\(UUID().uuidString).wav")
+        let missingSample = FileManager.default.temporaryDirectory
+            .appending(path: "missing-volc-sample-\(UUID().uuidString).wav")
+
+        await #expect(throws: DiarizationAPIError.knownSpeakerMatchingUnsupported) {
+            try await service.transcribeChunk(
+                at: missingAudio,
+                knownSpeakers: [
+                    KnownSpeakerReference(alias: "p_01", sampleURL: missingSample)
+                ]
+            )
+        }
+        #expect(service.knownSpeakerMatchingCapability == .unsupported)
+        #expect(storage.capturedRequests.isEmpty)
+    }
 }
