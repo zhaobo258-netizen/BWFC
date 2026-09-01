@@ -113,6 +113,36 @@ struct SpeakerVoiceProfileStoreTests {
         #expect(try AudioChunkExtractor.durationMs(of: copied) == 4_000)
     }
 
+    @Test("人工背景与沟通画像随永久声纹带入下一次录音")
+    func persistentContextFollowsAutomaticSpeaker() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SpeakerVoiceProfileStore(baseDirectory: root)
+        let profile = try store.enroll(
+            displayName: "王总",
+            role: "负责人",
+            colorToken: "blue",
+            sourceSampleURL: try sample(in: root),
+            durationMs: 3_000
+        )
+        let communicationProfile = SpeakerCommunicationProfile(
+            summary: "表达直接，习惯用数字确认边界。",
+            observations: [],
+            sourceProjectId: UUID(),
+            updatedAt: Date(timeIntervalSince1970: 2_000)
+        )
+
+        try store.updateContext(
+            profileID: profile.id,
+            backgroundContext: "负责区域经营与最终决策。",
+            communicationProfile: communicationProfile
+        )
+
+        let speaker = try #require(store.automaticSpeakers().first)
+        #expect(speaker.backgroundContext == "负责区域经营与最终决策。")
+        #expect(speaker.communicationProfile == communicationProfile)
+    }
+
     @Test("只允许四个永久声纹自动参加新会议，第五个明确拒绝启用")
     func autoEnabledLimitIsExplicit() throws {
         let root = try temporaryDirectory()

@@ -144,7 +144,7 @@ struct ConversationAnalysisView: View {
                     .foregroundStyle(speakerName(for: item.subjectSpeakerId) == nil
                                      ? AnyShapeStyle(BWTheme.accent)
                                      : AnyShapeStyle(.secondary))
-                    .help("确认这条内容归谁；只有唯一证据时才可另选回写原话，永久声纹需试听确认")
+                    .help("确认这条内容归谁；只有唯一证据时才可另选回写原话并学习声纹")
                 } else if let speakerName = speakerName(for: item.subjectSpeakerId) {
                     Text(speakerName)
                         .font(.caption2)

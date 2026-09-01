@@ -28,7 +28,12 @@ enum ConversationAnalysisInputAssembler {
             scenario: project.scenario.map(ConversationAnalysisTaxonomy.wireName(for:)) ?? "auto",
             scenarioWasUserSelected: project.scenarioWasUserSelected,
             speakers: project.speakers.map {
-                SpeakerDTO(id: $0.cloudAlias, role: $0.role?.isEmpty == false ? $0.role : nil)
+                SpeakerDTO(
+                    id: $0.cloudAlias,
+                    role: $0.role?.isEmpty == false ? $0.role : nil,
+                    backgroundContext: $0.backgroundContext,
+                    communicationProfile: $0.communicationProfile?.summary
+                )
             },
             previousState: previousSnapshot.map { snapshot in
                 PreviousStateDTO(
@@ -96,6 +101,14 @@ enum ConversationAnalysisInputAssembler {
     private struct SpeakerDTO: Encodable {
         let id: String
         let role: String?
+        let backgroundContext: String?
+        let communicationProfile: String?
+
+        enum CodingKeys: String, CodingKey {
+            case id, role
+            case backgroundContext = "background_context"
+            case communicationProfile = "communication_profile"
+        }
     }
 
     private struct PreviousStateDTO: Encodable {

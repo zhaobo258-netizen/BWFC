@@ -28,6 +28,10 @@ final class Speaker: Identifiable, Codable {
     var voiceSampleDurationMs: Int64?
     /// 应用级永久声纹 id；有值时样本来自独立 VoiceProfiles 目录，删除项目不删除该样本。
     var voiceProfileId: UUID?
+    /// 用户人工补充的人物背景；随永久人物档案跨会议复用。
+    var backgroundContext: String?
+    /// 基于已标注原话生成的可观察表达与沟通画像。
+    var communicationProfile: SpeakerCommunicationProfile?
 
     init(
         id: UUID = UUID(),
@@ -41,7 +45,9 @@ final class Speaker: Identifiable, Codable {
         legacyVoiceReferenceDurationMs: Int64? = nil,
         voiceSamplePath: String? = nil,
         voiceSampleDurationMs: Int64? = nil,
-        voiceProfileId: UUID? = nil
+        voiceProfileId: UUID? = nil,
+        backgroundContext: String? = nil,
+        communicationProfile: SpeakerCommunicationProfile? = nil
     ) {
         self.id = id
         self.cloudAlias = cloudAlias
@@ -55,5 +61,7 @@ final class Speaker: Identifiable, Codable {
         self.voiceSamplePath = voiceSamplePath
         self.voiceSampleDurationMs = voiceSampleDurationMs
         self.voiceProfileId = voiceProfileId
+        self.backgroundContext = backgroundContext
+        self.communicationProfile = communicationProfile
     }
 }

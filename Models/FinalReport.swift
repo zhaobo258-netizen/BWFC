@@ -138,7 +138,9 @@ enum FinalReportFingerprint {
                     $0.id.uuidString,
                     $0.cloudAlias,
                     $0.displayName,
-                    $0.role ?? ""
+                    $0.role ?? "",
+                    $0.backgroundContext ?? "",
+                    $0.communicationProfile?.summary ?? ""
                 ].joined(separator: "\u{1F}")
             })
         lines.append(contentsOf: project.segments

@@ -103,22 +103,27 @@ struct SpeakerAssignFlowTests {
 
     // MARK: - SpeakerBackfill
 
-    @Test("同标签的未识别片段全部回填；已识别的不动")
+    @Test("同标签的片段全部回填；只保护另一位用户已确认的归属")
     func backfillSameLabel() {
         let me = UUID(), other = UUID()
         let anchor = segment(startMs: 0, endMs: 2_000, label: "spk_a")
         let sameLabel = segment(startMs: 3_000, endMs: 5_000, label: "spk_a")
         let taken = segment(startMs: 6_000, endMs: 8_000, participantId: other, label: "spk_a")
+        let userConfirmed = segment(
+            startMs: 8_000, endMs: 9_000, participantId: other, label: "spk_a"
+        )
+        userConfirmed.speakerWasUserConfirmed = true
         let otherLabel = segment(startMs: 9_000, endMs: 11_000, label: "spk_b")
-        let all = [anchor, sameLabel, taken, otherLabel]
+        let all = [anchor, sameLabel, taken, userConfirmed, otherLabel]
 
         let outcome = SpeakerBackfill.assign(anchorSegmentId: anchor.id, to: me, segments: all)
 
-        #expect(Set(outcome.changedSegmentIds) == Set([anchor.id, sameLabel.id]))
+        #expect(Set(outcome.changedSegmentIds) == Set([anchor.id, sameLabel.id, taken.id]))
         #expect(outcome.remoteLabel == "spk_a")
         #expect(anchor.participantId == me)
         #expect(sameLabel.participantId == me)
-        #expect(taken.participantId == other, "已有归属不被批量回填覆盖")
+        #expect(taken.participantId == me, "云端暂定归属应随本次人工确认一起纠正")
+        #expect(userConfirmed.participantId == other, "另一位用户明确确认过的归属不能被覆盖")
         #expect(otherLabel.participantId == nil)
     }
 
@@ -142,7 +147,27 @@ struct SpeakerAssignFlowTests {
         #expect(anchor.participantId == me)
     }
 
-    @Test("回填不置 edited：云端后续更正不被挡")
+    @Test("云端已猜对时，人工点击仍写入确认状态")
+    func backfillConfirmsExistingAssignment() {
+        let me = UUID()
+        let anchor = segment(
+            startMs: 0,
+            endMs: 3_000,
+            participantId: me,
+            label: "spk_a"
+        )
+
+        let outcome = SpeakerBackfill.assign(
+            anchorSegmentId: anchor.id,
+            to: me,
+            segments: [anchor]
+        )
+
+        #expect(outcome.changedSegmentIds == [anchor.id])
+        #expect(anchor.speakerWasUserConfirmed == true)
+    }
+
+    @Test("回填不置 edited：云端仍可更新文字和分段")
     func backfillKeepsState() {
         let me = UUID()
         let anchor = segment(startMs: 0, endMs: 2_000, label: "spk_a")

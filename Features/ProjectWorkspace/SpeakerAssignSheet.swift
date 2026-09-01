@@ -35,7 +35,7 @@ struct SpeakerAssignSheet: View {
             }
             Text(isAnalysisItem
                  ? "这里确认的是这条 AI 内容归谁，不会把多段证据静默当成同一个人的声音。"
-                 : "这里会修改这句原话的说话人；永久识别需到「说话人」面板试听并确认一段 2–10 秒的单人样本。")
+                 : "这里会批量修改同一声音组的原话，并从已确认的 2–10 秒单人发言学习永久声纹。")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)

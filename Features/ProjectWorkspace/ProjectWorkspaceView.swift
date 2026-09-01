@@ -52,6 +52,7 @@ struct ProjectWorkspaceView: View {
     @State private var showExportSheet = false
     /// 说话人指认弹层的锚点（09 号计划需求 2；总结条目或转写行进入）
     @State private var speakerAssignRequest: SpeakerAssignRequest?
+    @State private var isRelabelingHistoricalSpeakers = false
     @State private var newDeviceID: String?
     @State private var sidebarProjects: [Project] = []
     @AppStorage("bwfx.workspace.projectSidebarVisible") private var prefersProjectSidebarVisible = true
@@ -1880,7 +1881,7 @@ struct ProjectWorkspaceView: View {
 
         // 声纹：从这个人的发言里切 2–10 秒存为样本（已有样本时 plan 为 nil）
         if let window = plan.sampleWindow {
-            extractVoiceSample(window: window, for: speaker, meeting: meeting)
+            _ = extractVoiceSample(window: window, for: speaker, meeting: meeting)
         }
 
         // 标签级前向匹配：同会话后续分片同标签直接解析为该说话人
@@ -1894,6 +1895,7 @@ struct ProjectWorkspaceView: View {
         persistProject(fields: .speakers)
         persistAndRefresh(meeting)
         analysis?.noteSpeakerContextChanged(segmentIDs: plan.changedSegmentIds)
+        startHistoricalSpeakerRelabel(project: project, meeting: meeting)
         return true
     }
 
@@ -1902,18 +1904,18 @@ struct ProjectWorkspaceView: View {
         window: SpeakerSampleWindowPlanner.Window,
         for speaker: Speaker,
         meeting: Meeting
-    ) {
+    ) -> SpeakerVoiceProfile? {
         guard let project,
               SpeakerPanelLogic.canActivateVoiceReference(
                 for: speaker.id,
                 in: project.speakers
               ) else {
             operationError = "已指认说话人，但本场已启用 4 个声纹，未自动录入第 5 份样本。可在「说话人」面板替换本场人员。"
-            return
+            return nil
         }
         do {
             guard let audioURL = try environment.fileStore.audioFileURL(for: meeting),
-                  FileManager.default.fileExists(atPath: audioURL.path) else { return }
+                  FileManager.default.fileExists(atPath: audioURL.path) else { return nil }
             let relativePath = environment.fileStore.relativeVoiceSamplePath(
                 meetingID: meeting.id,
                 participantID: speaker.id
@@ -1931,12 +1933,104 @@ struct ProjectWorkspaceView: View {
             )
             speaker.voiceSamplePath = relativePath
             speaker.voiceSampleDurationMs = window.audioEndMs - window.audioStartMs
+            let profile = try environment.speakerVoiceProfileStore.enroll(
+                profileID: speaker.voiceProfileId,
+                displayName: speaker.displayName,
+                role: speaker.role,
+                colorToken: speaker.colorToken,
+                sourceSampleURL: sampleURL,
+                durationMs: window.audioEndMs - window.audioStartMs
+            )
+            speaker.voiceProfileId = profile.id
+            speaker.voiceSamplePath = profile.sampleRelativePath
+            speaker.voiceSampleDurationMs = profile.sampleDurationMs
+            speaker.backgroundContext = profile.backgroundContext
+            speaker.communicationProfile = profile.communicationProfile
+            reviewNotice = profile.isAutoEnabled
+                ? "已标注并记住 \(speaker.displayName) 的声纹；正在回查本场历史发言。"
+                : "已保存 \(speaker.displayName) 的永久声纹；自动识别名额已满，本场仍会回查历史发言。"
+            return profile
         } catch {
-            // 指认本身已生效；样本提取失败如实提示，可去说话人面板手录
-            operationError = "已指认说话人，但自动提取声纹失败（\(String(describing: type(of: error)))）；可在「说话人」面板手动录制样本。"
+            // 指认本身已生效；样本提取或永久保存失败如实提示，可去说话人面板手录
+            operationError = "已批量标注同组发言，但自动学习声纹失败（\(String(describing: type(of: error)))）；可在「说话人」面板手动录制样本。"
             AppLog.logError(AppLog.diarization, LogSanitizer.formatEvent(
                 "voice_sample_extract_failed", error: String(describing: type(of: error))
             ))
+            return nil
+        }
+    }
+
+    private func startHistoricalSpeakerRelabel(project: Project, meeting: Meeting) {
+        guard !isRelabelingHistoricalSpeakers else { return }
+        let configuration = environment.diarizationConfigurationSnapshot()
+        guard configuration.selectedProvider == .openAICompatible else {
+            reviewNotice = "同一分片的发言已批量标注。全场历史声纹回查需要在设置中启用 OpenAI 兼容分人服务。"
+            return
+        }
+        let keyStore = environment.diarizationKeyStore(for: configuration)
+        guard keyStore.hasConfiguredKey else {
+            reviewNotice = "同一分片的发言已批量标注。配置分人 Key 后可自动回查整场历史发言。"
+            return
+        }
+        guard let audioURL = try? environment.fileStore.audioFileURL(for: meeting) else {
+            reviewNotice = "同一分片的发言已批量标注；当前项目没有可用于全场回查的录音。"
+            return
+        }
+        let references = project.speakers.compactMap { speaker -> HistoricalSpeakerRelabeler.SpeakerReference? in
+            guard let path = SpeakerPanelLogic.voiceReferencePath(for: speaker),
+                  let url = try? environment.fileStore.absoluteURL(forRelativePath: path) else {
+                return nil
+            }
+            return .init(speakerID: speaker.id, alias: speaker.cloudAlias, sampleURL: url)
+        }
+        guard !references.isEmpty else { return }
+        let snapshots = meeting.segments.map {
+            HistoricalSpeakerRelabeler.SegmentSnapshot(
+                id: $0.id,
+                startMs: $0.startMs,
+                endMs: $0.endMs,
+                text: $0.text,
+                participantId: $0.participantId,
+                speakerWasUserConfirmed: $0.speakerWasUserConfirmed == true
+            )
+        }
+        let relabeler = HistoricalSpeakerRelabeler(
+            diarization: environment.makeDiarizationService(for: configuration)
+        )
+        isRelabelingHistoricalSpeakers = true
+        reviewNotice = "正在用已记住的声纹回查本场历史发言…"
+        Task {
+            defer { isRelabelingHistoricalSpeakers = false }
+            do {
+                let result = try await relabeler.relabel(
+                    audioURL: audioURL,
+                    pauseIntervals: meeting.pauseIntervals,
+                    existingSegments: snapshots,
+                    speakerReferences: Array(references.prefix(KnownSpeakerReference.maximumCount))
+                )
+                var changed: [UUID] = []
+                for segment in meeting.segments {
+                    guard segment.speakerWasUserConfirmed != true,
+                          let speakerID = result.assignments[segment.id],
+                          segment.participantId != speakerID else {
+                        continue
+                    }
+                    segment.participantId = speakerID
+                    segment.speakerConfidence = .high
+                    segment.updatedAt = Date()
+                    changed.append(segment.id)
+                }
+                if !changed.isEmpty {
+                    persistAndRefresh(meeting)
+                    transcription?.refreshSegments()
+                    analysis?.noteSpeakerContextChanged(segmentIDs: changed)
+                }
+                reviewNotice = changed.isEmpty
+                    ? "历史声纹回查完成，未发现新的可靠匹配。"
+                    : "历史声纹回查完成，已自动标注 \(changed.count) 条发言。"
+            } catch {
+                reviewNotice = "同组发言已批量标注，但全场历史声纹回查未完成（\(error.localizedDescription)）。"
+            }
         }
     }
 

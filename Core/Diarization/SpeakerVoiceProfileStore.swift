@@ -10,6 +10,8 @@ struct SpeakerVoiceProfile: Identifiable, Codable, Sendable, Equatable {
     var isAutoEnabled: Bool
     var createdAt: Date
     var updatedAt: Date
+    var backgroundContext: String? = nil
+    var communicationProfile: SpeakerCommunicationProfile? = nil
 }
 
 enum SpeakerVoiceProfileStoreError: Error, Equatable {
@@ -139,6 +141,8 @@ final class SpeakerVoiceProfileStore: @unchecked Sendable {
         let autoEnabled = existingIndex.map { profiles[$0].isAutoEnabled }
             ?? (profiles.filter { $0.isAutoEnabled }.count < Self.maximumAutoEnabledProfiles)
         let createdAt = existingIndex.map { profiles[$0].createdAt } ?? now
+        let backgroundContext = existingIndex.flatMap { profiles[$0].backgroundContext }
+        let communicationProfile = existingIndex.flatMap { profiles[$0].communicationProfile }
         let profile = SpeakerVoiceProfile(
             id: id,
             displayName: displayName.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -148,7 +152,9 @@ final class SpeakerVoiceProfileStore: @unchecked Sendable {
             sampleDurationMs: measuredDurationMs,
             isAutoEnabled: autoEnabled,
             createdAt: createdAt,
-            updatedAt: now
+            updatedAt: now,
+            backgroundContext: backgroundContext,
+            communicationProfile: communicationProfile
         )
         if let existingIndex {
             profiles[existingIndex] = profile
@@ -219,6 +225,26 @@ final class SpeakerVoiceProfileStore: @unchecked Sendable {
             try validateStoredSample(for: profiles[index])
         }
         profiles[index].isAutoEnabled = enabled
+        profiles[index].updatedAt = now
+        try saveUnlocked(profiles)
+    }
+
+    func updateContext(
+        profileID: UUID,
+        backgroundContext: String?,
+        communicationProfile: SpeakerCommunicationProfile?,
+        now: Date = Date()
+    ) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        var profiles = try loadUnlocked(sampleValidation: .structure)
+        guard let index = profiles.firstIndex(where: { $0.id == profileID }) else {
+            throw SpeakerVoiceProfileStoreError.profileNotFound
+        }
+        profiles[index].backgroundContext = backgroundContext?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        profiles[index].communicationProfile = communicationProfile
         profiles[index].updatedAt = now
         try saveUnlocked(profiles)
     }
@@ -295,7 +321,9 @@ final class SpeakerVoiceProfileStore: @unchecked Sendable {
                     isUserConfirmed: true,
                     voiceSamplePath: profile.sampleRelativePath,
                     voiceSampleDurationMs: profile.sampleDurationMs,
-                    voiceProfileId: profile.id
+                    voiceProfileId: profile.id,
+                    backgroundContext: profile.backgroundContext,
+                    communicationProfile: profile.communicationProfile
                 )
             }
     }

@@ -37,6 +37,36 @@ struct ConversationAnalysisInputAssemblerTests {
         #expect(!json.contains("华东区客户回访"), "项目标题属本地信息，不发云端")
     }
 
+    @Test("历史人物的人工背景与沟通画像随代号进入后续分析上下文")
+    func persistentSpeakerContextIncluded() throws {
+        let project = makeProject()
+        project.speakers[0].backgroundContext = "负责最终采购审批，重视交付确定性。"
+        project.speakers[0].communicationProfile = SpeakerCommunicationProfile(
+            summary: "表达先给结论，再追问数字与期限。",
+            observations: [
+                .init(
+                    title: "结论优先",
+                    observation: "通常先表态，再要求补充量化依据。",
+                    evidenceSegmentIds: [UUID()]
+                )
+            ],
+            sourceProjectId: project.id,
+            updatedAt: Date(timeIntervalSince1970: 1_000)
+        )
+
+        let json = try ConversationAnalysisInputAssembler.makeInputJSON(
+            project: project,
+            previousSnapshot: nil,
+            newSegments: []
+        )
+
+        #expect(json.contains("负责最终采购审批"))
+        #expect(json.contains("表达先给结论"))
+        #expect(json.contains(#""background_context""#))
+        #expect(json.contains(#""communication_profile""#))
+        #expect(!json.contains("王经理"), "连续人物上下文仍只按代号发送，不发送姓名")
+    }
+
     @Test("场景字段：未选择时为 auto；已选择时发 wire 名与手选标记")
     func scenarioField() throws {
         let auto = try ConversationAnalysisInputAssembler.makeInputJSON(

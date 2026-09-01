@@ -17,6 +17,14 @@ struct ProjectAIContext: Sendable {
     struct SpeakerContext: Sendable, Encodable {
         var id: String
         var role: String?
+        var backgroundContext: String?
+        var communicationProfile: String?
+
+        enum CodingKeys: String, CodingKey {
+            case id, role
+            case backgroundContext = "background_context"
+            case communicationProfile = "communication_profile"
+        }
     }
 
     struct EvidenceItem: Sendable, Encodable {
@@ -108,7 +116,9 @@ enum ProjectAIContextBuilder {
             speakers: project.speakers.map {
                 ProjectAIContext.SpeakerContext(
                     id: $0.cloudAlias,
-                    role: $0.role
+                    role: $0.role,
+                    backgroundContext: $0.backgroundContext,
+                    communicationProfile: $0.communicationProfile?.summary
                 )
             },
             evidenceItems: validatedAnalysisItems.map {

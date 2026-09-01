@@ -78,6 +78,7 @@ struct SpeakerPanelView: View {
     @State private var pendingPermanentSpeaker: Speaker?
     @State private var pendingDeleteProfile: SpeakerVoiceProfile?
     @State private var editingProfile: SpeakerVoiceProfile?
+    @State private var contextProfile: SpeakerVoiceProfile?
     @State private var profileLibraryHasValidationFailure = false
     @State private var profileNotice: String?
 
@@ -100,7 +101,7 @@ struct SpeakerPanelView: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    Text("跨会议使用前必须试听并确认只有此人；确认后的样本才会复制进本机永久声纹库。")
+                    Text("在文稿中指认一次后，App 会从该人已确认的单人发言提取样本并记住；手工录制或更换样本时，请试听确认只有此人。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
@@ -165,6 +166,21 @@ struct SpeakerPanelView: View {
                     colorToken: colorToken
                 )
             }
+        }
+        .sheet(item: $contextProfile) { profile in
+            SpeakerCommunicationProfileSheet(
+                profile: profile,
+                speaker: project.speakers.first { $0.voiceProfileId == profile.id },
+                project: project,
+                onSave: { background, communicationProfile in
+                    updateProfileContext(
+                        profile,
+                        backgroundContext: background,
+                        communicationProfile: communicationProfile
+                    )
+                }
+            )
+            .environment(environment)
         }
         .confirmationDialog(
             "保存为永久声纹？",
@@ -395,6 +411,10 @@ struct SpeakerPanelView: View {
             }
             .buttonStyle(.plain)
             .help("修正永久姓名与角色")
+            Button("沟通画像") {
+                contextProfile = profile
+            }
+            .buttonStyle(.bordered)
             Button(profile.isAutoEnabled ? "自动使用中" : "设为自动") {
                 setAutoEnabled(!profile.isAutoEnabled, profile: profile)
             }
@@ -455,6 +475,8 @@ struct SpeakerPanelView: View {
             speaker.voiceProfileId = profile.id
             speaker.voiceSamplePath = profile.sampleRelativePath
             speaker.voiceSampleDurationMs = profile.sampleDurationMs
+            speaker.backgroundContext = profile.backgroundContext
+            speaker.communicationProfile = profile.communicationProfile
             profileNotice = profile.isAutoEnabled
                 ? "已保存为永久声纹，后续新录音会自动带入。"
                 : "已保存；自动名额已满，可先关闭一个现有声纹再启用。"
@@ -493,7 +515,9 @@ struct SpeakerPanelView: View {
             isUserConfirmed: true,
             voiceSamplePath: profile.sampleRelativePath,
             voiceSampleDurationMs: profile.sampleDurationMs,
-            voiceProfileId: profile.id
+            voiceProfileId: profile.id,
+            backgroundContext: profile.backgroundContext,
+            communicationProfile: profile.communicationProfile
         )
         project.speakers.append(speaker)
         changed()
@@ -569,6 +593,34 @@ struct SpeakerPanelView: View {
         }
     }
 
+    private func updateProfileContext(
+        _ profile: SpeakerVoiceProfile,
+        backgroundContext: String?,
+        communicationProfile: SpeakerCommunicationProfile?
+    ) -> String? {
+        do {
+            try environment.speakerVoiceProfileStore.updateContext(
+                profileID: profile.id,
+                backgroundContext: backgroundContext,
+                communicationProfile: communicationProfile
+            )
+            if let linked = project.speakers.first(where: { $0.voiceProfileId == profile.id }) {
+                let trimmed = backgroundContext?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                linked.backgroundContext = trimmed.isEmpty ? nil : trimmed
+                linked.communicationProfile = communicationProfile
+                changed()
+            }
+            reloadProfiles()
+            profileNotice = communicationProfile == nil
+                ? "人物背景已保存，将用于后续分析。"
+                : "表达与沟通画像已更新，将随此人物用于后续会议。"
+            return nil
+        } catch {
+            return "人物档案未保存（\(profileErrorText(error))）"
+        }
+    }
+
     private func playProfile(_ profile: SpeakerVoiceProfile) {
         do {
             let url = try environment.fileStore.absoluteURL(
@@ -590,6 +642,8 @@ struct SpeakerPanelView: View {
                     linked.voiceSamplePath = nil
                     linked.voiceSampleDurationMs = nil
                 }
+                linked.backgroundContext = nil
+                linked.communicationProfile = nil
                 changed()
             }
             reloadProfiles()
@@ -607,6 +661,8 @@ struct SpeakerPanelView: View {
         }
         speaker.voiceSamplePath = profile.sampleRelativePath
         speaker.voiceSampleDurationMs = profile.sampleDurationMs
+        speaker.backgroundContext = profile.backgroundContext
+        speaker.communicationProfile = profile.communicationProfile
         changed()
         profileNotice = "已将 \(profile.displayName) 加入本场识别。"
     }
@@ -619,6 +675,164 @@ struct SpeakerPanelView: View {
         speaker.voiceSampleDurationMs = nil
         changed()
         profileNotice = "已在本场停用 \(profile.displayName)；永久样本未删除。"
+    }
+}
+
+private struct SpeakerCommunicationProfileSheet: View {
+    @Environment(AppEnvironment.self) private var environment
+    @Environment(\.dismiss) private var dismiss
+
+    let profile: SpeakerVoiceProfile
+    let speaker: Speaker?
+    let project: Project
+    let onSave: (String?, SpeakerCommunicationProfile?) -> String?
+
+    @State private var backgroundContext = ""
+    @State private var communicationProfile: SpeakerCommunicationProfile?
+    @State private var isAnalyzing = false
+    @State private var message: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("\(profile.displayName) · 表达与沟通画像")
+                        .font(.headline)
+                    Text("基于已人工确认归属的原话，形成跨会议连续人物档案。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("完成") { dismiss() }
+            }
+
+            GroupBox("人工背景") {
+                VStack(alignment: .leading, spacing: 8) {
+                    TextEditor(text: $backgroundContext)
+                        .frame(minHeight: 90)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(Color.secondary.opacity(0.25))
+                        )
+                    Text("填写职责、关系、关注重点或历史约定。背景会随人物保存，并发送给当前分析模型作为用户补充信息，不作为录音证据。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    HStack {
+                        Spacer()
+                        Button("保存背景") { saveBackground() }
+                            .buttonStyle(.bordered)
+                    }
+                }
+                .padding(.top, 4)
+            }
+
+            GroupBox("表达方式") {
+                VStack(alignment: .leading, spacing: 10) {
+                    if let communicationProfile {
+                        Text(communicationProfile.summary)
+                            .font(.callout)
+                            .fixedSize(horizontal: false, vertical: true)
+                        ForEach(communicationProfile.observations) { item in
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(item.title).font(.caption).fontWeight(.semibold)
+                                Text(item.observation)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text("证据 \(item.evidenceSegmentIds.count) 条")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                    } else {
+                        Text("尚未生成。至少需要两条已确认属于此人的发言。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Divider()
+                    HStack {
+                        Label("只分析可观察的沟通模式，不做心理诊断。", systemImage: "checkmark.shield")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button(isAnalyzing ? "分析中…" : "用本场发言更新画像") {
+                            analyzeCurrentProject()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(isAnalyzing || speaker == nil)
+                    }
+                }
+                .padding(.top, 4)
+            }
+
+            if let message {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(
+                        message.contains("失败") || message.contains("不足")
+                            ? Color.orange
+                            : Color.secondary
+                    )
+            }
+        }
+        .padding(20)
+        .frame(width: 620, height: 610)
+        .onAppear {
+            backgroundContext = profile.backgroundContext ?? ""
+            communicationProfile = profile.communicationProfile
+        }
+    }
+
+    private func saveBackground() {
+        let normalized = backgroundContext
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = normalized.isEmpty ? nil : normalized
+        if let error = onSave(value, communicationProfile) {
+            message = error
+        } else {
+            speaker?.backgroundContext = value
+            message = "人物背景已保存。"
+        }
+    }
+
+    private func analyzeCurrentProject() {
+        guard let speaker else {
+            message = "请先把这个人物加入本场并完成发言标注。"
+            return
+        }
+        let normalized = backgroundContext
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = normalized.isEmpty ? nil : normalized
+        speaker.backgroundContext = value
+        speaker.communicationProfile = communicationProfile
+        if let error = onSave(value, communicationProfile) {
+            message = error
+            return
+        }
+        isAnalyzing = true
+        message = nil
+        Task {
+            defer { isAnalyzing = false }
+            do {
+                let generated = try await SpeakerCommunicationProfileAgent(
+                    generationService: environment.aiProviderRegistry
+                ).analyze(
+                    speaker: speaker,
+                    projectId: project.id,
+                    segments: project.segments
+                )
+                if let error = onSave(value, generated) {
+                    message = error
+                    return
+                }
+                speaker.communicationProfile = generated
+                communicationProfile = generated
+                message = "画像已更新，并写入此人物的跨会议档案。"
+            } catch {
+                message = (error as? AnalysisAPIError) == .invalidResponse
+                    ? "可用发言不足，或模型没有返回可核验证据。"
+                    : "画像分析失败：\(error.localizedDescription)"
+            }
+        }
     }
 }
 
