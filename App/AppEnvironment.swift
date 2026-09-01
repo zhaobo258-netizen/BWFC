@@ -293,7 +293,10 @@ final class AppEnvironment {
             persistProject: { [weak self] project, fields in
                 try self?.persist(project, fields: fields)
             },
-            knownTermsProvider: { [weak self] in self?.lexiconTerms ?? [] }
+            knownTermsProvider: { [weak self] in self?.lexiconTerms ?? [] },
+            connectionProbe: { [aiProviderRegistry] in
+                _ = try await aiProviderRegistry.testActiveConnection()
+            }
         )
         _finalReportCoordinator = coordinator
         return coordinator

@@ -1,5 +1,68 @@
 import Foundation
 
+struct ProxyAdaptiveURLSession: @unchecked Sendable {
+    private let fixedSession: URLSession?
+    private let sessionFactory: @Sendable () -> URLSession
+    private static let systemSessionFactory: @Sendable () -> URLSession = {
+        makeSystemSession()
+    }
+
+    init(
+        fixedSession: URLSession? = nil,
+        sessionFactory: (@Sendable () -> URLSession)? = nil
+    ) {
+        self.fixedSession = fixedSession
+        self.sessionFactory = sessionFactory ?? Self.systemSessionFactory
+    }
+
+    func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+        do {
+            return try await perform(request)
+        } catch let error as URLError
+            where fixedSession == nil && Self.shouldRecreateSession(for: error.code) {
+            AppLog.logWarning(
+                AppLog.analysis,
+                LogSanitizer.formatEvent(
+                    "analysis_session_recreated_after_network_change",
+                    error: String(error.code.rawValue)
+                )
+            )
+            return try await perform(request)
+        }
+    }
+
+    private func perform(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        if let fixedSession {
+            return try await fixedSession.data(for: request)
+        }
+        let session = sessionFactory()
+        defer { session.finishTasksAndInvalidate() }
+        return try await session.data(for: request)
+    }
+
+    private static func shouldRecreateSession(for code: URLError.Code) -> Bool {
+        switch code {
+        case .networkConnectionLost,
+             .notConnectedToInternet,
+             .cannotConnectToHost,
+             .cannotFindHost,
+             .dnsLookupFailed,
+             .resourceUnavailable:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func makeSystemSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.urlCache = nil
+        configuration.waitsForConnectivity = false
+        return URLSession(configuration: configuration)
+    }
+}
+
 /// 基于 Kimi 网关（Anthropic 风格 messages 接口）的谈判分析实现。
 ///
 /// 与 OpenAI Structured Outputs 的差异：
@@ -9,21 +72,25 @@ import Foundation
 /// - 可能包裹 ```json 围栏：解析前剥离；
 /// - 不发送 store 字段（该接口无此概念）。
 struct KimiAnalysisService: NegotiationAnalysisServicing {
-    private let session: URLSession
+    private let networkSession: ProxyAdaptiveURLSession
     private let credentials: any KimiCredentialProviding
     private let baseURL: URL
     private let modelID: String
     private let maxTokens: Int
 
     init(
-        session: URLSession = .shared,
+        session: URLSession? = nil,
+        sessionFactory: (@Sendable () -> URLSession)? = nil,
         apiKeyStore: CloudAPIKeyStore = CloudAPIKeyStore.store(for: .analysis),
         credentials: (any KimiCredentialProviding)? = nil,
         baseURL: URL = CloudModelConfig.analysisBaseURL,
         modelID: String = CloudModelConfig.analysisModelID,
         maxTokens: Int = CloudModelConfig.analysisMaxTokens
     ) {
-        self.session = session
+        self.networkSession = ProxyAdaptiveURLSession(
+            fixedSession: session,
+            sessionFactory: sessionFactory
+        )
         // 凭证优先级：Kimi 账号登录（OAuth，自动刷新）> 静态分析 Key
         self.credentials = credentials ?? KimiCredentialProvider(staticKeyStore: apiKeyStore)
         self.baseURL = baseURL
@@ -131,7 +198,7 @@ struct KimiAnalysisService: NegotiationAnalysisServicing {
 
     private func perform(_ request: URLRequest) async throws -> (Data, URLResponse) {
         do {
-            return try await session.data(for: request)
+            return try await networkSession.data(for: request)
         } catch let urlError as URLError where urlError.code == .timedOut {
             // 超时与断网区分（实施计划：超时单独归类便于诊断）
             throw AnalysisAPIError.timeout

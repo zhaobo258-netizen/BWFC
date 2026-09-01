@@ -21,6 +21,7 @@ final class FinalReportCoordinator {
     private let loadProject: (UUID) throws -> Project?
     private let persistProject: (Project, ProjectFieldOwnership) throws -> Void
     private let knownTermsProvider: () -> [String]
+    private let connectionProbe: @Sendable () async throws -> Void
     /// 可注入的延迟（测试避免真实等待）
     private let sleep: (Duration) async -> Void
 
@@ -44,6 +45,7 @@ final class FinalReportCoordinator {
         loadProject: @escaping (UUID) throws -> Project?,
         persistProject: @escaping (Project, ProjectFieldOwnership) throws -> Void,
         knownTermsProvider: @escaping () -> [String],
+        connectionProbe: @escaping @Sendable () async throws -> Void = {},
         sleep: @escaping (Duration) async -> Void = { duration in
             try? await Task.sleep(for: duration)
         }
@@ -54,6 +56,7 @@ final class FinalReportCoordinator {
         self.loadProject = loadProject
         self.persistProject = persistProject
         self.knownTermsProvider = knownTermsProvider
+        self.connectionProbe = connectionProbe
         self.sleep = sleep
     }
 
@@ -90,6 +93,18 @@ final class FinalReportCoordinator {
         }
         setJob(.running, in: project)
         persistQuietly(project, fields: .finalReport)
+
+        do {
+            try await connectionProbe()
+        } catch {
+            fail(
+                project: project,
+                projectID: projectID,
+                message: Self.userMessage(error),
+                error: error
+            )
+            return
+        }
 
         let analysisController = ConversationAnalysisController(service: analysisService)
         analysisController.knownTermsProvider = knownTermsProvider
@@ -191,7 +206,8 @@ final class FinalReportCoordinator {
             fail(
                 project: project,
                 projectID: projectID,
-                message: Self.userMessage(error)
+                message: Self.userMessage(error),
+                error: error
             )
         }
     }
@@ -236,20 +252,34 @@ final class FinalReportCoordinator {
         }
     }
 
-    private func fail(project: Project, projectID: UUID, message: String) {
-        setJob(.failedRetryable, in: project)
+    private func fail(
+        project: Project,
+        projectID: UUID,
+        message: String,
+        error: Error? = nil
+    ) {
+        setJob(
+            .failedRetryable,
+            in: project,
+            errorCategory: Self.errorCategory(error)
+        )
         persistQuietly(project, fields: .finalReport)
         states[projectID] = .failed(message: message)
         revision += 1
     }
 
-    private func setJob(_ status: ProcessingJobStatus, in project: Project) {
+    private func setJob(
+        _ status: ProcessingJobStatus,
+        in project: Project,
+        errorCategory: String? = nil
+    ) {
         if let index = project.processingJobs.firstIndex(where: { $0.kind == .finalReport }) {
             project.processingJobs[index].status = status
             project.processingJobs[index].progress = status == .completed ? 1 : nil
             if status == .failedRetryable || status == .failedFinal {
                 project.processingJobs[index].retryCount += 1
-                project.processingJobs[index].lastErrorCategory = "final_report_failed"
+                project.processingJobs[index].lastErrorCategory = errorCategory
+                    ?? "final_report_failed"
             } else {
                 project.processingJobs[index].lastErrorCategory = nil
             }
@@ -260,7 +290,7 @@ final class FinalReportCoordinator {
                 status: status,
                 retryCount: status == .failedRetryable || status == .failedFinal ? 1 : 0,
                 lastErrorCategory: status == .failedRetryable || status == .failedFinal
-                    ? "final_report_failed"
+                    ? errorCategory ?? "final_report_failed"
                     : nil
             ))
         }
@@ -292,9 +322,33 @@ final class FinalReportCoordinator {
             case .unauthorized:
                 return "AI 凭证无效或模型未开通，请前往设置检查连接与模型"
             case .timeout: return "完整总结生成超时，可重试"
+            case .network:
+                return "当前网络或代理连接不可用；恢复连接后可重试"
+            case .rateLimited:
+                return "AI 服务请求过多，请稍后重试"
+            case .serverError:
+                return "AI 服务暂时不可用，请稍后重试"
             default: return "完整总结暂时生成失败，可重试"
             }
         }
         return "完整总结暂时生成失败，可重试"
+    }
+
+    private static func errorCategory(_ error: Error?) -> String {
+        guard let apiError = error as? AnalysisAPIError else {
+            return "final_report_failed"
+        }
+        switch apiError {
+        case .network: return "network_or_proxy_unavailable"
+        case .timeout: return "model_timeout"
+        case .rateLimited: return "model_rate_limited"
+        case .serverError: return "model_server_error"
+        case .unauthorized: return "model_unauthorized"
+        case .missingAPIKey: return "model_not_connected"
+        case .credentialAccessRequired: return "credential_access_required"
+        case .truncated: return "model_output_truncated"
+        case .invalidResponse: return "model_output_invalid"
+        case .clientError: return "model_client_error"
+        }
     }
 }

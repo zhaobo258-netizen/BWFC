@@ -131,18 +131,22 @@ protocol KimiOAuthClientProtocol: Sendable {
 
 /// 真实实现：auth.kimi.com 的表单接口（与 kimi CLI 同一协议）
 struct KimiOAuthClient: KimiOAuthClientProtocol {
-    private let session: URLSession
+    private let networkSession: ProxyAdaptiveURLSession
     private let host: URL
     private let clientID: String
     private let now: @Sendable () -> Date
 
     init(
-        session: URLSession = .shared,
+        session: URLSession? = nil,
+        sessionFactory: (@Sendable () -> URLSession)? = nil,
         host: URL = CloudModelConfig.kimiOAuthHost,
         clientID: String = CloudModelConfig.kimiOAuthClientID,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
-        self.session = session
+        self.networkSession = ProxyAdaptiveURLSession(
+            fixedSession: session,
+            sessionFactory: sessionFactory
+        )
         self.host = host
         self.clientID = clientID
         self.now = now
@@ -255,7 +259,7 @@ struct KimiOAuthClient: KimiOAuthClientProtocol {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: request)
+            (data, response) = try await networkSession.data(for: request)
         } catch {
             throw KimiOAuthError.network
         }

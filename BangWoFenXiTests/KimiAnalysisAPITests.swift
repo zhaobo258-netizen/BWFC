@@ -2,6 +2,24 @@ import Foundation
 import Testing
 @testable import BangWoFenXi
 
+private final class KimiTestSessionFactory: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sessionCount = 0
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return sessionCount
+    }
+
+    func makeSession() -> URLSession {
+        lock.lock()
+        sessionCount += 1
+        lock.unlock()
+        return KimiMockURLProtocol.makeSession()
+    }
+}
+
 /// Kimi 网关分析接口集成测试（URLProtocol Mock，不依赖真实网络）。
 /// Anthropic 风格 messages 形态：x-api-key 头、anthropic-version 头、
 /// content 数组含 thinking/text 块、无 store 字段、围栏剥离。
@@ -188,6 +206,54 @@ final class KimiAnalysisAPITests {
         await #expect(throws: AnalysisAPIError.network) {
             _ = try await service.analyze(instructions: "", inputJSON: "{}")
         }
+    }
+
+    @Test("代理连接中断后重建会话并只重试一次")
+    func proxyConnectionLossRebuildsSession() async throws {
+        try saveTestKey()
+        let segmentID = UUID()
+        storage.requestHandler = { request in
+            if KimiMockURLProtocol.storage.capturedRequests.count == 1 {
+                throw URLError(.networkConnectionLost)
+            }
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (
+                response,
+                Self.messagesEnvelope(
+                    text: Self.validOutputJSON(segmentID: segmentID)
+                )
+            )
+        }
+        let staticStore = CloudAPIKeyStore(
+            service: keychainServiceName,
+            account: "test-key"
+        )
+        let sessionFactory = KimiTestSessionFactory()
+        let adaptiveService = KimiAnalysisService(
+            sessionFactory: { sessionFactory.makeSession() },
+            apiKeyStore: staticStore,
+            credentials: KimiCredentialProvider(
+                tokenStore: KimiOAuthTokenStore(
+                    service: keychainServiceName
+                ),
+                staticKeyStore: staticStore,
+                client: oauthClient
+            )
+        )
+
+        let dto = try await adaptiveService.analyze(
+            instructions: "",
+            inputJSON: "{}"
+        )
+
+        #expect(dto.currentTopic == "年度量能")
+        #expect(sessionFactory.count == 2)
+        #expect(storage.capturedRequests.count == 2)
     }
 
     @Test("stop_reason = max_tokens → truncated（截断单独归类）")

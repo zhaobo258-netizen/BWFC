@@ -18,19 +18,24 @@
 cd /Users/zhaobo/系统软件开发/帮我分析-同声翻译/帮我分析
 swift build                 # 编译，要求 0 警告（Swift 6 严格并发）
 Scripts/run_tests.sh        # 全部测试（当前 482 例 69 套件，必须全绿；BWFX_IT_MEDIA=1 加真实媒体探针）
-Scripts/make_app.sh         # 产出 build/BangWoFenXi.app（优先稳定本机身份签名 + entitlements）
+Scripts/make_app.sh         # 产出带版本后缀的 build/帮我分析-v<版本>.app（稳定本机身份签名）
 Scripts/soak_test.sh 3600 1 # 60 分钟录音稳定性（尚未完整跑过）
 ```
 
 安装到本机（用户实机测试的标准动作）：
 
 ```bash
-pkill -x BangWoFenXi; sleep 2
-mv ~/Applications/BangWoFenXi.app ~/Applications/BangWoFenXi.backup-<timestamp>.app
-cp -R build/BangWoFenXi.app ~/Applications/
-xattr -dr com.apple.quarantine ~/Applications/BangWoFenXi.app
-codesign --verify --deep --strict ~/Applications/BangWoFenXi.app
-open ~/Applications/BangWoFenXi.app
+APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
+BUILD_APP="build/帮我分析-v${APP_VERSION}.app"
+STAGING_APP="$TMPDIR/帮我分析-v${APP_VERSION}.staging.app"
+INSTALLED_APP="$HOME/Applications/帮我分析-v${APP_VERSION}.app"
+osascript -e 'tell application id "com.zhaobo.BangWoFenXi" to quit'
+ditto "$BUILD_APP" "$STAGING_APP"
+codesign --verify --deep --strict "$STAGING_APP"
+mv "$STAGING_APP" "$INSTALLED_APP"
+xattr -dr com.apple.quarantine "$INSTALLED_APP"
+codesign --verify --deep --strict "$INSTALLED_APP"
+open "$INSTALLED_APP"
 ```
 
 覆盖安装前必须确认 `codesign -dv` 的 Authority 为稳定身份；不得把

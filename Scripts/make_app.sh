@@ -6,7 +6,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG="${1:-debug}"
 BINARY_NAME="BangWoFenXi"
-APP_DIR="$ROOT/build/${BINARY_NAME}.app"
+INFO_PLIST="$ROOT/Resources/Info.plist"
+APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST")"
+if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "错误：Info.plist 中的版本号无效：$APP_VERSION" >&2
+    exit 1
+fi
+APP_DIR="$ROOT/build/帮我分析-v${APP_VERSION}.app"
 LOCAL_SIGNING_IDENTITY="BangWoFenXi Local Code Signing"
 SIGNING_IDENTITY="${BWFX_CODESIGN_IDENTITY:-}"
 
@@ -38,7 +44,7 @@ echo "==> 组装 ${APP_DIR}"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/${BINARY_NAME}"
-cp "$ROOT/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
+cp "$INFO_PLIST" "$APP_DIR/Contents/Info.plist"
 cp "$ROOT/Resources/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 
 # SPM 资源 bundle（本阶段暂无资源；存在则一并拷入）

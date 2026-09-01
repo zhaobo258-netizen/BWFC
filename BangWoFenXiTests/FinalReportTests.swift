@@ -675,6 +675,74 @@ struct FinalReportTests {
         )
     }
 
+    @Test("连接预检失败时不上传完整文稿并显示代理错误")
+    func connectionProbeFailureStopsBeforeTranscriptUpload() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "bwfx-final-probe-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileStore = MeetingFileStore(baseDirectory: directory)
+        let store = InMemoryProjectStore()
+        let segment = TranscriptSegment(
+            startMs: 0,
+            endMs: 1_000,
+            text: "连接失败时不得上传的完整逐字稿",
+            source: .local,
+            state: .final
+        )
+        let project = Project(
+            title: "连接预检",
+            sourceType: .liveRecording,
+            status: .ready,
+            segments: [segment]
+        )
+        try store.saveProjects([project])
+        let analysis = MockConversationAnalysisService()
+        let generator = CoordinatorFinalReportGenerator()
+        let coordinator = FinalReportCoordinator(
+            analysisService: analysis,
+            finalReportGenerator: generator,
+            fileWriter: FinalReportFileWriter(fileStore: fileStore),
+            loadProject: { id in
+                try store.loadProjects().first { $0.id == id }
+            },
+            persistProject: { candidate, fields in
+                var projects = try store.loadProjects()
+                ProjectPersistence.upsert(
+                    candidate,
+                    into: &projects,
+                    fields: fields
+                )
+                try store.saveProjects(projects)
+            },
+            knownTermsProvider: { [] },
+            connectionProbe: { throw AnalysisAPIError.network },
+            sleep: { _ in }
+        )
+
+        coordinator.start(projectID: project.id)
+        await waitUntil {
+            if case .failed = coordinator.state(for: project.id) {
+                return true
+            }
+            return false
+        }
+
+        #expect(analysis.calls.isEmpty)
+        #expect(generator.callCount == 0)
+        if case .failed(let message) = coordinator.state(for: project.id) {
+            #expect(message.contains("网络或代理"))
+        } else {
+            Issue.record("连接预检失败后应进入可重试失败态")
+        }
+        let stored = try #require(
+            try store.loadProjects().first { $0.id == project.id }
+        )
+        #expect(
+            stored.processingJobs.first { $0.kind == .finalReport }?
+                .lastErrorCategory == "network_or_proxy_unavailable"
+        )
+    }
+
     @Test("全量分析失败时仍从完整逐字稿生成总结")
     func coordinatorFallsBackToFullTranscript() async throws {
         let directory = FileManager.default.temporaryDirectory
