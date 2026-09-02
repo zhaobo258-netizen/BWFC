@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 import Testing
 @testable import BangWoFenXi
 
@@ -257,7 +258,16 @@ final class IFlytekDiarizationServiceTests {
         #expect(request.url?.path == "/res/feature/v1/register")
         let body = try #require(mockRequestBodyData(of: request))
         let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
-        #expect((json["audio_data"] as? String)?.isEmpty == false)
+        let audioBase64 = try #require(json["audio_data"] as? String)
+        let audioData = try #require(Data(base64Encoded: audioBase64))
+        let uploadedURL = FileManager.default.temporaryDirectory
+            .appending(path: "iflytek-uploaded-\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: uploadedURL) }
+        try audioData.write(to: uploadedURL)
+        let uploaded = try AVAudioFile(forReading: uploadedURL)
+        #expect(uploaded.fileFormat.sampleRate == 16_000)
+        #expect(uploaded.fileFormat.channelCount == 1)
+        #expect(uploaded.fileFormat.commonFormat == .pcmFormatInt16)
         #expect(json["audio_type"] as? String == "raw")
     }
 

@@ -427,7 +427,19 @@ final class DiarizationController {
             at: chunkURL,
             knownSpeakers: speakers
         )
-        return UploadedChunk(result: result, knownAliases: Set(speakers.map(\.alias)))
+        let transmittedSpeakers: [KnownSpeakerReference]
+        if configurationSnapshot.selectedProvider == .iflytek {
+            transmittedSpeakers = speakers.filter {
+                $0.iflytekFeatureID?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .isEmpty == false
+            }
+        } else {
+            transmittedSpeakers = speakers
+        }
+        return UploadedChunk(
+            result: result,
+            knownAliases: Set(transmittedSpeakers.map(\.alias))
+        )
     }
 
     /// 云端相对时间 → 会议时间轴 → 交给合并点

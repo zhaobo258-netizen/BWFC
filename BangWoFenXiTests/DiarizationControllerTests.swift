@@ -326,6 +326,42 @@ final class DiarizationControllerTests {
         )
     }
 
+    @Test("讯飞未注册人物不得被当成已发送的历史声纹")
+    func iflytekUnregisteredAliasDoesNotMap() async throws {
+        let participant = meeting.participants[0]
+        try installVoiceSample(for: participant)
+        mockDiarization.resultQueue = [
+            DiarizationChunkResult(durationMs: 20_000, segments: [
+                .init(startMs: 1_000, endMs: 4_000, text: "未注册声纹。", speakerLabel: "p_01")
+            ])
+        ]
+        let iflytekController = DiarizationController(
+            diarization: mockDiarization,
+            fileStore: fileStore,
+            transcriptController: transcriptController,
+            keyStore: CloudAPIKeyStore.store(
+                for: .diarization,
+                service: credentialServiceName
+            ),
+            configurationSnapshot: DiarizationProviderConfiguration(
+                selectedProvider: .iflytek
+            ),
+            sleep: { _ in }
+        )
+        try await transcriptController.start(for: meeting) { [timeline] in timeline }
+        iflytekController.start(for: meeting) { [timeline] in timeline }
+
+        iflytekController.produceChunks(uptoAudioMs: 20_000)
+        await iflytekController.finishAndDrain(uptoAudioMs: 18_500)
+
+        let segment = try #require(meeting.segments.first)
+        #expect(segment.participantId == nil)
+        #expect(
+            segment.remoteSpeakerLabel
+                == SpeakerMapper.scopedRemoteLabel("p_01", chunkIndex: 0)
+        )
+    }
+
     @Test("结尾：尾部残缺分片（36–45s）入队并处理")
     func tailWindowDrained() async throws {
         try await startAll()

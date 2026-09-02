@@ -30,6 +30,13 @@ struct SpeakerCommunicationEvidence: Equatable, Sendable {
     var text: String
 }
 
+struct HistoricalVoiceprintSampleClip: Equatable, Sendable {
+    var projectID: UUID
+    var sourceAudioRelativePath: String
+    var audioStartMs: Int64
+    var audioEndMs: Int64
+}
+
 enum HistoricalPersonLibrary {
     static func summaries(
         profiles: [SpeakerVoiceProfile],
@@ -101,6 +108,68 @@ enum HistoricalPersonLibrary {
             }
     }
 
+    /// 从已人工确认归属的历史发言中选取真实语音，拼足讯飞注册需要的时长。
+    /// 不使用仅云端自动归属的片段，也不用静音填充或重复音频伪造时长。
+    static func voiceprintSampleClips(
+        profileID: UUID,
+        projects: [Project],
+        targetDurationMs: Int64
+    ) -> [HistoricalVoiceprintSampleClip] {
+        guard targetDurationMs > 0 else { return [] }
+        let candidates = projects.flatMap { project -> [HistoricalVoiceprintSampleClip] in
+            guard let relativePath = project.runtimeAssetRelativePath,
+                  !relativePath.isEmpty else { return [] }
+            let speakerIDs = Set(
+                project.speakers
+                    .filter { $0.voiceProfileId == profileID }
+                    .map(\.id)
+            )
+            guard !speakerIDs.isEmpty else { return [] }
+            return project.segments.compactMap { segment in
+                guard let participantID = segment.participantId,
+                      speakerIDs.contains(participantID),
+                      segment.speakerWasUserConfirmed == true,
+                      segment.state == .final || segment.state == .edited,
+                      segment.endMs > segment.startMs else {
+                    return nil
+                }
+                let audioStart = SpeakerSampleWindowPlanner.audioMs(
+                    forWallMs: segment.startMs,
+                    pauseIntervals: project.pauseIntervals
+                )
+                let audioEnd = SpeakerSampleWindowPlanner.audioMs(
+                    forWallMs: segment.endMs,
+                    pauseIntervals: project.pauseIntervals
+                )
+                guard audioEnd > audioStart else { return nil }
+                return HistoricalVoiceprintSampleClip(
+                    projectID: project.id,
+                    sourceAudioRelativePath: relativePath,
+                    audioStartMs: audioStart,
+                    audioEndMs: audioEnd
+                )
+            }
+        }
+        .sorted {
+            ($0.audioEndMs - $0.audioStartMs) > ($1.audioEndMs - $1.audioStartMs)
+        }
+
+        var selected: [HistoricalVoiceprintSampleClip] = []
+        var accumulated: Int64 = 0
+        for candidate in candidates where accumulated < targetDurationMs {
+            let remaining = targetDurationMs - accumulated
+            let duration = candidate.audioEndMs - candidate.audioStartMs
+            guard duration > 0 else { continue }
+            var trimmed = candidate
+            if duration > remaining {
+                trimmed.audioEndMs = trimmed.audioStartMs + remaining
+            }
+            selected.append(trimmed)
+            accumulated += trimmed.audioEndMs - trimmed.audioStartMs
+        }
+        return accumulated == targetDurationMs ? selected : []
+    }
+
     @discardableResult
     static func applyProfile(
         _ profile: SpeakerVoiceProfile,
@@ -115,6 +184,8 @@ enum HistoricalPersonLibrary {
                 speaker.backgroundContext = profile.backgroundContext
                 speaker.communicationProfile = profile.communicationProfile
                 speaker.isCurrentUser = profile.isCurrentUser
+                speaker.voiceSamplePath = profile.sampleRelativePath
+                speaker.voiceSampleDurationMs = profile.sampleDurationMs
                 speaker.iflytekFeatureID = profile.iflytekFeatureID
                 updated += 1
             }

@@ -109,7 +109,7 @@ struct IFlytekVoiceprintService: Sendable {
     func register(sampleURL: URL) async throws -> String {
         try validateSample(sampleURL)
         let body = VoiceprintRequestBody(
-            audioData: try Data(contentsOf: sampleURL).base64EncodedString(),
+            audioData: try voiceprintUploadData(from: sampleURL).base64EncodedString(),
             audioType: "raw",
             uid: "bwfx",
             featureID: nil,
@@ -128,7 +128,7 @@ struct IFlytekVoiceprintService: Sendable {
     func update(featureID: String, sampleURL: URL) async throws {
         try validateSample(sampleURL)
         let body = VoiceprintRequestBody(
-            audioData: try Data(contentsOf: sampleURL).base64EncodedString(),
+            audioData: try voiceprintUploadData(from: sampleURL).base64EncodedString(),
             audioType: "raw",
             uid: nil,
             featureID: featureID,
@@ -173,6 +173,19 @@ struct IFlytekVoiceprintService: Sendable {
                 )
             )
         }
+    }
+
+    private func voiceprintUploadData(from sourceURL: URL) throws -> Data {
+        let temporaryURL = FileManager.default.temporaryDirectory.appending(
+            path: "bwfx-iflytek-upload-\(UUID().uuidString).wav",
+            directoryHint: .notDirectory
+        )
+        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+        try AudioChunkExtractor.convertToIFlytekVoiceprintWAV(
+            from: sourceURL,
+            to: temporaryURL
+        )
+        return try Data(contentsOf: temporaryURL)
     }
 
     private func request(

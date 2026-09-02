@@ -139,6 +139,43 @@ final class ChunkQueueAndExtractorTests {
         #expect(frames == 7 * 44_100)
     }
 
+    @Test("多段人工确认发言拼接为精确十秒声纹样本")
+    func concatenateWindows() throws {
+        let first = try makeSineFile(seconds: 8, named: "first.caf")
+        let second = try makeSineFile(seconds: 8, named: "second.caf")
+        let sampleURL = tempDirectory.appending(path: "voiceprint.wav")
+
+        let frames = try AudioChunkExtractor.concatenate(
+            clips: [
+                .init(sourceURL: first, startMs: 1_000, endMs: 6_000),
+                .init(sourceURL: second, startMs: 2_000, endMs: 7_000)
+            ],
+            to: sampleURL
+        )
+
+        #expect(frames == 10 * 44_100)
+        #expect(try AudioChunkExtractor.durationMs(of: sampleURL) == 10_000)
+    }
+
+    @Test("讯飞声纹样本转换为 16kHz 16bit 单声道 WAV")
+    func convertsIFlytekVoiceprintFormat() throws {
+        let source = try makeSineFile(seconds: 10, named: "iflytek-source.caf")
+        let outputURL = tempDirectory.appending(path: "iflytek-voiceprint.wav")
+
+        let frames = try AudioChunkExtractor.convertToIFlytekVoiceprintWAV(
+            from: source,
+            to: outputURL
+        )
+
+        let output = try AVAudioFile(forReading: outputURL)
+        #expect(frames == 160_000)
+        #expect(output.length == 160_000)
+        #expect(output.fileFormat.sampleRate == 16_000)
+        #expect(output.fileFormat.channelCount == 1)
+        #expect(output.fileFormat.commonFormat == .pcmFormatInt16)
+        #expect(try AudioChunkExtractor.durationMs(of: outputURL) == 10_000)
+    }
+
     @Test("空窗口与缺失源报错")
     func extractErrors() throws {
         let source = try makeSineFile(seconds: 5, named: "tiny.caf")

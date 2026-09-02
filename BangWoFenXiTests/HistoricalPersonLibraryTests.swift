@@ -151,11 +151,104 @@ struct HistoricalPersonLibraryTests {
         #expect(speaker.displayName == "新名")
         #expect(speaker.backgroundContext == "关注渠道效率")
         #expect(speaker.iflytekFeatureID == "feature-123")
+        #expect(speaker.voiceSamplePath == profile.sampleRelativePath)
+        #expect(speaker.voiceSampleDurationMs == 3_000)
 
         #expect(HistoricalPersonLibrary.unlinkProfile(profile, from: [project]) == 1)
         #expect(speaker.voiceProfileId == nil)
         #expect(speaker.voiceSamplePath == nil)
         #expect(speaker.backgroundContext == nil)
         #expect(speaker.iflytekFeatureID == nil)
+    }
+
+    @Test("讯飞声纹样本只拼接人工确认发言并精确补足十秒")
+    func voiceprintClipsUseConfirmedSpeechOnly() {
+        let profileID = UUID()
+        let speaker = Speaker(
+            cloudAlias: "p_01",
+            displayName: "张三",
+            voiceProfileId: profileID
+        )
+        let first = TranscriptSegment(
+            startMs: 1_000,
+            endMs: 7_000,
+            text: "第一段。",
+            participantId: speaker.id,
+            source: .cloud,
+            state: .final
+        )
+        first.speakerWasUserConfirmed = true
+        let automatic = TranscriptSegment(
+            startMs: 8_000,
+            endMs: 18_000,
+            text: "仅云端自动归属。",
+            participantId: speaker.id,
+            source: .cloud,
+            state: .final
+        )
+        let second = TranscriptSegment(
+            startMs: 20_000,
+            endMs: 26_000,
+            text: "第二段。",
+            participantId: speaker.id,
+            source: .cloud,
+            state: .edited
+        )
+        second.speakerWasUserConfirmed = true
+        let project = Project(
+            title: "会议",
+            sourceType: .liveRecording,
+            runtimeAssetRelativePath: "Meetings/test/recording.caf",
+            pauseIntervals: [PauseInterval(startMs: 3_000, endMs: 4_000)],
+            speakers: [speaker],
+            segments: [first, automatic, second]
+        )
+
+        let clips = HistoricalPersonLibrary.voiceprintSampleClips(
+            profileID: profileID,
+            projects: [project],
+            targetDurationMs: 10_000
+        )
+
+        #expect(clips.map(\.sourceAudioRelativePath) == [
+            "Meetings/test/recording.caf",
+            "Meetings/test/recording.caf"
+        ])
+        #expect(clips.map { $0.audioEndMs - $0.audioStartMs } == [6_000, 4_000])
+        #expect(clips.reduce(0) { $0 + $1.audioEndMs - $1.audioStartMs } == 10_000)
+    }
+
+    @Test("人工确认语音不足十秒时不伪造讯飞声纹样本")
+    func voiceprintClipsRejectInsufficientSpeech() {
+        let profileID = UUID()
+        let speaker = Speaker(
+            cloudAlias: "p_01",
+            displayName: "张三",
+            voiceProfileId: profileID
+        )
+        let segment = TranscriptSegment(
+            startMs: 0,
+            endMs: 6_000,
+            text: "只有六秒。",
+            participantId: speaker.id,
+            source: .cloud,
+            state: .final
+        )
+        segment.speakerWasUserConfirmed = true
+        let project = Project(
+            title: "会议",
+            sourceType: .liveRecording,
+            runtimeAssetRelativePath: "Meetings/test/recording.caf",
+            speakers: [speaker],
+            segments: [segment]
+        )
+
+        #expect(
+            HistoricalPersonLibrary.voiceprintSampleClips(
+                profileID: profileID,
+                projects: [project],
+                targetDurationMs: 10_000
+            ).isEmpty
+        )
     }
 }

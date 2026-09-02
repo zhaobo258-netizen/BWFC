@@ -45,6 +45,9 @@ struct HistoricalPeopleLibraryView: View {
     @State private var pendingDelete: SpeakerVoiceProfile?
     @State private var analyzingProfileID: UUID?
     @State private var syncingIFlytekProfileID: UUID?
+    @State private var syncingAllIFlytekVoiceprints = false
+    @State private var pendingIFlytekProfile: SpeakerVoiceProfile?
+    @State private var pendingAllIFlytekSync = false
     @State private var samplePlayer = AudioPlaybackController()
 
     var body: some View {
@@ -81,6 +84,36 @@ struct HistoricalPeopleLibraryView: View {
         } message: {
             Text("会删除本机永久声纹、人工背景和表达画像；历史录音和文稿保留。")
         }
+        .confirmationDialog(
+            "将历史语音注册为讯飞声纹？",
+            isPresented: $pendingAllIFlytekSync,
+            titleVisibility: .visible
+        ) {
+            Button("确认上传并注册") {
+                syncAllIFlytekVoiceprints()
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("会把每个人已人工确认的 10 秒语音上传给讯飞，形成跨录音持久使用的声纹 ID。")
+        }
+        .confirmationDialog(
+            "注册这个人的讯飞声纹？",
+            isPresented: Binding(
+                get: { pendingIFlytekProfile != nil },
+                set: { if !$0 { pendingIFlytekProfile = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("确认上传并注册") {
+                if let profile = pendingIFlytekProfile {
+                    syncIFlytekVoiceprint(profile)
+                }
+                pendingIFlytekProfile = nil
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("会把该人已人工确认的 10 秒语音上传给讯飞，形成跨录音持久使用的声纹 ID。")
+        }
     }
 
     private var statusSection: some View {
@@ -88,11 +121,37 @@ struct HistoricalPeopleLibraryView: View {
             HStack(spacing: 22) {
                 LabeledContent("人物档案", value: "\(summaries.count) 人")
                 LabeledContent(
-                    "已启用历史声纹",
+                    "自动带入人物",
                     value: "\(summaries.filter { $0.profile.isAutoEnabled }.count) / \(SpeakerVoiceProfileStore.maximumAutoEnabledProfiles)"
                 )
+                if environment.diarizationProviderConfigurationStore.load().selectedProvider
+                    == .iflytek {
+                    LabeledContent(
+                        "讯飞已注册",
+                        value: "\(summaries.filter { $0.profile.iflytekFeatureID != nil }.count) / \(summaries.count)"
+                    )
+                }
             }
             providerCapability
+            if environment.diarizationProviderConfigurationStore.load().selectedProvider == .iflytek,
+               summaries.contains(where: needsIFlytekVoiceprintSync) {
+                Button(
+                    syncingAllIFlytekVoiceprints
+                        ? "正在注册历史声纹…"
+                        : "一键补全并注册历史声纹"
+                ) {
+                    pendingAllIFlytekSync = true
+                }
+                .disabled(
+                    syncingAllIFlytekVoiceprints
+                        || syncingIFlytekProfileID != nil
+                        || !managementEnabled
+                        || !environment.iflytekCredentialStore.hasConfiguredKey
+                )
+                Text("只会从你已人工确认归属的历史发言中拼出 10 秒真实语音，再作为持久声纹上传给讯飞；不会用未确认发言、静音或复制音频凑时长。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
             if !managementEnabled {
                 Label("录音进行中可查看和试听；结束录音后才能修改或删除人物档案。", systemImage: "lock.fill")
                     .foregroundStyle(.orange)
@@ -192,8 +251,13 @@ struct HistoricalPeopleLibraryView: View {
                             Label("本机样本已变更，需更新讯飞声纹", systemImage: "arrow.triangle.2.circlepath")
                                 .font(.caption2)
                                 .foregroundStyle(.orange)
+                        } else if profile.sampleDurationMs < IFlytekVoiceprintService.minimumSampleDurationMs,
+                                  summary.userConfirmedSegmentCount > 0 {
+                            Label("可从已确认历史发言补足到 10 秒并注册", systemImage: "waveform.badge.plus")
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
                         } else if profile.sampleDurationMs < IFlytekVoiceprintService.minimumSampleDurationMs {
-                            Label("需重录到 10 秒才能注册讯飞声纹", systemImage: "exclamationmark.triangle")
+                            Label("已确认单人发言不足 10 秒，暂无法注册", systemImage: "exclamationmark.triangle")
                                 .font(.caption2)
                                 .foregroundStyle(.orange)
                         } else {
@@ -205,7 +269,7 @@ struct HistoricalPeopleLibraryView: View {
                 }
                 Spacer()
                 Toggle(
-                    "启用历史声纹",
+                    "自动带入",
                     isOn: Binding(
                         get: { profile.isAutoEnabled },
                         set: { setAutoEnabled($0, profile: profile) }
@@ -268,14 +332,19 @@ struct HistoricalPeopleLibraryView: View {
                     Button(
                         syncingIFlytekProfileID == profile.id
                             ? "正在同步…"
-                            : (profile.iflytekFeatureID == nil ? "注册讯飞声纹" : "更新讯飞声纹")
+                            : iflytekSyncButtonTitle(for: summary)
                     ) {
-                        syncIFlytekVoiceprint(profile)
+                        pendingIFlytekProfile = profile
                     }
                     .disabled(
                         syncingIFlytekProfileID != nil
+                            || syncingAllIFlytekVoiceprints
                             || !managementEnabled
-                            || profile.sampleDurationMs < IFlytekVoiceprintService.minimumSampleDurationMs
+                            || (
+                                profile.sampleDurationMs
+                                    < IFlytekVoiceprintService.minimumSampleDurationMs
+                                && summary.userConfirmedSegmentCount == 0
+                            )
                             || !environment.iflytekCredentialStore.hasConfiguredKey
                     )
                 }
@@ -511,49 +580,172 @@ struct HistoricalPeopleLibraryView: View {
             notice = "请先在「录音与说话人」中保存并测试讯飞配置。"
             return
         }
-        guard profile.sampleDurationMs >= IFlytekVoiceprintService.minimumSampleDurationMs,
-              let sampleURL = try? environment.fileStore.absoluteURL(
-                forRelativePath: profile.sampleRelativePath
-              ) else {
-            notice = "讯飞声纹需要 10 秒清晰单人说话样本，请在录音项目的「说话人」中重录。"
-            return
-        }
         syncingIFlytekProfileID = profile.id
         notice = nil
         Task { @MainActor in
             defer { syncingIFlytekProfileID = nil }
             do {
-                let service = IFlytekVoiceprintService(
-                    appID: configuration.normalizedIFlytekAppID,
-                    credentialStore: environment.iflytekCredentialStore
+                let outcome = try await synchronizeIFlytekVoiceprint(
+                    profile,
+                    configuration: configuration
                 )
-                let featureID: String
-                if let existing = profile.iflytekFeatureID {
-                    try await service.update(featureID: existing, sampleURL: sampleURL)
-                    featureID = existing
-                } else {
-                    featureID = try await service.register(sampleURL: sampleURL)
-                }
-                let digest = try IFlytekVoiceprintService.sampleSHA256(at: sampleURL)
-                try environment.speakerVoiceProfileStore.setIFlytekVoiceprint(
-                    profileID: profile.id,
-                    featureID: featureID,
-                    sampleSHA256: digest
-                )
-                guard let updated = try environment.speakerVoiceProfileStore
-                    .loadForManagement()
-                    .first(where: { $0.id == profile.id }) else {
-                    throw SpeakerVoiceProfileStoreError.profileNotFound
-                }
-                let projects = try environment.projectStore.loadProjects()
-                _ = HistoricalPersonLibrary.applyProfile(updated, to: projects)
-                try environment.projectStore.saveProjects(projects)
-                notice = "讯飞声纹已同步；下次录音会直接匹配这个人。"
+                notice = outcome.automaticallyEnabled
+                    ? "讯飞声纹已注册并开启历史人物识别；后续录音会按分片自动回填姓名。"
+                    : "讯飞声纹已注册，但自动识别已达 4 人上限；请先关闭一人再启用。"
                 reload()
             } catch {
                 notice = "讯飞声纹同步失败：\(error.localizedDescription)"
             }
         }
+    }
+
+    private func syncAllIFlytekVoiceprints() {
+        let configuration = environment.diarizationProviderConfigurationStore.load()
+        guard configuration.selectedProvider == .iflytek,
+              configuration.isValid,
+              environment.iflytekCredentialStore.hasConfiguredKey else {
+            notice = "请先在「录音与说话人」中保存并测试讯飞配置。"
+            return
+        }
+        let pending = summaries.filter(needsIFlytekVoiceprintSync).map(\.profile)
+        guard !pending.isEmpty else { return }
+        syncingAllIFlytekVoiceprints = true
+        notice = nil
+        Task { @MainActor in
+            defer {
+                syncingIFlytekProfileID = nil
+                syncingAllIFlytekVoiceprints = false
+            }
+            var succeeded = 0
+            var failures: [String] = []
+            for profile in pending {
+                syncingIFlytekProfileID = profile.id
+                do {
+                    _ = try await synchronizeIFlytekVoiceprint(
+                        profile,
+                        configuration: configuration
+                    )
+                    succeeded += 1
+                } catch {
+                    failures.append("\(profile.displayName)：\(error.localizedDescription)")
+                }
+            }
+            reload()
+            notice = failures.isEmpty
+                ? "已为 \(succeeded) 位历史人物注册讯飞声纹并开启自动识别。"
+                : "已完成 \(succeeded) 人；\(failures.joined(separator: "；"))"
+        }
+    }
+
+    private func synchronizeIFlytekVoiceprint(
+        _ original: SpeakerVoiceProfile,
+        configuration: DiarizationProviderConfiguration
+    ) async throws -> IFlytekVoiceprintSyncOutcome {
+        guard var profile = try environment.speakerVoiceProfileStore
+            .loadForManagement()
+            .first(where: { $0.id == original.id }) else {
+            throw SpeakerVoiceProfileStoreError.profileNotFound
+        }
+        let projects = try environment.projectStore.loadProjects()
+        if profile.sampleDurationMs < IFlytekVoiceprintService.minimumSampleDurationMs {
+            let clips = HistoricalPersonLibrary.voiceprintSampleClips(
+                profileID: profile.id,
+                projects: projects,
+                targetDurationMs: IFlytekVoiceprintService.minimumSampleDurationMs
+            )
+            guard !clips.isEmpty else {
+                throw IFlytekVoiceprintPreparationError.insufficientConfirmedSpeech
+            }
+            let temporaryDirectory = FileManager.default.temporaryDirectory.appending(
+                path: "bwfx-iflytek-voiceprint-\(UUID().uuidString)",
+                directoryHint: .isDirectory
+            )
+            try FileManager.default.createDirectory(
+                at: temporaryDirectory,
+                withIntermediateDirectories: true
+            )
+            defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+            let preparedURL = temporaryDirectory.appending(
+                path: "voiceprint.wav",
+                directoryHint: .notDirectory
+            )
+            let audioClips = try clips.map {
+                AudioChunkExtractor.Clip(
+                    sourceURL: try environment.fileStore.absoluteURL(
+                        forRelativePath: $0.sourceAudioRelativePath
+                    ),
+                    startMs: $0.audioStartMs,
+                    endMs: $0.audioEndMs
+                )
+            }
+            try AudioChunkExtractor.concatenate(clips: audioClips, to: preparedURL)
+            let measuredDurationMs = try AudioChunkExtractor.durationMs(of: preparedURL)
+            guard measuredDurationMs >= IFlytekVoiceprintService.minimumSampleDurationMs else {
+                throw IFlytekVoiceprintPreparationError.invalidPreparedSample
+            }
+            profile = try environment.speakerVoiceProfileStore.enroll(
+                profileID: profile.id,
+                displayName: profile.displayName,
+                role: profile.role,
+                colorToken: profile.colorToken,
+                sourceSampleURL: preparedURL,
+                durationMs: measuredDurationMs
+            )
+        }
+
+        let sampleURL = try environment.fileStore.absoluteURL(
+            forRelativePath: profile.sampleRelativePath
+        )
+        let service = IFlytekVoiceprintService(
+            appID: configuration.normalizedIFlytekAppID,
+            credentialStore: environment.iflytekCredentialStore
+        )
+        let featureID: String
+        if let existing = profile.iflytekFeatureID {
+            try await service.update(featureID: existing, sampleURL: sampleURL)
+            featureID = existing
+        } else {
+            featureID = try await service.register(sampleURL: sampleURL)
+        }
+        let digest = try IFlytekVoiceprintService.sampleSHA256(at: sampleURL)
+        try environment.speakerVoiceProfileStore.setIFlytekVoiceprint(
+            profileID: profile.id,
+            featureID: featureID,
+            sampleSHA256: digest
+        )
+        var automaticallyEnabled = true
+        do {
+            try environment.speakerVoiceProfileStore.setAutoEnabled(
+                true,
+                profileID: profile.id
+            )
+        } catch SpeakerVoiceProfileStoreError.autoRecognitionLimitReached {
+            automaticallyEnabled = false
+        }
+        guard let updated = try environment.speakerVoiceProfileStore
+            .loadForManagement()
+            .first(where: { $0.id == profile.id }) else {
+            throw SpeakerVoiceProfileStoreError.profileNotFound
+        }
+        _ = HistoricalPersonLibrary.applyProfile(updated, to: projects)
+        try environment.projectStore.saveProjects(projects)
+        return IFlytekVoiceprintSyncOutcome(automaticallyEnabled: automaticallyEnabled)
+    }
+
+    private func needsIFlytekVoiceprintSync(_ summary: HistoricalPersonSummary) -> Bool {
+        summary.profile.iflytekFeatureID == nil
+            || summary.profile.iflytekSampleSHA256 == nil
+    }
+
+    private func iflytekSyncButtonTitle(for summary: HistoricalPersonSummary) -> String {
+        if summary.profile.iflytekFeatureID != nil {
+            return "更新讯飞声纹"
+        }
+        if summary.profile.sampleDurationMs < IFlytekVoiceprintService.minimumSampleDurationMs,
+           summary.userConfirmedSegmentCount > 0 {
+            return "用历史发言注册"
+        }
+        return "注册讯飞声纹"
     }
 
     private func deleteProfile(_ profile: SpeakerVoiceProfile) {
@@ -709,6 +901,24 @@ struct HistoricalPeopleLibraryView: View {
 
     private func durationText(_ milliseconds: Int64) -> String {
         String(format: "%.1f 秒", Double(milliseconds) / 1_000)
+    }
+}
+
+private struct IFlytekVoiceprintSyncOutcome {
+    var automaticallyEnabled: Bool
+}
+
+private enum IFlytekVoiceprintPreparationError: LocalizedError {
+    case insufficientConfirmedSpeech
+    case invalidPreparedSample
+
+    var errorDescription: String? {
+        switch self {
+        case .insufficientConfirmedSpeech:
+            return "已人工确认归属且可读取原录音的单人发言不足 10 秒"
+        case .invalidPreparedSample:
+            return "历史发言拼接后不足 10 秒，未上传讯飞"
+        }
     }
 }
 
