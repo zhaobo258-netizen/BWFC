@@ -56,6 +56,32 @@ final class AudioFileWriteReadTests {
         #expect(readFile.processingFormat.sampleRate == format.sampleRate)
     }
 
+    @Test("续录准备保留旧音频并从文件末尾追加")
+    func prepareAppendingFilePreservesExistingAudio() throws {
+        let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)!
+        let fileURL = tempDirectory.appending(path: "append.caf")
+        do {
+            let original = try AVAudioFile(
+                forWriting: fileURL,
+                settings: AudioRecordingSettings.fileSettings(for: format)
+            )
+            try original.write(from: #require(makeSineBuffer(format: format, seconds: 2)))
+        }
+
+        do {
+            let candidate = try AVAudioCaptureService.preparePacketAppendWriter(
+                fileURL: fileURL,
+                format: format
+            )
+            let prepared = try #require(candidate)
+            #expect(abs(prepared.existingDurationMs - 2_000) <= 1)
+            try prepared.writer.write(#require(makeSineBuffer(format: format, seconds: 1)))
+        }
+
+        let reread = try AVAudioFile(forReading: fileURL)
+        #expect(reread.length == Int64(format.sampleRate * 3))
+    }
+
     @Test("写入的文件可被 AVAudioPlayer 加载，时长正确")
     func playbackLoadsWrittenFile() throws {
         let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)!

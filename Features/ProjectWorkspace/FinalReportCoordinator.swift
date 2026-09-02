@@ -108,6 +108,11 @@ final class FinalReportCoordinator {
 
         let analysisController = ConversationAnalysisController(service: analysisService)
         analysisController.knownTermsProvider = knownTermsProvider
+        analysisController.relatedProjectsProvider = { [loadProject] in
+            project.relatedProjectIDs.compactMap {
+                (try? loadProject($0)) ?? nil
+            }
+        }
         analysisController.attach(to: project)
         await analysisController.generateFinalAnalysis()
         guard !Task.isCancelled else {
@@ -226,6 +231,9 @@ final class FinalReportCoordinator {
                     project: project,
                     analysis: analysis,
                     knownTerms: knownTermsProvider(),
+                    relatedProjects: project.relatedProjectIDs.compactMap {
+                        (try? loadProject($0)) ?? nil
+                    },
                     version: version
                 )
             } catch let error as AnalysisAPIError

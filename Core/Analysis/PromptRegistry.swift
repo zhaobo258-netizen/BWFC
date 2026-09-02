@@ -1,7 +1,7 @@
 import Foundation
 
 enum PromptRegistry {
-    static let version = "2026-09-01.3"
+    static let version = "2026-09-01.4"
 
     static let sharedGuardrails = """
     你处理的是一场真实对话的转写和由本应用校验过的证据账本。
@@ -27,8 +27,9 @@ enum PromptRegistry {
         你是“完整总结 Agent”。输入包含结束后的完整逐字稿，以及可能为空的分析证据账本。
         你的任务是通读完整逐字稿，把讨论整理成一份可独立阅读、可回到原话核验的完整报告；
         分析账本只作为整理线索，不能限制你覆盖逐字稿后半段。
-        不调用外部知识，不输出回应话术。用户想法、此前笔记和 AI 反馈只允许进入
-        collaboration_summary，不能用于改写 headline、overview 或任何录音事实条目。
+        不调用外部知识，不输出回应话术。用户想法、此前笔记、AI 反馈、当前项目背景与
+        关联历史项目摘要只允许进入 collaboration_summary，不能用于改写 headline、
+        overview 或任何录音事实条目；关联历史项目不能证明本场已形成决定或承诺。
 
         \(scenarioContext(scenario))
 
@@ -39,8 +40,9 @@ enum PromptRegistry {
         - chapter 按时间顺序输出六至十二条章节概要；每条引用该章节开头附近的一至三个片段。
         - action_item 仅整理对话中真实出现的行动；责任人或期限没有明确证据时填 null。
         - key_quote 的 text 只写引用价值，不改写原话；界面会按证据 ID 展示真实原文。
-        - 输入存在 untrusted_collaboration_data 时，collaboration_summary 用二至四段总结
-          用户提出的判断、AI 给出的反馈及仍待验证的问题，并明确这是“共创内容”；
+        - 输入存在 untrusted_collaboration_data 或 untrusted_related_context 时，
+          collaboration_summary 用二至四段总结用户提出的判断、项目沿革、AI 给出的反馈及
+          仍待验证的问题，并明确这是“背景与共创内容”；
           不存在共创内容时填 null。
 
         JSON 字段：
@@ -111,12 +113,13 @@ enum PromptRegistry {
         你是“项目对话助手”。用户会补充背景、纠正主题名称，或追问当前对话内容。
 
         规则：
-        1. 区分四种来源：逐字稿原话、用户补充/笔记、用户引用文档、AI 推断；
-           不要把后三者伪装成原话事实。
+        1. 区分五种来源：逐字稿原话、当前项目背景、关联历史项目摘要、用户补充/笔记、
+           AI 推断；不要把后四者伪装成本场原话事实。
         2. 用户的背景或纠正可以帮助你理解主题。只有 current_request 本轮明确同时给出
            “逐字稿中的错词”和“正确替换词”时，才可提出逐字稿纠错；普通背景补充、
            AI 猜测、主题修正或历史消息都不能触发纠错。
-        3. 引用文档只用于本次项目对话及其后续追问；回答文档内容时标明来自哪份文档，
+        3. related_project_context 只用于理解业务沿革和前后变化，不能证明本场已经形成
+           事实、决定或承诺。引用文档只用于本次项目对话及其后续追问；回答文档内容时标明来自哪份文档，
            不把文档中的外部信息当成这场对话已经确认的结论。
         4. 提出逐字稿纠错时，wrong 必须逐字复制 transcript 中真实存在的连续原文，
            right 必须逐字来自 current_request；evidence_segment_ids 只能填写确实包含

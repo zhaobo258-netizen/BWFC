@@ -703,58 +703,75 @@ private struct ProjectHomeRow: View {
     @State private var isHovering = false
 
     var body: some View {
-        Button(action: onOpen) {
-            HStack(spacing: 12) {
-                if isMergeSelectionMode {
-                    Image(systemName: isSelectedForMerge ? "checkmark.circle.fill" : "circle")
-                        .font(.title3)
-                        .foregroundStyle(isSelectedForMerge ? BWTheme.accent : .secondary)
-                        .opacity(isEligibleForMerge ? 1 : 0.35)
-                }
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 8) {
-                        Text(project.title)
+        HStack(spacing: 12) {
+            Button(action: onOpen) {
+                HStack(spacing: 12) {
+                    if isMergeSelectionMode {
+                        Image(systemName: isSelectedForMerge ? "checkmark.circle.fill" : "circle")
+                            .font(.title3)
+                            .foregroundStyle(isSelectedForMerge ? BWTheme.accent : .secondary)
+                            .opacity(isEligibleForMerge ? 1 : 0.35)
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 8) {
+                            Text(project.title)
+                                .font(.callout)
+                                .fontWeight(.medium)
+                                .lineLimit(1)
+                            BWBadge(text: display.text, color: Self.badgeColor(display))
+                        }
+                        Text(ProjectHomeSupport.summary(for: project))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                    VStack(alignment: .trailing, spacing: 3) {
+                        Text(LiveMeetingView.formatDuration(ms: project.durationMs))
                             .font(.callout)
                             .fontWeight(.medium)
-                            .lineLimit(1)
-                        BWBadge(text: display.text, color: Self.badgeColor(display))
+                            .monospacedDigit()
+                            .foregroundStyle(.primary)
+                        HStack(spacing: 5) {
+                            Image(systemName: Self.sourceIcon(project.sourceType))
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                                .help(ProjectHomeSupport.sourceLabel(for: project.sourceType))
+                            Text(project.lastActivityAt,
+                                 format: .dateTime.month().day().hour().minute())
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
                     }
-                    Text(ProjectHomeSupport.summary(for: project))
+                    Image(systemName: "chevron.right")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                        .foregroundStyle(isHovering ? BWTheme.accent : Color.secondary.opacity(0.4))
                 }
-                Spacer()
-                VStack(alignment: .trailing, spacing: 3) {
-                    Text(LiveMeetingView.formatDuration(ms: project.durationMs))
-                        .font(.callout)
-                        .fontWeight(.medium)
-                        .monospacedDigit()
-                        .foregroundStyle(.primary)
-                    HStack(spacing: 5) {
-                        Image(systemName: Self.sourceIcon(project.sourceType))
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                            .help(ProjectHomeSupport.sourceLabel(for: project.sourceType))
-                        Text(project.lastActivityAt,
-                             format: .dateTime.month().day().hour().minute())
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-                Image(systemName: "chevron.right")
-                    .font(.caption)
-                    .foregroundStyle(isHovering ? BWTheme.accent : Color.secondary.opacity(0.4))
+                .contentShape(Rectangle())
             }
-            .bwCard(padding: 14)
-            .overlay(
-                RoundedRectangle(cornerRadius: 12)
-                    .strokeBorder(isHovering ? BWTheme.accent.opacity(0.5) : .clear, lineWidth: 1.5)
-            )
-            .contentShape(RoundedRectangle(cornerRadius: 12))
+            .buttonStyle(.plain)
+            .disabled(isMergeSelectionMode && !isEligibleForMerge)
+            .accessibilityLabel("\(project.title)，\(display.text)，时长 \(LiveMeetingView.formatDuration(ms: project.durationMs))")
+            .help("打开「\(project.title)」")
+
+            if !isMergeSelectionMode {
+                Button(role: .destructive, action: onDelete) {
+                    Label("删除", systemImage: "trash")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .foregroundStyle(.red)
+                .help("删除录音及这个项目的本地内容")
+                .accessibilityLabel("删除「\(project.title)」")
+            }
         }
-        .buttonStyle(.plain)
-        .disabled(isMergeSelectionMode && !isEligibleForMerge)
+        .bwCard(padding: 14)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(isHovering ? BWTheme.accent.opacity(0.5) : .clear, lineWidth: 1.5)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 12))
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.12)) { isHovering = hovering }
         }
@@ -769,8 +786,6 @@ private struct ProjectHomeRow: View {
             Divider()
             Button("删除项目…", role: .destructive) { onDelete() }
         }
-        .accessibilityLabel("\(project.title)，\(display.text)，时长 \(LiveMeetingView.formatDuration(ms: project.durationMs))")
-        .help("打开「\(project.title)」")
     }
 
     private static func sourceIcon(_ sourceType: ProjectSourceType) -> String {

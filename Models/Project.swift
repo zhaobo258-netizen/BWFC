@@ -119,6 +119,10 @@ final class Project: Identifiable, Codable {
     var title: String
     /// 业务项目/业务范畴。nil 表示尚未分组。
     var businessCategory: String?
+    /// 用户为当前录音人工补充的项目背景；经明确保存后供 AI 作为不可信上下文读取。
+    var projectBackgroundContext: String?
+    /// 用户明确关联、允许 AI 读取其摘要上下文的历史录音/项目。
+    var relatedProjectIDs: [UUID]
     /// 来源类型
     var sourceType: ProjectSourceType
     /// 跨录音合并分析的原始录音。普通录音/导入项目为空。
@@ -184,6 +188,8 @@ final class Project: Identifiable, Codable {
         id: UUID = UUID(),
         title: String,
         businessCategory: String? = nil,
+        projectBackgroundContext: String? = nil,
+        relatedProjectIDs: [UUID] = [],
         sourceType: ProjectSourceType,
         sourceRecordings: [SourceRecordingReference] = [],
         scenario: ProjectScenario? = nil,
@@ -218,6 +224,8 @@ final class Project: Identifiable, Codable {
         self.id = id
         self.title = title
         self.businessCategory = businessCategory
+        self.projectBackgroundContext = projectBackgroundContext
+        self.relatedProjectIDs = relatedProjectIDs
         self.sourceType = sourceType
         self.sourceRecordings = sourceRecordings
         self.scenario = scenario
@@ -256,6 +264,14 @@ final class Project: Identifiable, Codable {
         id = try container.decode(UUID.self, forKey: .id)
         title = try container.decode(String.self, forKey: .title)
         businessCategory = try container.decodeIfPresent(String.self, forKey: .businessCategory)
+        projectBackgroundContext = try container.decodeIfPresent(
+            String.self,
+            forKey: .projectBackgroundContext
+        )
+        relatedProjectIDs = try container.decodeIfPresent(
+            [UUID].self,
+            forKey: .relatedProjectIDs
+        ) ?? []
         sourceType = try container.decode(ProjectSourceType.self, forKey: .sourceType)
         sourceRecordings = try container.decodeIfPresent(
             [SourceRecordingReference].self,

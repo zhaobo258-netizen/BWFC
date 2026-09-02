@@ -90,7 +90,8 @@ enum ProjectRuntimeSession {
             audioUploadConsentAt: legacy?.audioUploadConsentAt,
             lastAnalyzedSegmentEndMs: legacy?.lastAnalyzedSegmentEndMs ?? 0,
             preferredInputDeviceID: project.preferredInputDeviceID,
-            pauseIntervals: project.pauseIntervals
+            pauseIntervals: project.pauseIntervals,
+            timelineDurationMs: project.durationMs
         )
         meeting.participants = project.speakers.map { speaker in
             Participant(
@@ -132,14 +133,23 @@ enum ProjectRuntimeSession {
         // 录音资产关联：运行时为权威（开录时由录音服务写入相对路径），必须回写项目
         project.runtimeAssetRelativePath = meeting.audioRelativePath
 
-        project.durationMs = wallClockDurationMs(
-            startedAt: meeting.startedAt,
-            endedAt: meeting.endedAt,
-            segmentEndMs: meeting.segments.map(\.endMs).max() ?? 0,
-            pauseEndMs: meeting.pauseIntervals.map(\.endMs).max() ?? 0,
-            fallbackDurationMs: project.durationMs,
-            now: now
-        )
+        let segmentEndMs = meeting.segments.map(\.endMs).max() ?? 0
+        let pauseEndMs = meeting.pauseIntervals.map(\.endMs).max() ?? 0
+        if meeting.timelineDurationMs > 0 {
+            project.durationMs = max(
+                meeting.timelineDurationMs,
+                max(segmentEndMs, pauseEndMs)
+            )
+        } else {
+            project.durationMs = wallClockDurationMs(
+                startedAt: meeting.startedAt,
+                endedAt: meeting.endedAt,
+                segmentEndMs: segmentEndMs,
+                pauseEndMs: pauseEndMs,
+                fallbackDurationMs: project.durationMs,
+                now: now
+            )
+        }
 
         var legacy = project.legacyMetadata ?? LegacyMeetingMetadata()
         legacy.lastAnalyzedSegmentEndMs = meeting.lastAnalyzedSegmentEndMs

@@ -212,6 +212,50 @@ struct ProjectAIChatTests {
         #expect(disabled.noteMarkdown == nil)
     }
 
+    @Test("项目对话读取人工背景与已关联摘要，不读取关联项目逐字稿")
+    func builderIncludesExplicitRelatedContext() throws {
+        let project = Project(
+            title: "本场",
+            projectBackgroundContext: "本场要确认第二阶段范围。",
+            sourceType: .liveRecording
+        )
+        let related = Project(
+            title: "第一阶段复盘",
+            businessCategory: "增长项目",
+            sourceType: .liveRecording,
+            status: .ready,
+            segments: [TranscriptSegment(
+                startMs: 0,
+                endMs: 1_000,
+                text: "不得随关联摘要上传的历史原话",
+                source: .local,
+                state: .final
+            )]
+        )
+        related.analysisSnapshots = [ConversationAnalysisSnapshot(
+            version: 1,
+            analyzedThroughMs: 1_000,
+            headline: "第一阶段已完成范围确认",
+            items: []
+        )]
+        project.relatedProjectIDs = [related.id]
+
+        let request = ProjectAIChatRequestBuilder.make(
+            project: project,
+            currentRequest: "第二阶段与第一阶段有什么变化？",
+            noteMarkdown: nil,
+            relatedProjects: [related]
+        )
+        let json = try ProjectAIChatAgent.inputJSON(request)
+
+        #expect(request.projectBackgroundContext?.contains("第二阶段范围") == true)
+        #expect(request.relatedProjectContext.count == 1)
+        #expect(json.contains("第一阶段复盘"))
+        #expect(json.contains("第一阶段已完成范围确认"))
+        #expect(!json.contains("不得随关联摘要上传的历史原话"))
+        #expect(json.contains("related_project_context"))
+    }
+
     @Test("Agent 严格解码回应，并把逐字稿、笔记和引用文档放入不可信数据区")
     func agentContract() async throws {
         let generation = ProjectAIChatGenerationService()

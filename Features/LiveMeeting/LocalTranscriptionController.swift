@@ -289,8 +289,8 @@ final class LocalTranscriptionController {
     private func consume(_ result: LocalTranscriptResult) {
         // 音频流时间 → 会议时间轴（含暂停区间的还原）
         let timeline = timelineProvider?()
-        let startWallMs = timeline?.wallMs(forEffectiveAudioMs: result.startAudioMs) ?? result.startAudioMs
-        let endWallMs = timeline?.wallMs(forEffectiveAudioMs: result.endAudioMs) ?? result.endAudioMs
+        let startWallMs = timeline?.wallMs(forSessionAudioMs: result.startAudioMs) ?? result.startAudioMs
+        let endWallMs = timeline?.wallMs(forSessionAudioMs: result.endAudioMs) ?? result.endAudioMs
 
         if result.isFinal {
             PerfCounters.increment(.finalResult)

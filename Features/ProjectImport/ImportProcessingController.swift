@@ -298,6 +298,11 @@ final class ImportProcessingController {
         }
         let controller = ConversationAnalysisController(service: analysisService)
         controller.knownTermsProvider = lexiconProvider
+        controller.relatedProjectsProvider = { [loadProject] in
+            project.relatedProjectIDs.compactMap {
+                (try? loadProject($0)) ?? nil
+            }
+        }
         controller.attach(to: project)
         await controller.generateFinalAnalysis()
         if Task.isCancelled { return .cancelled }
@@ -331,6 +336,9 @@ final class ImportProcessingController {
                 project: project,
                 analysis: analysis,
                 knownTerms: lexiconProvider(),
+                relatedProjects: project.relatedProjectIDs.compactMap {
+                    (try? loadProject($0)) ?? nil
+                },
                 version: (latestReport?.version ?? 0) + 1
             )
             let markdown = FinalReportMarkdownRenderer.makeMarkdown(

@@ -129,7 +129,10 @@ enum FinalReportFingerprint {
     static func make(for project: Project) -> String {
         var lines: [String] = [
             project.scenario.map(ConversationAnalysisTaxonomy.wireName(for:)) ?? "auto",
-            project.scenarioWasUserSelected ? "user" : "automatic"
+            project.scenarioWasUserSelected ? "user" : "automatic",
+            project.businessCategory ?? "",
+            project.projectBackgroundContext ?? "",
+            project.relatedProjectIDs.map(\.uuidString).joined(separator: ",")
         ]
         lines.append(contentsOf: project.speakers
             .sorted { $0.id.uuidString < $1.id.uuidString }

@@ -77,6 +77,7 @@ final class MeetingRecordingService {
 
             try meeting.transition(to: .recording)
             meeting.audioRelativePath = relativePath
+            meeting.timelineDurationMs = 0
             timeline = RecordingTimeline(startedAt: meeting.startedAt ?? Date())
             activeMeeting = meeting
             interruptionReason = nil
@@ -86,6 +87,79 @@ final class MeetingRecordingService {
             capture.stopCapture()
             lastErrorDescription = error.localizedDescription
             AppLog.logError(AppLog.audio, LogSanitizer.formatEvent("recording_start_failed", error: String(describing: type(of: error))))
+            throw error
+        }
+    }
+
+    /// 异常中断或已结束后继续录制同一项目。
+    /// 新音频从原文件末尾追加，会议时间轴从原项目末尾继续，不计入两次录制之间的墙钟空档。
+    func continueRecording(
+        for meeting: Meeting,
+        deviceID: String?,
+        timelineOffsetMs: Int64
+    ) throws {
+        guard activeMeeting == nil else {
+            throw MeetingRecordingError.activeSessionExists
+        }
+        guard meeting.status == .recording
+                || meeting.status == .paused
+                || meeting.status == .finalizing
+                || meeting.status == .completed else {
+            throw MeetingRecordingError.wrongStatus("继续录制", current: meeting.status)
+        }
+
+        let previousStatus = meeting.status
+        let previousEndedAt = meeting.endedAt
+        let previousDurationMs = meeting.timelineDurationMs
+        do {
+            try capture.selectInputDevice(id: deviceID)
+            try fileStore.ensureMeetingDirectory(for: meeting.id)
+            let relativePath = meeting.audioRelativePath
+                ?? fileStore.relativeAudioPath(for: meeting.id)
+            let fileURL = try fileStore.absoluteURL(forRelativePath: relativePath)
+            let existingAudioDurationMs = try capture.startAppendingCapture(fileURL: fileURL)
+            let priorPauseMs = meeting.pauseIntervals.reduce(Int64(0)) {
+                $0 + max(0, $1.durationMs)
+            }
+            let resolvedTimelineOffsetMs = max(
+                max(0, timelineOffsetMs),
+                max(
+                    existingAudioDurationMs + priorPauseMs,
+                    max(
+                        meeting.segments.map(\.endMs).max() ?? 0,
+                        meeting.pauseIntervals.map(\.endMs).max() ?? 0
+                    )
+                )
+            )
+            let sessionStartedAt = Date()
+
+            meeting.status = .recording
+            meeting.startedAt = meeting.startedAt ?? sessionStartedAt
+            meeting.endedAt = nil
+            meeting.audioRelativePath = relativePath
+            meeting.timelineDurationMs = resolvedTimelineOffsetMs
+            timeline = RecordingTimeline(
+                startedAt: sessionStartedAt,
+                initialWallOffsetMs: resolvedTimelineOffsetMs,
+                initialEffectiveAudioOffsetMs: existingAudioDurationMs,
+                priorIntervals: meeting.pauseIntervals
+            )
+            activeMeeting = meeting
+            interruptionReason = nil
+            lastErrorDescription = nil
+        } catch {
+            capture.stopCapture()
+            meeting.status = previousStatus
+            meeting.endedAt = previousEndedAt
+            meeting.timelineDurationMs = previousDurationMs
+            lastErrorDescription = error.localizedDescription
+            AppLog.logError(
+                AppLog.audio,
+                LogSanitizer.formatEvent(
+                    "recording_continuation_failed",
+                    error: String(describing: type(of: error))
+                )
+            )
             throw error
         }
     }
@@ -100,6 +174,7 @@ final class MeetingRecordingService {
         }
         capture.pauseCapture()
         try timeline?.beginPause(at: Date())
+        meeting.timelineDurationMs = elapsedWallMs()
         try meeting.transition(to: .paused)
     }
 
@@ -115,6 +190,7 @@ final class MeetingRecordingService {
         if let interval = try timeline?.endPause(at: Date()) {
             meeting.pauseIntervals.append(interval)
         }
+        meeting.timelineDurationMs = elapsedWallMs()
         try meeting.transition(to: .recording)
         interruptionReason = nil
         lastErrorDescription = nil
@@ -143,6 +219,7 @@ final class MeetingRecordingService {
             }
         }
         capture.stopCapture()
+        meeting.timelineDurationMs = elapsedWallMs()
         meeting.endedAt = Date()
         try meeting.transition(to: .finalizing)
     }
@@ -215,6 +292,8 @@ enum MeetingRecordingError: Error, Equatable {
     case wrongStatus(String, current: MeetingStatus)
     /// 没有进行中的录音会话
     case noActiveMeeting
+    /// 当前已有另一场录音会话持有采集器
+    case activeSessionExists
 }
 
 extension MeetingRecordingError: LocalizedError {
@@ -224,6 +303,8 @@ extension MeetingRecordingError: LocalizedError {
             return "当前状态（\(current.displayName)）不允许「\(action)」"
         case .noActiveMeeting:
             return "没有进行中的录音会话"
+        case .activeSessionExists:
+            return "已有录音会话正在进行，请先结束后再续录"
         }
     }
 }

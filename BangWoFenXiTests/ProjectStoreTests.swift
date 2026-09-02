@@ -403,6 +403,46 @@ final class ProjectStoreTests {
         #expect(modelFields == registeredFields)
     }
 
+    @Test("关联项目上下文独立合并，不覆盖笔记与录音数据")
+    func relatedContextOwnership() {
+        let stored = Project(
+            title: "存储副本",
+            sourceType: .liveRecording,
+            segments: [TranscriptSegment(
+                startMs: 0,
+                endMs: 500,
+                text: "保留原文",
+                source: .local,
+                state: .final
+            )],
+            note: NoteDocument(markdown: "保留笔记")
+        )
+        let incoming = Project(
+            id: stored.id,
+            title: "旧标题",
+            businessCategory: "经销商增长",
+            projectBackgroundContext: "这是人工确认的项目背景。",
+            relatedProjectIDs: [UUID(), UUID()],
+            sourceType: .liveRecording,
+            segments: [],
+            note: NoteDocument(markdown: "旧笔记")
+        )
+        var projects = [stored]
+
+        ProjectPersistence.upsert(
+            incoming,
+            into: &projects,
+            fields: .relatedContext
+        )
+
+        #expect(projects[0].businessCategory == "经销商增长")
+        #expect(projects[0].projectBackgroundContext == "这是人工确认的项目背景。")
+        #expect(projects[0].relatedProjectIDs == incoming.relatedProjectIDs)
+        #expect(projects[0].segments.count == 1)
+        #expect(projects[0].note.markdown == "保留笔记")
+        #expect(projects[0].title == "存储副本")
+    }
+
     @Test("转写复查候选只更新自己的字段")
     func transcriptReviewOwnershipDoesNotOverwriteSegments() {
         let segment = TranscriptSegment(

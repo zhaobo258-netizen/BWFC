@@ -131,4 +131,25 @@ struct RecordingTimelineTests {
         // 第二段后：+5000（音频 9500 → 墙钟 14500）
         #expect(timeline.wallMs(forEffectiveAudioMs: 9_500) == 14_500)
     }
+
+    @Test("续录时间轴从旧项目末尾继续，不计两次录制空档")
+    func continuationOffsets() throws {
+        let start = Date(timeIntervalSince1970: 2_000)
+        var timeline = RecordingTimeline(
+            startedAt: start,
+            initialWallOffsetMs: 50_000,
+            initialEffectiveAudioOffsetMs: 45_000,
+            priorIntervals: [PauseInterval(startMs: 10_000, endMs: 15_000)]
+        )
+
+        #expect(timeline.wallMs(at: start) == 50_000)
+        #expect(timeline.effectiveAudioMs(at: start) == 45_000)
+        #expect(timeline.wallMs(forSessionAudioMs: 2_000) == 52_000)
+        #expect(timeline.wallMs(forEffectiveAudioMs: 10_000) == 15_000)
+
+        try timeline.beginPause(at: start.addingTimeInterval(3))
+        _ = try timeline.endPause(at: start.addingTimeInterval(5))
+        #expect(timeline.effectiveAudioMs(at: start.addingTimeInterval(7)) == 50_000)
+        #expect(timeline.wallMs(forSessionAudioMs: 3_000) == 55_000)
+    }
 }

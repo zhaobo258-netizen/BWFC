@@ -79,4 +79,30 @@ struct ProjectExportTests {
         project.segments = []
         #expect(ProjectAssetBannerPolicy.shouldShow(project: project))
     }
+
+    @Test("只有无活动采集器的实时录音项目可续录")
+    func recordingContinuationPolicy() {
+        let project = Project(
+            title: "已完成录音",
+            sourceType: .liveRecording,
+            status: .ready
+        )
+        #expect(ProjectRecordingContinuationPolicy.canContinue(
+            project: project,
+            meetingStatus: .completed,
+            hasLiveRecorder: false
+        ))
+        #expect(!ProjectRecordingContinuationPolicy.canContinue(
+            project: project,
+            meetingStatus: .completed,
+            hasLiveRecorder: true
+        ))
+
+        project.sourceType = .importedAudio
+        #expect(!ProjectRecordingContinuationPolicy.canContinue(
+            project: project,
+            meetingStatus: .completed,
+            hasLiveRecorder: false
+        ))
+    }
 }

@@ -115,6 +115,18 @@ final class DiarizationController {
                         .appending(path: entry.fileName).path
                 )
             }
+            if let existingAudioDurationMs = timelineProvider()?.initialEffectiveAudioOffsetMs,
+               existingAudioDurationMs > 0,
+               let tail = queue.max(by: { $0.index < $1.index }),
+               tail.audioEndMs <= existingAudioDurationMs,
+               tail.audioEndMs - tail.audioStartMs < planner.chunkLengthMs {
+                queue.removeAll { $0.index == tail.index }
+                try? FileManager.default.removeItem(
+                    at: fileStore.chunksDirectory(for: meeting.id)
+                        .appending(path: tail.fileName)
+                )
+            }
+            nextChunkIndex = (queue.map(\.index).max() ?? -1) + 1
             try? store.save(queue)
         }
 

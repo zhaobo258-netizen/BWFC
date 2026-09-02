@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import AudioToolbox
 import CoreAudio
 
 /// 音频输入设备描述
@@ -52,6 +53,8 @@ protocol AudioCaptureServicing: AnyObject, Sendable {
     func selectInputDevice(id: String?) throws
     /// 打开文件并开始采集写入
     func startCapture(fileURL: URL) throws
+    /// 从已有录音文件末尾继续写入；返回续录前的媒体时长
+    func startAppendingCapture(fileURL: URL) throws -> Int64
     /// 暂停采集：不写文件，文件保持打开
     func pauseCapture()
     /// 继续采集
@@ -80,6 +83,48 @@ struct SendableAudioBuffer: @unchecked Sendable {
     let buffer: AVAudioPCMBuffer
     init(_ buffer: AVAudioPCMBuffer) {
         self.buffer = buffer
+    }
+}
+
+final class AudioPacketAppendWriter: @unchecked Sendable {
+    private let audioFileID: AudioFileID
+    private let bytesPerPacket: UInt32
+    private var nextPacket: Int64
+
+    init(audioFileID: AudioFileID, bytesPerPacket: UInt32, nextPacket: Int64) {
+        self.audioFileID = audioFileID
+        self.bytesPerPacket = bytesPerPacket
+        self.nextPacket = nextPacket
+    }
+
+    deinit {
+        AudioFileClose(audioFileID)
+    }
+
+    func write(_ buffer: AVAudioPCMBuffer) throws {
+        let audioBuffer = buffer.audioBufferList.pointee.mBuffers
+        guard buffer.audioBufferList.pointee.mNumberBuffers == 1,
+              let data = audioBuffer.mData else {
+            throw AudioCaptureError.incompatibleDeviceFormat
+        }
+        var packetCount = UInt32(buffer.frameLength)
+        let expectedBytes = packetCount * bytesPerPacket
+        guard audioBuffer.mDataByteSize >= expectedBytes else {
+            throw AudioCaptureError.incompatibleDeviceFormat
+        }
+        let status = AudioFileWritePackets(
+            audioFileID,
+            false,
+            expectedBytes,
+            nil,
+            nextPacket,
+            &packetCount,
+            data
+        )
+        guard status == noErr, packetCount == buffer.frameLength else {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
+        }
+        nextPacket += Int64(packetCount)
     }
 }
 
@@ -154,6 +199,8 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
 
     /// 当前打开的录音文件
     private var audioFile: AVAudioFile?
+    /// 单声道 PCM CAF 续录时的原地追加写入器
+    private var packetAppendWriter: AudioPacketAppendWriter?
     /// 是否写文件（暂停 / 电平监听时为 false）
     private var writingEnabled = false
     /// 是否已安装 tap
@@ -328,12 +375,181 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
             forWriting: fileURL,
             settings: AudioRecordingSettings.fileSettings(for: format)
         )
+        packetAppendWriter = nil
+        try prepareCaptureLocked(format: format)
+    }
+
+    func startAppendingCapture(fileURL: URL) throws -> Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        installTapLocked(format: format)
+
+        let existingDurationMs: Int64
+        if FileManager.default.fileExists(atPath: fileURL.path),
+           let prepared = try Self.preparePacketAppendWriter(
+                fileURL: fileURL,
+                format: format
+           ) {
+            audioFile = nil
+            packetAppendWriter = prepared.writer
+            existingDurationMs = prepared.existingDurationMs
+        } else {
+            let prepared = try Self.prepareAppendingFile(fileURL: fileURL, format: format)
+            audioFile = prepared.file
+            packetAppendWriter = nil
+            existingDurationMs = prepared.existingDurationMs
+        }
+        try prepareCaptureLocked(format: format)
+        return existingDurationMs
+    }
+
+    static func preparePacketAppendWriter(
+        fileURL: URL,
+        format: AVAudioFormat
+    ) throws -> (writer: AudioPacketAppendWriter, existingDurationMs: Int64)? {
+        guard format.channelCount == 1 else { return nil }
+
+        var audioFileID: AudioFileID?
+        let openStatus = AudioFileOpenURL(
+            fileURL as CFURL,
+            .readWritePermission,
+            0,
+            &audioFileID
+        )
+        guard openStatus == noErr, let audioFileID else {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(openStatus))
+        }
+
+        var shouldClose = true
+        defer {
+            if shouldClose { AudioFileClose(audioFileID) }
+        }
+
+        var fileFormat = AudioStreamBasicDescription()
+        var formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        let formatStatus = AudioFileGetProperty(
+            audioFileID,
+            kAudioFilePropertyDataFormat,
+            &formatSize,
+            &fileFormat
+        )
+        guard formatStatus == noErr else {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(formatStatus))
+        }
+
+        let clientFormat = format.streamDescription.pointee
+        guard fileFormat.mFormatID == kAudioFormatLinearPCM,
+              fileFormat.mChannelsPerFrame == 1,
+              fileFormat.mFramesPerPacket == 1,
+              fileFormat.mBytesPerPacket == clientFormat.mBytesPerFrame,
+              fileFormat.mSampleRate == clientFormat.mSampleRate else {
+            return nil
+        }
+
+        var packetCount: UInt64 = 0
+        var packetCountSize = UInt32(MemoryLayout<UInt64>.size)
+        let countStatus = AudioFileGetProperty(
+            audioFileID,
+            kAudioFilePropertyAudioDataPacketCount,
+            &packetCountSize,
+            &packetCount
+        )
+        guard countStatus == noErr else {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(countStatus))
+        }
+
+        shouldClose = false
+        let durationMs = fileFormat.mSampleRate > 0
+            ? Int64((Double(packetCount) / fileFormat.mSampleRate * 1_000).rounded())
+            : 0
+        return (
+            AudioPacketAppendWriter(
+                audioFileID: audioFileID,
+                bytesPerPacket: fileFormat.mBytesPerPacket,
+                nextPacket: Int64(packetCount)
+            ),
+            durationMs
+        )
+    }
+
+    static func prepareAppendingFile(
+        fileURL: URL,
+        format: AVAudioFormat
+    ) throws -> (file: AVAudioFile, existingDurationMs: Int64) {
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            let existingFile = try AVAudioFile(
+                forReading: fileURL,
+                commonFormat: format.commonFormat,
+                interleaved: format.isInterleaved
+            )
+            let existingFormat = existingFile.processingFormat
+            guard existingFormat.sampleRate == format.sampleRate,
+                  existingFormat.channelCount == format.channelCount else {
+                throw AudioCaptureError.incompatibleDeviceFormat
+            }
+            let sampleRate = existingFile.fileFormat.sampleRate
+            let existingDurationMs = sampleRate > 0
+                ? Int64((Double(existingFile.length) / sampleRate * 1_000).rounded())
+                : 0
+
+            let temporaryURL = fileURL.deletingLastPathComponent()
+                .appending(path: ".recording-append-\(UUID().uuidString).caf")
+            do {
+                let appendedFile = try AVAudioFile(
+                    forWriting: temporaryURL,
+                    settings: AudioRecordingSettings.fileSettings(for: format),
+                    commonFormat: format.commonFormat,
+                    interleaved: format.isInterleaved
+                )
+                guard let buffer = AVAudioPCMBuffer(
+                    pcmFormat: existingFormat,
+                    frameCapacity: 16_384
+                ) else {
+                    throw AudioCaptureError.incompatibleDeviceFormat
+                }
+                while existingFile.framePosition < existingFile.length {
+                    let remaining = existingFile.length - existingFile.framePosition
+                    let frames = AVAudioFrameCount(min(Int64(buffer.frameCapacity), remaining))
+                    try existingFile.read(into: buffer, frameCount: frames)
+                    guard buffer.frameLength > 0 else { break }
+                    try appendedFile.write(from: buffer)
+                }
+                _ = try FileManager.default.replaceItemAt(
+                    fileURL,
+                    withItemAt: temporaryURL
+                )
+                return (appendedFile, existingDurationMs)
+            } catch {
+                try? FileManager.default.removeItem(at: temporaryURL)
+                throw error
+            }
+        }
+        return (
+            try AVAudioFile(
+                forWriting: fileURL,
+                settings: AudioRecordingSettings.fileSettings(for: format)
+            ),
+            0
+        )
+    }
+
+    private func prepareCaptureLocked(format: AVAudioFormat) throws {
         writeFailureLock.withLock {
             writeFailureTracker.reset()
         }
         fileFormat = format
         writingEnabled = true
-        try startEngineLocked()
+        do {
+            try startEngineLocked()
+        } catch {
+            writingEnabled = false
+            audioFile = nil
+            packetAppendWriter = nil
+            fileFormat = nil
+            throw error
+        }
     }
 
     func pauseCapture() {
@@ -363,6 +579,7 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
             writingEnabled = false
             engine.stop()
             audioFile = nil // 关闭文件句柄
+            packetAppendWriter = nil
             fileFormat = nil
         }
         writeFailureLock.withLock {
@@ -406,11 +623,17 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
 
     /// tap 实时回调：写文件 + 分发缓冲 + 计算 RMS 电平（节流约 10Hz）
     private func processTapBuffer(_ buffer: AVAudioPCMBuffer) {
-        let (file, shouldWrite) = lock.withLock { (audioFile, writingEnabled) }
-        if shouldWrite, let file {
+        let (file, packetWriter, shouldWrite) = lock.withLock {
+            (audioFile, packetAppendWriter, writingEnabled)
+        }
+        if shouldWrite, file != nil || packetWriter != nil {
             let failure = writeFailureLock.withLock {
                 writeFailureTracker.attempt {
-                    try file.write(from: buffer)
+                    if let file {
+                        try file.write(from: buffer)
+                    } else if let packetWriter {
+                        try packetWriter.write(buffer)
+                    }
                 }
             }
             if let failure {

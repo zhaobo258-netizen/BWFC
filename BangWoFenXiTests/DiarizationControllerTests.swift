@@ -150,6 +150,62 @@ final class DiarizationControllerTests {
         #expect(mockDiarization.calls.isEmpty)
     }
 
+    @Test("续录时重开上次尾部残缺分片，避免两次录制之间漏识别")
+    func continuationReopensPreviousTailChunk() throws {
+        let configuration = DiarizationProviderConfiguration()
+        try ChunkQueueStore(fileURL: fileStore.chunkQueueFileURL(for: meeting.id)).save([
+            ChunkQueueEntry(
+                index: 0,
+                audioStartMs: 0,
+                audioEndMs: 20_000,
+                wallStartMs: 0,
+                wallEndMs: 20_000,
+                fileName: "chunk_0000.wav",
+                provider: configuration.selectedProvider,
+                providerConfigurationFingerprint: configuration.fingerprint,
+                status: .succeeded,
+                attemptCount: 0
+            ),
+            ChunkQueueEntry(
+                index: 1,
+                audioStartMs: 18_000,
+                audioEndMs: 38_000,
+                wallStartMs: 18_000,
+                wallEndMs: 38_000,
+                fileName: "chunk_0001.wav",
+                provider: configuration.selectedProvider,
+                providerConfigurationFingerprint: configuration.fingerprint,
+                status: .succeeded,
+                attemptCount: 0
+            ),
+            ChunkQueueEntry(
+                index: 2,
+                audioStartMs: 36_000,
+                audioEndMs: 45_000,
+                wallStartMs: 36_000,
+                wallEndMs: 45_000,
+                fileName: "chunk_0002.wav",
+                provider: configuration.selectedProvider,
+                providerConfigurationFingerprint: configuration.fingerprint,
+                status: .succeeded,
+                attemptCount: 0
+            )
+        ])
+        let continuationTimeline = RecordingTimeline(
+            startedAt: Date(),
+            initialWallOffsetMs: 45_000,
+            initialEffectiveAudioOffsetMs: 45_000
+        )
+
+        controller.start(for: meeting) { continuationTimeline }
+
+        #expect(controller.queue.map(\.index) == [0, 1])
+        let restored = try ChunkQueueStore(
+            fileURL: fileStore.chunkQueueFileURL(for: meeting.id)
+        ).load()
+        #expect(restored.map(\.index) == [0, 1])
+    }
+
     @Test("成功流：云端片段合并入库、说话人按代号映射、分片文件删除")
     func successFlow() async throws {
         try installVoiceSample(for: meeting.participants[0])

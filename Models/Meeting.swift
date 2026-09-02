@@ -122,6 +122,8 @@ final class Meeting: Identifiable, Codable {
     var preferredInputDeviceID: String?
     /// 录音暂停区间（会议时间轴），回放与审计使用
     var pauseIntervals: [PauseInterval]
+    /// 当前会议时间轴已达到的毫秒位置，续录时作为新会话起点
+    var timelineDurationMs: Int64
 
     /// 参会人
     var participants: [Participant] = []
@@ -150,7 +152,8 @@ final class Meeting: Identifiable, Codable {
         audioUploadConsentAt: Date? = nil,
         lastAnalyzedSegmentEndMs: Int64 = 0,
         preferredInputDeviceID: String? = nil,
-        pauseIntervals: [PauseInterval] = []
+        pauseIntervals: [PauseInterval] = [],
+        timelineDurationMs: Int64 = 0
     ) {
         self.id = id
         self.title = title
@@ -167,6 +170,7 @@ final class Meeting: Identifiable, Codable {
         self.lastAnalyzedSegmentEndMs = lastAnalyzedSegmentEndMs
         self.preferredInputDeviceID = preferredInputDeviceID
         self.pauseIntervals = pauseIntervals
+        self.timelineDurationMs = timelineDurationMs
     }
 
     // 自定义解码：新增字段允许缺失并回退默认值，保证旧版本 JSON 可读
@@ -187,6 +191,7 @@ final class Meeting: Identifiable, Codable {
         lastAnalyzedSegmentEndMs = try container.decodeIfPresent(Int64.self, forKey: .lastAnalyzedSegmentEndMs) ?? 0
         preferredInputDeviceID = try container.decodeIfPresent(String.self, forKey: .preferredInputDeviceID)
         pauseIntervals = try container.decodeIfPresent([PauseInterval].self, forKey: .pauseIntervals) ?? []
+        timelineDurationMs = try container.decodeIfPresent(Int64.self, forKey: .timelineDurationMs) ?? 0
         participants = try container.decodeIfPresent([Participant].self, forKey: .participants) ?? []
         segments = try container.decodeIfPresent([TranscriptSegment].self, forKey: .segments) ?? []
         snapshots = try container.decodeIfPresent([AnalysisSnapshot].self, forKey: .snapshots) ?? []

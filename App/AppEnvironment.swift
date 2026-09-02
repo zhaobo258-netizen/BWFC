@@ -9,6 +9,7 @@ enum ProjectFieldOwnership: Sendable, Equatable {
     case note
     case title
     case businessGrouping
+    case relatedContext
     case userScenario
     case speakers
     case manualSegments
@@ -34,6 +35,8 @@ enum ProjectPersistence {
         "id": .identity,
         "title": .workspace,
         "businessCategory": .workspace,
+        "projectBackgroundContext": .workspace,
+        "relatedProjectIDs": .workspace,
         "sourceType": .identity,
         "sourceRecordings": .identity,
         "scenario": .shared,
@@ -90,6 +93,11 @@ enum ProjectPersistence {
             stored.lastActivityAt = incoming.lastActivityAt
         case .businessGrouping:
             stored.businessCategory = incoming.businessCategory
+            stored.lastActivityAt = incoming.lastActivityAt
+        case .relatedContext:
+            stored.businessCategory = incoming.businessCategory
+            stored.projectBackgroundContext = incoming.projectBackgroundContext
+            stored.relatedProjectIDs = incoming.relatedProjectIDs
             stored.lastActivityAt = incoming.lastActivityAt
         case .userScenario:
             stored.scenario = incoming.scenario

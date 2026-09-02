@@ -40,6 +40,8 @@ final class ConversationAnalysisController {
     /// 追加进分析输入作补充上下文，让实时总结/开花不再等云端说话人确认。
     /// 触发计数与游标仍只认最终片段——尾巴不驱动触发、不推进 analyzedThroughMs。
     var provisionalTailProvider: () -> TranscriptSegment? = { nil }
+    /// 用户在录音现场明确关联的历史项目；只由输入组装器提取受限摘要。
+    var relatedProjectsProvider: () -> [Project] = { [] }
     /// 模型建议场景被采纳后的回调（UI 刷新场景标签）
     var onScenarioSuggested: (() -> Void)?
 
@@ -79,6 +81,14 @@ final class ConversationAnalysisController {
             pendingSpeakerContextRevisions[id] = speakerContextRevision
         }
         lastSpeakerContextChangeAtMs = nowMs()
+    }
+
+    /// 关联项目或人工背景变化后，用现有最终片段刷新一次分析。
+    func noteProjectContextChanged() {
+        guard let project else { return }
+        noteSpeakerContextChanged(segmentIDs: project.segments.compactMap {
+            $0.state == .final || $0.state == .edited ? $0.id : nil
+        })
     }
 
     /// 用户确认某条分析内容归属谁：只改分析卡片，不把多条证据静默回写成同一说话人。
@@ -235,7 +245,8 @@ final class ConversationAnalysisController {
                 project: project,
                 previousSnapshot: forceFullTranscript ? nil : currentSnapshot,
                 newSegments: newSegments,
-                provisionalTail: provisionalTail
+                provisionalTail: provisionalTail,
+                relatedProjects: relatedProjectsProvider()
             )
             let dto = try await service.analyze(
                 instructions: ConversationAnalysisPrompt.text(

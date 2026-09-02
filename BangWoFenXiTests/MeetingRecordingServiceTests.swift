@@ -177,4 +177,51 @@ final class MeetingRecordingServiceTests {
         #expect(meeting.pauseIntervals.count == 1, "暂停中结束必须闭合暂停区间")
         #expect(mock.stopCount == 1)
     }
+
+    @Test("已结束项目续录：追加原音频并沿用原时间轴")
+    func continueCompletedRecording() throws {
+        let originalStart = Date(timeIntervalSince1970: 1_000)
+        let meeting = Meeting(
+            title: "已结束项目",
+            status: .completed,
+            startedAt: originalStart,
+            endedAt: originalStart.addingTimeInterval(50),
+            audioRelativePath: fileStore.relativeAudioPath(for: UUID()),
+            pauseIntervals: [PauseInterval(startMs: 20_000, endMs: 25_000)],
+            timelineDurationMs: 50_000
+        )
+        meeting.audioRelativePath = fileStore.relativeAudioPath(for: meeting.id)
+        mock.existingAudioDurationMs = 45_000
+
+        try service.continueRecording(for: meeting, deviceID: "mock-usb", timelineOffsetMs: 50_000)
+
+        #expect(meeting.status == .recording)
+        #expect(meeting.startedAt == originalStart)
+        #expect(meeting.endedAt == nil)
+        #expect(meeting.timelineDurationMs == 50_000)
+        #expect(mock.appendCaptureURLs.count == 1)
+        #expect(mock.startCaptureURLs.isEmpty)
+        #expect(service.elapsedWallMs() >= 50_000)
+        #expect(service.timeline?.initialEffectiveAudioOffsetMs == 45_000)
+    }
+
+    @Test("续录启动失败时恢复原结束状态")
+    func continuationFailureRollsBack() {
+        let endedAt = Date(timeIntervalSince1970: 2_000)
+        let meeting = Meeting(
+            title: "续录失败",
+            status: .completed,
+            endedAt: endedAt,
+            timelineDurationMs: 30_000
+        )
+        mock.startCaptureError = AudioCaptureError.engineStartFailed("模拟失败")
+
+        #expect(throws: (any Error).self) {
+            try service.continueRecording(for: meeting, deviceID: nil, timelineOffsetMs: 30_000)
+        }
+        #expect(meeting.status == .completed)
+        #expect(meeting.endedAt == endedAt)
+        #expect(meeting.timelineDurationMs == 30_000)
+        #expect(service.activeMeeting == nil)
+    }
 }

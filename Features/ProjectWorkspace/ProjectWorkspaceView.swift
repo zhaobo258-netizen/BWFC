@@ -12,6 +12,22 @@ enum ProjectAssetBannerPolicy {
     }
 }
 
+enum ProjectRecordingContinuationPolicy {
+    static func canContinue(
+        project: Project,
+        meetingStatus: MeetingStatus,
+        hasLiveRecorder: Bool
+    ) -> Bool {
+        guard project.sourceType == .liveRecording,
+              project.status != .creating,
+              !hasLiveRecorder else { return false }
+        return meetingStatus == .recording
+            || meetingStatus == .paused
+            || meetingStatus == .finalizing
+            || meetingStatus == .completed
+    }
+}
+
 /// 项目工作台（阶段 B，方案 3「知识花园」三栏骨架，03 文档 §6.3）：
 /// 左栏录音文稿 / 中栏 AI 工作区 / 右栏 AI 共创笔记。
 ///
@@ -50,6 +66,7 @@ struct ProjectWorkspaceView: View {
     @State private var showBackConfirmation = false
     @State private var showSpeakerPanel = false
     @State private var showPeopleLibrary = false
+    @State private var showRelatedProjectContext = false
     @State private var showExportSheet = false
     /// 说话人指认弹层的锚点（09 号计划需求 2；总结条目或转写行进入）
     @State private var speakerAssignRequest: SpeakerAssignRequest?
@@ -169,6 +186,15 @@ struct ProjectWorkspaceView: View {
                 managementEnabled: !isRecordingActive
             )
                 .frame(minWidth: 820, minHeight: 680)
+        }
+        .sheet(isPresented: $showRelatedProjectContext) {
+            if let project {
+                RelatedProjectContextSheet(
+                    project: project,
+                    availableProjects: sidebarProjects,
+                    onSave: applyRelatedProjectContext
+                )
+            }
         }
         .sheet(isPresented: $showExportSheet) {
             if let project {
@@ -292,7 +318,7 @@ struct ProjectWorkspaceView: View {
                     if meeting.status.isAbnormalIfAppRelaunched, !isFinishing, !didStartSessionThisView,
                        !hasResolvedAbnormalExit,
                        environment.importProcessing.activeProjectID != project.id {
-                        abnormalBanner(meeting: meeting)
+                        abnormalBanner(project: project, meeting: meeting)
                     }
                     if let operationError {
                         errorBanner(text: operationError)
@@ -709,7 +735,43 @@ struct ProjectWorkspaceView: View {
                 .buttonStyle(.borderedProminent)
             }
 
+            if meeting.status == .completed,
+               ProjectRecordingContinuationPolicy.canContinue(
+                    project: project,
+                    meetingStatus: meeting.status,
+                    hasLiveRecorder: recorder?.activeMeeting != nil
+               ) {
+                Button("继续录制") {
+                    continueRecording(project: project, meeting: meeting)
+                }
+                .buttonStyle(.borderedProminent)
+                .help("追加到同一项目，不覆盖原录音和文稿")
+            }
+
             Spacer()
+
+            Button {
+                reloadSidebarProjects()
+                showRelatedProjectContext = true
+            } label: {
+                HStack(spacing: 5) {
+                    if mode == .narrow {
+                        Image(systemName: "link")
+                    } else {
+                        Label("关联上下文", systemImage: "link")
+                    }
+                    if !project.relatedProjectIDs.isEmpty {
+                        Text("\(project.relatedProjectIDs.count)")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(BWTheme.accent.opacity(0.14))
+                            .clipShape(Capsule())
+                    }
+                }
+            }
+            .help("关联历史录音或项目，让 AI 理解业务背景")
+            .accessibilityLabel("关联录音或项目上下文")
 
             Button {
                 showPeopleLibrary = true
@@ -1345,12 +1407,22 @@ struct ProjectWorkspaceView: View {
     }
 
     /// 未正常结束项目的恢复提示（恢复中心语义：查看 / 标记已结束，不自动删除任何内容）
-    private func abnormalBanner(meeting: Meeting) -> some View {
+    private func abnormalBanner(project: Project, meeting: Meeting) -> some View {
         HStack(spacing: 8) {
             Image(systemName: "exclamationmark.arrow.triangle.2.circlepath")
             Text("此项目上次未正常结束（\(meeting.status.displayName)）。录音与文稿已保留在本机。")
                 .font(.callout)
             Spacer()
+            if ProjectRecordingContinuationPolicy.canContinue(
+                project: project,
+                meetingStatus: meeting.status,
+                hasLiveRecorder: recorder?.activeMeeting != nil
+            ) {
+                Button("继续录制") {
+                    continueRecording(project: project, meeting: meeting)
+                }
+                .buttonStyle(.borderedProminent)
+            }
             Button("标记为已结束") {
                 do {
                     try MeetingRecovery.markCompletedAfterAbnormalExit(meeting)
@@ -1520,6 +1592,9 @@ struct ProjectWorkspaceView: View {
         project.segments = fresh.segments
         project.scenario = fresh.scenario
         project.scenarioWasUserSelected = fresh.scenarioWasUserSelected
+        project.businessCategory = fresh.businessCategory
+        project.projectBackgroundContext = fresh.projectBackgroundContext
+        project.relatedProjectIDs = fresh.relatedProjectIDs
     }
 
     // MARK: - 装配与持久化桥接
@@ -1628,6 +1703,12 @@ struct ProjectWorkspaceView: View {
         chatController.noteContextProvider = { [weak noteController] in
             noteController?.markdown
         }
+        chatController.relatedProjectsProvider = { [environment, weak project] in
+            guard let project else { return [] }
+            let projects = (try? environment.allProjects()) ?? []
+            let relatedIDs = Set(project.relatedProjectIDs)
+            return projects.filter { relatedIDs.contains($0.id) }
+        }
         chatController.prepareRequestContext = {
             self.syncAndPersist(meeting)
         }
@@ -1672,6 +1753,12 @@ struct ProjectWorkspaceView: View {
             triggerConfig: project.sourceType == .liveRecording ? .liveRecording : AnalysisTrigger()
         )
         analysisController.knownTermsProvider = { [environment] in environment.lexiconTerms }
+        analysisController.relatedProjectsProvider = { [environment, weak project] in
+            guard let project else { return [] }
+            let projects = (try? environment.allProjects()) ?? []
+            let relatedIDs = Set(project.relatedProjectIDs)
+            return projects.filter { relatedIDs.contains($0.id) }
+        }
         // 实时尾巴（09 号计划需求 3-②）：把「识别中」的最新片段作为补充上下文
         // 交给分析，实时总结/开花不再等云端说话人确认。太短的尾巴没有分析价值。
         analysisController.provisionalTailProvider = { [weak controller] in
@@ -1738,6 +1825,43 @@ struct ProjectWorkspaceView: View {
             operationError = "项目保存失败（\(String(describing: type(of: error)))）"
             return false
         }
+    }
+
+    private func applyRelatedProjectContext(
+        businessCategory: String?,
+        backgroundContext: String?,
+        relatedProjectIDs: [UUID]
+    ) -> Bool {
+        guard let project else { return false }
+        let previousCategory = project.businessCategory
+        let previousBackground = project.projectBackgroundContext
+        let previousRelatedIDs = project.relatedProjectIDs
+        let previousLastActivityAt = project.lastActivityAt
+        project.businessCategory = businessCategory
+        project.projectBackgroundContext = backgroundContext
+        project.relatedProjectIDs = relatedProjectIDs
+        project.lastActivityAt = Date()
+        guard persistProject(fields: .relatedContext) else {
+            project.businessCategory = previousCategory
+            project.projectBackgroundContext = previousBackground
+            project.relatedProjectIDs = previousRelatedIDs
+            project.lastActivityAt = previousLastActivityAt
+            return false
+        }
+        operationError = nil
+        analysis?.noteProjectContextChanged()
+        if environment.isAnalysisConfigured,
+           project.status == .ready || project.status == .readyWithWarnings,
+           project.segments.contains(where: {
+               ($0.state == .final || $0.state == .edited)
+                   && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+           }) {
+            environment.finalReportCoordinator.start(
+                projectID: project.id,
+                refreshIfRunning: true
+            )
+        }
+        return true
     }
 
     private func setNoteAIContextEnabled(_ enabled: Bool) {
@@ -2110,6 +2234,22 @@ struct ProjectWorkspaceView: View {
     // MARK: - 录音控制
 
     private func startRecording(meeting: Meeting) {
+        beginRecordingSession(meeting: meeting, continuationOffsetMs: nil)
+    }
+
+    private func continueRecording(project: Project, meeting: Meeting) {
+        guard ProjectRecordingContinuationPolicy.canContinue(
+            project: project,
+            meetingStatus: meeting.status,
+            hasLiveRecorder: recorder?.activeMeeting != nil
+        ) else {
+            operationError = "当前项目不能继续录制。"
+            return
+        }
+        beginRecordingSession(meeting: meeting, continuationOffsetMs: project.durationMs)
+    }
+
+    private func beginRecordingSession(meeting: Meeting, continuationOffsetMs: Int64?) {
         // 麦克风权限：拒绝时不阻塞界面，给出系统设置入口
         guard MicrophonePermission.currentStatus == .authorized else {
             operationError = "未获得麦克风权限。请在「系统设置 → 隐私与安全性 → 麦克风」中允许「帮我分析」后重试。"
@@ -2135,8 +2275,20 @@ struct ProjectWorkspaceView: View {
             do {
                 audioQuality.reset()
                 liveAudioLevel = 0
-                try recorder?.startRecording(for: meeting, deviceID: meeting.preferredInputDeviceID)
+                if let continuationOffsetMs {
+                    try recorder?.continueRecording(
+                        for: meeting,
+                        deviceID: meeting.preferredInputDeviceID,
+                        timelineOffsetMs: continuationOffsetMs
+                    )
+                } else {
+                    try recorder?.startRecording(
+                        for: meeting,
+                        deviceID: meeting.preferredInputDeviceID
+                    )
+                }
                 didStartSessionThisView = true
+                hasResolvedAbnormalExit = true
                 environment.markProjectLive(projectID)
                 syncAndPersist(meeting)
                 operationError = environment.consumePendingWarning(for: projectID)

@@ -56,6 +56,7 @@ private final class CoordinatorFinalReportGenerator:
         project: Project,
         analysis: ConversationAnalysisSnapshot,
         knownTerms: [String],
+        relatedProjects: [Project],
         version: Int
     ) async throws -> FinalReportSnapshot {
         callCount += 1
@@ -93,6 +94,61 @@ private final class CoordinatorFinalReportGenerator:
 @Suite("完整总结", .serialized)
 @MainActor
 struct FinalReportTests {
+    @Test("完整总结把项目背景和关联摘要隔离为非证据上下文")
+    func relatedContextContract() throws {
+        let segment = TranscriptSegment(
+            startMs: 0,
+            endMs: 1_000,
+            text: "本场正在确认第二阶段范围。",
+            source: .local,
+            state: .final
+        )
+        let project = Project(
+            title: "本场",
+            projectBackgroundContext: "这是第二阶段确认会。",
+            sourceType: .liveRecording,
+            segments: [segment]
+        )
+        let related = Project(
+            title: "第一阶段复盘",
+            sourceType: .liveRecording,
+            status: .ready
+        )
+        related.analysisSnapshots = [ConversationAnalysisSnapshot(
+            version: 1,
+            analyzedThroughMs: 1_000,
+            headline: "第一阶段已完成",
+            items: []
+        )]
+        project.relatedProjectIDs = [related.id]
+        let analysis = ConversationAnalysisSnapshot(
+            version: 1,
+            analyzedThroughMs: 1_000,
+            headline: "本场范围确认",
+            items: [AnalysisItem(
+                category: .topic,
+                text: "讨论第二阶段范围",
+                epistemicStatus: .explicit,
+                confidence: .high,
+                evidenceSegmentIds: [segment.id]
+            )]
+        )
+
+        let context = ProjectAIContextBuilder.make(
+            project: project,
+            analysis: analysis,
+            knownTerms: [],
+            relatedProjects: [related]
+        )
+        let json = try ProjectAIContextBuilder.inputJSON(context)
+
+        #expect(context.hasCollaborationContent)
+        #expect(json.contains("这是第二阶段确认会"))
+        #expect(json.contains("第一阶段复盘"))
+        #expect(json.contains("第一阶段已完成"))
+        #expect(json.contains("untrusted_related_context"))
+    }
+
     @Test("Agent 只接收证据账本，过滤无效证据并记录模型与提示词版本")
     func agentEvidenceContract() async throws {
         let speaker = Speaker(

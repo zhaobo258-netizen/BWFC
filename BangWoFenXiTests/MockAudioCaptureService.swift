@@ -8,6 +8,7 @@ final class MockAudioCaptureService: AudioCaptureServicing, @unchecked Sendable 
     // 调用记录
     private(set) var selectDeviceCalls: [String?] = []
     private(set) var startCaptureURLs: [URL] = []
+    private(set) var appendCaptureURLs: [URL] = []
     private(set) var pauseCount = 0
     private(set) var resumeCount = 0
     private(set) var stopCount = 0
@@ -18,6 +19,7 @@ final class MockAudioCaptureService: AudioCaptureServicing, @unchecked Sendable 
     var startCaptureError: (any Error)?
     var selectDeviceError: (any Error)?
     var resumeError: (any Error)?
+    var existingAudioDurationMs: Int64 = 0
 
     /// 模拟设备列表
     var devices: [AudioInputDevice] = [
@@ -67,6 +69,12 @@ final class MockAudioCaptureService: AudioCaptureServicing, @unchecked Sendable 
     func startCapture(fileURL: URL) throws {
         if let startCaptureError { throw startCaptureError }
         startCaptureURLs.append(fileURL)
+    }
+
+    func startAppendingCapture(fileURL: URL) throws -> Int64 {
+        if let startCaptureError { throw startCaptureError }
+        appendCaptureURLs.append(fileURL)
+        return existingAudioDurationMs
     }
 
     func pauseCapture() { pauseCount += 1 }

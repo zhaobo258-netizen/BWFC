@@ -28,6 +28,7 @@ final class ProjectAIChatController {
     private(set) var draftSaveError: String?
     var isWebSearchEnabled = true
     var noteContextProvider: () -> String? = { nil }
+    var relatedProjectsProvider: () -> [Project] = { [] }
     var prepareRequestContext: (() -> Bool)?
     var onConversationUpdated: () -> Void = {}
     var onTranscriptCorrection:
@@ -134,6 +135,7 @@ final class ProjectAIChatController {
             currentRequest: text,
             noteMarkdown: noteContextProvider(),
             currentAttachments: attachments,
+            relatedProjects: relatedProjectsProvider(),
             webSearchEnabled: isWebSearchEnabled
         )
         let previousMessages = project.aiChatMessages

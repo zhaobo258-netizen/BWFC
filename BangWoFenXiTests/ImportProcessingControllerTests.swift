@@ -15,6 +15,7 @@ private final class ImportFinalReportGenerator:
         project: Project,
         analysis: ConversationAnalysisSnapshot,
         knownTerms: [String],
+        relatedProjects: [Project],
         version: Int
     ) async throws -> FinalReportSnapshot {
         callCount += 1
