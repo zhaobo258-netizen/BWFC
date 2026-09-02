@@ -5,6 +5,7 @@ struct HistoricalSpeakerRelabeler: @unchecked Sendable {
         var speakerID: UUID
         var alias: String
         var sampleURL: URL
+        var iflytekFeatureID: String? = nil
     }
 
     struct SegmentSnapshot: Sendable, Equatable {
@@ -84,7 +85,11 @@ struct HistoricalSpeakerRelabeler: @unchecked Sendable {
         defer { try? fileManager.removeItem(at: directory) }
 
         let knownSpeakers = speakerReferences.map {
-            KnownSpeakerReference(alias: $0.alias, sampleURL: $0.sampleURL)
+            KnownSpeakerReference(
+                alias: $0.alias,
+                sampleURL: $0.sampleURL,
+                iflytekFeatureID: $0.iflytekFeatureID
+            )
         }
         let knownSpeakerIDs = Dictionary(
             uniqueKeysWithValues: speakerReferences.map { ($0.alias, $0.speakerID) }

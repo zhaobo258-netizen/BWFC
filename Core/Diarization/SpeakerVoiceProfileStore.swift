@@ -13,6 +13,8 @@ struct SpeakerVoiceProfile: Identifiable, Codable, Sendable, Equatable {
     var backgroundContext: String? = nil
     var communicationProfile: SpeakerCommunicationProfile? = nil
     var isCurrentUser: Bool? = nil
+    var iflytekFeatureID: String? = nil
+    var iflytekSampleSHA256: String? = nil
 }
 
 enum SpeakerVoiceProfileStoreError: Error, Equatable {
@@ -145,6 +147,10 @@ final class SpeakerVoiceProfileStore: @unchecked Sendable {
         let backgroundContext = existingIndex.flatMap { profiles[$0].backgroundContext }
         let communicationProfile = existingIndex.flatMap { profiles[$0].communicationProfile }
         let isCurrentUser = existingIndex.flatMap { profiles[$0].isCurrentUser }
+        let iflytekFeatureID = existingIndex.flatMap { profiles[$0].iflytekFeatureID }
+        // enroll 会替换本机样本；保留远端 feature ID，但清空已同步指纹，
+        // 人物库必须明示「需更新讯飞声纹」，不能冒充新样本已生效。
+        let iflytekSampleSHA256: String? = nil
         let profile = SpeakerVoiceProfile(
             id: id,
             displayName: displayName.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -157,7 +163,9 @@ final class SpeakerVoiceProfileStore: @unchecked Sendable {
             updatedAt: now,
             backgroundContext: backgroundContext,
             communicationProfile: communicationProfile,
-            isCurrentUser: isCurrentUser
+            isCurrentUser: isCurrentUser,
+            iflytekFeatureID: iflytekFeatureID,
+            iflytekSampleSHA256: iflytekSampleSHA256
         )
         if let existingIndex {
             profiles[existingIndex] = profile
@@ -269,6 +277,28 @@ final class SpeakerVoiceProfileStore: @unchecked Sendable {
         try saveUnlocked(profiles)
     }
 
+    func setIFlytekVoiceprint(
+        profileID: UUID,
+        featureID: String?,
+        sampleSHA256: String?,
+        now: Date = Date()
+    ) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        var profiles = try loadUnlocked(sampleValidation: .structure)
+        guard let index = profiles.firstIndex(where: { $0.id == profileID }) else {
+            throw SpeakerVoiceProfileStoreError.profileNotFound
+        }
+        profiles[index].iflytekFeatureID = featureID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        profiles[index].iflytekSampleSHA256 = sampleSHA256?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty
+        profiles[index].updatedAt = now
+        try saveUnlocked(profiles)
+    }
+
     func delete(profileID: UUID) throws {
         lock.lock()
         defer { lock.unlock() }
@@ -347,6 +377,7 @@ final class SpeakerVoiceProfileStore: @unchecked Sendable {
                     voiceSamplePath: profile.sampleRelativePath,
                     voiceSampleDurationMs: profile.sampleDurationMs,
                     voiceProfileId: profile.id,
+                    iflytekFeatureID: profile.iflytekFeatureID,
                     backgroundContext: profile.backgroundContext,
                     communicationProfile: profile.communicationProfile,
                     isCurrentUser: profile.isCurrentUser

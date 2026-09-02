@@ -28,6 +28,8 @@ final class Speaker: Identifiable, Codable {
     var voiceSampleDurationMs: Int64?
     /// 应用级永久声纹 id；有值时样本来自独立 VoiceProfiles 目录，删除项目不删除该样本。
     var voiceProfileId: UUID?
+    /// 讯飞声纹分离特征 ID；不是姓名或密钥。
+    var iflytekFeatureID: String?
     /// 用户人工补充的人物背景；随永久人物档案跨会议复用。
     var backgroundContext: String?
     /// 基于已标注原话生成的可观察表达与沟通画像。
@@ -48,6 +50,7 @@ final class Speaker: Identifiable, Codable {
         voiceSamplePath: String? = nil,
         voiceSampleDurationMs: Int64? = nil,
         voiceProfileId: UUID? = nil,
+        iflytekFeatureID: String? = nil,
         backgroundContext: String? = nil,
         communicationProfile: SpeakerCommunicationProfile? = nil,
         isCurrentUser: Bool? = nil
@@ -64,6 +67,7 @@ final class Speaker: Identifiable, Codable {
         self.voiceSamplePath = voiceSamplePath
         self.voiceSampleDurationMs = voiceSampleDurationMs
         self.voiceProfileId = voiceProfileId
+        self.iflytekFeatureID = iflytekFeatureID
         self.backgroundContext = backgroundContext
         self.communicationProfile = communicationProfile
         self.isCurrentUser = isCurrentUser

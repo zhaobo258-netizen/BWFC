@@ -102,7 +102,8 @@ enum ProjectRuntimeSession {
                 role: speaker.role ?? "",
                 colorToken: speaker.colorToken,
                 voiceReferencePath: speaker.voiceSamplePath ?? speaker.legacyVoiceReferencePath,
-                voiceReferenceDurationMs: speaker.voiceSampleDurationMs ?? speaker.legacyVoiceReferenceDurationMs
+                voiceReferenceDurationMs: speaker.voiceSampleDurationMs ?? speaker.legacyVoiceReferenceDurationMs,
+                iflytekFeatureID: speaker.iflytekFeatureID
             )
         }
         // 深拷贝：与迁移器同一 iso8601 配置

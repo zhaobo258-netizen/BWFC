@@ -49,7 +49,8 @@ enum SpeakerPanelLogic {
                 role: speaker.role ?? "",
                 colorToken: speaker.colorToken,
                 voiceReferencePath: voiceReferencePath(for: speaker),
-                voiceReferenceDurationMs: voiceReferenceDurationMs(for: speaker)
+                voiceReferenceDurationMs: voiceReferenceDurationMs(for: speaker),
+                iflytekFeatureID: speaker.iflytekFeatureID
             )
         }
     }
@@ -57,7 +58,7 @@ enum SpeakerPanelLogic {
 
 /// 工作台「说话人」面板（声纹识别入口）：
 /// 录入说话人（本地姓名 + 角色 + 颜色）并录制 2–10 秒声纹样本；
-/// 样本仅存本机，云端识别时随分片上传做已知说话人匹配（只发代号 p_01…）。
+/// 样本由本机管理：OpenAI 请求时随分片发送，讯飞只在注册/更新声纹时发送。
 /// 录音进行中麦克风被占用，样本录制入口置灰（如实说明原因）。
 struct SpeakerPanelView: View {
     @Environment(AppEnvironment.self) private var environment
@@ -96,7 +97,7 @@ struct SpeakerPanelView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("上面是本场人物；下面的人物库是跨录音的全局档案，可直接加入本场，不再重复建人。声纹样本只保存在本机；云端只见代号（\(project.speakers.map(\.cloudAlias).joined(separator: "、")))，不见姓名。")
+                    Text("上面是本场人物；下面的人物库是跨录音的全局档案，可直接加入本场，不再重复建人。声纹样本由本机管理，只在声纹匹配需要时发送；云端只见代号，不见姓名。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -487,6 +488,7 @@ struct SpeakerPanelView: View {
             speaker.backgroundContext = profile.backgroundContext
             speaker.communicationProfile = profile.communicationProfile
             speaker.isCurrentUser = profile.isCurrentUser
+            speaker.iflytekFeatureID = profile.iflytekFeatureID
             profileNotice = profile.isAutoEnabled
                 ? "已保存为永久声纹，后续新录音会自动带入。"
                 : "已保存；自动名额已满，可先关闭一个现有声纹再启用。"
@@ -542,6 +544,7 @@ struct SpeakerPanelView: View {
             voiceSamplePath: profile.sampleRelativePath,
             voiceSampleDurationMs: profile.sampleDurationMs,
             voiceProfileId: profile.id,
+            iflytekFeatureID: profile.iflytekFeatureID,
             backgroundContext: profile.backgroundContext,
             communicationProfile: profile.communicationProfile,
             isCurrentUser: profile.isCurrentUser
@@ -672,6 +675,7 @@ struct SpeakerPanelView: View {
                 linked.backgroundContext = nil
                 linked.communicationProfile = nil
                 linked.isCurrentUser = nil
+                linked.iflytekFeatureID = nil
                 changed()
             }
             reloadProfiles()
@@ -692,6 +696,7 @@ struct SpeakerPanelView: View {
         speaker.backgroundContext = profile.backgroundContext
         speaker.communicationProfile = profile.communicationProfile
         speaker.isCurrentUser = profile.isCurrentUser
+        speaker.iflytekFeatureID = profile.iflytekFeatureID
         changed()
         profileNotice = "已将 \(profile.displayName) 加入本场识别。"
     }

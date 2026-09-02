@@ -2050,6 +2050,7 @@ struct ProjectWorkspaceView: View {
             let previousSampleDurationMs = speaker.voiceSampleDurationMs
             let previousBackground = speaker.backgroundContext
             let previousCommunicationProfile = speaker.communicationProfile
+            let previousIFlytekFeatureID = speaker.iflytekFeatureID
             if let profile = extractVoiceSample(window: window, for: speaker, meeting: meeting) {
                 if persistProject(fields: .speakers) {
                     canRelabelWithVoice = true
@@ -2062,6 +2063,7 @@ struct ProjectWorkspaceView: View {
                     speaker.voiceSampleDurationMs = previousSampleDurationMs
                     speaker.backgroundContext = previousBackground
                     speaker.communicationProfile = previousCommunicationProfile
+                    speaker.iflytekFeatureID = previousIFlytekFeatureID
                     reviewNotice = "说话人标注已保存，但声纹未完整关联；未启动全场历史回查，请稍后重新标注声纹。"
                     canRelabelWithVoice = false
                 }
@@ -2129,6 +2131,7 @@ struct ProjectWorkspaceView: View {
             speaker.backgroundContext = profile.backgroundContext
             speaker.communicationProfile = profile.communicationProfile
             speaker.isCurrentUser = profile.isCurrentUser
+            speaker.iflytekFeatureID = profile.iflytekFeatureID
             reviewNotice = profile.isAutoEnabled
                 ? "已标注并记住 \(speaker.displayName) 的声纹；正在回查本场历史发言。"
                 : "已保存 \(speaker.displayName) 的永久声纹；自动识别名额已满，本场仍会回查历史发言。"
@@ -2146,8 +2149,9 @@ struct ProjectWorkspaceView: View {
     private func startHistoricalSpeakerRelabel(project: Project, meeting: Meeting) {
         guard !isRelabelingHistoricalSpeakers else { return }
         let configuration = environment.diarizationConfigurationSnapshot()
-        guard configuration.selectedProvider == .openAICompatible else {
-            reviewNotice = "同一分片的发言已批量标注。全场历史声纹回查需要在设置中启用 OpenAI 兼容分人服务。"
+        guard configuration.selectedProvider == .openAICompatible
+                || configuration.selectedProvider == .iflytek else {
+            reviewNotice = "同一分片的发言已批量标注。全场历史声纹回查需要启用 OpenAI 兼容或讯飞分人服务。"
             return
         }
         let keyStore = environment.diarizationKeyStore(for: configuration)
@@ -2164,7 +2168,12 @@ struct ProjectWorkspaceView: View {
                   let url = try? environment.fileStore.absoluteURL(forRelativePath: path) else {
                 return nil
             }
-            return .init(speakerID: speaker.id, alias: speaker.cloudAlias, sampleURL: url)
+            return .init(
+                speakerID: speaker.id,
+                alias: speaker.cloudAlias,
+                sampleURL: url,
+                iflytekFeatureID: speaker.iflytekFeatureID
+            )
         }
         guard !references.isEmpty else { return }
         let snapshots = meeting.segments.map {

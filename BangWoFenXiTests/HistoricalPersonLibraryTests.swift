@@ -143,16 +143,19 @@ struct HistoricalPersonLibraryTests {
             isAutoEnabled: true,
             createdAt: .distantPast,
             updatedAt: .now,
-            backgroundContext: "关注渠道效率"
+            backgroundContext: "关注渠道效率",
+            iflytekFeatureID: "feature-123"
         )
 
         #expect(HistoricalPersonLibrary.applyProfile(profile, to: [project]) == 1)
         #expect(speaker.displayName == "新名")
         #expect(speaker.backgroundContext == "关注渠道效率")
+        #expect(speaker.iflytekFeatureID == "feature-123")
 
         #expect(HistoricalPersonLibrary.unlinkProfile(profile, from: [project]) == 1)
         #expect(speaker.voiceProfileId == nil)
         #expect(speaker.voiceSamplePath == nil)
         #expect(speaker.backgroundContext == nil)
+        #expect(speaker.iflytekFeatureID == nil)
     }
 }

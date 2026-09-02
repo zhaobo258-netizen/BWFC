@@ -62,6 +62,11 @@ final class VolcengineMockURLProtocol: MockURLProtocolBase, @unchecked Sendable 
     override class var sharedStorage: MockURLProtocolStorage { storage }
 }
 
+final class IFlytekMockURLProtocol: MockURLProtocolBase, @unchecked Sendable {
+    static let storage = MockURLProtocolStorage()
+    override class var sharedStorage: MockURLProtocolStorage { storage }
+}
+
 /// 阶段 4 谈判分析接口测试专用
 final class AnalysisMockURLProtocol: MockURLProtocolBase, @unchecked Sendable {
     static let storage = MockURLProtocolStorage()

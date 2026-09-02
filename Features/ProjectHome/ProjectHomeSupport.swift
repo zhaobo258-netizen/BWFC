@@ -338,7 +338,11 @@ enum ProjectHomeSupport {
             legacyVoiceReferenceDurationMs: speaker.legacyVoiceReferenceDurationMs,
             voiceSamplePath: speaker.voiceSamplePath,
             voiceSampleDurationMs: speaker.voiceSampleDurationMs,
-            voiceProfileId: speaker.voiceProfileId
+            voiceProfileId: speaker.voiceProfileId,
+            iflytekFeatureID: speaker.iflytekFeatureID,
+            backgroundContext: speaker.backgroundContext,
+            communicationProfile: speaker.communicationProfile,
+            isCurrentUser: speaker.isCurrentUser
         )
     }
 

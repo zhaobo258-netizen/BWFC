@@ -115,6 +115,7 @@ enum HistoricalPersonLibrary {
                 speaker.backgroundContext = profile.backgroundContext
                 speaker.communicationProfile = profile.communicationProfile
                 speaker.isCurrentUser = profile.isCurrentUser
+                speaker.iflytekFeatureID = profile.iflytekFeatureID
                 updated += 1
             }
         }
@@ -137,6 +138,7 @@ enum HistoricalPersonLibrary {
                 speaker.backgroundContext = nil
                 speaker.communicationProfile = nil
                 speaker.isCurrentUser = nil
+                speaker.iflytekFeatureID = nil
                 updated += 1
             }
         }

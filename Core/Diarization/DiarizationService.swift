@@ -4,12 +4,14 @@ enum DiarizationProvider: String, Codable, Sendable, CaseIterable {
     case disabled
     case openAICompatible
     case volcengine
+    case iflytek
 
     var displayName: String {
         switch self {
         case .disabled: return "关闭"
         case .openAICompatible: return "OpenAI 兼容"
         case .volcengine: return "火山引擎"
+        case .iflytek: return "讯飞"
         }
     }
 
@@ -20,17 +22,20 @@ struct DiarizationProviderConfiguration: Codable, Equatable, Sendable {
     var openAIBaseURL: String
     var openAIModelID: String
     var volcengineResourceID: String
+    var iflytekAppID: String
 
     init(
         selectedProvider: DiarizationProvider = .openAICompatible,
         openAIBaseURL: String = CloudModelConfig.apiBaseURL.absoluteString,
         openAIModelID: String = CloudModelConfig.diarizationModelID,
-        volcengineResourceID: String = VolcengineDiarizationService.resourceID
+        volcengineResourceID: String = VolcengineDiarizationService.resourceID,
+        iflytekAppID: String = "d83cc043"
     ) {
         self.selectedProvider = selectedProvider
         self.openAIBaseURL = openAIBaseURL
         self.openAIModelID = openAIModelID
         self.volcengineResourceID = volcengineResourceID
+        self.iflytekAppID = iflytekAppID
     }
 
     init(from decoder: any Decoder) throws {
@@ -57,6 +62,10 @@ struct DiarizationProviderConfiguration: Codable, Equatable, Sendable {
         default:
             volcengineResourceID = decodedVolcengineResourceID
         }
+        iflytekAppID = try container.decodeIfPresent(
+            String.self,
+            forKey: .iflytekAppID
+        ) ?? "d83cc043"
     }
 
     var validatedOpenAIBaseURL: URL? {
@@ -71,6 +80,10 @@ struct DiarizationProviderConfiguration: Codable, Equatable, Sendable {
         volcengineResourceID.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    var normalizedIFlytekAppID: String {
+        iflytekAppID.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     var isValid: Bool {
         switch selectedProvider {
         case .disabled:
@@ -79,6 +92,8 @@ struct DiarizationProviderConfiguration: Codable, Equatable, Sendable {
             return validatedOpenAIBaseURL != nil && !normalizedOpenAIModelID.isEmpty
         case .volcengine:
             return normalizedVolcengineResourceID == VolcengineDiarizationService.resourceID
+        case .iflytek:
+            return !normalizedIFlytekAppID.isEmpty
         }
     }
 
@@ -87,7 +102,8 @@ struct DiarizationProviderConfiguration: Codable, Equatable, Sendable {
             selectedProvider.rawValue,
             openAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines),
             normalizedOpenAIModelID,
-            volcengineResourceID.trimmingCharacters(in: .whitespacesAndNewlines)
+            volcengineResourceID.trimmingCharacters(in: .whitespacesAndNewlines),
+            normalizedIFlytekAppID
         ].joined(separator: "\u{1F}")
         var hash: UInt64 = 14_695_981_039_346_656_037
         for byte in value.utf8 {
@@ -153,6 +169,8 @@ struct KnownSpeakerReference: Equatable, Sendable {
     var alias: String
     /// 声音样本文件（2–10 秒）
     var sampleURL: URL
+    /// 讯飞声纹分离的远端特征 ID；OpenAI 兼容服务会忽略此字段。
+    var iflytekFeatureID: String? = nil
 }
 
 enum KnownSpeakerMatchingCapability: Equatable, Sendable {
@@ -164,6 +182,7 @@ enum KnownSpeakerSampleIssue: Equatable, Sendable {
     case invalidPath
     case fileMissingOrUnreadable
     case invalidDuration(actualMs: Int64?)
+    case providerMinimumDuration(actualMs: Int64, minimumMs: Int64)
 }
 
 /// 云端分片识别结果（时间均为相对分片起点的毫秒）
@@ -206,6 +225,10 @@ enum DiarizationAPIError: Error, Equatable {
     case invalidKnownSpeakerSample(alias: String, issue: KnownSpeakerSampleIssue)
     /// 当前 provider 只支持匿名分人，不支持已知人物声纹匹配。
     case knownSpeakerMatchingUnsupported
+    /// 已启用历史人物，但尚未注册讯飞声纹。
+    case missingProviderVoiceprint(alias: String)
+    /// Provider 返回了可读的业务错误。
+    case providerError(code: String, message: String)
 }
 
 extension DiarizationAPIError: LocalizedError {
@@ -233,9 +256,15 @@ extension DiarizationAPIError: LocalizedError {
                     return "说话人代号 \(alias) 的声纹样本时长为 \(actualMs) 毫秒，必须在 2–10 秒之间"
                 }
                 return "说话人代号 \(alias) 的声纹样本缺少时长，必须在 2–10 秒之间"
+            case .providerMinimumDuration(let actualMs, let minimumMs):
+                return "说话人代号 \(alias) 的声纹样本时长为 \(actualMs) 毫秒，讯飞注册至少需要 \(minimumMs) 毫秒"
             }
         case .knownSpeakerMatchingUnsupported:
             return "当前分人服务只支持匿名说话人，不支持历史声纹身份匹配"
+        case .missingProviderVoiceprint(let alias):
+            return "说话人代号 \(alias) 尚未注册讯飞声纹"
+        case .providerError(let code, let message):
+            return "云端服务错误 \(code)：\(message)"
         }
     }
 }
@@ -465,6 +494,10 @@ enum DiarizationServiceFactory {
             service: CloudAPIKeyStore.defaultService,
             account: VolcengineDiarizationService.accessTokenCredentialAccount
         ),
+        iflytekCredentialStore: CloudAPIKeyStore = CloudAPIKeyStore(
+            service: CloudAPIKeyStore.defaultService,
+            account: IFlytekCredentials.credentialAccount
+        ),
         session: URLSession = .shared
     ) -> any DiarizationServicing {
         switch configuration.selectedProvider {
@@ -490,6 +523,15 @@ enum DiarizationServiceFactory {
                 apiKeyStore: volcengineKeyStore,
                 accessTokenStore: volcengineAccessTokenStore,
                 resourceID: configuration.normalizedVolcengineResourceID
+            )
+        case .iflytek:
+            guard configuration.isValid else {
+                return DisabledDiarizationService()
+            }
+            return IFlytekDiarizationService(
+                session: session,
+                appID: configuration.normalizedIFlytekAppID,
+                credentialStore: iflytekCredentialStore
             )
         }
     }

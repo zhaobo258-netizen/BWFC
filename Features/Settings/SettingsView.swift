@@ -33,10 +33,14 @@ struct SettingsView: View {
     @State private var diarizationKeyInput = ""
     @State private var volcengineKeyInput = ""
     @State private var volcengineAccessTokenInput = ""
+    @State private var iflytekAccessKeyIDInput = ""
+    @State private var iflytekAccessKeySecretInput = ""
     @State private var diarizationConfiguration = DiarizationProviderConfiguration()
     @State private var diarizationMessage: String?
     @State private var volcengineTestResult: (ok: Bool, text: String)?
     @State private var isTestingVolcengine = false
+    @State private var iflytekTestResult: (ok: Bool, text: String)?
+    @State private var isTestingIFlytek = false
     @State private var testResults: [CloudProvider: (ok: Bool, text: String)] = [:]
     @State private var testingProvider: CloudProvider?
     @State private var login: KimiLoginController?
@@ -204,6 +208,8 @@ struct SettingsView: View {
                     )
                 } else if diarizationConfiguration.selectedProvider == .volcengine {
                     diarizationVolcengineConfigurationSection
+                } else if diarizationConfiguration.selectedProvider == .iflytek {
+                    diarizationIFlytekConfigurationSection
                 }
                 Section("当前能力") {
                     LabeledContent("本地实时转写", value: "Apple Speech · 始终启用")
@@ -325,6 +331,60 @@ struct SettingsView: View {
                 statusText(result.text)
             }
             Text("支持新版单 API Key 鉴权；填写 Access Token 后自动使用服务接口双凭据鉴权。Secret Key 不用于此接口。Resource ID 固定为极速版。连接测试只发送约 0.1 秒合成静音，不发送项目、录音或逐字稿。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var diarizationIFlytekConfigurationSection: some View {
+        let hasSavedCredentials = environment.iflytekCredentialStore.hasConfiguredKey
+        return Section("讯飞录音文件转写大模型") {
+            TextField("APPID", text: $diarizationConfiguration.iflytekAppID)
+                .textFieldStyle(.roundedBorder)
+            SecureField(
+                hasSavedCredentials ? "APIKey 已保存；粘贴可替换" : "APIKey",
+                text: $iflytekAccessKeyIDInput
+            )
+            .textFieldStyle(.roundedBorder)
+            SecureField(
+                hasSavedCredentials ? "APISecret 已保存；粘贴可替换" : "APISecret",
+                text: $iflytekAccessKeySecretInput
+            )
+            .textFieldStyle(.roundedBorder)
+            HStack {
+                Button("保存") {
+                    saveIFlytekConfiguration()
+                }
+                Button(isTestingIFlytek ? "测试中…" : "保存并测试") {
+                    saveAndTestIFlytek()
+                }
+                .disabled(
+                    isTestingIFlytek
+                        || (!hasSavedCredentials
+                            && (iflytekAccessKeyIDInput.isEmpty
+                                || iflytekAccessKeySecretInput.isEmpty))
+                )
+                Button("删除已保存的凭据", role: .destructive) {
+                    deleteIFlytekCredentials()
+                }
+                .disabled(!hasSavedCredentials)
+                Spacer()
+                configurationBadge(
+                    configured: diarizationConfiguration.isValid && hasSavedCredentials
+                )
+            }
+            if hasSavedCredentials {
+                Label(
+                    "APIKey 和 APISecret 已明文保存在本机配置中，此处不会回显。",
+                    systemImage: "checkmark.circle"
+                )
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            }
+            if let result = iflytekTestResult {
+                statusText(result.text)
+            }
+            Text("连接测试只用随机无效订单号验证鉴权，不上传项目、录音或逐字稿。历史人物还需在人物库用 10 秒样本注册讯飞声纹。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -1321,6 +1381,66 @@ struct SettingsView: View {
             } catch {
                 volcengineTestResult = (false, "不可用：\(error.localizedDescription)")
             }
+        }
+    }
+
+    private func saveIFlytekConfiguration() {
+        do {
+            try environment.diarizationProviderConfigurationStore.save(diarizationConfiguration)
+            let accessKeyID = iflytekAccessKeyIDInput
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let accessKeySecret = iflytekAccessKeySecretInput
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !accessKeyID.isEmpty || !accessKeySecret.isEmpty {
+                guard !accessKeyID.isEmpty, !accessKeySecret.isEmpty else {
+                    throw DiarizationAPIError.providerError(
+                        code: "local",
+                        message: "APIKey 和 APISecret 需要同时填写"
+                    )
+                }
+                try IFlytekCredentials(
+                    accessKeyID: accessKeyID,
+                    accessKeySecret: accessKeySecret
+                ).save(to: environment.iflytekCredentialStore)
+                iflytekAccessKeyIDInput = ""
+                iflytekAccessKeySecretInput = ""
+            }
+            environment.refreshCloudConfiguration()
+            iflytekTestResult = (true, "已保存；从下一次会议开始生效。")
+        } catch {
+            iflytekTestResult = (false, "保存失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func saveAndTestIFlytek() {
+        guard !isTestingIFlytek else { return }
+        saveIFlytekConfiguration()
+        guard diarizationConfiguration.isValid,
+              environment.iflytekCredentialStore.hasConfiguredKey else { return }
+        isTestingIFlytek = true
+        iflytekTestResult = nil
+        Task { @MainActor in
+            defer { isTestingIFlytek = false }
+            do {
+                let ok = try await environment.makeDiarizationService(
+                    for: diarizationConfiguration
+                ).testConnection()
+                iflytekTestResult = ok
+                    ? (true, "连接正常（讯飞转写鉴权可用）")
+                    : (false, "连接失败")
+            } catch {
+                iflytekTestResult = (false, "不可用：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func deleteIFlytekCredentials() {
+        do {
+            try environment.iflytekCredentialStore.deleteKey()
+            environment.refreshCloudConfiguration()
+            iflytekTestResult = (true, "已删除讯飞认证凭据。")
+        } catch {
+            iflytekTestResult = (false, "删除失败：\(error.localizedDescription)")
         }
     }
 

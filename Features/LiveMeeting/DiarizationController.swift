@@ -411,7 +411,11 @@ final class DiarizationController {
                     issue: .fileMissingOrUnreadable
                 )
             }
-            speakers.append(KnownSpeakerReference(alias: alias, sampleURL: url))
+            speakers.append(KnownSpeakerReference(
+                alias: alias,
+                sampleURL: url,
+                iflytekFeatureID: participant.iflytekFeatureID
+            ))
         }
         guard speakers.count <= KnownSpeakerReference.maximumCount else {
             throw DiarizationAPIError.tooManyKnownSpeakers(
@@ -512,7 +516,7 @@ final class DiarizationController {
             cloudState = .suspended(
                 reason: "声纹配置暂停：已配置 \(actual) 个声纹样本，单次分人最多支持 \(maximum) 个，本次未上传。修正后将自动继续。"
             )
-        case .invalidKnownSpeakerSample:
+        case .invalidKnownSpeakerSample, .missingProviderVoiceprint:
             queue[entryIndex].status = .pending
             suspensionCause = .knownSpeakerConfiguration
             cloudState = .suspended(
@@ -534,7 +538,7 @@ final class DiarizationController {
                 queue[entryIndex].status = .awaitingUserRetry
                 AppLog.logError(AppLog.diarization, LogSanitizer.formatEvent("chunk_awaiting_user_retry"))
             }
-        case .clientError, .invalidResponse:
+        case .clientError, .invalidResponse, .providerError:
             // 请求/响应问题：不重试，直接待用户处理
             queue[entryIndex].status = .awaitingUserRetry
             AppLog.logWarning(
@@ -628,6 +632,8 @@ final class DiarizationController {
         case .openAICompatible:
             return configurationSnapshot.isValid && keyStore.hasConfiguredKey
         case .volcengine:
+            return configurationSnapshot.isValid && keyStore.hasConfiguredKey
+        case .iflytek:
             return configurationSnapshot.isValid && keyStore.hasConfiguredKey
         }
     }

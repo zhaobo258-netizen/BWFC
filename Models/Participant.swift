@@ -34,6 +34,8 @@ final class Participant: Identifiable, Codable {
     var voiceReferencePath: String?
     /// 声音样本时长（毫秒），合格范围 2–10 秒
     var voiceReferenceDurationMs: Int64?
+    /// 讯飞历史声纹特征 ID，随运行时会议快照固定。
+    var iflytekFeatureID: String?
 
     init(
         id: UUID = UUID(),
@@ -43,7 +45,8 @@ final class Participant: Identifiable, Codable {
         role: String = "",
         colorToken: String = "gray",
         voiceReferencePath: String? = nil,
-        voiceReferenceDurationMs: Int64? = nil
+        voiceReferenceDurationMs: Int64? = nil,
+        iflytekFeatureID: String? = nil
     ) {
         self.id = id
         self.cloudAlias = cloudAlias
@@ -53,5 +56,6 @@ final class Participant: Identifiable, Codable {
         self.colorToken = colorToken
         self.voiceReferencePath = voiceReferencePath
         self.voiceReferenceDurationMs = voiceReferenceDurationMs
+        self.iflytekFeatureID = iflytekFeatureID
     }
 }

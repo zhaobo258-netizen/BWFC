@@ -369,6 +369,7 @@ final class AppEnvironment {
     let openAICompatibleKeyStore: CloudAPIKeyStore
     let volcengineDiarizationKeyStore: CloudAPIKeyStore
     let volcengineDiarizationAccessTokenStore: CloudAPIKeyStore
+    let iflytekCredentialStore: CloudAPIKeyStore
     let aiProviderRegistry: AIProviderRegistry
     /// 外部知识 MCP 的非敏感连接配置与独立本机 Token
     let externalMCPConfigurationStore: ExternalMCPConfigurationStore
@@ -492,6 +493,10 @@ final class AppEnvironment {
             service: credentialServiceName,
             account: VolcengineDiarizationService.accessTokenCredentialAccount
         )
+        let iflytekCredentialStore = CloudAPIKeyStore(
+            service: credentialServiceName,
+            account: IFlytekCredentials.credentialAccount
+        )
         self.diarizationServiceOverride = diarization
         self.negotiationAnalysis = negotiationAnalysis ?? sharedTransport
         self.conversationAnalysis = conversationAnalysis
@@ -529,6 +534,7 @@ final class AppEnvironment {
         self.openAICompatibleKeyStore = openAIKeyStore
         self.volcengineDiarizationKeyStore = volcengineDiarizationKeyStore
         self.volcengineDiarizationAccessTokenStore = volcengineDiarizationAccessTokenStore
+        self.iflytekCredentialStore = iflytekCredentialStore
         self.aiProviderRegistry = providerRegistry
         self.externalMCPConfigurationStore = externalMCPConfigurationStore
             ?? ExternalMCPConfigurationStore()
@@ -536,9 +542,13 @@ final class AppEnvironment {
         self.isKimiAccountConnected = hasStoredOAuthTokens
         self.isDiarizationConfigured = Self.isDiarizationConfigured(
             configuration: diarizationConfiguration,
-            keyStore: diarizationConfiguration.selectedProvider == .volcengine
-                ? volcengineDiarizationKeyStore
-                : diarizationStore
+            keyStore: {
+                switch diarizationConfiguration.selectedProvider {
+                case .volcengine: return volcengineDiarizationKeyStore
+                case .iflytek: return iflytekCredentialStore
+                case .disabled, .openAICompatible: return diarizationStore
+                }
+            }()
         )
     }
 
@@ -699,16 +709,22 @@ final class AppEnvironment {
             configuration: configuration,
             keyStore: keyStore(for: .diarization),
             volcengineKeyStore: volcengineDiarizationKeyStore,
-            volcengineAccessTokenStore: volcengineDiarizationAccessTokenStore
+            volcengineAccessTokenStore: volcengineDiarizationAccessTokenStore,
+            iflytekCredentialStore: iflytekCredentialStore
         )
     }
 
     func diarizationKeyStore(
         for configuration: DiarizationProviderConfiguration
     ) -> CloudAPIKeyStore {
-        configuration.selectedProvider == .volcengine
-            ? volcengineDiarizationKeyStore
-            : keyStore(for: .diarization)
+        switch configuration.selectedProvider {
+        case .volcengine:
+            return volcengineDiarizationKeyStore
+        case .iflytek:
+            return iflytekCredentialStore
+        case .disabled, .openAICompatible:
+            return keyStore(for: .diarization)
+        }
     }
 
     func diarizationConfigurationSnapshot() -> DiarizationProviderConfiguration {
@@ -737,6 +753,8 @@ final class AppEnvironment {
         case .openAICompatible:
             return configuration.isValid && keyStore.hasConfiguredKey
         case .volcengine:
+            return configuration.isValid && keyStore.hasConfiguredKey
+        case .iflytek:
             return configuration.isValid && keyStore.hasConfiguredKey
         }
     }

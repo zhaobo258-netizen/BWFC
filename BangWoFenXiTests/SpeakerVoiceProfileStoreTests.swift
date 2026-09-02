@@ -143,6 +143,32 @@ struct SpeakerVoiceProfileStoreTests {
         #expect(speaker.communicationProfile == communicationProfile)
     }
 
+    @Test("讯飞 feature id 与样本指纹跨会议持久化")
+    func iflytekVoiceprintFollowsAutomaticSpeaker() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SpeakerVoiceProfileStore(baseDirectory: root)
+        let profile = try store.enroll(
+            displayName: "王总",
+            role: nil,
+            colorToken: "blue",
+            sourceSampleURL: try sample(in: root),
+            durationMs: 3_000
+        )
+
+        try store.setIFlytekVoiceprint(
+            profileID: profile.id,
+            featureID: "feature-123",
+            sampleSHA256: "digest-456"
+        )
+
+        let persisted = try #require(store.loadForManagement().first)
+        let speaker = try #require(store.automaticSpeakers().first)
+        #expect(persisted.iflytekFeatureID == "feature-123")
+        #expect(persisted.iflytekSampleSHA256 == "digest-456")
+        #expect(speaker.iflytekFeatureID == "feature-123")
+    }
+
     @Test("人物库只有一个“我”，且会优先带入新录音")
     func currentUserIsUniqueAndAlwaysIncluded() throws {
         let root = try temporaryDirectory()

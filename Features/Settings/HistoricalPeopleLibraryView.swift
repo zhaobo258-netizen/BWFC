@@ -44,6 +44,7 @@ struct HistoricalPeopleLibraryView: View {
     @State private var editingProfile: SpeakerVoiceProfile?
     @State private var pendingDelete: SpeakerVoiceProfile?
     @State private var analyzingProfileID: UUID?
+    @State private var syncingIFlytekProfileID: UUID?
     @State private var samplePlayer = AudioPlaybackController()
 
     var body: some View {
@@ -127,6 +128,12 @@ struct HistoricalPeopleLibraryView: View {
                 systemImage: "exclamationmark.triangle.fill"
             )
             .foregroundStyle(.orange)
+        case .iflytek:
+            Label(
+                "讯飞支持历史声纹身份匹配；每个人需先用 10 秒清晰单人样本注册一次。",
+                systemImage: "checkmark.circle.fill"
+            )
+            .foregroundStyle(.green)
         case .disabled:
             Label(
                 "云端分人已关闭，历史声纹不会自动匹配。",
@@ -175,6 +182,26 @@ struct HistoricalPeopleLibraryView: View {
                     Text("关联 \(summary.projects.count) 场录音 · \(summary.attributedSegmentCount) 条归属发言 · \(summary.userConfirmedSegmentCount) 条人工确认 · 声纹 \(durationText(profile.sampleDurationMs))")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+                    if environment.diarizationProviderConfigurationStore.load().selectedProvider == .iflytek {
+                        if profile.iflytekFeatureID != nil,
+                           profile.iflytekSampleSHA256 != nil {
+                            Label("讯飞声纹已注册", systemImage: "checkmark.seal.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.green)
+                        } else if profile.iflytekFeatureID != nil {
+                            Label("本机样本已变更，需更新讯飞声纹", systemImage: "arrow.triangle.2.circlepath")
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                        } else if profile.sampleDurationMs < IFlytekVoiceprintService.minimumSampleDurationMs {
+                            Label("需重录到 10 秒才能注册讯飞声纹", systemImage: "exclamationmark.triangle")
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                        } else {
+                            Label("待注册讯飞声纹", systemImage: "waveform.badge.plus")
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                        }
+                    }
                 }
                 Spacer()
                 Toggle(
@@ -237,6 +264,21 @@ struct HistoricalPeopleLibraryView: View {
                         || summary.userConfirmedSegmentCount < 2
                         || !environment.isAnalysisConfigured
                 )
+                if environment.diarizationProviderConfigurationStore.load().selectedProvider == .iflytek {
+                    Button(
+                        syncingIFlytekProfileID == profile.id
+                            ? "正在同步…"
+                            : (profile.iflytekFeatureID == nil ? "注册讯飞声纹" : "更新讯飞声纹")
+                    ) {
+                        syncIFlytekVoiceprint(profile)
+                    }
+                    .disabled(
+                        syncingIFlytekProfileID != nil
+                            || !managementEnabled
+                            || profile.sampleDurationMs < IFlytekVoiceprintService.minimumSampleDurationMs
+                            || !environment.iflytekCredentialStore.hasConfiguredKey
+                    )
+                }
                 if !summary.projects.isEmpty, allowsProjectNavigation {
                     Menu("关联录音 \(summary.projects.count)") {
                         ForEach(summary.projects) { project in
@@ -461,6 +503,59 @@ struct HistoricalPeopleLibraryView: View {
         }
     }
 
+    private func syncIFlytekVoiceprint(_ profile: SpeakerVoiceProfile) {
+        let configuration = environment.diarizationProviderConfigurationStore.load()
+        guard configuration.selectedProvider == .iflytek,
+              configuration.isValid,
+              environment.iflytekCredentialStore.hasConfiguredKey else {
+            notice = "请先在「录音与说话人」中保存并测试讯飞配置。"
+            return
+        }
+        guard profile.sampleDurationMs >= IFlytekVoiceprintService.minimumSampleDurationMs,
+              let sampleURL = try? environment.fileStore.absoluteURL(
+                forRelativePath: profile.sampleRelativePath
+              ) else {
+            notice = "讯飞声纹需要 10 秒清晰单人说话样本，请在录音项目的「说话人」中重录。"
+            return
+        }
+        syncingIFlytekProfileID = profile.id
+        notice = nil
+        Task { @MainActor in
+            defer { syncingIFlytekProfileID = nil }
+            do {
+                let service = IFlytekVoiceprintService(
+                    appID: configuration.normalizedIFlytekAppID,
+                    credentialStore: environment.iflytekCredentialStore
+                )
+                let featureID: String
+                if let existing = profile.iflytekFeatureID {
+                    try await service.update(featureID: existing, sampleURL: sampleURL)
+                    featureID = existing
+                } else {
+                    featureID = try await service.register(sampleURL: sampleURL)
+                }
+                let digest = try IFlytekVoiceprintService.sampleSHA256(at: sampleURL)
+                try environment.speakerVoiceProfileStore.setIFlytekVoiceprint(
+                    profileID: profile.id,
+                    featureID: featureID,
+                    sampleSHA256: digest
+                )
+                guard let updated = try environment.speakerVoiceProfileStore
+                    .loadForManagement()
+                    .first(where: { $0.id == profile.id }) else {
+                    throw SpeakerVoiceProfileStoreError.profileNotFound
+                }
+                let projects = try environment.projectStore.loadProjects()
+                _ = HistoricalPersonLibrary.applyProfile(updated, to: projects)
+                try environment.projectStore.saveProjects(projects)
+                notice = "讯飞声纹已同步；下次录音会直接匹配这个人。"
+                reload()
+            } catch {
+                notice = "讯飞声纹同步失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
     private func deleteProfile(_ profile: SpeakerVoiceProfile) {
         let projects: [Project]
         do {
@@ -509,6 +604,7 @@ struct HistoricalPeopleLibraryView: View {
         var voiceSamplePath: String?
         var voiceSampleDurationMs: Int64?
         var voiceProfileID: UUID?
+        var iflytekFeatureID: String?
         var backgroundContext: String?
         var communicationProfile: SpeakerCommunicationProfile?
     }
@@ -529,6 +625,7 @@ struct HistoricalPeopleLibraryView: View {
                     voiceSamplePath: speaker.voiceSamplePath,
                     voiceSampleDurationMs: speaker.voiceSampleDurationMs,
                     voiceProfileID: speaker.voiceProfileId,
+                    iflytekFeatureID: speaker.iflytekFeatureID,
                     backgroundContext: speaker.backgroundContext,
                     communicationProfile: speaker.communicationProfile
                 )
@@ -553,6 +650,7 @@ struct HistoricalPeopleLibraryView: View {
             speaker.voiceSamplePath = snapshot.voiceSamplePath
             speaker.voiceSampleDurationMs = snapshot.voiceSampleDurationMs
             speaker.voiceProfileId = snapshot.voiceProfileID
+            speaker.iflytekFeatureID = snapshot.iflytekFeatureID
             speaker.backgroundContext = snapshot.backgroundContext
             speaker.communicationProfile = snapshot.communicationProfile
         }
