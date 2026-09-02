@@ -270,6 +270,43 @@ final class DiarizationControllerTests {
         #expect(controller.displayName(forRemoteLabel: labels[1]) == "待识别 B")
     }
 
+    @Test("分片重叠原话会把同一人稳定串起来")
+    func overlappingSpeechStitchesAcrossChunks() async throws {
+        mockDiarization.resultQueue = [
+            DiarizationChunkResult(durationMs: 20_000, segments: [
+                .init(
+                    startMs: 17_000,
+                    endMs: 20_000,
+                    text: "这是跨过分片边界的同一句话",
+                    speakerLabel: "speaker_0"
+                )
+            ]),
+            DiarizationChunkResult(durationMs: 20_000, segments: [
+                .init(
+                    startMs: 0,
+                    endMs: 2_000,
+                    text: "这是跨过分片边界的同一句话",
+                    speakerLabel: "speaker_9"
+                ),
+                .init(
+                    startMs: 2_100,
+                    endMs: 5_000,
+                    text: "后面还是这个人继续说",
+                    speakerLabel: "speaker_9"
+                )
+            ])
+        ]
+        try await startAll()
+        controller.produceChunks(uptoAudioMs: 40_000)
+        await controller.finishAndDrain(uptoAudioMs: 38_000)
+
+        let labels = Set(meeting.segments.compactMap(\.remoteSpeakerLabel))
+        #expect(labels == [
+            SpeakerMapper.scopedRemoteLabel("speaker_0", chunkIndex: 0)
+        ])
+        #expect(controller.displayName(forRemoteLabel: labels.first) == "待识别 A")
+    }
+
     @Test("未在本次请求发送样本的 alias 不得映射为已知说话人")
     func unsentAliasDoesNotMap() async throws {
         mockDiarization.resultQueue = [

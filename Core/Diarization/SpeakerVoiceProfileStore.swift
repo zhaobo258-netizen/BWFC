@@ -12,6 +12,7 @@ struct SpeakerVoiceProfile: Identifiable, Codable, Sendable, Equatable {
     var updatedAt: Date
     var backgroundContext: String? = nil
     var communicationProfile: SpeakerCommunicationProfile? = nil
+    var isCurrentUser: Bool? = nil
 }
 
 enum SpeakerVoiceProfileStoreError: Error, Equatable {
@@ -143,6 +144,7 @@ final class SpeakerVoiceProfileStore: @unchecked Sendable {
         let createdAt = existingIndex.map { profiles[$0].createdAt } ?? now
         let backgroundContext = existingIndex.flatMap { profiles[$0].backgroundContext }
         let communicationProfile = existingIndex.flatMap { profiles[$0].communicationProfile }
+        let isCurrentUser = existingIndex.flatMap { profiles[$0].isCurrentUser }
         let profile = SpeakerVoiceProfile(
             id: id,
             displayName: displayName.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -154,7 +156,8 @@ final class SpeakerVoiceProfileStore: @unchecked Sendable {
             createdAt: createdAt,
             updatedAt: now,
             backgroundContext: backgroundContext,
-            communicationProfile: communicationProfile
+            communicationProfile: communicationProfile,
+            isCurrentUser: isCurrentUser
         )
         if let existingIndex {
             profiles[existingIndex] = profile
@@ -226,6 +229,23 @@ final class SpeakerVoiceProfileStore: @unchecked Sendable {
         }
         profiles[index].isAutoEnabled = enabled
         profiles[index].updatedAt = now
+        try saveUnlocked(profiles)
+    }
+
+    func setCurrentUser(profileID: UUID?, now: Date = Date()) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        var profiles = try loadUnlocked(sampleValidation: .structure)
+        if let profileID,
+           !profiles.contains(where: { $0.id == profileID }) {
+            throw SpeakerVoiceProfileStoreError.profileNotFound
+        }
+        for index in profiles.indices {
+            let selected = profiles[index].id == profileID
+            guard profiles[index].isCurrentUser != selected else { continue }
+            profiles[index].isCurrentUser = selected
+            profiles[index].updatedAt = now
+        }
         try saveUnlocked(profiles)
     }
 
@@ -308,8 +328,13 @@ final class SpeakerVoiceProfileStore: @unchecked Sendable {
 
     func automaticSpeakers() throws -> [Speaker] {
         try load()
-            .filter { $0.isAutoEnabled }
-            .sorted { $0.updatedAt > $1.updatedAt }
+            .filter { $0.isAutoEnabled || $0.isCurrentUser == true }
+            .sorted {
+                if ($0.isCurrentUser == true) != ($1.isCurrentUser == true) {
+                    return $0.isCurrentUser == true
+                }
+                return $0.updatedAt > $1.updatedAt
+            }
             .prefix(Self.maximumAutoEnabledProfiles)
             .enumerated()
             .map { index, profile in
@@ -323,7 +348,8 @@ final class SpeakerVoiceProfileStore: @unchecked Sendable {
                     voiceSampleDurationMs: profile.sampleDurationMs,
                     voiceProfileId: profile.id,
                     backgroundContext: profile.backgroundContext,
-                    communicationProfile: profile.communicationProfile
+                    communicationProfile: profile.communicationProfile,
+                    isCurrentUser: profile.isCurrentUser
                 )
             }
     }

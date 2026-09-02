@@ -11,12 +11,13 @@ struct SpeakerAssignSheet: View {
     let anchorText: String
     let isAnalysisItem: Bool
     let canAlsoAssignTranscript: Bool
-    let onPickExisting: (Speaker, Bool) -> Bool
-    let onCreate: (String, String?, Bool) -> Bool
+    let onPickExisting: (Speaker, Bool, Bool) -> Bool
+    let onCreate: (String, String?, Bool, Bool) -> Bool
 
     @State private var newName: String = ""
     @State private var newRole: String = ""
     @State private var alsoAssignTranscript = false
+    @State private var assignAllUnconfirmed = false
 
     private var trimmedName: String {
         newName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -45,11 +46,25 @@ struct SpeakerAssignSheet: View {
                     .font(.caption)
             }
 
+            if !isAnalysisItem {
+                Toggle("将本录音里其余未确认发言也标为此人", isOn: $assignAllUnconfirmed)
+                    .font(.caption)
+                if assignAllUnconfirmed {
+                    Text("仅在这段录音主要由同一人发言时使用；已经人工确认给其他人的发言不会被覆盖。")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+            }
+
             if !speakers.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
                     ForEach(speakers) { speaker in
                         Button {
-                            if onPickExisting(speaker, alsoAssignTranscript) {
+                            if onPickExisting(
+                                speaker,
+                                alsoAssignTranscript,
+                                assignAllUnconfirmed
+                            ) {
                                 dismiss()
                             }
                         } label: {
@@ -109,7 +124,12 @@ struct SpeakerAssignSheet: View {
     private func createIfValid() {
         guard !trimmedName.isEmpty else { return }
         let role = newRole.trimmingCharacters(in: .whitespacesAndNewlines)
-        if onCreate(trimmedName, role.isEmpty ? nil : role, alsoAssignTranscript) {
+        if onCreate(
+            trimmedName,
+            role.isEmpty ? nil : role,
+            alsoAssignTranscript,
+            assignAllUnconfirmed
+        ) {
             dismiss()
         }
     }

@@ -6,7 +6,7 @@ struct SettingsView: View {
         case ai = "大模型与 AI"
         case knowledge = "MCP 与知识源"
         case lexicon = "词库与纠错"
-        case people = "历史人物库"
+        case people = "人物库与我的背景"
         case recording = "录音与说话人"
         case storage = "存储与隐私"
 

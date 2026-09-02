@@ -211,14 +211,15 @@ struct ProjectWorkspaceView: View {
                     anchorText: request.anchorText,
                     isAnalysisItem: request.isAnalysisItem,
                     canAlsoAssignTranscript: request.source.transcriptSegmentId != nil,
-                    onPickExisting: { speaker, alsoAssignTranscript in
+                    onPickExisting: { speaker, alsoAssignTranscript, assignAllUnconfirmed in
                         performSpeakerAssign(
                             request: request,
                             speaker: speaker,
-                            alsoAssignTranscript: alsoAssignTranscript
+                            alsoAssignTranscript: alsoAssignTranscript,
+                            assignAllUnconfirmed: assignAllUnconfirmed
                         )
                     },
-                    onCreate: { name, role, alsoAssignTranscript in
+                    onCreate: { name, role, alsoAssignTranscript, assignAllUnconfirmed in
                         let speaker = Speaker(
                             cloudAlias: SpeakerPanelLogic.nextCloudAlias(existing: project.speakers),
                             displayName: name,
@@ -230,7 +231,8 @@ struct ProjectWorkspaceView: View {
                         let didAssign = performSpeakerAssign(
                             request: request,
                             speaker: speaker,
-                            alsoAssignTranscript: alsoAssignTranscript
+                            alsoAssignTranscript: alsoAssignTranscript,
+                            assignAllUnconfirmed: assignAllUnconfirmed
                         )
                         if !didAssign {
                             project.speakers.removeAll { $0.id == speaker.id }
@@ -935,7 +937,7 @@ struct ProjectWorkspaceView: View {
                 onGlobalCorrect: { wrong, right in
                     globalCorrect(wrong: wrong, right: right, meeting: meeting)
                 },
-                onRequestNewSpeaker: { segment in
+                onRequestSpeakerAssignment: { segment in
                     speakerAssignRequest = SpeakerAssignRequest(
                         source: .transcript(segmentId: segment.id),
                         anchorText: String(segment.text.prefix(80))
@@ -1951,11 +1953,16 @@ struct ProjectWorkspaceView: View {
     private func performSpeakerAssign(
         request: SpeakerAssignRequest,
         speaker: Speaker,
-        alsoAssignTranscript: Bool
+        alsoAssignTranscript: Bool,
+        assignAllUnconfirmed: Bool
     ) -> Bool {
         switch request.source {
         case .transcript(let segmentId):
-            return performTranscriptSpeakerAssign(anchorSegmentId: segmentId, speaker: speaker)
+            return performTranscriptSpeakerAssign(
+                anchorSegmentId: segmentId,
+                speaker: speaker,
+                includeAllUnconfirmed: assignAllUnconfirmed
+            )
         case .analysisItem(let itemId, let uniqueEvidenceSegmentId):
             guard let project, let meeting,
                   analysis?.currentSnapshot?.items.contains(where: { $0.id == itemId }) == true else {
@@ -2008,7 +2015,11 @@ struct ProjectWorkspaceView: View {
 
     /// 指认落地：回填同标签历史片段 + 自动提取声纹 + 前向匹配。
     /// 声纹提取失败不阻断指认（回填仍生效，样本可后续手录）。
-    private func performTranscriptSpeakerAssign(anchorSegmentId: UUID, speaker: Speaker) -> Bool {
+    private func performTranscriptSpeakerAssign(
+        anchorSegmentId: UUID,
+        speaker: Speaker,
+        includeAllUnconfirmed: Bool = false
+    ) -> Bool {
         guard let project, let meeting else { return false }
         // 指认操作永远作用在权威片段上（meeting.segments 与运行时是同一批实例；
         // 回看场景 transcription 为空，meeting.segments 即持久化片段的运行时拷贝）
@@ -2022,7 +2033,8 @@ struct ProjectWorkspaceView: View {
             anchorSegmentId: anchorSegmentId,
             speaker: speaker,
             segments: segments,
-            pauseIntervals: meeting.pauseIntervals
+            pauseIntervals: meeting.pauseIntervals,
+            includeAllUnconfirmed: includeAllUnconfirmed
         )
 
         guard persistAndRefresh(meeting) else {
@@ -2116,6 +2128,7 @@ struct ProjectWorkspaceView: View {
             speaker.voiceSampleDurationMs = profile.sampleDurationMs
             speaker.backgroundContext = profile.backgroundContext
             speaker.communicationProfile = profile.communicationProfile
+            speaker.isCurrentUser = profile.isCurrentUser
             reviewNotice = profile.isAutoEnabled
                 ? "已标注并记住 \(speaker.displayName) 的声纹；正在回查本场历史发言。"
                 : "已保存 \(speaker.displayName) 的永久声纹；自动识别名额已满，本场仍会回查历史发言。"
@@ -2455,6 +2468,20 @@ struct ProjectWorkspaceView: View {
                     // 复查失败不阻断——转写保持原样，总结照常生成。
                     await reviewTranscriptAfterRecording(meeting: meeting)
                     environment.finalReportCoordinator.start(projectID: projectID)
+                    if let project {
+                        Task {
+                            do {
+                                if let count = try await environment
+                                    .refreshCurrentUserCommunicationProfile(
+                                        from: project
+                                    ) {
+                                    reviewNotice = "已从 \(count) 条人工确认原话更新“我”的表达画像，下次对话会继续使用。"
+                                }
+                            } catch {
+                                reviewNotice = "录音已安全结束；“我”的表达画像本次未更新，可在人物库重试。"
+                            }
+                        }
+                    }
                 } else {
                     // 静默跳过会让人误以为「完整总结」功能缺失；必须说清原因和补救入口
                     operationError = "AI 未连接，完整总结未生成；可前往设置连接后在「完整总结」页签手动生成。"

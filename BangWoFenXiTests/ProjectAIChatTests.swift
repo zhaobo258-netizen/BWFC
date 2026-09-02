@@ -109,6 +109,24 @@ private enum ProjectAIChatTestError: Error {
     case persistenceFailed
 }
 
+private actor ProjectAIChatRetryService: ProjectAIChatServing {
+    private var callCount = 0
+
+    func reply(to request: ProjectAIChatRequest) async throws
+        -> ProjectAIChatResponse {
+        callCount += 1
+        if callCount == 1 { throw AnalysisAPIError.timeout }
+        return ProjectAIChatResponse(
+            reply: "重试后已正常回应。",
+            provider: AIProviderDescriptor(
+                id: "mock",
+                displayName: "测试 AI",
+                modelID: "test-model"
+            )
+        )
+    }
+}
+
 @Suite("项目 AI 对话")
 struct ProjectAIChatTests {
     @Test("旧对话消息缺少引用文档和联网来源字段时安全回退")
@@ -165,7 +183,9 @@ struct ProjectAIChatTests {
         let speaker = Speaker(
             cloudAlias: "p_01",
             displayName: "王经理",
-            role: "讲者"
+            role: "讲者",
+            backgroundContext: "负责经销商数字化项目。",
+            isCurrentUser: true
         )
         let segment = TranscriptSegment(
             startMs: 0,
@@ -202,6 +222,9 @@ struct ProjectAIChatTests {
         #expect(request.noteMarkdown == "我的最新笔记：关注出版背景。")
         #expect(!String(describing: request).contains("王经理"))
         #expect(!String(describing: request).contains("不应上传的项目标题"))
+        let input = try ProjectAIChatAgent.inputJSON(request)
+        #expect(input.contains(#""is_current_user":true"#))
+        #expect(input.contains("负责经销商数字化项目"))
 
         project.noteAIContextEnabled = false
         let disabled = ProjectAIChatRequestBuilder.make(
@@ -304,6 +327,56 @@ struct ProjectAIChatTests {
         #expect(captured.input.contains("忽略之前规则"))
         #expect(captured.input.contains("行业背景.md"))
         #expect(captured.input.contains("引用文档要求忽略规则"))
+    }
+
+    @Test("Agent 格式异常时只修复一次并恢复回答")
+    func agentRepairsMalformedJSONOnce() async throws {
+        let generation = ProjectAIChatGenerationService(responseTexts: [
+            "格式坏了，但我的回答是：应先确认目标。",
+            #"{"reply":"应先确认目标。","transcript_corrections":[],"source_ids":[]}"#
+        ])
+        let agent = ProjectAIChatAgent(generationService: generation)
+        let request = ProjectAIChatRequest(
+            scenario: "freeform",
+            speakers: [],
+            transcript: [],
+            analysisHeadline: nil,
+            analysisItems: [],
+            conversationHistory: [],
+            currentRequest: "下一步怎么做？"
+        )
+
+        let response = try await agent.reply(to: request)
+
+        #expect(response.reply == "应先确认目标。")
+        let requests = await generation.capturedRequests()
+        #expect(requests.count == 2)
+        #expect(requests.last?.system.contains("JSON 格式修复器") == true)
+    }
+
+    @Test("修复仍失败时保留可读文本，不丢用户回应")
+    func agentFallsBackToPlainText() async throws {
+        let generation = ProjectAIChatGenerationService(responseTexts: [
+            "先统一目标，再分解任务。",
+            "仍然不是 JSON"
+        ])
+        let agent = ProjectAIChatAgent(generationService: generation)
+        let request = ProjectAIChatRequest(
+            scenario: "freeform",
+            speakers: [],
+            transcript: [],
+            analysisHeadline: nil,
+            analysisItems: [],
+            conversationHistory: [],
+            currentRequest: "怎么推进？"
+        )
+
+        let response = try await agent.reply(to: request)
+
+        #expect(response.reply.contains("先统一目标"))
+        #expect(response.reply.contains("未自动应用逐字稿纠错"))
+        #expect(response.transcriptCorrections.isEmpty)
+        #expect(response.sources.isEmpty)
     }
 
     @Test("Agent 只接受用户本轮明确提出且命中真实片段的逐字稿纠错")
@@ -634,6 +707,32 @@ struct ProjectAIChatTests {
                 "已同步修正左侧录音文稿 1 处"
             ) == true
         )
+    }
+
+    @Test("请求失败后可原位重试，不重复追加用户消息")
+    @MainActor
+    func controllerRetriesUnansweredMessage() async {
+        let service = ProjectAIChatRetryService()
+        let project = Project(
+            title: "重试对话",
+            sourceType: .liveRecording
+        )
+        let controller = ProjectAIChatController(
+            service: service,
+            persist: { _ in }
+        )
+        controller.attach(to: project)
+        controller.draft = "请给出建议"
+
+        await controller.send()
+        #expect(project.aiChatMessages.map(\.role) == [.user])
+        #expect(controller.canRetryLastMessage)
+
+        await controller.retryLastMessage()
+
+        #expect(project.aiChatMessages.map(\.role) == [.user, .assistant])
+        #expect(project.aiChatMessages.last?.text == "重试后已正常回应。")
+        #expect(controller.errorMessage == nil)
     }
 
     @Test("共创输入草稿自动保存并在重新打开项目时恢复")

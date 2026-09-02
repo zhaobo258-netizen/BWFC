@@ -34,7 +34,8 @@ enum ConversationAnalysisInputAssembler {
                     id: $0.cloudAlias,
                     role: $0.role?.isEmpty == false ? $0.role : nil,
                     backgroundContext: $0.backgroundContext,
-                    communicationProfile: $0.communicationProfile?.summary
+                    communicationProfile: $0.communicationProfile?.summary,
+                    isCurrentUser: $0.isCurrentUser == true
                 )
             },
             previousState: previousSnapshot.map { snapshot in
@@ -125,11 +126,13 @@ enum ConversationAnalysisInputAssembler {
         let role: String?
         let backgroundContext: String?
         let communicationProfile: String?
+        let isCurrentUser: Bool
 
         enum CodingKeys: String, CodingKey {
             case id, role
             case backgroundContext = "background_context"
             case communicationProfile = "communication_profile"
+            case isCurrentUser = "is_current_user"
         }
     }
 

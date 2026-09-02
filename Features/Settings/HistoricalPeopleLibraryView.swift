@@ -12,7 +12,7 @@ struct HistoricalPeopleLibraryPage: View {
                     Label("返回项目", systemImage: "chevron.left")
                 }
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("历史人物库")
+                    Text("人物库与我的背景")
                         .font(.title3)
                         .fontWeight(.bold)
                     Text("声纹 · 关联录音 · 人工背景 · 表达与沟通画像")
@@ -83,7 +83,7 @@ struct HistoricalPeopleLibraryView: View {
     }
 
     private var statusSection: some View {
-        Section("历史人物库") {
+        Section("人物库") {
             HStack(spacing: 22) {
                 LabeledContent("人物档案", value: "\(summaries.count) 人")
                 LabeledContent(
@@ -96,7 +96,7 @@ struct HistoricalPeopleLibraryView: View {
                 Label("录音进行中可查看和试听；结束录音后才能修改或删除人物档案。", systemImage: "lock.fill")
                     .foregroundStyle(.orange)
             }
-            Text("在任意录音文稿中点击「标注说话人」，确认一次后会自动提取 2–10 秒单人样本并写入这里。支持已知声纹的服务还会立即回查整场未确认发言，并在下次录音自动带入人物。")
+            Text("这里是全局人物主档；录音里的“本场人物”只引用它，不是另一套人物。将一人设为“我”后，经你确认的背景与有原话证据的表达画像会继续用于下次 AI 对话。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
             if invalidLibrary {
@@ -167,6 +167,11 @@ struct HistoricalPeopleLibraryView: View {
                     Text(profile.role ?? "未填写角色")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    if profile.isCurrentUser == true {
+                        Label("这是我 · AI 连续上下文", systemImage: "person.crop.circle.fill.badge.checkmark")
+                            .font(.caption2)
+                            .foregroundStyle(BWTheme.accent)
+                    }
                     Text("关联 \(summary.projects.count) 场录音 · \(summary.attributedSegmentCount) 条归属发言 · \(summary.userConfirmedSegmentCount) 条人工确认 · 声纹 \(durationText(profile.sampleDurationMs))")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -215,6 +220,10 @@ struct HistoricalPeopleLibraryView: View {
                 Button("试听声纹") { playSample(profile) }
                 Button("编辑人物档案") { editingProfile = profile }
                     .disabled(!managementEnabled)
+                Button(profile.isCurrentUser == true ? "这是我" : "设为我") {
+                    setCurrentUser(profile)
+                }
+                .disabled(!managementEnabled)
                 Button(
                     analyzingProfileID == profile.id
                         ? "正在分析…"
@@ -282,6 +291,28 @@ struct HistoricalPeopleLibraryView: View {
             notice = "每场最多自动识别 4 人，请先关闭一位。"
         } catch {
             notice = "自动识别状态未保存：\(error.localizedDescription)"
+        }
+    }
+
+    private func setCurrentUser(_ profile: SpeakerVoiceProfile) {
+        do {
+            try environment.speakerVoiceProfileStore.setCurrentUser(
+                profileID: profile.id
+            )
+            let updatedProfiles = try environment.speakerVoiceProfileStore
+                .loadForManagement()
+            let projects = try environment.projectStore.loadProjects()
+            for updated in updatedProfiles {
+                _ = HistoricalPersonLibrary.applyProfile(
+                    updated,
+                    to: projects
+                )
+            }
+            try environment.projectStore.saveProjects(projects)
+            notice = "已设为“我”；人工背景与可核验表达画像会用于后续 AI 对话。"
+            reload()
+        } catch {
+            notice = "“我”的设置未完整保存：\(error.localizedDescription)"
         }
     }
 

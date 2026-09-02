@@ -78,6 +78,48 @@ final class ProjectHomeSupportTests {
         #expect(ProjectHomeSupport.normalizedBusinessCategory("  ") == nil)
     }
 
+    @Test("业务项目选项按最近使用排序，搜索并复用已有名称")
+    func businessProjectPickerOptions() {
+        let old = makeProject(
+            title: "旧录音",
+            lastActivityAt: Date(timeIntervalSince1970: 100)
+        )
+        old.businessCategory = "河北文旅"
+        let recent = makeProject(
+            title: "新录音",
+            lastActivityAt: Date(timeIntervalSince1970: 300)
+        )
+        recent.businessCategory = "经销商培训"
+        let duplicate = makeProject(
+            title: "同组",
+            lastActivityAt: Date(timeIntervalSince1970: 200)
+        )
+        duplicate.businessCategory = "  河北文旅  "
+
+        let options = ProjectHomeSupport.businessCategoryOptions(
+            from: [old, recent, duplicate]
+        )
+        #expect(options.map(\.name) == ["经销商培训", "河北文旅"])
+        #expect(options.last?.projectCount == 2)
+        #expect(
+            ProjectHomeSupport.businessCategoryOptions(
+                from: [old, recent, duplicate],
+                search: "文旅"
+            ).map(\.name) == ["河北文旅"]
+        )
+        #expect(
+            ProjectHomeSupport.canonicalBusinessCategory(
+                "河北文旅",
+                projects: [old, recent]
+            ) == "河北文旅"
+        )
+        #expect(
+            ProjectHomeSupport.normalizedBusinessCategory(
+                "  新   业务  "
+            ) == "新 业务"
+        )
+    }
+
     @Test("跨录音合并保持顺序、来源、原始时间戳与独立副本")
     func combinedAnalysisKeepsProvenance() throws {
         let firstDate = Date(timeIntervalSince1970: 1_000)

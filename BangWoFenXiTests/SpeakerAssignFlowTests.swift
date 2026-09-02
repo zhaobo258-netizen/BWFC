@@ -138,6 +138,32 @@ struct SpeakerAssignFlowTests {
         #expect(another.participantId == nil)
     }
 
+    @Test("用户明确选择后可一次标注全部未确认发言")
+    func assignAllUnconfirmedWhenExplicitlyRequested() {
+        let me = UUID()
+        let other = UUID()
+        let anchor = segment(startMs: 0, endMs: 2_000, label: "spk_a")
+        let anotherLabel = segment(startMs: 3_000, endMs: 5_000, label: "spk_b")
+        let protected = segment(
+            startMs: 6_000,
+            endMs: 8_000,
+            participantId: other,
+            label: "spk_c"
+        )
+        protected.speakerWasUserConfirmed = true
+
+        let outcome = SpeakerBackfill.assign(
+            anchorSegmentId: anchor.id,
+            to: me,
+            segments: [anchor, anotherLabel, protected],
+            includeAllUnconfirmed: true
+        )
+
+        #expect(Set(outcome.changedSegmentIds) == [anchor.id, anotherLabel.id])
+        #expect(anotherLabel.participantId == me)
+        #expect(protected.participantId == other)
+    }
+
     @Test("锚点允许改判（已有归属的锚点直接换人）")
     func backfillAnchorReassign() {
         let me = UUID(), wrong = UUID()

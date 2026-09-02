@@ -26,6 +26,7 @@ enum SpeakerBackfill {
         anchorSegmentId: UUID,
         to speakerId: UUID,
         segments: [TranscriptSegment],
+        includeAllUnconfirmed: Bool = false,
         now: Date = Date()
     ) -> Outcome {
         guard let anchor = segments.first(where: { $0.id == anchorSegmentId }) else {
@@ -36,7 +37,10 @@ enum SpeakerBackfill {
         for segment in segments {
             let isAnchor = segment.id == anchorSegmentId
             let sameLabel = label != nil && segment.remoteSpeakerLabel == label
-            guard isAnchor || sameLabel else { continue }
+            let eligibleUnconfirmed = includeAllUnconfirmed
+                && segment.speakerWasUserConfirmed != true
+                && (segment.state == .final || segment.state == .edited)
+            guard isAnchor || sameLabel || eligibleUnconfirmed else { continue }
             // 另一位用户明确确认过的片段不能被一次批量操作覆盖；锚点允许改判。
             if !isAnchor,
                segment.speakerWasUserConfirmed == true,

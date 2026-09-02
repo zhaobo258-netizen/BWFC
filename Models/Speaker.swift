@@ -32,6 +32,8 @@ final class Speaker: Identifiable, Codable {
     var backgroundContext: String?
     /// 基于已标注原话生成的可观察表达与沟通画像。
     var communicationProfile: SpeakerCommunicationProfile?
+    /// 全局人物库中经用户确认的“我”，供 AI 跨项目读取连续上下文。
+    var isCurrentUser: Bool?
 
     init(
         id: UUID = UUID(),
@@ -47,7 +49,8 @@ final class Speaker: Identifiable, Codable {
         voiceSampleDurationMs: Int64? = nil,
         voiceProfileId: UUID? = nil,
         backgroundContext: String? = nil,
-        communicationProfile: SpeakerCommunicationProfile? = nil
+        communicationProfile: SpeakerCommunicationProfile? = nil,
+        isCurrentUser: Bool? = nil
     ) {
         self.id = id
         self.cloudAlias = cloudAlias
@@ -63,5 +66,6 @@ final class Speaker: Identifiable, Codable {
         self.voiceProfileId = voiceProfileId
         self.backgroundContext = backgroundContext
         self.communicationProfile = communicationProfile
+        self.isCurrentUser = isCurrentUser
     }
 }

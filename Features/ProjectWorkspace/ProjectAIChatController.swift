@@ -45,6 +45,10 @@ final class ProjectAIChatController {
             )
     }
 
+    var canRetryLastMessage: Bool {
+        !isSending && errorMessage != nil && messages.last?.role == .user
+    }
+
     init(
         service: any ProjectAIChatServing,
         persist: @escaping (Project) throws -> Void
@@ -162,6 +166,34 @@ final class ProjectAIChatController {
         messages = project.aiChatMessages
         setDraftWithoutAutosave("")
         pendingAttachments = []
+        await perform(request, project: project)
+    }
+
+    func retryLastMessage() async {
+        guard canRetryLastMessage,
+              let project,
+              let message = project.aiChatMessages.last,
+              message.role == .user else { return }
+        if prepareRequestContext?() == false {
+            errorMessage = "最新录音文稿保存失败，尚未重试。"
+            return
+        }
+        let request = ProjectAIChatRequestBuilder.make(
+            project: project,
+            currentRequest: message.text,
+            noteMarkdown: noteContextProvider(),
+            currentAttachments: message.attachments,
+            relatedProjects: relatedProjectsProvider(),
+            webSearchEnabled: isWebSearchEnabled,
+            excludingMessageID: message.id
+        )
+        await perform(request, project: project)
+    }
+
+    private func perform(
+        _ request: ProjectAIChatRequest,
+        project: Project
+    ) async {
         errorMessage = nil
         draftSaveError = nil
         isSending = true
@@ -190,7 +222,7 @@ final class ProjectAIChatController {
         } catch let error as AnalysisAPIError {
             errorMessage = Self.message(for: error)
         } catch {
-            errorMessage = "AI 共创暂不可用，请稍后重试。"
+            errorMessage = "AI 共创暂不可用，消息已保存，可直接重试。"
         }
     }
 
@@ -285,6 +317,8 @@ final class ProjectAIChatController {
             return "AI 回应超时，可稍后重试。"
         case .rateLimited:
             return "AI 请求已达到额度或频率限制，请稍后重试。"
+        case .invalidResponse:
+            return "AI 返回格式异常，消息已保存，可直接重试。"
         default:
             return error.localizedDescription
         }

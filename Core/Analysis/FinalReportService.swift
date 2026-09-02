@@ -21,11 +21,13 @@ struct ProjectAIContext: Sendable {
         var role: String?
         var backgroundContext: String?
         var communicationProfile: String?
+        var isCurrentUser: Bool
 
         enum CodingKeys: String, CodingKey {
             case id, role
             case backgroundContext = "background_context"
             case communicationProfile = "communication_profile"
+            case isCurrentUser = "is_current_user"
         }
     }
 
@@ -124,7 +126,8 @@ enum ProjectAIContextBuilder {
                     id: $0.cloudAlias,
                     role: $0.role,
                     backgroundContext: $0.backgroundContext,
-                    communicationProfile: $0.communicationProfile?.summary
+                    communicationProfile: $0.communicationProfile?.summary,
+                    isCurrentUser: $0.isCurrentUser == true
                 )
             },
             evidenceItems: validatedAnalysisItems.map {

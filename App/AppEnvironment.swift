@@ -247,6 +247,43 @@ final class AppEnvironment {
         pendingProjectWarnings.removeValue(forKey: projectID)
     }
 
+    func refreshCurrentUserCommunicationProfile(
+        from project: Project
+    ) async throws -> Int? {
+        guard let speaker = project.speakers.first(where: {
+            $0.isCurrentUser == true && $0.voiceProfileId != nil
+        }), let profileID = speaker.voiceProfileId else {
+            return nil
+        }
+        let projects = try projectStore.loadProjects()
+        let evidence = HistoricalPersonLibrary.communicationEvidence(
+            profileID: profileID,
+            projects: projects
+        )
+        guard evidence.count >= 2 else { return nil }
+        let profiles = try speakerVoiceProfileStore.loadForManagement()
+        guard let current = profiles.first(where: { $0.id == profileID }) else {
+            throw SpeakerVoiceProfileStoreError.profileNotFound
+        }
+        let generated = try await SpeakerCommunicationProfileAgent(
+            generationService: aiProviderRegistry
+        ).analyze(
+            profileID: profileID,
+            backgroundContext: current.backgroundContext,
+            previousProfile: current.communicationProfile,
+            evidence: evidence
+        )
+        try speakerVoiceProfileStore.updateContext(
+            profileID: profileID,
+            backgroundContext: current.backgroundContext,
+            communicationProfile: generated
+        )
+        speaker.backgroundContext = current.backgroundContext
+        speaker.communicationProfile = generated
+        try persist(project, fields: .speakers)
+        return evidence.count
+    }
+
     /// 音频采集（阶段 1：AVAudioEngine 实现）
     let audioCapture: any AudioCaptureServicing
     /// 本地转写（阶段 2 实现）

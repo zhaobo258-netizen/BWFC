@@ -38,6 +38,71 @@ struct SpeakerMapper: Sendable {
         "chunk:\(chunkIndex):\(remoteLabel)"
     }
 
+    /// 相邻分片对同一段重叠发言给出足够证据时，沿用上一分片的
+    /// 本地稳定标签。这个标签一旦被人工指认，历史回填和后续分片都可复用。
+    static func stitchedRemoteLabels(
+        for segments: [DiarizationChunkResult.Segment],
+        chunkIndex: Int,
+        wallStartMs: Int64,
+        existingSegments: [TranscriptSegment]
+    ) -> [String: String] {
+        let rawLabels = Set(segments.compactMap { segment in
+            segment.speakerLabel?.isEmpty == false ? segment.speakerLabel : nil
+        })
+        guard !rawLabels.isEmpty else { return [:] }
+
+        let candidates = existingSegments.filter {
+            $0.source == .cloud
+                && $0.remoteSpeakerLabel?.isEmpty == false
+                && $0.endMs >= wallStartMs - 2_500
+        }
+        var resolved: [String: String] = [:]
+        var claimedStableLabels = Set<String>()
+
+        for rawLabel in rawLabels.sorted() {
+            let current = segments.filter { $0.speakerLabel == rawLabel }
+            var best: (label: String, score: Double)?
+            for incoming in current {
+                let incomingStart = wallStartMs + incoming.startMs
+                let incomingEnd = wallStartMs + incoming.endMs
+                for existing in candidates {
+                    guard let stableLabel = existing.remoteSpeakerLabel,
+                          !claimedStableLabels.contains(stableLabel) else {
+                        continue
+                    }
+                    let overlap = TranscriptReconciler.overlapMs(
+                        startA: incomingStart,
+                        endA: incomingEnd,
+                        startB: existing.startMs,
+                        endB: existing.endMs
+                    )
+                    guard overlap > 0 else { continue }
+                    let shorter = max(
+                        1,
+                        min(incomingEnd - incomingStart, existing.endMs - existing.startMs)
+                    )
+                    let overlapRatio = Double(overlap) / Double(shorter)
+                    let textSimilarity = TranscriptText.similarity(
+                        incoming.text,
+                        existing.text
+                    )
+                    guard overlapRatio >= 0.35, textSimilarity >= 0.45 else {
+                        continue
+                    }
+                    let score = overlapRatio * 0.6 + textSimilarity * 0.4
+                    if best == nil || score > best!.score {
+                        best = (stableLabel, score)
+                    }
+                }
+            }
+            let stableLabel = best?.label
+                ?? scopedRemoteLabel(rawLabel, chunkIndex: chunkIndex)
+            resolved[rawLabel] = stableLabel
+            claimedStableLabels.insert(stableLabel)
+        }
+        return resolved
+    }
+
     /// 解析结果
     enum Resolution: Equatable, Sendable {
         /// 已映射到参会人

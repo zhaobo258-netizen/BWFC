@@ -91,6 +91,16 @@ final class DiarizationController {
         self.meeting = meeting
         self.timelineProvider = timelineProvider
         self.mapper = SpeakerMapper(participants: meeting.participants)
+        let validParticipantIDs = Set(meeting.participants.map(\.id))
+        for segment in meeting.segments {
+            guard let label = segment.remoteSpeakerLabel else { continue }
+            mapper.register(remoteLabel: label)
+            if segment.speakerWasUserConfirmed == true,
+               let participantID = segment.participantId,
+               validParticipantIDs.contains(participantID) {
+                mapper.assign(remoteLabel: label, to: participantID)
+            }
+        }
         suspensionCause = nil
 
         let store = ChunkQueueStore(fileURL: fileStore.chunkQueueFileURL(for: meeting.id))
@@ -172,8 +182,8 @@ final class DiarizationController {
     }
 
     /// 手工指认云端标签归属（09 号计划需求 2）。
-    /// generic label 已按 chunk 加作用域，仅回填该次请求的同标签片段；
-    /// 后续分片要等声纹样本作为 known alias 真实发送后才稳定映射。
+    /// generic label 在有相邻分片重叠证据时会沿用本地稳定标签；
+    /// 因此一次人工指认可同时回填旧片段，并约束后续能证明同一人的分片。
     func assignRemoteLabel(_ label: String, to participantId: UUID) {
         mapper.assign(remoteLabel: label, to: participantId)
     }
@@ -422,6 +432,15 @@ final class DiarizationController {
         knownAliases: Set<String>,
         for entry: ChunkQueueEntry
     ) throws {
+        let stitchedLabels = SpeakerMapper.stitchedRemoteLabels(
+            for: result.segments.filter {
+                guard let label = $0.speakerLabel else { return false }
+                return !knownAliases.contains(label)
+            },
+            chunkIndex: entry.index,
+            wallStartMs: entry.wallStartMs,
+            existingSegments: meeting?.segments ?? []
+        )
         for segment in result.segments {
             let storedLabel: String?
             let participantId: UUID?
@@ -433,14 +452,14 @@ final class DiarizationController {
                 storedLabel = label
                 participantId = knownParticipantId
             } else if let label = segment.speakerLabel, !label.isEmpty {
-                // generic label 不保证跨请求一致，必须按 chunk 隔离。
-                let scopedLabel = SpeakerMapper.scopedRemoteLabel(
-                    label,
-                    chunkIndex: entry.index
-                )
-                storedLabel = scopedLabel
-                mapper.register(remoteLabel: scopedLabel)
-                if case .known(let id) = mapper.resolve(remoteLabel: scopedLabel) {
+                let stableLabel = stitchedLabels[label]
+                    ?? SpeakerMapper.scopedRemoteLabel(
+                        label,
+                        chunkIndex: entry.index
+                    )
+                storedLabel = stableLabel
+                mapper.register(remoteLabel: stableLabel)
+                if case .known(let id) = mapper.resolve(remoteLabel: stableLabel) {
                     participantId = id
                 } else {
                     participantId = nil

@@ -3,6 +3,14 @@ import UniformTypeIdentifiers
 
 /// 首页列表的纯逻辑（可单测）：排序与一行摘要。
 enum ProjectHomeSupport {
+    struct BusinessCategoryOption: Identifiable, Equatable {
+        let name: String
+        let projectCount: Int
+        let lastActivityAt: Date
+
+        var id: String { name.localizedLowercase }
+    }
+
     struct DisplayGroup: Identifiable {
         let businessCategory: String?
         let projects: [Project]
@@ -94,8 +102,63 @@ enum ProjectHomeSupport {
     }
 
     static func normalizedBusinessCategory(_ raw: String?) -> String? {
-        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = raw?
+            .replacingOccurrences(
+                of: #"\s+"#,
+                with: " ",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         return (trimmed?.isEmpty ?? true) ? nil : trimmed
+    }
+
+    static func businessCategoryOptions(
+        from projects: [Project],
+        search: String = ""
+    ) -> [BusinessCategoryOption] {
+        let grouped = Dictionary(grouping: projects.compactMap { project in
+            normalizedBusinessCategory(project.businessCategory).map {
+                (name: $0, project: project)
+            }
+        }) { $0.name.localizedLowercase }
+        let query = search.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        return grouped.compactMap { _, values in
+            guard let displayName = values
+                .max(by: { $0.project.lastActivityAt < $1.project.lastActivityAt })?
+                .name else { return nil }
+            guard query.isEmpty
+                    || displayName.localizedStandardContains(query) else {
+                return nil
+            }
+            return BusinessCategoryOption(
+                name: displayName,
+                projectCount: values.count,
+                lastActivityAt: values.map(\.project.lastActivityAt).max()
+                    ?? .distantPast
+            )
+        }
+        .sorted {
+            $0.lastActivityAt == $1.lastActivityAt
+                ? $0.name.localizedStandardCompare($1.name) == .orderedAscending
+                : $0.lastActivityAt > $1.lastActivityAt
+        }
+    }
+
+    static func canonicalBusinessCategory(
+        _ raw: String?,
+        projects: [Project]
+    ) -> String? {
+        guard let normalized = normalizedBusinessCategory(raw) else {
+            return nil
+        }
+        return businessCategoryOptions(from: projects).first {
+            $0.name.compare(
+                normalized,
+                options: [.caseInsensitive, .diacriticInsensitive]
+            ) == .orderedSame
+        }?.name ?? normalized
     }
 
     static func isEligibleForMerge(_ project: Project) -> Bool {

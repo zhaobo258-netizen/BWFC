@@ -54,12 +54,14 @@ enum SpeakerAssignPlanner {
         speaker: Speaker,
         segments: [TranscriptSegment],
         pauseIntervals: [PauseInterval],
+        includeAllUnconfirmed: Bool = false,
         now: Date = Date()
     ) -> Plan {
         let outcome = SpeakerBackfill.assign(
             anchorSegmentId: anchorSegmentId,
             to: speaker.id,
             segments: segments,
+            includeAllUnconfirmed: includeAllUnconfirmed,
             now: now
         )
         // 已有声纹样本不覆盖（用户手录的样本质量优先）

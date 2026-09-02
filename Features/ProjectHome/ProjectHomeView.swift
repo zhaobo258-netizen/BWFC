@@ -20,7 +20,6 @@ struct ProjectHomeView: View {
     @State private var renameTarget: Project?
     @State private var renameDraft = ""
     @State private var groupingTarget: Project?
-    @State private var groupingDraft = ""
     @State private var isSelectingForMerge = false
     @State private var selectedMergeProjectIDs: Set<UUID> = []
     @State private var deleteTarget: Project?
@@ -90,15 +89,14 @@ struct ProjectHomeView: View {
         } message: {
             Text("只改标题，不影响录音文件与已生成的分析。")
         }
-        .alert("归入业务项目", isPresented: Binding(
-            get: { groupingTarget != nil },
-            set: { if !$0 { groupingTarget = nil } }
-        )) {
-            TextField("业务项目或业务范畴名称", text: $groupingDraft)
-            Button("保存") { commitBusinessGrouping() }
-            Button("取消", role: .cancel) { groupingTarget = nil }
-        } message: {
-            Text("输入已有名称可归入同一组；输入新名称会创建新的业务项目。")
+        .sheet(item: $groupingTarget) { project in
+            BusinessProjectPickerSheet(
+                project: project,
+                projects: projects,
+                onSelect: { category in
+                    commitBusinessGrouping(project, category: category)
+                }
+            )
         }
         .confirmationDialog(
             "删除这个项目？",
@@ -435,7 +433,6 @@ struct ProjectHomeView: View {
                             },
                             onGroup: {
                                 groupingTarget = project
-                                groupingDraft = project.businessCategory ?? ""
                             },
                             onRemoveFromGroup: project.businessCategory == nil ? nil : {
                                 removeFromBusinessGrouping(project)
@@ -511,10 +508,15 @@ struct ProjectHomeView: View {
         reload()
     }
 
-    private func commitBusinessGrouping() {
-        guard let project = groupingTarget else { return }
+    private func commitBusinessGrouping(
+        _ project: Project,
+        category rawCategory: String?
+    ) {
         groupingTarget = nil
-        let category = ProjectHomeSupport.normalizedBusinessCategory(groupingDraft)
+        let category = ProjectHomeSupport.canonicalBusinessCategory(
+            rawCategory,
+            projects: projects
+        )
         guard category != project.businessCategory else { return }
         project.businessCategory = category
         project.lastActivityAt = Date()
@@ -681,6 +683,113 @@ struct ProjectHomeView: View {
                 importErrorMessage = "导入失败：\(error.localizedDescription)"
             }
         }
+    }
+}
+
+private struct BusinessProjectPickerSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    let project: Project
+    let projects: [Project]
+    let onSelect: (String?) -> Void
+
+    @State private var search = ""
+    @State private var newName = ""
+    @State private var isCreating = false
+
+    private var options: [ProjectHomeSupport.BusinessCategoryOption] {
+        ProjectHomeSupport.businessCategoryOptions(
+            from: projects,
+            search: search
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("归入业务项目")
+                        .font(.headline)
+                    Text(project.title)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                Button("取消") { dismiss() }
+            }
+            .padding(16)
+            Divider()
+
+            List {
+                Section("现有业务项目 · 最近使用优先") {
+                    if options.isEmpty {
+                        Text(search.isEmpty ? "还没有业务项目" : "没有匹配的业务项目")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(options) { option in
+                            Button {
+                                choose(option.name)
+                            } label: {
+                                HStack {
+                                    Image(systemName: "folder.fill")
+                                        .foregroundStyle(BWTheme.accent)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(option.name)
+                                        Text("已有 \(option.projectCount) 条录音")
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if ProjectHomeSupport.normalizedBusinessCategory(
+                                        project.businessCategory
+                                    ) == option.name {
+                                        Image(systemName: "checkmark")
+                                            .foregroundStyle(BWTheme.accent)
+                                    }
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+
+                Section {
+                    Button {
+                        isCreating.toggle()
+                        if isCreating && newName.isEmpty { newName = search }
+                    } label: {
+                        Label("新建业务项目", systemImage: "folder.badge.plus")
+                    }
+                    if isCreating {
+                        HStack {
+                            TextField("输入新名称", text: $newName)
+                            Button("创建并归入") {
+                                choose(newName)
+                            }
+                            .disabled(
+                                ProjectHomeSupport.normalizedBusinessCategory(
+                                    newName
+                                ) == nil
+                            )
+                        }
+                    }
+                    if project.businessCategory != nil {
+                        Button("移出当前业务项目") {
+                            choose(nil)
+                        }
+                    }
+                }
+            }
+            .searchable(text: $search, prompt: "搜索已有业务项目")
+        }
+        .frame(width: 520, height: 440)
+    }
+
+    private func choose(_ category: String?) {
+        onSelect(category)
+        dismiss()
     }
 }
 

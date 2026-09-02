@@ -143,6 +143,32 @@ struct SpeakerVoiceProfileStoreTests {
         #expect(speaker.communicationProfile == communicationProfile)
     }
 
+    @Test("人物库只有一个“我”，且会优先带入新录音")
+    func currentUserIsUniqueAndAlwaysIncluded() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SpeakerVoiceProfileStore(baseDirectory: root)
+        var profiles: [SpeakerVoiceProfile] = []
+        for index in 0..<5 {
+            profiles.append(try store.enroll(
+                displayName: "人物\(index)",
+                role: nil,
+                colorToken: "gray",
+                sourceSampleURL: try sample(in: root),
+                durationMs: 3_000
+            ))
+        }
+
+        try store.setCurrentUser(profileID: profiles[4].id)
+
+        let managed = try store.loadForManagement()
+        #expect(managed.filter { $0.isCurrentUser == true }.map(\.id) == [profiles[4].id])
+        let automatic = try store.automaticSpeakers()
+        #expect(automatic.count == 4)
+        #expect(automatic.first?.voiceProfileId == profiles[4].id)
+        #expect(automatic.first?.isCurrentUser == true)
+    }
+
     @Test("只允许四个永久声纹自动参加新会议，第五个明确拒绝启用")
     func autoEnabledLimitIsExplicit() throws {
         let root = try temporaryDirectory()

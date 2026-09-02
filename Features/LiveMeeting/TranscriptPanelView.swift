@@ -88,8 +88,8 @@ struct TranscriptPanelView: View {
     var onToggleStar: ((TranscriptSegment) -> Void)?
     /// 全局纠错（错词, 正词）→ 由父视图执行替换、持久化并记住规则
     var onGlobalCorrect: ((String, String) -> Int)?
-    /// 新建说话人并指认（09 号计划需求 2：工作台弹层编排回填+自动声纹；nil 时菜单不显示）
-    var onRequestNewSpeaker: ((TranscriptSegment) -> Void)?
+    /// 打开完整指认弹层：可选已有/新建人物，并显式批量标注未确认发言。
+    var onRequestSpeakerAssignment: ((TranscriptSegment) -> Void)?
     /// 合并分析项目用：展示该片段来自哪段原始录音及其原始时间戳。
     var sourceRecordingTitle: ((TranscriptSegment) -> String?)? = nil
     var sourceRecordingStartMs: ((TranscriptSegment) -> Int64)? = nil
@@ -294,10 +294,10 @@ struct TranscriptPanelView: View {
                     onAssignSpeaker?(segment, nil)
                 }
             }
-            if onRequestNewSpeaker != nil {
-                Button("新建说话人并指认…") {
+            if onRequestSpeakerAssignment != nil {
+                Button("指认或批量标注…") {
                     guard let segment = segment(for: row) else { return }
-                    onRequestNewSpeaker?(segment)
+                    onRequestSpeakerAssignment?(segment)
                 }
             }
         }

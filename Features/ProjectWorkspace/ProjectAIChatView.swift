@@ -354,6 +354,13 @@ struct ProjectAIChatView: View {
             Image(systemName: "exclamationmark.circle")
             Text(text)
                 .lineLimit(2)
+            if controller.canRetryLastMessage {
+                Spacer()
+                Button("重试") {
+                    Task { await controller.retryLastMessage() }
+                }
+                .controlSize(.mini)
+            }
             if text.contains("设置") {
                 Spacer()
                 Button("前往设置", action: onOpenSettings)

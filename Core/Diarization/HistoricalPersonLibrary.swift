@@ -114,6 +114,7 @@ enum HistoricalPersonLibrary {
                 speaker.colorToken = profile.colorToken
                 speaker.backgroundContext = profile.backgroundContext
                 speaker.communicationProfile = profile.communicationProfile
+                speaker.isCurrentUser = profile.isCurrentUser
                 updated += 1
             }
         }
@@ -135,6 +136,7 @@ enum HistoricalPersonLibrary {
                 }
                 speaker.backgroundContext = nil
                 speaker.communicationProfile = nil
+                speaker.isCurrentUser = nil
                 updated += 1
             }
         }

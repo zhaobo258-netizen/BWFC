@@ -150,6 +150,34 @@ struct SpeakerMapperTests {
         #expect(first == SpeakerMapper.scopedRemoteLabel("speaker_0", chunkIndex: 3))
         #expect(first != SpeakerMapper.scopedRemoteLabel("speaker_0", chunkIndex: 4))
     }
+
+    @Test("相邻分片有重叠原话时沿用稳定说话人标签")
+    func stitchesOverlappingGenericLabels() {
+        let stable = SpeakerMapper.scopedRemoteLabel("speaker_0", chunkIndex: 3)
+        let existing = TranscriptSegment(
+            startMs: 19_000,
+            endMs: 21_000,
+            text: "这段话跨过了分片边界",
+            remoteSpeakerLabel: stable,
+            source: .cloud,
+            state: .final
+        )
+        let labels = SpeakerMapper.stitchedRemoteLabels(
+            for: [
+                .init(
+                    startMs: 0,
+                    endMs: 2_000,
+                    text: "这段话跨过了分片边界",
+                    speakerLabel: "speaker_7"
+                )
+            ],
+            chunkIndex: 4,
+            wallStartMs: 19_000,
+            existingSegments: [existing]
+        )
+
+        #expect(labels["speaker_7"] == stable)
+    }
 }
 
 /// 声音样本校验：2–10 秒 + 有效音量（实施计划 7.5）

@@ -85,7 +85,7 @@ struct SpeakerPanelView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("说话人与声纹")
+                Text("本场人物与声纹")
                     .font(.headline)
                 Spacer()
                 Button("完成") { dismiss() }
@@ -96,7 +96,7 @@ struct SpeakerPanelView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("为每位说话人录一段 2–10 秒的声音样本，云端识别会把发言自动匹配到对应的人。样本只保存在本机；云端只见代号（\(project.speakers.map(\.cloudAlias).joined(separator: "、")))，不见姓名。")
+                    Text("上面是本场人物；下面的人物库是跨录音的全局档案，可直接加入本场，不再重复建人。声纹样本只保存在本机；云端只见代号（\(project.speakers.map(\.cloudAlias).joined(separator: "、")))，不见姓名。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -131,7 +131,7 @@ struct SpeakerPanelView: View {
 
                     if !voiceProfiles.isEmpty {
                         Divider().padding(.vertical, 4)
-                        Text("跨会议自动识别")
+                        Text("人物库（跨录音复用）")
                             .font(.subheadline)
                             .fontWeight(.semibold)
                         Text("当前服务每场最多自动匹配 4 个永久声纹。关闭自动使用不会删除样本。")
@@ -390,6 +390,11 @@ struct SpeakerPanelView: View {
                 Text(profile.role ?? "未填写角色")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+                if profile.isCurrentUser == true {
+                    Label("这是我 · AI 连续上下文", systemImage: "person.crop.circle.fill.badge.checkmark")
+                        .font(.caption2)
+                        .foregroundStyle(BWTheme.accent)
+                }
                 if profileLibraryHasValidationFailure {
                     Text("样本需试听确认；失效时请更新或删除")
                         .font(.caption2)
@@ -413,6 +418,10 @@ struct SpeakerPanelView: View {
             .help("修正永久姓名与角色")
             Button("沟通画像") {
                 contextProfile = profile
+            }
+            .buttonStyle(.bordered)
+            Button(profile.isCurrentUser == true ? "这是我" : "设为我") {
+                setCurrentUser(profile)
             }
             .buttonStyle(.bordered)
             Button(profile.isAutoEnabled ? "自动使用中" : "设为自动") {
@@ -477,6 +486,7 @@ struct SpeakerPanelView: View {
             speaker.voiceSampleDurationMs = profile.sampleDurationMs
             speaker.backgroundContext = profile.backgroundContext
             speaker.communicationProfile = profile.communicationProfile
+            speaker.isCurrentUser = profile.isCurrentUser
             profileNotice = profile.isAutoEnabled
                 ? "已保存为永久声纹，后续新录音会自动带入。"
                 : "已保存；自动名额已满，可先关闭一个现有声纹再启用。"
@@ -494,6 +504,22 @@ struct SpeakerPanelView: View {
             reloadProfiles()
         } catch {
             profileNotice = profileErrorText(error)
+        }
+    }
+
+    private func setCurrentUser(_ profile: SpeakerVoiceProfile) {
+        do {
+            try environment.speakerVoiceProfileStore.setCurrentUser(
+                profileID: profile.id
+            )
+            for speaker in project.speakers {
+                speaker.isCurrentUser = speaker.voiceProfileId == profile.id
+            }
+            changed()
+            reloadProfiles()
+            profileNotice = "已设为“我”；人工背景与可核验表达画像会用于后续 AI 对话。"
+        } catch {
+            profileNotice = "“我”的设置未保存（\(profileErrorText(error))）"
         }
     }
 
@@ -517,7 +543,8 @@ struct SpeakerPanelView: View {
             voiceSampleDurationMs: profile.sampleDurationMs,
             voiceProfileId: profile.id,
             backgroundContext: profile.backgroundContext,
-            communicationProfile: profile.communicationProfile
+            communicationProfile: profile.communicationProfile,
+            isCurrentUser: profile.isCurrentUser
         )
         project.speakers.append(speaker)
         changed()
@@ -644,6 +671,7 @@ struct SpeakerPanelView: View {
                 }
                 linked.backgroundContext = nil
                 linked.communicationProfile = nil
+                linked.isCurrentUser = nil
                 changed()
             }
             reloadProfiles()
@@ -663,6 +691,7 @@ struct SpeakerPanelView: View {
         speaker.voiceSampleDurationMs = profile.sampleDurationMs
         speaker.backgroundContext = profile.backgroundContext
         speaker.communicationProfile = profile.communicationProfile
+        speaker.isCurrentUser = profile.isCurrentUser
         changed()
         profileNotice = "已将 \(profile.displayName) 加入本场识别。"
     }

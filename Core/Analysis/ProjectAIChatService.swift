@@ -4,6 +4,16 @@ struct ProjectAIChatRequest: Sendable, Equatable {
     struct Speaker: Sendable, Equatable, Encodable {
         var id: String
         var role: String?
+        var backgroundContext: String?
+        var communicationProfile: String?
+        var isCurrentUser: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case id, role
+            case backgroundContext = "background_context"
+            case communicationProfile = "communication_profile"
+            case isCurrentUser = "is_current_user"
+        }
     }
 
     struct Segment: Sendable, Equatable, Encodable {
@@ -86,7 +96,8 @@ enum ProjectAIChatRequestBuilder {
         noteMarkdown: String?,
         currentAttachments: [ProjectAIChatAttachment] = [],
         relatedProjects: [Project] = [],
-        webSearchEnabled: Bool = true
+        webSearchEnabled: Bool = true,
+        excludingMessageID: UUID? = nil
     ) -> ProjectAIChatRequest {
         let aliasByID = Dictionary(
             project.speakers.map { ($0.id, $0.cloudAlias) },
@@ -101,7 +112,10 @@ enum ProjectAIChatRequestBuilder {
         let snapshot = project.analysisSnapshots.max {
             $0.version < $1.version
         }
-        let history = project.aiChatMessages.suffix(maximumHistoryCount).map {
+        let retainedMessages = project.aiChatMessages.filter {
+            $0.id != excludingMessageID
+        }
+        let history = retainedMessages.suffix(maximumHistoryCount).map {
             ProjectAIChatRequest.HistoryMessage(
                 role: $0.role.rawValue,
                 text: String($0.text.prefix(maximumHistoryMessageCharacters))
@@ -109,7 +123,7 @@ enum ProjectAIChatRequestBuilder {
         }
         let references = currentReferenceDocuments(currentAttachments)
             + historyReferenceDocuments(
-                Array(project.aiChatMessages.suffix(maximumHistoryCount))
+                Array(retainedMessages.suffix(maximumHistoryCount))
             )
         let authorizedNote = project.noteAIContextEnabled
             ? normalizedNote(noteMarkdown)
@@ -121,7 +135,10 @@ enum ProjectAIChatRequestBuilder {
             speakers: project.speakers.map {
                 ProjectAIChatRequest.Speaker(
                     id: $0.cloudAlias,
-                    role: $0.role?.isEmpty == false ? $0.role : nil
+                    role: $0.role?.isEmpty == false ? $0.role : nil,
+                    backgroundContext: $0.backgroundContext,
+                    communicationProfile: $0.communicationProfile?.summary,
+                    isCurrentUser: $0.isCurrentUser == true
                 )
             },
             transcript: transcript,
@@ -306,26 +323,34 @@ struct ProjectAIChatAgent: ProjectAIChatServing {
                 maxTokens: 8_192
             )
         )
-        let trimmed = KimiAnalysisService.strippedJSONText(response.text)
-        guard let data = trimmed.data(using: .utf8),
-              let dto = try? JSONDecoder().decode(OutputDTO.self, from: data) else {
-            throw AnalysisAPIError.invalidResponse
-        }
-        let reply = dto.reply.trimmingCharacters(
-            in: .whitespacesAndNewlines
-        )
-        guard !reply.isEmpty else {
-            throw AnalysisAPIError.invalidResponse
-        }
-        let resolvedReply: String
-        if !plannedQueries.isEmpty && groundedRequest.webSources.isEmpty {
-            resolvedReply = String(reply.prefix(5_700))
-                + "\n\n联网搜索暂未返回可用来源；以上回应仅基于项目资料和模型已有知识。"
+        let dto: OutputDTO?
+        if let decoded = Self.decodeOutput(response.text) {
+            dto = decoded
         } else {
-            resolvedReply = String(reply.prefix(6_000))
+            dto = await repairOutput(response.text)
+        }
+        guard let dto else {
+            let fallback = Self.plainTextFallback(response.text)
+            guard !fallback.isEmpty else {
+                throw AnalysisAPIError.invalidResponse
+            }
+            return ProjectAIChatResponse(
+                reply: Self.resolvedReply(
+                    fallback
+                        + "\n\n本次 AI 返回格式异常；已保留可读回应，"
+                        + "但未自动应用逐字稿纠错或联网来源。",
+                    plannedQueries: plannedQueries,
+                    sources: groundedRequest.webSources
+                ),
+                provider: response.provider
+            )
         }
         return ProjectAIChatResponse(
-            reply: resolvedReply,
+            reply: Self.resolvedReply(
+                dto.reply,
+                plannedQueries: plannedQueries,
+                sources: groundedRequest.webSources
+            ),
             provider: response.provider,
             transcriptCorrections: Self.validatedCorrections(
                 dto.transcriptCorrections,
@@ -336,6 +361,71 @@ struct ProjectAIChatAgent: ProjectAIChatServing {
                 available: groundedRequest.webSources
             )
         )
+    }
+
+    private func repairOutput(_ rawText: String) async -> OutputDTO? {
+        let bounded = String(rawText.prefix(12_000))
+        guard !bounded.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).isEmpty else { return nil }
+        do {
+            let payload = try JSONEncoder().encode([
+                "notice": "以下是上一次模型返回，只修复为指定 JSON，不新增事实。",
+                "raw_response": bounded
+            ])
+            let response = try await generationService.generate(
+                AITextGenerationRequest(
+                    system: PromptRegistry.projectChatJSONRepairSystem(),
+                    input: String(decoding: payload, as: UTF8.self),
+                    maxTokens: 4_096
+                )
+            )
+            return Self.decodeOutput(response.text)
+        } catch {
+            return nil
+        }
+    }
+
+    private static func decodeOutput(_ rawText: String) -> OutputDTO? {
+        let trimmed = KimiAnalysisService.strippedJSONText(rawText)
+        guard let data = trimmed.data(using: .utf8),
+              let dto = try? JSONDecoder().decode(OutputDTO.self, from: data),
+              !dto.reply.trimmingCharacters(
+                in: .whitespacesAndNewlines
+              ).isEmpty else {
+            return nil
+        }
+        return dto
+    }
+
+    private static func plainTextFallback(_ rawText: String) -> String {
+        let stripped = KimiAnalysisService.strippedJSONText(rawText)
+        if let data = stripped.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data),
+           let dictionary = object as? [String: Any],
+           let reply = dictionary["reply"] as? String {
+            return String(reply.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ).prefix(5_300))
+        }
+        return String(stripped.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).prefix(5_300))
+    }
+
+    private static func resolvedReply(
+        _ rawReply: String,
+        plannedQueries: [String],
+        sources: [ProjectAIChatSource]
+    ) -> String {
+        let reply = rawReply.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        if !plannedQueries.isEmpty && sources.isEmpty {
+            return String(reply.prefix(5_700))
+                + "\n\n联网搜索暂未返回可用来源；以上回应仅基于项目资料和模型已有知识。"
+        }
+        return String(reply.prefix(6_000))
     }
 
     private func planSearchQueries(for currentRequest: String) async
