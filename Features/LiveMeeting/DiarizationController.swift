@@ -516,7 +516,7 @@ final class DiarizationController {
             cloudState = .suspended(
                 reason: "声纹配置暂停：已配置 \(actual) 个声纹样本，单次分人最多支持 \(maximum) 个，本次未上传。修正后将自动继续。"
             )
-        case .invalidKnownSpeakerSample, .missingProviderVoiceprint:
+        case .invalidKnownSpeakerSample:
             queue[entryIndex].status = .pending
             suspensionCause = .knownSpeakerConfiguration
             cloudState = .suspended(

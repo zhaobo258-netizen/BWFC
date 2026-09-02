@@ -225,8 +225,6 @@ enum DiarizationAPIError: Error, Equatable {
     case invalidKnownSpeakerSample(alias: String, issue: KnownSpeakerSampleIssue)
     /// 当前 provider 只支持匿名分人，不支持已知人物声纹匹配。
     case knownSpeakerMatchingUnsupported
-    /// 已启用历史人物，但尚未注册讯飞声纹。
-    case missingProviderVoiceprint(alias: String)
     /// Provider 返回了可读的业务错误。
     case providerError(code: String, message: String)
 }
@@ -261,8 +259,6 @@ extension DiarizationAPIError: LocalizedError {
             }
         case .knownSpeakerMatchingUnsupported:
             return "当前分人服务只支持匿名说话人，不支持历史声纹身份匹配"
-        case .missingProviderVoiceprint(let alias):
-            return "说话人代号 \(alias) 尚未注册讯飞声纹"
         case .providerError(let code, let message):
             return "云端服务错误 \(code)：\(message)"
         }

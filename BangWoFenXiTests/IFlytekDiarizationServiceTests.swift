@@ -117,20 +117,98 @@ final class IFlytekDiarizationServiceTests {
         #expect(storage.capturedRequests.first?.value(forHTTPHeaderField: "signature")?.isEmpty == false)
     }
 
-    @Test("已启用人物缺少 feature id 时零请求并明确拒绝")
-    func missingVoiceprintDoesNotUpload() async throws {
+    @Test("人物未注册讯飞声纹时继续匿名分人")
+    func missingVoiceprintFallsBackToAnonymousDiarization() async throws {
         try saveCredentials()
         let chunk = try makeSilentWAV(durationMs: 1_000)
         defer { try? FileManager.default.removeItem(at: chunk) }
+        let best = #"{"st":{"bg":"0","ed":"800","rl":"1","rt":[{"ws":[{"cw":[{"w":"继续识别","wp":"n"}]}]}]}}"#
+        let orderData = try JSONSerialization.data(withJSONObject: [
+            "lattice": [["json_1best": best]]
+        ])
+        let orderResult = try #require(String(data: orderData, encoding: .utf8))
+        storage.requestHandler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil
+            )!
+            if request.url?.path == "/v2/upload" {
+                return (response, Data(#"{"code":"000000","descInfo":"success","content":{"orderId":"order-anonymous"}}"#.utf8))
+            }
+            let body = try JSONSerialization.data(withJSONObject: [
+                "code": "000000",
+                "descInfo": "success",
+                "content": [
+                    "orderInfo": ["status": 4, "originalDuration": 1_000],
+                    "orderResult": orderResult
+                ]
+            ])
+            return (response, body)
+        }
         let service = makeService()
 
-        await #expect(throws: DiarizationAPIError.missingProviderVoiceprint(alias: "p_01")) {
-            try await service.transcribeChunk(
-                at: chunk,
-                knownSpeakers: [KnownSpeakerReference(alias: "p_01", sampleURL: chunk)]
-            )
+        let result = try await service.transcribeChunk(
+            at: chunk,
+            knownSpeakers: [KnownSpeakerReference(alias: "p_01", sampleURL: chunk)]
+        )
+        #expect(result.segments.first?.speakerLabel == "speaker_1")
+        let uploadURL = try #require(storage.capturedRequests.first?.url)
+        let query = Dictionary(
+            uniqueKeysWithValues: (
+                URLComponents(url: uploadURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            ).map { ($0.name, $0.value ?? "") }
+        )
+        #expect(query["roleType"] == "1")
+        #expect(query["featureIds"] == nil)
+    }
+
+    @Test("部分人物未注册时只上传已注册声纹且角色顺序正确")
+    func mixedVoiceprintsUseRegisteredSpeakersOnly() async throws {
+        try saveCredentials()
+        let chunk = try makeSilentWAV(durationMs: 1_000)
+        defer { try? FileManager.default.removeItem(at: chunk) }
+        let best = #"{"st":{"bg":"0","ed":"800","rl":"1","rt":[{"ws":[{"cw":[{"w":"已注册人物","wp":"n"}]}]}]}}"#
+        let orderData = try JSONSerialization.data(withJSONObject: [
+            "lattice": [["json_1best": best]]
+        ])
+        let orderResult = try #require(String(data: orderData, encoding: .utf8))
+        storage.requestHandler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil
+            )!
+            if request.url?.path == "/v2/upload" {
+                return (response, Data(#"{"code":"000000","descInfo":"success","content":{"orderId":"order-mixed"}}"#.utf8))
+            }
+            let body = try JSONSerialization.data(withJSONObject: [
+                "code": "000000",
+                "descInfo": "success",
+                "content": [
+                    "orderInfo": ["status": 4, "originalDuration": 1_000],
+                    "orderResult": orderResult
+                ]
+            ])
+            return (response, body)
         }
-        #expect(storage.capturedRequests.isEmpty)
+
+        let result = try await makeService().transcribeChunk(
+            at: chunk,
+            knownSpeakers: [
+                KnownSpeakerReference(alias: "p_01", sampleURL: chunk),
+                KnownSpeakerReference(
+                    alias: "p_02",
+                    sampleURL: chunk,
+                    iflytekFeatureID: "feature-2"
+                )
+            ]
+        )
+        #expect(result.segments.first?.speakerLabel == "p_02")
+        let uploadURL = try #require(storage.capturedRequests.first?.url)
+        let query = Dictionary(
+            uniqueKeysWithValues: (
+                URLComponents(url: uploadURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            ).map { ($0.name, $0.value ?? "") }
+        )
+        #expect(query["roleType"] == "3")
+        #expect(query["featureIds"] == "feature-2")
     }
 
     @Test("连接测试不上传音频")

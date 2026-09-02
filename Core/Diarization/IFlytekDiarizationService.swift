@@ -299,10 +299,19 @@ struct IFlytekDiarizationService: DiarizationServicing, Sendable {
         at chunkURL: URL,
         knownSpeakers: [KnownSpeakerReference]
     ) async throws -> DiarizationChunkResult {
-        guard knownSpeakers.count <= 64 else {
+        let registeredSpeakers = knownSpeakers.compactMap {
+            reference -> (reference: KnownSpeakerReference, featureID: String)? in
+            guard let featureID = reference.iflytekFeatureID?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !featureID.isEmpty else {
+                return nil
+            }
+            return (reference, featureID)
+        }
+        guard registeredSpeakers.count <= 64 else {
             throw DiarizationAPIError.tooManyKnownSpeakers(
                 maximum: 64,
-                actual: knownSpeakers.count
+                actual: registeredSpeakers.count
             )
         }
         let credentials = try IFlytekCredentials.load(from: credentialStore)
@@ -317,15 +326,7 @@ struct IFlytekDiarizationService: DiarizationServicing, Sendable {
         guard !audioData.isEmpty, durationMs > 0 else {
             throw DiarizationAPIError.invalidResponse
         }
-        var featureIDs: [String] = []
-        for speaker in knownSpeakers {
-            guard let featureID = speaker.iflytekFeatureID?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-                  !featureID.isEmpty else {
-                throw DiarizationAPIError.missingProviderVoiceprint(alias: speaker.alias)
-            }
-            featureIDs.append(featureID)
-        }
+        let featureIDs = registeredSpeakers.map(\.featureID)
 
         let signatureRandom = randomString()
         let upload = try await upload(
@@ -336,12 +337,14 @@ struct IFlytekDiarizationService: DiarizationServicing, Sendable {
             signatureRandom: signatureRandom
         )
         let aliasesByRole = Dictionary(
-            uniqueKeysWithValues: knownSpeakers.enumerated().map {
-                (String($0.offset + 1), $0.element.alias)
+            uniqueKeysWithValues: registeredSpeakers.enumerated().map {
+                (String($0.offset + 1), $0.element.reference.alias)
             }
         )
         let aliasesByFeatureID = Dictionary(
-            uniqueKeysWithValues: zip(featureIDs, knownSpeakers.map(\.alias)).map { ($0, $1) }
+            uniqueKeysWithValues: registeredSpeakers.map {
+                ($0.featureID, $0.reference.alias)
+            }
         )
         for attempt in 0..<maximumPollCount {
             if attempt > 0 { await sleep(2_000) }
