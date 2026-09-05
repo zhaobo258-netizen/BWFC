@@ -448,8 +448,23 @@ final class DiarizationController {
         knownAliases: Set<String>,
         for entry: ChunkQueueEntry
     ) throws {
+        let timeline = timelineProvider?()
+        let mappedSegments = result.segments.map { segment in
+            var mapped = segment
+            let start = entry.audioStartMs + segment.startMs
+            let end = entry.audioStartMs + segment.endMs
+            mapped.startMs = (timeline?.wallMs(forEffectiveAudioMs: start)
+                ?? HistoricalSpeakerRelabeler.wallMs(
+                    forAudioMs: start, pauseIntervals: meeting?.pauseIntervals ?? []
+                )) - entry.wallStartMs
+            mapped.endMs = (timeline?.wallMs(forEffectiveAudioMs: end)
+                ?? HistoricalSpeakerRelabeler.wallMs(
+                    forAudioMs: end, pauseIntervals: meeting?.pauseIntervals ?? []
+                )) - entry.wallStartMs
+            return mapped
+        }
         let stitchedLabels = SpeakerMapper.stitchedRemoteLabels(
-            for: result.segments.filter {
+            for: mappedSegments.filter {
                 guard let label = $0.speakerLabel else { return false }
                 return !knownAliases.contains(label)
             },
@@ -457,7 +472,7 @@ final class DiarizationController {
             wallStartMs: entry.wallStartMs,
             existingSegments: meeting?.segments ?? []
         )
-        for segment in result.segments {
+        for segment in mappedSegments {
             let storedLabel: String?
             let participantId: UUID?
 

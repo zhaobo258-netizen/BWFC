@@ -239,6 +239,37 @@ final class FileTranscriptionRunnerTests {
         #expect(service.cancelCount >= 1)
     }
 
+    @Test("连续短读逐块送入，不覆盖已读音频或丢失帧")
+    func shortReadsPreserveEveryFrame() async throws {
+        let mock = MockLocalTranscriptionService()
+        mock.finishEndsStream = true
+        let url = try makeAudioFile(seconds: 0.1)
+        let runner = FileTranscriptionRunner(service: mock, readAudio: { file, buffer, requested in
+            try file.read(into: buffer, frameCount: min(requested, 600))
+        })
+        _ = try await runner.run(audioURL: url)
+        #expect(mock.fedFrameCount == 4_800)
+        #expect(mock.fedBufferCount == 8)
+    }
+
+    @Test("收尾错误返回失败并携带已得文稿，不能成为成功结果")
+    func finalizationFailurePreservesPartialResults() async throws {
+        let mock = MockLocalTranscriptionService()
+        mock.finishEndsStream = true
+        mock.finishError = .finalizationFailed
+        mock.finalResultsOnFinish = [
+            .init(startAudioMs: 0, endAudioMs: 100, text: "已保存的一句话", isFinal: true)
+        ]
+        let url = try makeAudioFile(seconds: 0.1)
+        do {
+            _ = try await FileTranscriptionRunner(service: mock).run(audioURL: url)
+            Issue.record("收尾失败不得返回成功")
+        } catch let failure as FileTranscriptionRunner.Failure {
+            #expect(failure.cause == .finalizationFailed)
+            #expect(failure.partialResults.map(\.text) == ["已保存的一句话"])
+        }
+    }
+
     private final class ProgressRecorder: @unchecked Sendable {
         private let lock = NSLock()
         private var storage: [Double] = []

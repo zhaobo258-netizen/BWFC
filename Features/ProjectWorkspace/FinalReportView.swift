@@ -7,6 +7,7 @@ struct FinalReportView: View {
     var onGenerate: () -> Void
     var onOpenSettings: () -> Void
     var onEvidenceTap: (UUID) -> Void
+    var relatedProjects: [Project] = []
 
     @State private var selectedReportID: UUID?
 
@@ -103,7 +104,7 @@ struct FinalReportView: View {
             .font(.caption2)
             .foregroundStyle(.tertiary)
 
-            if report.inputFingerprint != FinalReportFingerprint.make(for: project) {
+            if FinalReportFingerprint.isStale(report, for: project, relatedProjects: relatedProjects) {
                 HStack(spacing: 7) {
                     Image(systemName: "arrow.triangle.2.circlepath")
                     Text("文稿、说话人、场景或共创记录已变化，需要更新完整总结。旧版本仍可查看。")
@@ -204,6 +205,20 @@ struct FinalReportView: View {
 
     @ViewBuilder
     private var emptyReportState: some View {
+        if !project.hasUsableTranscript {
+            VStack(spacing: 10) {
+                Image(systemName: "waveform.badge.exclamationmark")
+                    .font(.title2)
+                Text("文稿尚不可用")
+                    .font(.headline)
+                Text("请在左侧先回听原音频、重新转写。获得可用文稿后再生成总结。")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 40)
+        } else {
         switch state {
         case .generating:
             VStack(spacing: 10) {
@@ -253,6 +268,7 @@ struct FinalReportView: View {
                     showsSettings: false
                 )
             }
+        }
         }
     }
 

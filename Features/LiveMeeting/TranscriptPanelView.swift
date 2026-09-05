@@ -82,6 +82,9 @@ struct TranscriptPanelView: View {
     /// 录音中的实时电平（0…1）。空态时把「已在录、收到声音了」放到用户正在看的位置，
     /// 而不是只留在窗口边缘的电平条上。非录音场景传 nil。
     var liveAudioLevel: Float?
+    var emptyTitle: String = "等待第一段发言"
+    var emptyDetail: String = "开始说话后，实时转写会显示在这里"
+    var onPlaySegment: ((TranscriptSegment) -> Void)?
     /// 编辑回调（由父视图持久化）
     var onAssignSpeaker: ((TranscriptSegment, Participant?) -> Void)?
     var onEditText: ((TranscriptSegment, String) -> Void)?
@@ -114,10 +117,10 @@ struct TranscriptPanelView: View {
                                 Image(systemName: "waveform")
                                     .font(.title2)
                                     .foregroundStyle(BWTheme.accent.opacity(0.75))
-                                Text("等待第一段发言")
+                                Text(emptyTitle)
                                     .font(.callout)
                                     .fontWeight(.medium)
-                                Text("开始说话后，实时转写会显示在这里")
+                                Text(emptyDetail)
                                     .font(.caption)
                                     .foregroundStyle(.tertiary)
                                 if let liveAudioLevel {
@@ -129,7 +132,16 @@ struct TranscriptPanelView: View {
                         }
                         ForEach(rows) { row in
                             TranscriptRowView(row: row)
+                                .onTapGesture(count: 2) {
+                                    if let segment = segments.first(where: { $0.id == row.id }) {
+                                        onPlaySegment?(segment)
+                                    }
+                                }
                                 .contextMenu {
+                                    if let onPlaySegment,
+                                       let segment = segments.first(where: { $0.id == row.id }) {
+                                        Button("从此处回听") { onPlaySegment(segment) }
+                                    }
                                     rowContextMenu(for: row)
                                 }
                         }

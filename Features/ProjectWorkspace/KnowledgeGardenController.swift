@@ -105,13 +105,14 @@ final class KnowledgeGardenController {
             Self.needsBloom($0) ? nil : $0.id
         })
         self.project = project
-        refreshCandidates()
+        state = .idle
+        refreshCandidates(scheduleAutomatic: false)
     }
 
     /// 种子数量上限（超限时只裁剪可丢弃的候选，绝不丢用户已收藏/已开花/选中的种子）
     static let maxSeeds = 12
 
-    func refreshCandidates() {
+    func refreshCandidates(scheduleAutomatic: Bool = true) {
         guard let project else { return }
         let previousIDs = project.knowledgeSeeds.map(\.id)
         var merged = project.knowledgeSeeds
@@ -151,11 +152,11 @@ final class KnowledgeGardenController {
             onUpdated?()
         }
         let previousIDSet = Set(previousIDs)
-        scheduleAutomaticBloom(
+        if scheduleAutomatic { scheduleAutomaticBloom(
             preferredIDs: merged.compactMap {
                 previousIDSet.contains($0.id) ? nil : $0.id
             }
-        )
+        ) }
     }
 
     func selectSeed(_ id: UUID) {
@@ -214,6 +215,7 @@ final class KnowledgeGardenController {
                 : nil,
             providers: providers
         )
+        guard self.project === project, !Task.isCancelled else { return }
         apply(
             outcomes: output.initialOutcomes,
             to: seedID,
@@ -257,7 +259,7 @@ final class KnowledgeGardenController {
 
     private func scheduleAutomaticBloom(preferredIDs: [UUID]) {
         guard automaticallyBloomNewSeeds else { return }
-        let orderedIDs = preferredIDs + seeds.map(\.id)
+        let orderedIDs = preferredIDs
         guard let candidateID = orderedIDs.first(where: { id in
             !automaticallyAttemptedSeedIDs.contains(id)
                 && seeds.first(where: { $0.id == id }).map(Self.needsBloom) == true

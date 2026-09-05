@@ -10,10 +10,17 @@ import AVFoundation
 /// 复用纪律：与 LocalTranscriptionController 相同的 reconciler 纯逻辑，
 /// 保证导入与实时两条链路的去重口径一致。
 struct FileTranscriptionRunner: Sendable {
+    struct Failure: Error {
+        var cause: LocalTranscriptionError
+        var partialResults: [LocalTranscriptResult]
+    }
     /// 每次喂入的帧块大小（约 0.68 秒 @48kHz；与实时采集缓冲同数量级）
     static let chunkFrameCount: AVAudioFrameCount = 32_768
 
     let service: any LocalTranscriptionServicing
+    var readAudio: @Sendable (AVAudioFile, AVAudioPCMBuffer, AVAudioFrameCount) throws -> Void = {
+        try $0.read(into: $1, frameCount: $2)
+    }
 
     /// 执行整篇转写。
     /// - Parameters:
@@ -56,20 +63,13 @@ struct FileTranscriptionRunner: Sendable {
                     ) else {
                         throw AudioImportError.extractionFailed
                     }
-                    // AVAudioFile.read 可能短读（血泪教训 #5）：循环读满或到文件尾
-                    while buffer.frameLength < buffer.frameCapacity,
-                          framesRead < totalFrames {
-                        let before = buffer.frameLength
-                        try file.read(
-                            into: buffer,
-                            frameCount: buffer.frameCapacity - buffer.frameLength
-                        )
-                        let readNow = buffer.frameLength - before
-                        if readNow == 0 { break } // 文件尾
-                        framesRead += AVAudioFramePosition(readNow)
+                    try readAudio(file, buffer, buffer.frameCapacity)
+                    guard buffer.frameLength > 0 else {
+                        throw AudioImportError.undecodable
                     }
-                    if buffer.frameLength == 0 { break }
+                    framesRead += AVAudioFramePosition(buffer.frameLength)
                     await service.feed(buffer)
+                    if let error = service.sessionError { throw error }
                     onProgress(
                         min(Double(framesRead) / Double(totalFrames), 1.0)
                     )
@@ -77,6 +77,7 @@ struct FileTranscriptionRunner: Sendable {
                 await service.finishSession()
                 _ = await collectTask.value
                 try Task.checkCancellation()
+                if let error = service.sessionError { throw error }
             } onCancel: {
                 collectTask.cancel()
                 Task {
@@ -91,15 +92,21 @@ struct FileTranscriptionRunner: Sendable {
             await service.cancelSession()
             collectTask.cancel()
             _ = await collectTask.value
+            if let error = error as? LocalTranscriptionError {
+                throw Failure(cause: error, partialResults: await collector.all())
+            }
             throw error
         }
 
         onProgress(1.0)
 
-        // 导入无暂停区间：音频时间即项目时间轴；reconciler 与实时链路同一去重口径
+        return Self.reconciledSegments(from: await collector.all())
+    }
+
+    static func reconciledSegments(from results: [LocalTranscriptResult]) -> [TranscriptSegment] {
         var reconciler = TranscriptReconciler()
         var segments: [TranscriptSegment] = []
-        for result in await collector.all() {
+        for result in results {
             let outcome = reconciler.applyFinal(
                 startMs: result.startAudioMs,
                 endMs: result.endAudioMs,

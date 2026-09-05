@@ -98,6 +98,34 @@ final class DiarizationControllerTests {
         }
     }
 
+    @Test("分片跨暂停时逐点恢复墙钟时间，与本地转写合并不重复")
+    func cloudChunkCrossingPauseUsesPerSegmentMapping() async throws {
+        let start = Date().addingTimeInterval(-60)
+        var paused = RecordingTimeline(startedAt: start)
+        try paused.beginPause(at: start.addingTimeInterval(10))
+        try paused.endPause(at: start.addingTimeInterval(30))
+        meeting.pauseIntervals = paused.intervals
+        let frozen = paused
+        try await transcriptController.start(for: meeting) { frozen }
+        controller.start(for: meeting) { frozen }
+        mockTranscription.emit(.init(startAudioMs: 12_000, endAudioMs: 15_000,
+                                    text: "暂停恢复后的原话", isFinal: true))
+        await waitUntil { self.meeting.segments.count == 1 }
+        mockDiarization.resultQueue = [
+            .init(durationMs: 20_000, segments: [
+                .init(startMs: 12_000, endMs: 15_000,
+                      text: "暂停恢复后的原话", speakerLabel: "speaker_0")
+            ])
+        ]
+        controller.produceChunks(uptoAudioMs: 20_000)
+        await controller.finishAndDrain(uptoAudioMs: 18_500)
+        #expect(meeting.segments.count == 1)
+        #expect(meeting.segments.first?.startMs == 32_000)
+        #expect(meeting.segments.first?.endMs == 35_000)
+        #expect(meeting.segments.first?.source == .cloud)
+        await transcriptController.cancel()
+    }
+
     @Test("分片产出：闭合窗口入队、文件生成、队列持久化")
     func chunkProduction() async throws {
         mockDiarization.delayMs = 600 // 让上传慢一点，先看出队列入队

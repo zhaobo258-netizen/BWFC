@@ -33,6 +33,23 @@ struct ImportPlannerTests {
         )
     }
 
+    @Test("导入分人位于转写之后，晚补分人会重建受影响分析")
+    func diarizationRunsBeforeAnalysis() {
+        let jobs = ImportPlanner.planJobs(
+            analysisConfigured: true, finalReportConfigured: true, diarizationConfigured: true
+        )
+        #expect(jobs.map(\.kind) == [.audioExtraction, .transcription, .diarization, .analysis, .finalReport])
+        var previous = ImportPlanner.planJobs(analysisConfigured: true, finalReportConfigured: true)
+        for index in previous.indices { previous[index].status = .completed }
+        let resumed = ImportPlanner.jobsForResume(
+            previous, analysisConfigured: true, finalReportConfigured: true, diarizationConfigured: true
+        )
+        #expect(resumed.first { $0.kind == .transcription }?.status == .completed)
+        #expect(resumed.first { $0.kind == .diarization }?.status == .pending)
+        #expect(resumed.first { $0.kind == .analysis }?.status == .pending)
+        #expect(resumed.first { $0.kind == .finalReport }?.status == .pending)
+    }
+
     // MARK: - 续跑
 
     @Test("续跑：running（崩溃遗留）与 failedRetryable 回 pending，completed 不动")

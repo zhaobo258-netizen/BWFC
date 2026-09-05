@@ -132,6 +132,70 @@ final class MeetingFileStoreTests {
             == vault.appending(path: "帮我分析", directoryHint: .isDirectory))
     }
 
+    @Test("已选 Vault 授权失效时拒绝切到另一可写目录")
+    func invalidVaultAuthorizationDoesNotCreateFallbackStore() throws {
+        let suite = "bwfx-vault-regression-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let invalidBookmark = Data([0x01, 0x02, 0x03])
+        defaults.set(invalidBookmark, forKey: AppStorageLocation.bookmarkDefaultsKey)
+
+        #expect(throws: AppStorageLocationError.obsidianAccessUnavailable) {
+            _ = try AppStorageLocation.resolveDefault(userDefaults: defaults)
+        }
+        #expect(defaults.data(forKey: AppStorageLocation.bookmarkDefaultsKey) == invalidBookmark)
+    }
+
+    @Test("恢复原 Vault 只验证现有项目库，不修改或迁移文件")
+    func reconnectingVaultOnlyValidatesExistingData() throws {
+        let vault = makeCaseDirectory("reconnect")
+        try FileManager.default.createDirectory(
+            at: vault.appending(path: ".obsidian"), withIntermediateDirectories: true
+        )
+        let directory = AppStorageLocation.storageDirectory(inVault: vault)
+        let project = Project(title: "原录音", sourceType: .liveRecording)
+        try JSONProjectStore(directory: directory).saveProjects([project])
+        let index = directory.appending(path: "projects.json")
+        let original = try Data(contentsOf: index)
+        let files = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+
+        #expect(try AppStorageLocation.validateExistingVault(vault) == directory)
+        #expect(try Data(contentsOf: index) == original)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path) == files)
+    }
+
+    @Test("恢复时选空 Vault 不会创建新库或导入临时目录")
+    func reconnectingEmptyVaultDoesNotCreateStore() throws {
+        let vault = makeCaseDirectory("empty-reconnect")
+        try FileManager.default.createDirectory(
+            at: vault.appending(path: ".obsidian"), withIntermediateDirectories: true
+        )
+
+        #expect(throws: AppStorageLocationError.existingProjectStoreUnavailable) {
+            _ = try AppStorageLocation.validateExistingVault(vault)
+        }
+        #expect(!FileManager.default.fileExists(atPath: AppStorageLocation.storageDirectory(inVault: vault).path))
+    }
+
+    @Test("恢复时损坏项目库保持原字节，不备份改名或覆盖")
+    func reconnectingCorruptVaultDoesNotMoveOriginal() throws {
+        let vault = makeCaseDirectory("corrupt-reconnect")
+        try FileManager.default.createDirectory(
+            at: vault.appending(path: ".obsidian"), withIntermediateDirectories: true
+        )
+        let directory = AppStorageLocation.storageDirectory(inVault: vault)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let index = directory.appending(path: "projects.json")
+        let original = Data("invalid project index".utf8)
+        try original.write(to: index)
+
+        #expect(throws: AppStorageLocationError.existingProjectStoreUnavailable) {
+            _ = try AppStorageLocation.validateExistingVault(vault)
+        }
+        #expect(try Data(contentsOf: index) == original)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path) == ["projects.json"])
+    }
+
     @Test("迁移到 Obsidian 会复制并校验全部数据，原目录保持不变")
     func obsidianMigrationCopiesWithoutDeletingSource() throws {
         let caseDirectory = makeCaseDirectory("migration")

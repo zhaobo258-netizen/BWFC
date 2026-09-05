@@ -25,6 +25,8 @@ struct AppStorageResolution {
 
 enum AppStorageLocationError: Error, Equatable {
     case invalidObsidianVault
+    case obsidianAccessUnavailable
+    case existingProjectStoreUnavailable
     case destinationNotEmpty
     case migrationInventoryMismatch
     case migrationDataUnreadable
@@ -35,6 +37,10 @@ extension AppStorageLocationError: LocalizedError {
         switch self {
         case .invalidObsidianVault:
             return "所选文件夹不是 Obsidian Vault，请选择包含 .obsidian 的根目录。"
+        case .obsidianAccessUnavailable:
+            return "原 Obsidian Vault 暂时无法访问，已停止新数据写入以避免录音分散。请在设置中重新授权原 Vault；原数据不会被覆盖。"
+        case .existingProjectStoreUnavailable:
+            return "所选 Vault 中未找到可读取的“帮我分析”项目库。请选择原来的 Vault；没有创建、移动或覆盖数据。"
         case .destinationNotEmpty:
             return "Vault 中的“帮我分析”文件夹已有其他内容，已停止迁移以避免覆盖。"
         case .migrationInventoryMismatch:
@@ -138,13 +144,27 @@ enum AppStorageLocation {
                 warning: nil
             )
         } catch {
-            return AppStorageResolution(
-                baseDirectory: fallback,
-                obsidianVaultURL: nil,
-                securityScopedAccess: nil,
-                warning: "Obsidian 授权已失效，当前暂用本机安全目录，请在设置中重新选择 Vault。"
-            )
+            throw AppStorageLocationError.obsidianAccessUnavailable
         }
+    }
+
+    static func validateExistingVault(
+        _ vaultURL: URL,
+        fileManager: FileManager = .default
+    ) throws -> URL {
+        guard isObsidianVault(vaultURL, fileManager: fileManager) else {
+            throw AppStorageLocationError.invalidObsidianVault
+        }
+        let directory = storageDirectory(inVault: vaultURL)
+        do {
+            guard try containsValidProjectStore(directory, fileManager: fileManager),
+                  try storedJSONIsReadable(in: directory, fileManager: fileManager) else {
+                throw AppStorageLocationError.existingProjectStoreUnavailable
+            }
+        } catch {
+            throw AppStorageLocationError.existingProjectStoreUnavailable
+        }
+        return directory
     }
 
     static func prepareVault(

@@ -10,6 +10,8 @@ struct ProjectAIChatView: View {
     let onLegacyNoteContextChanged: (Bool) -> Void
     let onReanalyze: () -> Void
     let onOpenSettings: () -> Void
+    /// 语音外放（12 号 §10：点击播放/停止，可取消）
+    var speechController: AnswerSpeechController?
 
     @State private var isConfirmingClear = false
     @State private var isSelectingReferenceDocuments = false
@@ -34,6 +36,21 @@ struct ProjectAIChatView: View {
             .layoutPriority(1)
             if let errorMessage = controller.errorMessage {
                 errorRow(errorMessage)
+            }
+            if let errorMessage = speechController?.errorMessage {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+            }
+            if let coverage = controller.contextCoverageMessage {
+                Text(coverage)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .accessibilityLabel("本轮原文覆盖范围：" + coverage)
             }
             composer
         }
@@ -67,12 +84,14 @@ struct ProjectAIChatView: View {
             titleVisibility: .visible
         ) {
             Button("清空共创记录", role: .destructive) {
+                speechController?.stop()
                 controller.clearConversation()
             }
             Button("取消", role: .cancel) {}
         } message: {
             Text("此前笔记和逐字稿不会删除；已有完整总结会标记为需要更新。")
         }
+        .onDisappear { speechController?.handleDisappear() }
     }
 
     private var header: some View {
@@ -208,6 +227,44 @@ struct ProjectAIChatView: View {
                     .foregroundStyle(
                         message.role == .user ? BWTheme.accent : .secondary
                     )
+                if message.role == .assistant, let speechController {
+                    HStack(spacing: 4) {
+                        Button {
+                            speechController.togglePlayback(
+                                messageID: message.id.uuidString,
+                                reply: message.text
+                            )
+                        } label: {
+                            Image(
+                                systemName: speechController.speakingMessageID
+                                    == message.id.uuidString
+                                    ? "speaker.wave.2.fill"
+                                    : "speaker.wave.2"
+                            )
+                            .font(.caption2)
+                        }
+                        .buttonStyle(.borderless)
+                        .controlSize(.mini)
+                        .help(
+                            speechController.speakingMessageID
+                                == message.id.uuidString
+                                ? "停止朗读这条回答"
+                                : "朗读这条回答"
+                        )
+                        .accessibilityLabel(
+                            speechController.speakingMessageID
+                                == message.id.uuidString
+                                ? "停止朗读这条回答"
+                                : "朗读这条回答"
+                        )
+                        if speechController.speakingMessageID
+                            == message.id.uuidString {
+                            Text("正在朗读")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
                 Text(message.text)
                     .font(.caption)
                     .textSelection(.enabled)

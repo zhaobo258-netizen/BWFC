@@ -4,6 +4,43 @@ import Testing
 
 @Suite("历史发言声纹重标")
 struct HistoricalSpeakerRelabelerTests {
+    @Test("多人或未知人命中同一原稿长段时不整段归给首人")
+    func mixedSpeakersAreNotAssignedToOnePerson() {
+        let first = UUID()
+        let second = UUID()
+        let segment = HistoricalSpeakerRelabeler.SegmentSnapshot(
+            id: UUID(), startMs: 0, endMs: 10_000,
+            text: "甲方问交付时间，乙方回答下周完成", participantId: nil,
+            speakerWasUserConfirmed: false
+        )
+        for otherLabel in ["p_02", "speaker_unknown"] {
+            let result = DiarizationChunkResult(durationMs: 10_000, segments: [
+                .init(startMs: 0, endMs: 4_000, text: "甲方问交付时间", speakerLabel: "p_01"),
+                .init(startMs: 4_000, endMs: 10_000, text: "乙方回答下周完成", speakerLabel: otherLabel)
+            ])
+            #expect(HistoricalSpeakerRelabelMatcher.assignments(
+                result: result, chunkWallStartMs: 0,
+                knownSpeakerIDs: ["p_01": first, "p_02": second],
+                existingSegments: [segment]
+            ).isEmpty)
+        }
+    }
+
+    @Test("只重叠时间而原话不符不能认作同一人物证据")
+    func unrelatedTextDoesNotAssign() {
+        let segment = HistoricalSpeakerRelabeler.SegmentSnapshot(
+            id: UUID(), startMs: 0, endMs: 3_000, text: "库存需要盘点",
+            participantId: nil, speakerWasUserConfirmed: false
+        )
+        let result = DiarizationChunkResult(durationMs: 3_000, segments: [
+            .init(startMs: 0, endMs: 3_000, text: "天气非常晴朗", speakerLabel: "p_01")
+        ])
+        #expect(HistoricalSpeakerRelabelMatcher.assignments(
+            result: result, chunkWallStartMs: 0,
+            knownSpeakerIDs: ["p_01": UUID()], existingSegments: [segment]
+        ).isEmpty)
+    }
+
     @Test("不支持历史声纹时在读取音频和联网前失败")
     func unsupportedProviderFailsBeforeAudioOrNetwork() async {
         let service = UnsupportedKnownSpeakerDiarizationService()

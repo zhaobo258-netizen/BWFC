@@ -7,6 +7,8 @@ struct RelatedProjectAIContext: Sendable, Equatable, Encodable {
     var scenario: String?
     var backgroundContext: String?
     var latestSummary: String?
+    var summaryStatus: String = "unavailable"
+    var sourceRevision: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case title, scenario
@@ -14,6 +16,8 @@ struct RelatedProjectAIContext: Sendable, Equatable, Encodable {
         case businessCategory = "business_category"
         case backgroundContext = "background_context"
         case latestSummary = "latest_summary"
+        case summaryStatus = "summary_status"
+        case sourceRevision = "source_revision"
     }
 }
 
@@ -58,7 +62,10 @@ enum RelatedProjectContextBuilder {
                         related.projectBackgroundContext,
                         maximum: maximumBackgroundCharacters
                     ),
-                    latestSummary: latestSummary(for: related)
+                    latestSummary: latestSummary(for: related),
+                    summaryStatus: summaryStatus(for: related),
+                    sourceRevision: related.finalReportSnapshots.max { $0.version < $1.version }
+                        .map { "report_v\($0.version):\($0.inputFingerprint)" }
                 )
             }
     }
@@ -71,6 +78,7 @@ enum RelatedProjectContextBuilder {
         if let report = project.finalReportSnapshots.max(by: {
             $0.version < $1.version
         }) {
+            guard !FinalReportFingerprint.isStale(report, for: project) else { return nil }
             return bounded(
                 [report.headline, report.overview]
                     .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -89,6 +97,14 @@ enum RelatedProjectContextBuilder {
                 .joined(separator: "\n"),
             maximum: maximumSummaryCharacters
         )
+    }
+
+    private static func summaryStatus(for project: Project) -> String {
+        if let report = project.finalReportSnapshots.max(by: { $0.version < $1.version }) {
+            return FinalReportFingerprint.isStale(report, for: project)
+                ? "stale_summary_omitted" : "current_local_inputs"
+        }
+        return project.analysisSnapshots.isEmpty ? "unavailable" : "analysis_only_unverified"
     }
 
     private static func bounded(

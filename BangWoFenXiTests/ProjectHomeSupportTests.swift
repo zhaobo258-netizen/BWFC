@@ -167,6 +167,36 @@ final class ProjectHomeSupportTests {
         #expect(first.segments[0].text == "第一段内容")
     }
 
+    @Test("合并用人物主档归并身份，同名未关联人物保持独立")
+    func combinedAnalysisUsesGlobalPersonIdentity() throws {
+        let profileID = UUID()
+        let firstPerson = Speaker(cloudAlias: "p_01", displayName: "王总", voiceProfileId: profileID)
+        let secondPerson = Speaker(cloudAlias: "p_02", displayName: "王总", voiceProfileId: profileID)
+        let unknownOne = Speaker(cloudAlias: "p_03", displayName: "同名")
+        let unknownTwo = Speaker(cloudAlias: "p_04", displayName: "同名")
+        let first = makeProject(title: "一", lastActivityAt: Date(timeIntervalSince1970: 1))
+        first.speakers = [firstPerson, unknownOne]
+        first.segments = first.speakers.map { speaker in
+            TranscriptSegment(startMs: 0, endMs: 1_000, text: "一场发言", participantId: speaker.id, source: .local, state: .final)
+        }
+        let second = makeProject(title: "二", lastActivityAt: Date(timeIntervalSince1970: 2))
+        second.speakers = [secondPerson, unknownTwo]
+        second.segments = second.speakers.map { speaker in
+            TranscriptSegment(startMs: 0, endMs: 1_000, text: "二场发言", participantId: speaker.id, source: .local, state: .final)
+        }
+
+        let combined = try ProjectHomeSupport.makeCombinedAnalysisProject(from: [first, second])
+
+        #expect(combined.speakers.count == 3)
+        let canonical = try #require(combined.speakers.first { $0.voiceProfileId == profileID })
+        let knownSegmentIDs = Set([first.segments[0].id, second.segments[0].id])
+        #expect(combined.segments.filter { knownSegmentIDs.contains($0.id) }.allSatisfy { $0.participantId == canonical.id })
+        #expect(combined.speakers.filter { $0.displayName == "同名" }.count == 2)
+        #expect(second.segments[0].participantId == secondPerson.id)
+        #expect(firstPerson.cloudAlias == "p_01")
+        #expect(secondPerson.cloudAlias == "p_02")
+    }
+
     @Test("跨业务项目的录音拒绝合并")
     func combinedAnalysisRejectsMixedCategories() {
         let a = makeProject(title: "A", lastActivityAt: Date())
@@ -228,6 +258,15 @@ final class ProjectHomeSupportTests {
         )
         #expect(display == .liveRecording(.recording))
         #expect(display.text == "录音中")
+    }
+
+    @Test("可重试处理失败显示真实状态，不归入崩溃恢复列表")
+    func failedProcessingIsNotAbnormalExit() {
+        let project = Project(title: "转写失败", sourceType: .importedAudio, status: .processing,
+                              processingJobs: [ProcessingJob(kind: .transcription, status: .failedRetryable)])
+        #expect(ProjectHomeSupport.displayStatus(for: project, liveProjectIDs: []) == .normal(.processing))
+        #expect(ProjectHomeSupport.leftoverProjects(in: [project], liveProjectIDs: []).isEmpty)
+        #expect(project.processingStatusText == "处理失败 · 可重试")
     }
 
     @Test("未登记的 recording 是崩溃残留，显示「未正常结束」")

@@ -26,6 +26,7 @@ protocol AudioPlaybackServicing: AnyObject, Sendable {
 enum AudioPlaybackError: Error, Equatable {
     case notLoaded
     case fileMissing
+    case playbackFailed
 }
 
 /// 基于 AVAudioPlayer 的回放实现
@@ -34,6 +35,10 @@ final class AVAudioPlaybackService: AudioPlaybackServicing, @unchecked Sendable 
     private let lock = NSLock()
 
     func load(url: URL) throws {
+        lock.withLock {
+            player?.stop()
+            player = nil
+        }
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw AudioPlaybackError.fileMissing
         }
@@ -45,7 +50,7 @@ final class AVAudioPlaybackService: AudioPlaybackServicing, @unchecked Sendable 
     func play() throws {
         let current = lock.withLock { player }
         guard let current else { throw AudioPlaybackError.notLoaded }
-        current.play()
+        guard current.play() else { throw AudioPlaybackError.playbackFailed }
     }
 
     func pause() {
@@ -90,6 +95,7 @@ final class AudioPlaybackController {
     private(set) var isPlaying = false
     private(set) var currentTime: TimeInterval = 0
     private(set) var duration: TimeInterval = 0
+    private(set) var errorMessage: String?
 
     init(player: any AudioPlaybackServicing = AVAudioPlaybackService()) {
         self.player = player
@@ -97,11 +103,20 @@ final class AudioPlaybackController {
 
     /// 加载音频文件
     func load(url: URL) throws {
-        try player.load(url: url)
+        stop()
+        isLoaded = false
+        duration = 0
+        do {
+            try player.load(url: url)
+        } catch {
+            errorMessage = "原音频无法读取，请检查文件是否存在。"
+            throw error
+        }
         duration = player.duration
         currentTime = 0
         isLoaded = true
         isPlaying = false
+        errorMessage = nil
     }
 
     /// 播放 / 暂停切换
@@ -111,9 +126,26 @@ final class AudioPlaybackController {
             player.pause()
             isPlaying = false
         } else {
-            try? player.play()
-            isPlaying = true
+            play()
         }
+    }
+
+    func play() {
+        guard isLoaded else { return }
+        do {
+            try player.play()
+            isPlaying = player.isPlaying
+            errorMessage = isPlaying ? nil : "音频未能播放，请检查输出设备后重试。"
+        } catch {
+            isPlaying = false
+            errorMessage = "音频未能播放，请检查输出设备后重试。"
+        }
+    }
+
+    func stop() {
+        player.stop()
+        isPlaying = false
+        currentTime = 0
     }
 
     /// 跳转到指定秒
@@ -138,5 +170,47 @@ final class AudioPlaybackController {
     func stopTicker() {
         ticker?.invalidate()
         ticker = nil
+    }
+}
+
+struct ProjectAudioPlaybackTarget: Equatable {
+    var projectID: UUID
+    var title: String
+    var relativePath: String
+    var seconds: TimeInterval
+
+    static func resolve(
+        project: Project,
+        segment: TranscriptSegment? = nil,
+        sourceProjects: [Project] = []
+    ) -> Self? {
+        let source: Project
+        let wallMs: Int64
+        if project.sourceType.isCombinedAnalysis {
+            let reference: SourceRecordingReference?
+            if let segment {
+                reference = ProjectHomeSupport.sourceRecording(for: segment, in: project)
+            } else {
+                reference = project.sourceRecordings.first
+            }
+            guard let reference,
+                  let original = sourceProjects.first(where: { $0.id == reference.projectID }) else { return nil }
+            source = original
+            wallMs = max(0, (segment?.startMs ?? reference.timelineOffsetMs) - reference.timelineOffsetMs)
+        } else {
+            source = project
+            wallMs = max(0, segment?.startMs ?? 0)
+        }
+        guard let path = source.runtimeAssetRelativePath, !path.isEmpty else { return nil }
+        var coveredUntil: Int64 = 0
+        var pausedMs: Int64 = 0
+        for pause in source.pauseIntervals.sorted(by: { $0.startMs < $1.startMs }) {
+            let start = max(coveredUntil, max(0, pause.startMs))
+            let end = min(wallMs, pause.endMs)
+            if end > start { pausedMs += end - start }
+            coveredUntil = max(coveredUntil, end)
+        }
+        return Self(projectID: source.id, title: source.title, relativePath: path,
+                    seconds: TimeInterval(max(0, wallMs - pausedMs)) / 1_000)
     }
 }

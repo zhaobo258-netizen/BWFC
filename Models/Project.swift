@@ -111,6 +111,35 @@ enum ConversationAnalysisSnapshotRetention {
 /// 新增存储属性必须同步登记 ProjectRuntimeSession.applyRuntime、
 /// ProjectPersistence.fieldOwnership 与 ProjectWorkspaceView.reloadImportedProjectFromStore。
 final class Project: Identifiable, Codable {
+    var hasUsableTranscript: Bool {
+        segments.contains {
+            ($0.state == .final || $0.state == .edited)
+                && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    var processingStatusText: String {
+        switch status {
+        case .creating, .recording, .paused, .failed:
+            return status.displayName
+        case .processing:
+            return hasFailedProcessingJobs ? "处理失败 · 可重试" : status.displayName
+        case .ready, .readyWithWarnings:
+            if !hasUsableTranscript { return "录音已结束 · 无可用文稿" }
+            if hasFailedProcessingJobs {
+                return "文稿可用 · 部分处理失败"
+            }
+            if processingJobs.contains(where: { $0.status == .pending || $0.status == .running }) {
+                return "文稿可用 · 处理未完成"
+            }
+            return finalReportSnapshots.isEmpty ? "文稿可用 · 未生成总结" : "文稿与总结可用"
+        }
+    }
+
+    var hasFailedProcessingJobs: Bool {
+        processingJobs.contains { $0.status == .failedRetryable || $0.status == .failedFinal }
+    }
+
     /// 数据结构版本（V2 恒为 2）
     var schemaVersion: Int
     /// 主键（迁移时保留旧 Meeting id）
@@ -164,6 +193,10 @@ final class Project: Identifiable, Codable {
     var analysisSpeakerOverrides: [AnalysisSpeakerOverride] = []
     /// AI 全文复查产生、尚未由用户处理的转写更正候选。
     var transcriptReviewCandidates: [TranscriptReviewCandidate] = []
+    /// 录音完成后 AI 提出、尚未由老板处理的业务记忆候选（12 号 §6.3，默认不写入有效记忆）
+    var businessMemoryCandidates: [BusinessMemoryCandidate] = []
+    /// AI 从原话提出、尚未确认的跟进候选（12 号 §7.3；确认后进入业务项目）
+    var followUpCandidates: [FollowUpCandidate] = []
     /// 录音或导入完成后的完整总结；与实时分析快照分开版本化
     var finalReportSnapshots: [FinalReportSnapshot] = []
     /// 由分析条目继续延展的知识种子、联想分支与真实来源
@@ -210,6 +243,8 @@ final class Project: Identifiable, Codable {
         analysisSnapshots: [ConversationAnalysisSnapshot] = [],
         analysisSpeakerOverrides: [AnalysisSpeakerOverride] = [],
         transcriptReviewCandidates: [TranscriptReviewCandidate] = [],
+        businessMemoryCandidates: [BusinessMemoryCandidate] = [],
+        followUpCandidates: [FollowUpCandidate] = [],
         finalReportSnapshots: [FinalReportSnapshot] = [],
         knowledgeSeeds: [KnowledgeSeed] = [],
         aiChatMessages: [ProjectAIChatMessage] = [],
@@ -246,6 +281,8 @@ final class Project: Identifiable, Codable {
         self.analysisSnapshots = analysisSnapshots
         self.analysisSpeakerOverrides = analysisSpeakerOverrides
         self.transcriptReviewCandidates = transcriptReviewCandidates
+        self.businessMemoryCandidates = businessMemoryCandidates
+        self.followUpCandidates = followUpCandidates
         self.finalReportSnapshots = finalReportSnapshots
         self.knowledgeSeeds = knowledgeSeeds
         self.aiChatMessages = aiChatMessages
@@ -301,6 +338,14 @@ final class Project: Identifiable, Codable {
         transcriptReviewCandidates = try container.decodeIfPresent(
             [TranscriptReviewCandidate].self,
             forKey: .transcriptReviewCandidates
+        ) ?? []
+        businessMemoryCandidates = try container.decodeIfPresent(
+            [BusinessMemoryCandidate].self,
+            forKey: .businessMemoryCandidates
+        ) ?? []
+        followUpCandidates = try container.decodeIfPresent(
+            [FollowUpCandidate].self,
+            forKey: .followUpCandidates
         ) ?? []
         finalReportSnapshots = try container.decodeIfPresent(
             [FinalReportSnapshot].self,

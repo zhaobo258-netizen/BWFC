@@ -56,10 +56,24 @@ struct ProjectWorkspaceView: View {
     @State private var noteController: NoteController?
     @State private var runtimePersistence: ProjectRuntimePersistenceController?
     @State private var operationError: String?
+    @State private var playback = AudioPlaybackController()
+    @State private var playbackTarget: ProjectAudioPlaybackTarget?
+    @State private var isRetranscribing = false
     /// 收尾后 AI 全文复查的进行中/结果提示（非错误通道；10 号需求 1）
     @State private var reviewNotice: String?
     @State private var transcriptReviewCandidates: [TranscriptReviewCandidate] = []
     @State private var showTranscriptReviewCandidates = false
+    /// 记忆/跟进候选（12 号 §6.3/§7.3）：录音结束后提出，确认后生效
+    @State private var pendingMemoryCandidates: [BusinessMemoryCandidate] = []
+    @State private var pendingFollowUpCandidates: [FollowUpCandidate] = []
+    @State private var showMemoryCandidates = false
+    @State private var isProposingMemoryCandidates = false
+    @State private var needsCandidateStatusRecovery = false
+    @State private var memoryProposalID: UUID?
+    @State private var memoryProposalTask: Task<Void, Never>?
+    /// 仅保存音频模式（本地转写不可用时不阻断录音；12 号 §4.1）
+    @State private var isAudioOnlyRecording = false
+    @State private var audioOnlyNotice: String?
     @State private var highlightedSegmentID: UUID?
     @State private var showEndConfirmation = false
     @State private var isFinishing = false
@@ -116,8 +130,16 @@ struct ProjectWorkspaceView: View {
             loadProject()
             reloadSidebarProjects()
             openRequestedFinalReportIfNeeded()
+            openRequestedEvidenceIfNeeded()
+            playback.startTicker()
         }
         .onDisappear {
+            memoryProposalID = nil
+            memoryProposalTask?.cancel()
+            memoryProposalTask = nil
+            isProposingMemoryCandidates = false
+            playback.stop()
+            playback.stopTicker()
             environment.audioCapture.onLevel = nil
             // 录音中直接返回首页时也必须撤回缓冲回调，否则旧闭包会把音频
             // 继续喂给已废弃的转写会话（只清自己登记的那份）
@@ -145,6 +167,9 @@ struct ProjectWorkspaceView: View {
         .onChange(of: environment.cloudConfigurationRevision) { _, _ in
             diarization?.resumeAfterKeyFix()
             analysis?.resumeAfterKeyFix()
+        }
+        .onChange(of: router.requestedEvidenceSegmentID) { _, _ in
+            openRequestedEvidenceIfNeeded()
         }
         .onChange(of: router.requestedFinalReportProjectID) { _, _ in
             openRequestedFinalReportIfNeeded()
@@ -220,32 +245,11 @@ struct ProjectWorkspaceView: View {
                         )
                     },
                     onCreate: { name, role, alsoAssignTranscript, assignAllUnconfirmed in
-                        let speaker = Speaker(
-                            cloudAlias: SpeakerPanelLogic.nextCloudAlias(existing: project.speakers),
-                            displayName: name,
-                            role: role,
-                            colorToken: SpeakerPanelLogic.nextColorToken(existing: project.speakers),
-                            isUserConfirmed: true
-                        )
-                        project.speakers.append(speaker)
-                        let didAssign = performSpeakerAssign(
-                            request: request,
-                            speaker: speaker,
+                        createPersonAndAssignSpeaker(
+                            name: name, role: role, request: request,
                             alsoAssignTranscript: alsoAssignTranscript,
                             assignAllUnconfirmed: assignAllUnconfirmed
                         )
-                        if !didAssign {
-                            project.speakers.removeAll { $0.id == speaker.id }
-                            if let meeting {
-                                SpeakerPanelLogic.syncRuntimeParticipants(
-                                    speakers: project.speakers,
-                                    meeting: meeting
-                                )
-                            }
-                            _ = persistProject(fields: .speakers)
-                            diarization?.refreshKnownSpeakers()
-                        }
-                        return didAssign
                     }
                 )
             }
@@ -256,6 +260,34 @@ struct ProjectWorkspaceView: View {
                 onApply: applyTranscriptReviewCandidates,
                 onDiscardAll: discardTranscriptReviewCandidates
             )
+        }
+        .sheet(isPresented: $showMemoryCandidates) {
+            MemoryCandidatesSheet(
+                memoryItems: pendingMemoryCandidates.map { candidate in
+                    MemoryCandidatesSheet.MemoryItem(
+                        candidate: candidate,
+                        isConfirmed: false,
+                        editedStatement: candidate.statement,
+                        personName: candidate.targetPersonDisplayName ?? "未关联人物"
+                    )
+                },
+                followUpItems: pendingFollowUpCandidates.map { candidate in
+                    MemoryCandidatesSheet.FollowUpItem(
+                        candidate: candidate,
+                        isConfirmed: false
+                    )
+                },
+                existingBusinessProjects: (try? environment.businessProjectStore.load()) ?? [],
+                suggestedBusinessProjectName: project?.businessCategory,
+                operationError: operationError,
+                canPropose: environment.isAnalysisConfigured && !isProposingMemoryCandidates,
+                onRefresh: manuallyProposeMemoryCandidates,
+                onConfirmMemories: confirmMemoryCandidates,
+                onResolveMemory: resolveMemoryCandidate,
+                onConfirmFollowUps: confirmFollowUpCandidates,
+                onResolveFollowUp: resolveFollowUpCandidate
+            )
+            .environment(environment)
         }
         .confirmationDialog("录音仍在进行", isPresented: $showBackConfirmation, titleVisibility: .visible) {
             Button("结束录音并返回", role: .destructive) {
@@ -318,6 +350,7 @@ struct ProjectWorkspaceView: View {
                         analysisSuspendedBanner(reason: reason)
                     }
                     if meeting.status.isAbnormalIfAppRelaunched, !isFinishing, !didStartSessionThisView,
+                       !isRetranscribing, !project.hasFailedProcessingJobs,
                        !hasResolvedAbnormalExit,
                        environment.importProcessing.activeProjectID != project.id {
                         abnormalBanner(project: project, meeting: meeting)
@@ -325,10 +358,22 @@ struct ProjectWorkspaceView: View {
                     if let operationError {
                         errorBanner(text: operationError)
                     }
+                    if isAudioOnlyRecording,
+                       meeting.status == .recording || meeting.status == .paused,
+                       let audioOnlyNotice {
+                        HStack(spacing: 8) {
+                            Image(systemName: "waveform.badge.exclamationmark")
+                            Text(audioOnlyNotice).font(.callout)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(.orange.opacity(0.12))
+                    }
                     if let reviewNotice {
                         noticeBanner(text: reviewNotice)
                     }
-                    if project.sourceType.isImportedMedia {
+                    if project.sourceType.isImportedMedia || isRetranscribing {
                         importProgressSection(project: project)
                     }
                     workspaceColumns(mode: mode, meeting: meeting)
@@ -529,7 +574,7 @@ struct ProjectWorkspaceView: View {
                 Circle()
                     .fill(sidebarStatusColor(item.status))
                     .frame(width: 6, height: 6)
-                Text(item.status.displayName)
+                Text(item.processingStatusText)
                 Text("·")
                 Text(ProjectHomeSupport.sourceLabel(for: item.sourceType))
                 Spacer(minLength: 0)
@@ -715,7 +760,8 @@ struct ProjectWorkspaceView: View {
                     Text("正在收尾…可返回首页")
                         .foregroundStyle(.secondary)
                 } else {
-                    Text(project.status.displayName)
+                    Text(project.processingStatusText)
+                        .lineLimit(1)
                 }
             }
             .font(.callout)
@@ -746,11 +792,53 @@ struct ProjectWorkspaceView: View {
                 Button("继续录制") {
                     continueRecording(project: project, meeting: meeting)
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.bordered)
+                .disabled(environment.importProcessing.activeProjectID == project.id)
                 .help("追加到同一项目，不覆盖原录音和文稿")
             }
 
             Spacer()
+
+            if needsCandidateStatusRecovery {
+                Button("恢复候选状态") { refreshPendingMemoryCandidates() }
+                    .help("重试保存已写入记忆或跟进的确认状态，不调用模型")
+            }
+
+            // 记忆/跟进候选入口（录音结束或导入完成后可用；12 号 §6.3/§7.3）
+            if meeting.status == .completed || meeting.status == .ready,
+               project.segments.contains(where: {
+                   ($0.state == .final || $0.state == .edited)
+                       && !$0.text.trimmingCharacters(
+                           in: .whitespacesAndNewlines
+                       ).isEmpty
+               }) {
+                Button {
+                    if pendingMemoryCandidates.isEmpty && pendingFollowUpCandidates.isEmpty {
+                        manuallyProposeMemoryCandidates()
+                    } else {
+                        showMemoryCandidates = true
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Label("记忆候选", systemImage: "brain.head.profile")
+                        let pendingCount = pendingMemoryCandidates.count
+                            + pendingFollowUpCandidates.count
+                        if pendingCount > 0 {
+                            Text("\(pendingCount)")
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 2)
+                                .background(BWTheme.accent.opacity(0.14))
+                                .clipShape(Capsule())
+                        }
+                    }
+                }
+                .help(isProposingMemoryCandidates
+                    ? "正在从原话提取候选…"
+                    : "从本场已确认归属原话提出业务记忆与跟进候选；确认后生效")
+                .disabled(isProposingMemoryCandidates || (!environment.isAnalysisConfigured
+                    && pendingMemoryCandidates.isEmpty && pendingFollowUpCandidates.isEmpty))
+            }
 
             Button {
                 reloadSidebarProjects()
@@ -838,6 +926,7 @@ struct ProjectWorkspaceView: View {
 
             // 技术状态收进处理详情弹层
             ProcessingDetailsButton(
+                project: project,
                 transcription: transcription,
                 diarization: diarization,
                 analysis: analysis,
@@ -894,9 +983,95 @@ struct ProjectWorkspaceView: View {
 
     // MARK: - 三栏
 
+    private var playbackBar: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Button {
+                    if playback.isLoaded {
+                        playback.togglePlay()
+                    } else if let project {
+                        preparePlayback(project: project)
+                    }
+                } label: {
+                    Label(playback.isPlaying ? "暂停回听" : "回听原音频",
+                          systemImage: playback.isPlaying ? "pause.fill" : "play.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                Spacer(minLength: 0)
+                if project?.sourceType.isCombinedAnalysis != true {
+                    Button("重新转写", action: retranscribeRecording)
+                        .controlSize(.small)
+                        .disabled(environment.importProcessing.isRunning)
+                }
+            }
+            if playback.isLoaded {
+                HStack(spacing: 6) {
+                    Text(LiveMeetingView.formatDuration(ms: Int64(playback.currentTime * 1_000)))
+                    Slider(value: Binding(get: { playback.currentTime }, set: { playback.seek(to: $0) }),
+                           in: 0...max(0.001, playback.duration))
+                        .accessibilityLabel("原音频播放进度")
+                    Text(LiveMeetingView.formatDuration(ms: Int64(playback.duration * 1_000)))
+                }
+                .font(.caption.monospacedDigit())
+                if project?.sourceType.isCombinedAnalysis == true, let playbackTarget {
+                    Text("正在回听：\(playbackTarget.title)")
+                        .font(.caption).lineLimit(1)
+                }
+            }
+            Text(playback.errorMessage ?? "双击文稿或点击总结证据，从对应位置回听。")
+                .font(.caption2)
+                .foregroundStyle(playback.errorMessage == nil ? Color.secondary : Color.orange)
+        }
+        .padding(12)
+        .background(BWTheme.accent.opacity(0.06))
+    }
+
+    private func preparePlayback(project: Project, segment: TranscriptSegment? = nil) {
+        guard let target = ProjectAudioPlaybackTarget.resolve(
+            project: project, segment: segment, sourceProjects: sidebarProjects
+        ) else {
+            playback.stop()
+            operationError = "原音频或来源录音不可用；文稿仍可查看。"
+            return
+        }
+        do {
+            if playbackTarget?.relativePath != target.relativePath || !playback.isLoaded {
+                let url = try environment.fileStore.absoluteURL(forRelativePath: target.relativePath)
+                try playback.load(url: url)
+            }
+            playbackTarget = target
+            playback.seek(to: target.seconds)
+            playback.play()
+        } catch {
+            operationError = "原音频无法读取，请检查文件是否存在；文稿仍可查看。"
+        }
+    }
+
+    private func retranscribeRecording() {
+        guard let project, !isFinishing,
+              meeting?.status != .recording, meeting?.status != .paused else { return }
+        do {
+            noteController?.saveNow()
+            projectAIChat?.saveDraftNow()
+            runtimePersistence?.flush()
+            playback.stop()
+            environment.finalReportCoordinator.cancel(projectID: project.id)
+            try environment.importProcessing.retranscribe(projectID: project.id)
+            isRetranscribing = true
+            operationError = nil
+            reloadImportedProjectFromStore()
+        } catch {
+            operationError = error.localizedDescription
+        }
+    }
+
     private func transcriptColumn(meeting: Meeting) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             columnHeader("录音文稿")
+            if meeting.status != .recording && meeting.status != .paused && !isFinishing {
+                playbackBar
+            }
             TranscriptPanelView(
                 // 控制器只反映本会话实时转写；只读回看与导入项目用已持久化片段
                 segments: (transcription?.segments.isEmpty ?? true) ? meeting.segments : (transcription?.segments ?? []),
@@ -907,6 +1082,11 @@ struct ProjectWorkspaceView: View {
                 },
                 highlightedSegmentID: highlightedSegmentID,
                 liveAudioLevel: meeting.status == .recording ? liveAudioLevel : nil,
+                emptyTitle: meeting.status == .recording ? "等待第一段发言" : "还没有可用文稿",
+                emptyDetail: meeting.status == .recording
+                    ? "开始说话后，实时转写会显示在这里"
+                    : "先回听原音频检查收音，再尝试重新转写。",
+                onPlaySegment: { segment in locateEvidence(segmentID: segment.id) },
                 onAssignSpeaker: { segment, participant in
                     if let participant {
                         if let speaker = project?.speakers.first(where: { $0.id == participant.id }) {
@@ -1065,7 +1245,8 @@ struct ProjectWorkspaceView: View {
                     isAIConfigured: environment.isAnalysisConfigured,
                     onGenerate: startFinalReportGeneration,
                     onOpenSettings: router.showSettings,
-                    onEvidenceTap: locateEvidence
+                    onEvidenceTap: locateEvidence,
+                    relatedProjects: sidebarProjects.filter { project.relatedProjectIDs.contains($0.id) }
                 )
             } else {
                 ContentUnavailableView(
@@ -1190,7 +1371,8 @@ struct ProjectWorkspaceView: View {
                     onReanalyze: {
                         Task { await analysis?.generateFinalAnalysis() }
                     },
-                    onOpenSettings: router.showSettings
+                    onOpenSettings: router.showSettings,
+                    speechController: environment.answerSpeechController
                 )
             } else {
                 ContentUnavailableView(
@@ -1428,9 +1610,10 @@ struct ProjectWorkspaceView: View {
             Button("标记为已结束") {
                 do {
                     try MeetingRecovery.markCompletedAfterAbnormalExit(meeting)
-                    if syncAndPersist(meeting) {
-                        hasResolvedAbnormalExit = true
-                    }
+                    try ProjectRuntimeSession.applyRuntime(meeting, to: project)
+                    try environment.persist(project, fields: .recordingRuntime)
+                    hasResolvedAbnormalExit = true
+                    reloadSidebarProjects()
                 } catch {
                     operationError = error.localizedDescription
                 }
@@ -1450,7 +1633,12 @@ struct ProjectWorkspaceView: View {
             if !transcriptReviewCandidates.isEmpty {
                 Button("查看候选") { showTranscriptReviewCandidates = true }
             }
-            if transcriptReviewCandidates.isEmpty {
+            if !pendingMemoryCandidates.isEmpty || !pendingFollowUpCandidates.isEmpty {
+                Button("记忆候选") { showMemoryCandidates = true }
+            }
+            if transcriptReviewCandidates.isEmpty
+                && pendingMemoryCandidates.isEmpty
+                && pendingFollowUpCandidates.isEmpty {
                 Button("知道了") { reviewNotice = nil }
             }
         }
@@ -1564,7 +1752,7 @@ struct ProjectWorkspaceView: View {
     /// 流水线阶段完成后，从存储刷新本视图的项目副本（字段级更新，不重建控制器；
     /// 笔记与标题归工作台所有，不从存储回灌，避免覆盖正在编辑的内容）
     private func reloadImportedProjectFromStore() {
-        guard let project, project.sourceType.isImportedMedia,
+        guard let project, project.sourceType.isImportedMedia || isRetranscribing,
               let fresh = try? environment.allProjects().first(where: { $0.id == projectID }) else {
             return
         }
@@ -1572,6 +1760,9 @@ struct ProjectWorkspaceView: View {
         if let meeting {
             meeting.status = ProjectRuntimeSession.runtimeStatus(for: fresh.status)
             meeting.segments = fresh.segments
+            meeting.pauseIntervals = fresh.pauseIntervals
+            meeting.audioRelativePath = fresh.runtimeAssetRelativePath
+            SpeakerPanelLogic.syncRuntimeParticipants(speakers: fresh.speakers, meeting: meeting)
             meeting.snapshots = fresh.legacySnapshots
             // 分析快照刷新（导入流水线的最终分析在后台生成；V2 快照直接挂在 Project 上）
             analysis?.attach(to: project)
@@ -1589,9 +1780,12 @@ struct ProjectWorkspaceView: View {
         project.analysisSnapshots = fresh.analysisSnapshots
         project.analysisSpeakerOverrides = fresh.analysisSpeakerOverrides
         project.transcriptReviewCandidates = fresh.transcriptReviewCandidates
+        project.businessMemoryCandidates = fresh.businessMemoryCandidates
+        project.followUpCandidates = fresh.followUpCandidates
         project.finalReportSnapshots = fresh.finalReportSnapshots
         project.knowledgeSeeds = fresh.knowledgeSeeds
         project.segments = fresh.segments
+        project.speakers = fresh.speakers
         project.scenario = fresh.scenario
         project.scenarioWasUserSelected = fresh.scenarioWasUserSelected
         project.businessCategory = fresh.businessCategory
@@ -1613,6 +1807,11 @@ struct ProjectWorkspaceView: View {
         transcriptReviewCandidates = loaded.transcriptReviewCandidates
         if !loaded.transcriptReviewCandidates.isEmpty {
             reviewNotice = "有 \(loaded.transcriptReviewCandidates.count) 处 AI 转写更正候选待确认，原文尚未修改。"
+        }
+        refreshPendingMemoryCandidates()
+        if !pendingMemoryCandidates.isEmpty || !pendingFollowUpCandidates.isEmpty {
+            reviewNotice = "有 \(pendingMemoryCandidates.count) 条记忆候选、"
+                + "\(pendingFollowUpCandidates.count) 条跟进候选待确认；确认后才生效。"
         }
         let notes = NoteController(project: loaded) { [environment] in
             try environment.persist($0, fields: .note)
@@ -1651,9 +1850,8 @@ struct ProjectWorkspaceView: View {
             meeting: meeting,
             project: project,
             persist: { [environment] project in
-                // 实时录音没有并发导入流水线，工作台持有唯一写副本，可整对象保存。
-                let fields: ProjectFieldOwnership = project.sourceType == .liveRecording
-                    ? .all
+                let fields: ProjectFieldOwnership = self.didStartSessionThisView && !self.isRetranscribing
+                    ? .recordingRuntime
                     : .manualSegments
                 try environment.persist(project, fields: fields)
             },
@@ -1681,7 +1879,7 @@ struct ProjectWorkspaceView: View {
             providerFactory: { [environment] in
                 environment.makeKnowledgeProviders()
             },
-            automaticallyBloomNewSeeds: true
+            automaticallyBloomNewSeeds: false
         )
         knowledgeController.noteContextProvider = { [weak noteController] in
             noteController?.markdown
@@ -1710,6 +1908,10 @@ struct ProjectWorkspaceView: View {
             let projects = (try? environment.allProjects()) ?? []
             let relatedIDs = Set(project.relatedProjectIDs)
             return projects.filter { relatedIDs.contains($0.id) }
+        }
+        chatController.confirmedMemoriesProvider = { [environment, weak project] in
+            guard let project else { return [] }
+            return (try? environment.applicableMemories(for: project)) ?? []
         }
         chatController.prepareRequestContext = {
             self.syncAndPersist(meeting)
@@ -1803,8 +2005,8 @@ struct ProjectWorkspaceView: View {
         }
         do {
             try ProjectRuntimeSession.applyRuntime(meeting, to: project)
-            let fields: ProjectFieldOwnership = project.sourceType == .liveRecording
-                ? .all
+            let fields: ProjectFieldOwnership = didStartSessionThisView && !isRetranscribing
+                ? .recordingRuntime
                 : .manualSegments
             try environment.persist(project, fields: fields)
             operationError = nil
@@ -1904,6 +2106,11 @@ struct ProjectWorkspaceView: View {
     /// 点击中栏证据：左栏滚动并高亮对应片段
     private func locateEvidence(segmentID: UUID) {
         highlightedSegmentID = segmentID
+        guard let project,
+              let segment = project.segments.first(where: { $0.id == segmentID }),
+              meeting?.status != .recording, meeting?.status != .paused,
+              !isFinishing else { return }
+        preparePlayback(project: project, segment: segment)
     }
 
     // MARK: - 说话人指认（09 号计划需求 2）
@@ -1950,6 +2157,52 @@ struct ProjectWorkspaceView: View {
     }
 
     @discardableResult
+    private func createPersonAndAssignSpeaker(
+        name: String, role: String?, request: SpeakerAssignRequest,
+        alsoAssignTranscript: Bool, assignAllUnconfirmed: Bool
+    ) -> Bool {
+        guard let project else { return false }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let personID = UUID()
+        let speaker = Speaker(
+            cloudAlias: SpeakerPanelLogic.nextCloudAlias(existing: project.speakers),
+            displayName: trimmed, role: role,
+            colorToken: SpeakerPanelLogic.nextColorToken(existing: project.speakers),
+            isUserConfirmed: true, personId: personID
+        )
+        let person = Person(id: personID, displayName: trimmed, role: role,
+            colorToken: speaker.colorToken,
+            speakerLinks: [PersonSpeakerLink(projectID: project.id, speakerID: speaker.id,
+                speakerDisplayName: trimmed, linkedAt: Date())])
+        do {
+            _ = try environment.personLibraryStore.insert(person)
+        } catch {
+            operationError = "人物未保存，未执行指认：\(error.localizedDescription)"
+            return false
+        }
+        project.speakers.append(speaker)
+        let didAssign = performSpeakerAssign(request: request, speaker: speaker,
+            alsoAssignTranscript: alsoAssignTranscript, assignAllUnconfirmed: assignAllUnconfirmed)
+        if !didAssign {
+            project.speakers.removeAll { $0.id == speaker.id }
+            if let meeting {
+                SpeakerPanelLogic.syncRuntimeParticipants(speakers: project.speakers, meeting: meeting)
+            }
+            if persistProject(fields: .speakers) {
+                do {
+                    try environment.personLibraryStore.deletePerson(personID: personID)
+                } catch {
+                    operationError = "指认未保存；新人物回滚失败，请在人物库复核。"
+                }
+            } else {
+                operationError = "指认未完成且回滚保存失败；新人物已保留，请在人物库复核关联。"
+            }
+            diarization?.refreshKnownSpeakers()
+        }
+        return didAssign
+    }
+
     private func performSpeakerAssign(
         request: SpeakerAssignRequest,
         speaker: Speaker,
@@ -2029,6 +2282,9 @@ struct ProjectWorkspaceView: View {
             operationError = "这句话还在识别中，等它确认后（几秒内）再指认说话人。"
             return false
         }
+        let previousAttribution = Dictionary(uniqueKeysWithValues: segments.map {
+            ($0.id, ($0.participantId, $0.speakerWasUserConfirmed, $0.updatedAt))
+        })
         let plan = SpeakerAssignPlanner.makePlan(
             anchorSegmentId: anchorSegmentId,
             speaker: speaker,
@@ -2038,6 +2294,14 @@ struct ProjectWorkspaceView: View {
         )
 
         guard persistAndRefresh(meeting) else {
+            for segment in meeting.segments + project.segments {
+                if let previous = previousAttribution[segment.id] {
+                    segment.participantId = previous.0
+                    segment.speakerWasUserConfirmed = previous.1
+                    segment.updatedAt = previous.2
+                }
+            }
+            transcription?.refreshSegments()
             reviewNotice = "说话人标注未保存，未启动全场历史回查；请重试。"
             return false
         }
@@ -2133,8 +2397,8 @@ struct ProjectWorkspaceView: View {
             speaker.isCurrentUser = profile.isCurrentUser
             speaker.iflytekFeatureID = profile.iflytekFeatureID
             reviewNotice = profile.isAutoEnabled
-                ? "已标注并记住 \(speaker.displayName) 的声纹；正在回查本场历史发言。"
-                : "已保存 \(speaker.displayName) 的永久声纹；自动识别名额已满，本场仍会回查历史发言。"
+                ? "已标注并保存 \(speaker.displayName) 的本地声纹样本。"
+                : "已保存 \(speaker.displayName) 的永久声纹；自动识别名额已满。"
             return profile
         } catch {
             // 指认本身已生效；样本提取或永久保存失败如实提示，可去说话人面板手录
@@ -2164,6 +2428,10 @@ struct ProjectWorkspaceView: View {
             return
         }
         let references = project.speakers.compactMap { speaker -> HistoricalSpeakerRelabeler.SpeakerReference? in
+            if configuration.selectedProvider == .iflytek,
+               speaker.iflytekFeatureID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+                return nil
+            }
             guard let path = SpeakerPanelLogic.voiceReferencePath(for: speaker),
                   let url = try? environment.fileStore.absoluteURL(forRelativePath: path) else {
                 return nil
@@ -2175,7 +2443,10 @@ struct ProjectWorkspaceView: View {
                 iflytekFeatureID: speaker.iflytekFeatureID
             )
         }
-        guard !references.isEmpty else { return }
+        guard !references.isEmpty else {
+            reviewNotice = "人工标注与本地样本已保存；当前没有已在所选服务登记的人物声纹，未启动全场回查。"
+            return
+        }
         let snapshots = meeting.segments.map {
             HistoricalSpeakerRelabeler.SegmentSnapshot(
                 id: $0.id,
@@ -2272,6 +2543,15 @@ struct ProjectWorkspaceView: View {
     }
 
     private func beginRecordingSession(meeting: Meeting, continuationOffsetMs: Int64?) {
+        guard !environment.isPersistentStorageUnavailable else {
+            operationError = ProjectWriteError.storageUnavailable.localizedDescription
+            return
+        }
+        guard environment.importProcessing.activeProjectID != projectID else {
+            operationError = "当前录音正在重新处理，请完成后再继续录制。"
+            return
+        }
+        playback.stop()
         // 麦克风权限：拒绝时不阻塞界面，给出系统设置入口
         guard MicrophonePermission.currentStatus == .authorized else {
             operationError = "未获得麦克风权限。请在「系统设置 → 隐私与安全性 → 麦克风」中允许「帮我分析」后重试。"
@@ -2279,18 +2559,16 @@ struct ProjectWorkspaceView: View {
             return
         }
 
-        // 本地中文转写不可用：阻止开始并显示真实原因，不静默切换
-        if let availability = transcription?.availability, !availability.isReady {
-            operationError = "无法开始：本地中文转写不可用。\n\(availability.issueSummary ?? "")"
-            return
-        }
-
         Task {
-            if transcription?.availability == nil {
+            // 本地转写不可用时不再阻断开录（12 号 §4.1）：
+            // 仍保存音频，结束后可用「重新转写」补文稿。
+            var transcriptionIssue: String?
+            if let availability = transcription?.availability, !availability.isReady {
+                transcriptionIssue = availability.issueSummary ?? ""
+            } else if transcription?.availability == nil {
                 let result = await transcription?.checkAvailability()
                 if result?.isReady == false {
-                    operationError = "无法开始：本地中文转写不可用。\n\(result?.issueSummary ?? "")"
-                    return
+                    transcriptionIssue = result?.issueSummary ?? ""
                 }
             }
 
@@ -2309,11 +2587,23 @@ struct ProjectWorkspaceView: View {
                         deviceID: meeting.preferredInputDeviceID
                     )
                 }
+                environment.finalReportCoordinator.cancel(projectID: projectID)
+                memoryProposalID = nil
+                memoryProposalTask?.cancel()
+                isProposingMemoryCandidates = false
+                isRetranscribing = false
                 didStartSessionThisView = true
                 hasResolvedAbnormalExit = true
                 environment.markProjectLive(projectID)
                 syncAndPersist(meeting)
                 operationError = environment.consumePendingWarning(for: projectID)
+                isAudioOnlyRecording = transcriptionIssue != nil
+                if transcriptionIssue != nil {
+                    audioOnlyNotice = "仅保存音频模式：本地转写不可用（\(transcriptionIssue ?? "原因未知")）。"
+                        + "音频会正常保存；结束后可用「重新转写」生成文稿。"
+                } else {
+                    audioOnlyNotice = nil
+                }
                 environment.audioCapture.onLevel = { level in
                     Task { @MainActor in
                         liveAudioLevel = level
@@ -2321,9 +2611,17 @@ struct ProjectWorkspaceView: View {
                     }
                 }
 
-                if let recorder, let transcription {
-                    try await transcription.start(for: meeting) { [weak recorder] in
-                        recorder?.timeline
+                if let recorder, let transcription, transcriptionIssue == nil {
+                    do {
+                        try await transcription.start(for: meeting) { [weak recorder] in
+                            recorder?.timeline
+                        }
+                    } catch {
+                        await transcription.cancel()
+                        environment.audioCapture.clearBufferHandler(token: audioSessionToken)
+                        isAudioOnlyRecording = true
+                        audioOnlyNotice = "仅保存音频模式：本地转写启动失败；音频仍在保存，结束后可重新转写。"
+                        return
                     }
                     let transcriptionService = environment.localTranscription
                     let token = UUID()
@@ -2455,6 +2753,326 @@ struct ProjectWorkspaceView: View {
         }
     }
 
+    // MARK: - 记忆与跟进候选（12 号 §6.3 / §7.3）
+
+    private func proposeMemoryCandidatesIfNeeded(manual: Bool = false) async {
+        guard let project, !isProposingMemoryCandidates else { return }
+        guard environment.isAnalysisConfigured else {
+            if manual { operationError = "请先配置分析模型，再提取候选；已保存候选仍可确认。" }
+            return
+        }
+        let requestID = UUID()
+        memoryProposalID = requestID
+        isProposingMemoryCandidates = true
+        operationError = nil
+        defer {
+            if memoryProposalID == requestID {
+                memoryProposalID = nil
+                isProposingMemoryCandidates = false
+            }
+        }
+        do {
+            let existing = try environment.activeMemoryContents(for: project)
+            let linked = try environment.businessProjectStore.load().filter {
+                $0.linkedProjectIDs.contains(project.id)
+            }
+            let outcome = try await environment.businessMemoryCandidateAgent.propose(
+                project: project,
+                existingActiveMemoryContents: existing,
+                businessProjectID: linked.count == 1 ? linked.first?.id : nil
+            )
+            try Task.checkCancellation()
+            guard memoryProposalID == requestID, self.project?.id == project.id else { return }
+            guard let stored = try environment.allProjects().first(where: { $0.id == project.id }),
+                  BusinessMemoryCandidateBuilder.proposalVersion(project: stored)
+                    == BusinessMemoryCandidateBuilder.proposalVersion(project: project) else {
+                throw BusinessMemoryCandidateError.sourceChanged
+            }
+            let previousMemory = project.businessMemoryCandidates
+            let previousFollowUps = project.followUpCandidates
+            project.businessMemoryCandidates.removeAll {
+                $0.status == .pending && !BusinessMemoryCandidateBuilder.sourceIsCurrent(
+                    project: project, segmentID: $0.evidenceSegmentID,
+                    version: $0.sourceVersion, personID: $0.targetPersonID
+                )
+            }
+            project.followUpCandidates.removeAll {
+                $0.status == .pending && !BusinessMemoryCandidateBuilder.sourceIsCurrent(
+                    project: project, segmentID: $0.evidenceSegmentID, version: $0.sourceVersion
+                )
+            }
+            project.businessMemoryCandidates.append(contentsOf: outcome.memoryCandidates)
+            project.followUpCandidates.append(contentsOf: outcome.followUpCandidates)
+            do {
+                try environment.persist(project, fields: .memoryCandidates)
+            } catch {
+                project.businessMemoryCandidates = previousMemory
+                project.followUpCandidates = previousFollowUps
+                throw error
+            }
+            refreshPendingMemoryCandidates()
+            if pendingMemoryCandidates.isEmpty && pendingFollowUpCandidates.isEmpty {
+                if manual {
+                    reviewNotice = "本次没有新的候选。需要至少两条已确认人物归属的最终原话；已处置的同来源候选不会重复提出。"
+                }
+            } else {
+                reviewNotice = "有 \(pendingMemoryCandidates.count) 条记忆候选、"
+                    + "\(pendingFollowUpCandidates.count) 条跟进候选待确认。"
+                if manual { showMemoryCandidates = true }
+            }
+        } catch {
+            guard memoryProposalID == requestID, !Task.isCancelled else { return }
+            let detail = error is BusinessMemoryCandidateError
+                ? error.localizedDescription : TranscriptReviewFailureText.message(for: error)
+            operationError = "候选提取未完成：\(detail)；可以重试。"
+            AppLog.logWarning(AppLog.analysis, LogSanitizer.formatEvent(
+                "memory_candidate_proposal_failed", error: String(describing: type(of: error))
+            ))
+        }
+    }
+
+    private func manuallyProposeMemoryCandidates() {
+        guard !isProposingMemoryCandidates else { return }
+        memoryProposalTask = Task { await proposeMemoryCandidatesIfNeeded(manual: true) }
+    }
+
+    @discardableResult
+    private func refreshPendingMemoryCandidates() -> Bool {
+        guard let project else { return false }
+        do {
+            let memories = try environment.personLibraryStore.load().flatMap(\.memoryEntries)
+            let followUps = try environment.businessProjectStore.load().flatMap(\.followUps)
+            let recovered = BusinessMemoryCandidateBuilder.reconcileCommittedCandidates(
+                project: project, memories: memories, followUps: followUps
+            )
+            if recovered || needsCandidateStatusRecovery {
+                do {
+                    try environment.persist(project, fields: .memoryCandidates)
+                    needsCandidateStatusRecovery = false
+                    reviewNotice = "已恢复记忆与跟进的确认状态；已写入内容请在人物库或业务项目页管理。"
+                } catch {
+                    needsCandidateStatusRecovery = true
+                    operationError = "记忆或跟进已写入，候选状态待恢复；请点击“恢复候选状态”。"
+                }
+            }
+        } catch {
+            needsCandidateStatusRecovery = true
+            pendingMemoryCandidates = []
+            pendingFollowUpCandidates = []
+            operationError = "无法核验已写入的记忆与跟进，候选处置暂不可用；请点击“恢复候选状态”重试。"
+            return false
+        }
+        pendingMemoryCandidates = project.businessMemoryCandidates.filter {
+            $0.status == .pending
+        }
+        pendingFollowUpCandidates = project.followUpCandidates.filter {
+            $0.status == .pending
+        }
+        if pendingMemoryCandidates.isEmpty && pendingFollowUpCandidates.isEmpty {
+            showMemoryCandidates = false
+        }
+        return true
+    }
+
+    private func confirmMemoryCandidates(_ items: [MemoryCandidatesSheet.MemoryItem]) {
+        guard refreshPendingMemoryCandidates(), let project else { return }
+        operationError = nil
+        let now = Date()
+        var confirmedCount = 0
+        for item in items {
+            do {
+                let statement = item.editedStatement.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !statement.isEmpty,
+                      let index = project.businessMemoryCandidates.firstIndex(where: { $0.id == item.id }),
+                      project.businessMemoryCandidates[index].status == .pending else { continue }
+                let candidate = project.businessMemoryCandidates[index]
+                guard let personID = candidate.targetPersonID,
+                      BusinessMemoryCandidateBuilder.sourceIsCurrent(
+                        project: project, segmentID: candidate.evidenceSegmentID,
+                        version: candidate.sourceVersion, personID: personID
+                      ),
+                      let stored = try environment.allProjects().first(where: { $0.id == project.id }),
+                      BusinessMemoryCandidateBuilder.sourceIsCurrent(
+                        project: stored, segmentID: candidate.evidenceSegmentID,
+                        version: candidate.sourceVersion, personID: personID
+                      ) else { throw BusinessMemoryCandidateError.sourceChanged }
+                let businessProjectID = item.candidate.targetBusinessProjectID
+                var scopeText = "人物（\(candidate.targetPersonDisplayName ?? "已关联人物")）"
+                if candidate.requiresBusinessProjectScope == true {
+                    guard let businessProjectID,
+                          let target = try environment.businessProjectStore.load().first(where: {
+                              $0.id == businessProjectID
+                          }) else {
+                        operationError = "请选择真实业务项目；该候选不能作为全部项目通用记忆。"
+                        continue
+                    }
+                    scopeText += " + 业务项目（\(target.name)）"
+                }
+                guard var person = try environment.personLibraryStore.person(id: personID) else {
+                    operationError = "人物已不存在，请重新关联人物并提取候选。"
+                    continue
+                }
+                if let written = person.memoryEntries.first(where: { $0.id == candidate.id }),
+                   written.status != .active {
+                    operationError = "该记忆已在人物库被另行处置，请先复核；不会重复新增。"
+                    continue
+                }
+                if !person.memoryEntries.contains(where: { $0.id == candidate.id }) {
+                    let entry = MemoryEntry(
+                        id: candidate.id,
+                        content: statement,
+                        kind: candidate.kind,
+                        scope: MemoryScope(personID: personID,
+                            businessProjectID: candidate.requiresBusinessProjectScope == true ? businessProjectID : nil,
+                            displayText: scopeText),
+                        source: MemorySourceReference(recordingID: project.id,
+                            segmentID: candidate.evidenceSegmentID, snippet: candidate.evidenceSnippet,
+                            sourceVersion: candidate.sourceVersion),
+                        status: .active, confirmedAt: now, effectiveFrom: now,
+                        createdAt: now, updatedAt: now
+                    )
+                    person.memoryEntries.append(entry)
+                    _ = try environment.personLibraryStore.replaceMemoryEntries(
+                        personID: personID, entries: person.memoryEntries, now: now
+                    )
+                }
+                project.businessMemoryCandidates[index].status = .confirmed
+                project.businessMemoryCandidates[index].resolvedAt = now
+                confirmedCount += 1
+                do {
+                    try environment.persist(project, fields: .memoryCandidates)
+                } catch {
+                    needsCandidateStatusRecovery = true
+                    operationError = "记忆已写入人物库，候选状态待恢复；该条不会再作为未确认候选。"
+                }
+            } catch {
+                operationError = "记忆未确认：\(error.localizedDescription)"
+            }
+        }
+        refreshPendingMemoryCandidates()
+        if confirmedCount > 0 {
+            reviewNotice = "已确认 \(confirmedCount) 条记忆，可在人物库查看和撤回。"
+        }
+    }
+
+    private func resolveMemoryCandidate(_ id: UUID, _ status: PendingCandidateStatus) {
+        guard refreshPendingMemoryCandidates() else { return }
+        guard status == .rejected || status == .keptLocalOnly,
+              let project,
+              let index = project.businessMemoryCandidates.firstIndex(where: { $0.id == id }),
+              project.businessMemoryCandidates[index].status == .pending else { return }
+        let previous = project.businessMemoryCandidates[index]
+        project.businessMemoryCandidates[index].status = status
+        project.businessMemoryCandidates[index].resolvedAt = Date()
+        do {
+            try environment.persist(project, fields: .memoryCandidates)
+        } catch {
+            project.businessMemoryCandidates[index] = previous
+            operationError = "候选处置保存失败：\(error.localizedDescription)"
+        }
+        refreshPendingMemoryCandidates()
+    }
+
+    private func confirmFollowUpCandidates(
+        _ items: [MemoryCandidatesSheet.FollowUpItem],
+        target: MemoryCandidatesSheet.FollowUpTarget
+    ) {
+        guard refreshPendingMemoryCandidates(), let project, !items.isEmpty else { return }
+        let now = Date()
+        do {
+            guard let stored = try environment.allProjects().first(where: { $0.id == project.id }) else {
+                throw BusinessMemoryCandidateError.sourceChanged
+            }
+            let selectedIDs = Set(items.map(\.id))
+            let candidates = project.followUpCandidates.filter {
+                selectedIDs.contains($0.id) && $0.status == .pending
+            }
+            guard !candidates.isEmpty else { return }
+            guard candidates.allSatisfy({ candidate in
+                BusinessMemoryCandidateBuilder.sourceIsCurrent(
+                    project: project, segmentID: candidate.evidenceSegmentID, version: candidate.sourceVersion
+                ) && BusinessMemoryCandidateBuilder.sourceIsCurrent(
+                    project: stored, segmentID: candidate.evidenceSegmentID, version: candidate.sourceVersion
+                )
+            }) else { throw BusinessMemoryCandidateError.sourceChanged }
+            let projects = try environment.businessProjectStore.load()
+            let writtenProjects = projects.filter { business in
+                business.followUps.contains { selectedIDs.contains($0.id) }
+            }
+            guard writtenProjects.count <= 1 else {
+                operationError = "所选跟进已分别写入不同业务项目，请逐条确认状态。"
+                return
+            }
+            var businessProject: BusinessProject
+            if let written = writtenProjects.first {
+                businessProject = written
+            } else if let id = target.existingBusinessProjectID,
+                      let existing = projects.first(where: { $0.id == id }) {
+                businessProject = existing
+            } else if let name = target.newBusinessProjectName {
+                let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let existing = projects.first(where: { $0.name == trimmed }) {
+                    businessProject = existing
+                } else {
+                    businessProject = try environment.businessProjectStore.create(
+                        name: trimmed, linkedProjectIDs: [project.id], now: now
+                    )
+                }
+            } else {
+                operationError = "请选择跟进的目标业务项目。"
+                return
+            }
+            for candidate in candidates where !businessProject.followUps.contains(where: { $0.id == candidate.id }) {
+                // 原话中的姓名只保留文本，不能用同名人物的首个结果自动决定负责人。
+                businessProject.followUps.append(FollowUp(
+                    id: candidate.id, title: candidate.title,
+                    ownerDisplayText: candidate.ownerDisplayText, dueDate: candidate.dueDate,
+                    source: FollowUpSourceReference(recordingID: project.id,
+                        segmentID: candidate.evidenceSegmentID, snippet: candidate.evidenceSnippet,
+                        sourceVersion: candidate.sourceVersion),
+                    confirmationStatus: .confirmed, handlingStatus: .pending,
+                    createdAt: now, updatedAt: now
+                ))
+            }
+            if !businessProject.linkedProjectIDs.contains(project.id) {
+                businessProject.linkedProjectIDs.append(project.id)
+            }
+            _ = try environment.businessProjectStore.update(businessProject, now: now)
+            for index in project.followUpCandidates.indices where selectedIDs.contains(project.followUpCandidates[index].id) {
+                project.followUpCandidates[index].status = .confirmed
+                project.followUpCandidates[index].resolvedAt = now
+            }
+            do {
+                try environment.persist(project, fields: .memoryCandidates)
+                reviewNotice = "已把 \(candidates.count) 条跟进写入「\(businessProject.name)」；完成时请记录实际结果。"
+            } catch {
+                needsCandidateStatusRecovery = true
+                operationError = "跟进已写入业务项目，候选状态待恢复；该条不会再作为未确认候选。"
+            }
+        } catch {
+            operationError = "跟进未确认：\(error.localizedDescription)"
+        }
+        refreshPendingMemoryCandidates()
+    }
+
+    private func resolveFollowUpCandidate(_ id: UUID, _ status: PendingCandidateStatus) {
+        guard refreshPendingMemoryCandidates() else { return }
+        guard status == .rejected || status == .keptLocalOnly,
+              let project,
+              let index = project.followUpCandidates.firstIndex(where: { $0.id == id }),
+              project.followUpCandidates[index].status == .pending else { return }
+        let previous = project.followUpCandidates[index]
+        project.followUpCandidates[index].status = status
+        project.followUpCandidates[index].resolvedAt = Date()
+        do {
+            try environment.persist(project, fields: .memoryCandidates)
+        } catch {
+            project.followUpCandidates[index] = previous
+            operationError = "候选处置保存失败：\(error.localizedDescription)"
+        }
+        refreshPendingMemoryCandidates()
+    }
+
     private func finishRecording() {
         guard let meeting, !isFinishing else { return }
         noteController?.saveNow()
@@ -2471,12 +3089,32 @@ struct ProjectWorkspaceView: View {
                 try recorder?.completeFinalizing()
                 syncAndPersist(meeting)
                 environment.clearProjectLive(projectID)
+                if isAudioOnlyRecording {
+                    isAudioOnlyRecording = false
+                    audioOnlyNotice = nil
+                }
+                let transcriptionFailed = transcription?.lastErrorDescription != nil
+                    || project?.hasUsableTranscript != true
+                if let project {
+                    project.processingJobs.removeAll { $0.kind == .transcription }
+                    project.processingJobs.append(ProcessingJob(
+                        kind: .transcription,
+                        status: transcriptionFailed ? .failedRetryable : .completed,
+                        progress: transcriptionFailed ? nil : 1,
+                        lastErrorCategory: transcriptionFailed ? "transcription_incomplete" : nil
+                    ))
+                    if transcriptionFailed { project.status = .readyWithWarnings }
+                    try environment.persist(project, fields: .importPipeline)
+                }
                 operationError = nil
-                if environment.isAnalysisConfigured {
+                if transcriptionFailed {
+                    operationError = "录音已保存，但转写未完成。请先回听原音频，再使用“重新转写”；本次未自动生成总结。"
+                } else if environment.isAnalysisConfigured {
                     // 先复查全文更正识别错误，再生成完整总结（报告用的是更正后文稿）。
                     // 复查失败不阻断——转写保持原样，总结照常生成。
                     await reviewTranscriptAfterRecording(meeting: meeting)
                     environment.finalReportCoordinator.start(projectID: projectID)
+                    await proposeMemoryCandidatesIfNeeded()
                     if let project {
                         Task {
                             do {
@@ -2539,6 +3177,10 @@ struct ProjectWorkspaceView: View {
             operationError = "请先结束录音，完成收尾后再生成完整总结。"
             return
         }
+        guard environment.importProcessing.activeProjectID != projectID else {
+            operationError = "录音正在重新处理，请完成后再生成总结。"
+            return
+        }
         if project.sourceType.isImportedMedia,
            project.status == .processing,
            environment.importProcessing.activeProjectID == nil,
@@ -2556,6 +3198,15 @@ struct ProjectWorkspaceView: View {
             return
         }
         environment.finalReportCoordinator.start(projectID: projectID)
+    }
+
+    private func openRequestedEvidenceIfNeeded() {
+        guard let segmentID = router.consumeEvidenceRequest(for: projectID) else { return }
+        guard project?.segments.contains(where: { $0.id == segmentID }) == true else {
+            operationError = "来源片段已不存在，请复核该记忆或跟进。"
+            return
+        }
+        locateEvidence(segmentID: segmentID)
     }
 
     private func openRequestedFinalReportIfNeeded() {
@@ -2607,6 +3258,7 @@ private struct TranscriptReviewPersistenceFailure: Error {}
 
 /// 处理详情弹层（03 §6.3：Provider Key 状态、分片计数等技术细节不占据主工作区，仅在此查看）
 private struct ProcessingDetailsButton: View {
+    let project: Project
     let transcription: LocalTranscriptionController?
     let diarization: DiarizationController?
     let analysis: ConversationAnalysisController?
@@ -2621,7 +3273,12 @@ private struct ProcessingDetailsButton: View {
 
     /// 异常计数（有异常时按钮以橙色提示）
     private var issueCount: Int {
-        var count = 0
+        var count = project.processingJobs.filter {
+            $0.status == .failedRetryable || $0.status == .failedFinal
+        }.count
+        if (project.status == .ready || project.status == .readyWithWarnings) && !project.hasUsableTranscript {
+            count += 1
+        }
         if case .unavailable = transcription?.runState { count += 1 }
         if case .suspended = diarization?.cloudState { count += 1 }
         if case .unconfigured = diarization?.cloudState { count += 1 }
@@ -2639,17 +3296,19 @@ private struct ProcessingDetailsButton: View {
         }
         .popover(isPresented: $isPresented, arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: 10) {
-                row("麦克风", microphoneName ?? "系统默认")
+                Text(project.processingStatusText).font(.headline)
+                row("麦克风", microphoneName ?? "当前未采集")
                 row("本地转写", transcriptionStatusText)
                 row("高精度转写与说话人", diarizationStatusText)
-                row("云端分析", analysis?.statusDescription ?? "分析待启动")
+                row("云端分析", savedStatus(for: .analysis) ?? analysis?.statusDescription ?? "本场未运行")
+                row("完整总结", savedStatus(for: .finalReport) ?? (project.finalReportSnapshots.isEmpty ? "尚未生成" : "已有历史总结"))
                 Divider()
-                row("文字分析模型", isAnalysisConfigured ? "已连接" : "未连接")
+                row("文字分析模型", isAnalysisConfigured ? "已配置" : "未配置")
                 row(
                     "高精度音频服务",
                     isDiarizationConfigured
-                        ? "已连接"
-                        : "未连接（当前仅 Apple Speech）"
+                        ? "已配置"
+                        : "未配置（当前仅 Apple Speech）"
                 )
                 if let diarization, diarization.awaitingUserRetryCount > 0 {
                     Button("重试 \(diarization.awaitingUserRetryCount) 个失败分片", action: onRetryChunks)
@@ -2671,20 +3330,34 @@ private struct ProcessingDetailsButton: View {
         .font(.callout)
     }
 
+    private func savedStatus(for kind: ProcessingJobKind) -> String? {
+        guard project.status != .recording, project.status != .paused,
+              let job = project.processingJobs.last(where: { $0.kind == kind }) else { return nil }
+        switch job.status {
+        case .pending: return "等待处理"
+        case .running: return "处理未完成"
+        case .completed: return "已完成"
+        case .failedRetryable: return "失败 · 可重试"
+        case .failedFinal: return "失败 · 需检查素材"
+        }
+    }
+
     private var transcriptionStatusText: String {
-        guard let transcription else { return "待启动" }
+        if let stored = savedStatus(for: .transcription) { return stored }
+        guard let transcription else { return "本场未运行" }
         switch transcription.runState {
-        case .idle: return "就绪"
+        case .idle: return project.hasUsableTranscript ? "已有文稿 · 无本场运行记录" : "本场未运行"
         case .running: return "转写中"
         case .unavailable(let reason): return "不可用：\(reason)"
         }
     }
 
     private var diarizationStatusText: String {
-        guard let diarization else { return "待启动" }
+        if let stored = savedStatus(for: .diarization) { return stored }
+        guard let diarization else { return "本场未运行" }
         switch diarization.cloudState {
-        case .idle: return "正常"
-        case .working(let pending): return pending > 0 ? "识别中（待处理 \(pending)）" : "正常"
+        case .idle: return "本场未运行"
+        case .working(let pending): return pending > 0 ? "识别中（待处理 \(pending)）" : "本场队列已处理"
         case .suspended: return "已暂停"
         case .unconfigured: return "未配置（仅本地转写）"
         }

@@ -775,6 +775,77 @@ final class ProjectStoreTests {
         #expect(workspace.noteAIContextEnabled)
     }
 
+    @Test("实时保存只更新录音字段，保留后台报告、人物和笔记")
+    func recordingRuntimePreservesConcurrentFields() throws {
+        let stored = Project(title: "新标题", sourceType: .liveRecording, status: .recording,
+                             speakers: [Speaker(cloudAlias: "p_01", displayName: "已更新姓名", colorToken: "blue")],
+                             note: NoteDocument(markdown: "新笔记"),
+                             processingJobs: [ProcessingJob(kind: .finalReport, status: .completed)])
+        let segment = TranscriptSegment(startMs: 0, endMs: 1_000, text: "新文稿", source: .local, state: .final)
+        let incoming = Project(id: stored.id, title: "旧标题", sourceType: .liveRecording, status: .ready,
+                               runtimeAssetRelativePath: "Meetings/test/recording.caf", durationMs: 1_000,
+                               segments: [segment])
+        var projects = [stored]
+        ProjectPersistence.upsert(incoming, into: &projects, fields: .recordingRuntime)
+        #expect(stored.title == "新标题")
+        #expect(stored.speakers.first?.displayName == "已更新姓名")
+        #expect(stored.note.markdown == "新笔记")
+        #expect(stored.processingJobs.first?.status == .completed)
+        #expect(stored.status == .ready)
+        #expect(stored.segments.first?.id == segment.id)
+        #expect(stored.runtimeAssetRelativePath == incoming.runtimeAssetRelativePath)
+    }
+
+    @Test("报告保存保留同时更新的转写失败状态")
+    func finalReportOnlyOwnsReportJob() {
+        let stored = Project(title: "记录", sourceType: .liveRecording,
+                             processingJobs: [ProcessingJob(kind: .transcription, status: .failedRetryable)])
+        let incoming = Project(id: stored.id, title: "记录", sourceType: .liveRecording,
+                               processingJobs: [ProcessingJob(kind: .transcription, status: .completed),
+                                                ProcessingJob(kind: .finalReport, status: .completed)])
+        var projects = [stored]
+        ProjectPersistence.upsert(incoming, into: &projects, fields: .finalReport)
+        #expect(stored.processingJobs.first(where: { $0.kind == .transcription })?.status == .failedRetryable)
+        #expect(stored.processingJobs.first(where: { $0.kind == .finalReport })?.status == .completed)
+    }
+
+    @Test("结束空录音与失败任务不得显示成就绪")
+    func processingStatusReflectsEvidence() {
+        let project = Project(title: "记录", sourceType: .liveRecording, status: .ready)
+        #expect(!project.hasUsableTranscript)
+        #expect(project.processingStatusText == "录音已结束 · 无可用文稿")
+        project.segments = [TranscriptSegment(startMs: 0, endMs: 1_000, text: "   ", source: .local, state: .final)]
+        #expect(!project.hasUsableTranscript)
+        project.segments[0].text = "有内容"
+        #expect(project.processingStatusText == "文稿可用 · 未生成总结")
+        project.processingJobs = [ProcessingJob(kind: .finalReport, status: .failedRetryable)]
+        #expect(project.processingStatusText == "文稿可用 · 部分处理失败")
+        project.status = .processing
+        #expect(project.processingStatusText == "处理失败 · 可重试")
+        #expect(project.hasFailedProcessingJobs)
+    }
+
+    @Test("存储不可用拒绝临时写入，删除后拒绝后台旧副本")
+    @MainActor
+    func unavailableAndDeletedProjectRejectWrites() throws {
+        let directory = makeCaseDirectory("write-guard")
+        let store = InMemoryProjectStore()
+        let environment = AppEnvironment(meetingStore: InMemoryMeetingStore(),
+            fileStore: MeetingFileStore(baseDirectory: directory), projectStore: store,
+            credentialServiceName: "com.zhaobo.BangWoFenXi.tests.unavailable-\(UUID())",
+            isPersistentStorageUnavailable: true)
+        let project = Project(title: "测试", sourceType: .liveRecording)
+        #expect(throws: ProjectWriteError.self) { try environment.persist(project) }
+        #expect(try store.loadProjects().isEmpty)
+        let active = AppEnvironment(meetingStore: InMemoryMeetingStore(),
+            fileStore: MeetingFileStore(baseDirectory: directory), projectStore: store,
+            credentialServiceName: "com.zhaobo.BangWoFenXi.tests.deleted-\(UUID())")
+        try active.persist(project)
+        try active.deleteProject(project)
+        #expect(throws: ProjectWriteError.self) { try active.persist(project, fields: .finalReport) }
+        #expect(try store.loadProjects().isEmpty)
+    }
+
     @Test("删除项目：记录与项目目录一起消失，其他项目和其他目录不受影响")
     @MainActor
     func deleteProjectRemovesRecordAndDirectory() throws {

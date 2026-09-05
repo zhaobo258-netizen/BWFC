@@ -6,6 +6,23 @@ import Testing
 @Suite("说话人面板逻辑")
 struct SpeakerPanelLogicTests {
 
+    @Test("无声纹人物可加入本场，同名人物保持独立身份且不占声纹名额")
+    func personDoesNotRequireVoiceSample() {
+        let first = Person(displayName: "王总", role: "采购", backgroundContext: "人工背景")
+        let second = Person(displayName: "王总", isCurrentUser: true)
+        let speaker1 = SpeakerPanelLogic.speaker(for: first, existing: [])
+        let speaker2 = SpeakerPanelLogic.speaker(for: second, existing: [speaker1])
+        #expect(speaker1.personId == first.id)
+        #expect(speaker2.personId == second.id)
+        #expect(speaker1.personId != speaker2.personId)
+        #expect(speaker1.cloudAlias != speaker2.cloudAlias)
+        #expect(speaker1.role == "采购")
+        #expect(speaker1.backgroundContext == "人工背景")
+        #expect(speaker2.isCurrentUser == true)
+        #expect(speaker1.isUserConfirmed)
+        #expect(SpeakerPanelLogic.activeVoiceReferenceCount(in: [speaker1, speaker2]) == 0)
+    }
+
     @Test("代号分配：跳过已占用，按序取下一个")
     func aliasAllocation() {
         #expect(SpeakerPanelLogic.nextCloudAlias(existing: []) == "p_01")

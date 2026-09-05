@@ -44,6 +44,7 @@ enum HistoricalPersonLibrary {
     ) -> [HistoricalPersonSummary] {
         profiles.map { profile in
             let matches = projects.compactMap { project -> HistoricalPersonProjectSummary? in
+                guard !project.sourceType.isCombinedAnalysis else { return nil }
                 let speakerIDs = Set(
                     project.speakers
                         .filter { $0.voiceProfileId == profile.id }
@@ -79,7 +80,9 @@ enum HistoricalPersonLibrary {
         profileID: UUID,
         projects: [Project]
     ) -> [SpeakerCommunicationEvidence] {
-        projects
+        var seenSegmentIDs = Set<UUID>()
+        return projects
+            .filter { !$0.sourceType.isCombinedAnalysis }
             .sorted { $0.lastActivityAt < $1.lastActivityAt }
             .flatMap { project -> [SpeakerCommunicationEvidence] in
                 let speakerIDs = Set(
@@ -106,6 +109,86 @@ enum HistoricalPersonLibrary {
                         )
                     }
             }
+            .filter { seenSegmentIDs.insert($0.segmentID).inserted }
+    }
+
+    @MainActor
+    static func updateCommunicationProfile(
+        profileID: UUID,
+        profileStore: SpeakerVoiceProfileStore,
+        projectStore: any ProjectStoring,
+        generationService: any AITextGenerationServing
+    ) async throws -> Int {
+        guard let original = try profileStore.loadForManagement()
+            .first(where: { $0.id == profileID }) else {
+            throw SpeakerVoiceProfileStoreError.profileNotFound
+        }
+        let evidence = communicationEvidence(
+            profileID: profileID,
+            projects: try projectStore.loadProjects()
+        )
+        let generated = try await SpeakerCommunicationProfileAgent(
+            generationService: generationService
+        ).analyze(
+            profileID: profileID,
+            backgroundContext: original.backgroundContext,
+            previousProfile: original.communicationProfile,
+            evidence: evidence
+        )
+        guard let current = try profileStore.loadForManagement()
+            .first(where: { $0.id == profileID }) else {
+            throw SpeakerVoiceProfileStoreError.profileNotFound
+        }
+        // AI 等待期间项目、人物或录音可能变化，提交和回滚都只用此刻读取的数据。
+        let projects = try projectStore.loadProjects()
+        let speakers = projects.flatMap(\.speakers).filter { $0.voiceProfileId == profileID }
+        let previous = speakers.map { ($0, $0.communicationProfile) }
+        do {
+            try profileStore.updateContext(
+                profileID: profileID,
+                backgroundContext: current.backgroundContext,
+                communicationProfile: generated
+            )
+            for speaker in speakers { speaker.communicationProfile = generated }
+            try projectStore.saveProjects(projects)
+        } catch {
+            for (speaker, profile) in previous { speaker.communicationProfile = profile }
+            try profileStore.updateContext(
+                profileID: profileID,
+                backgroundContext: current.backgroundContext,
+                communicationProfile: current.communicationProfile,
+                now: current.updatedAt
+            )
+            try projectStore.saveProjects(projects)
+            throw error
+        }
+        return evidence.count
+    }
+
+    @MainActor
+    static func setCurrentUser(
+        profileID: UUID,
+        profileStore: SpeakerVoiceProfileStore,
+        projectStore: any ProjectStoring
+    ) throws {
+        let profiles = try profileStore.loadForManagement()
+        let previousProfileID = profiles.first { $0.isCurrentUser == true }?.id
+        let projects = try projectStore.loadProjects()
+        let previous = projects.flatMap(\.speakers).map { ($0, $0.isCurrentUser) }
+        do {
+            try profileStore.setCurrentUser(profileID: profileID)
+            for project in projects {
+                for speaker in project.speakers {
+                    speaker.isCurrentUser = speaker.voiceProfileId == profileID
+                }
+            }
+            try projectStore.saveProjects(projects)
+        } catch {
+            for (speaker, wasCurrentUser) in previous { speaker.isCurrentUser = wasCurrentUser }
+            try profileStore.setCurrentUser(profileID: previousProfileID)
+            try projectStore.saveProjects(projects)
+            throw error
+        }
     }
 
     /// 从已人工确认归属的历史发言中选取真实语音，拼足讯飞注册需要的时长。
@@ -117,7 +200,8 @@ enum HistoricalPersonLibrary {
     ) -> [HistoricalVoiceprintSampleClip] {
         guard targetDurationMs > 0 else { return [] }
         let candidates = projects.flatMap { project -> [HistoricalVoiceprintSampleClip] in
-            guard let relativePath = project.runtimeAssetRelativePath,
+            guard !project.sourceType.isCombinedAnalysis,
+                  let relativePath = project.runtimeAssetRelativePath,
                   !relativePath.isEmpty else { return [] }
             let speakerIDs = Set(
                 project.speakers

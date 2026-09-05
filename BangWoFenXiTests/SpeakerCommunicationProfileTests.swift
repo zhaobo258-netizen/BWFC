@@ -50,4 +50,81 @@ struct SpeakerCommunicationProfileTests {
             )
         }
     }
+    @MainActor
+    @Test("本场画像只上传人工确认归属的有效发言")
+    func currentProjectProfileRequiresConfirmedSpeakerEvidence() async throws {
+        let speaker = Speaker(cloudAlias: "p_01", displayName: "测试人物")
+        let confirmedOne = TranscriptSegment(
+            startMs: 0, endMs: 1_000, text: "确认一", participantId: speaker.id,
+            source: .local, state: .final, speakerWasUserConfirmed: true
+        )
+        let confirmedTwo = TranscriptSegment(
+            startMs: 1_000, endMs: 2_000, text: "确认二", participantId: speaker.id,
+            source: .local, state: .edited, speakerWasUserConfirmed: true
+        )
+        let automatic = TranscriptSegment(
+            startMs: 2_000, endMs: 3_000, text: "仅自动归属", participantId: speaker.id,
+            source: .cloud, state: .final
+        )
+        let provisional = TranscriptSegment(
+            startMs: 3_000, endMs: 4_000, text: "未定稿", participantId: speaker.id,
+            source: .local, state: .provisional, speakerWasUserConfirmed: true
+        )
+        let generation = CommunicationProfileCapturingGeneration(evidenceID: confirmedOne.id)
+        _ = try await SpeakerCommunicationProfileAgent(generationService: generation).analyze(
+            speaker: speaker, projectId: UUID(),
+            segments: [confirmedOne, automatic, provisional, confirmedTwo]
+        )
+
+        let input = try #require(await generation.lastInput())
+        let root = try #require(JSONSerialization.jsonObject(with: Data(input.utf8)) as? [String: Any])
+        let transcript = try #require(root["untrusted_transcript_data"] as? [String: Any])
+        let segments = try #require(transcript["segments"] as? [[String: Any]])
+        #expect(segments.compactMap { $0["id"] as? String } == [confirmedOne.id.uuidString, confirmedTwo.id.uuidString])
+    }
+
+    @MainActor
+    @Test("自动归属不能凑足画像所需两条人工确认证据")
+    func unconfirmedSpeechDoesNotStartProfileRequest() async {
+        let speaker = Speaker(cloudAlias: "p_01", displayName: "测试人物")
+        let confirmed = TranscriptSegment(
+            startMs: 0, endMs: 1_000, text: "确认一", participantId: speaker.id,
+            source: .local, state: .final, speakerWasUserConfirmed: true
+        )
+        let automatic = TranscriptSegment(
+            startMs: 1_000, endMs: 2_000, text: "仅自动归属", participantId: speaker.id,
+            source: .cloud, state: .final
+        )
+        let generation = CommunicationProfileCapturingGeneration(evidenceID: confirmed.id)
+        await #expect(throws: AnalysisAPIError.invalidResponse) {
+            _ = try await SpeakerCommunicationProfileAgent(generationService: generation).analyze(
+                speaker: speaker, projectId: UUID(), segments: [confirmed, automatic]
+            )
+        }
+        #expect(await generation.lastInput() == nil)
+    }
+
+}
+
+private actor CommunicationProfileCapturingGeneration: AITextGenerationServing {
+    private let evidenceID: UUID
+    private var input: String?
+
+    init(evidenceID: UUID) { self.evidenceID = evidenceID }
+
+    func generate(_ request: AITextGenerationRequest) async throws -> AITextGenerationResponse {
+        input = request.input
+        return AITextGenerationResponse(
+            text: """
+            {"summary":"结论清楚","observations":[{"title":"清楚","observation":"明确表达结论","evidence_segment_ids":["\(evidenceID.uuidString)"]}]}
+            """,
+            provider: .init(id: "fixture", displayName: "本地测试", modelID: "fixture")
+        )
+    }
+
+    func lastInput() -> String? { input }
+
+    func testActiveConnection() async throws -> AIProviderDescriptor {
+        .init(id: "fixture", displayName: "本地测试", modelID: "fixture")
+    }
 }

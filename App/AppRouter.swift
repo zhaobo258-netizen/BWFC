@@ -10,6 +10,8 @@ enum AppRoute: Hashable {
     case projectWorkspace(UUID, autoStart: Bool)
     /// 跨录音的历史人物、声纹、背景与表达画像
     case peopleLibrary
+    /// 轻 CRM 业务项目（人物、录音与跟进闭环）
+    case businessProjects
     // 旧版路由（保留兼容，不再作为主流程入口）
     case meetingList
     /// 会议表单：nil = 新建；有 id = 编辑既有草稿
@@ -25,31 +27,50 @@ final class AppRouter {
     var route: AppRoute = .projectHome
     var isSettingsPresented = false
     var requestedFinalReportProjectID: UUID?
+    private var requestedEvidence: (projectID: UUID, segmentID: UUID)?
+    var requestedEvidenceSegmentID: UUID? { requestedEvidence?.segmentID }
 
     func showProjectHome() {
+        requestedEvidence = nil
         requestedFinalReportProjectID = nil
         route = .projectHome
     }
 
-    func showProjectWorkspace(_ id: UUID, autoStart: Bool) {
+    func showProjectWorkspace(_ id: UUID, autoStart: Bool, evidenceSegmentID: UUID? = nil) {
+        requestedEvidence = evidenceSegmentID.map { (id, $0) }
         requestedFinalReportProjectID = nil
         route = .projectWorkspace(id, autoStart: autoStart)
     }
 
     func showProjectFinalReport(_ id: UUID) {
+        requestedEvidence = nil
         requestedFinalReportProjectID = id
         route = .projectWorkspace(id, autoStart: false)
     }
 
     func showPeopleLibrary() {
+        requestedEvidence = nil
         requestedFinalReportProjectID = nil
         route = .peopleLibrary
+    }
+
+    func showBusinessProjects() {
+        requestedEvidence = nil
+        requestedFinalReportProjectID = nil
+        route = .businessProjects
     }
 
     func consumeFinalReportRequest(for id: UUID) -> Bool {
         guard requestedFinalReportProjectID == id else { return false }
         requestedFinalReportProjectID = nil
         return true
+    }
+
+    func consumeEvidenceRequest(for id: UUID) -> UUID? {
+        guard requestedEvidence?.projectID == id else { return nil }
+        let segmentID = requestedEvidence?.segmentID
+        requestedEvidence = nil
+        return segmentID
     }
 
     func showSettings() {

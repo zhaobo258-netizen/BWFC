@@ -22,6 +22,9 @@ final class MockLocalTranscriptionService: LocalTranscriptionServicing, @uncheck
     private(set) var installCallCount = 0
     private(set) var availabilityProbeCount = 0
     var startError: (any Error)?
+    var sessionError: LocalTranscriptionError?
+    var finishError: LocalTranscriptionError?
+    private(set) var fedFrameCount: Int64 = 0
 
     /// 安装脚本：设置后 installMandarinAssets 抛出该错误
     var installError: (any Error)?
@@ -59,6 +62,7 @@ final class MockLocalTranscriptionService: LocalTranscriptionServicing, @uncheck
 
     func feed(_ buffer: AVAudioPCMBuffer) async {
         fedBufferCount += 1
+        fedFrameCount += Int64(buffer.frameLength)
     }
 
     /// finishSession 时结束结果流（真实服务行为；文件转写 Runner 测试需要）
@@ -71,6 +75,10 @@ final class MockLocalTranscriptionService: LocalTranscriptionServicing, @uncheck
             continuation?.yield(result)
         }
         if finishEndsStream {
+            continuation?.finish()
+        }
+        if let finishError {
+            sessionError = finishError
             continuation?.finish()
         }
     }
@@ -91,6 +99,11 @@ final class MockLocalTranscriptionService: LocalTranscriptionServicing, @uncheck
 
     /// 结束结果流
     func finishStream() {
+        continuation?.finish()
+    }
+
+    func fail(_ error: LocalTranscriptionError) {
+        sessionError = error
         continuation?.finish()
     }
 }

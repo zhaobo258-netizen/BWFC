@@ -22,6 +22,7 @@ enum KnowledgeProviderError: Error, Equatable {
     case permissionDenied
     case responseTooLarge
     case serverRejected(Int)
+    case invalidSearchQuery
 }
 
 extension KnowledgeProviderError: LocalizedError {
@@ -36,6 +37,24 @@ extension KnowledgeProviderError: LocalizedError {
         case .permissionDenied: return "没有读取知识库的权限"
         case .responseTooLarge: return "来源返回内容过大"
         case .serverRejected(let status): return "来源请求失败（HTTP \(status)）"
+        case .invalidSearchQuery: return "搜索只接受不超过 24 字的关键词，请勿发送原话或整段资料"
         }
+    }
+}
+
+enum KnowledgeSearchQueryPolicy {
+    static func keywords(_ raw: String, excluding sourceTexts: [String] = []) -> String? {
+        let query = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (2...24).contains(query.count),
+              query.rangeOfCharacter(from: .newlines) == nil,
+              query.range(of: #"[。！？；\n\r]|https?://|\S+@\S+|\d{7,}"#,
+                          options: .regularExpression) == nil else { return nil }
+        let normalized = query.replacingOccurrences(of: " ", with: "").lowercased()
+        guard !sourceTexts.contains(where: { source in
+            let text = source.trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: " ", with: "").lowercased()
+            return text == normalized || (normalized.count >= 12 && text.contains(normalized))
+        }) else { return nil }
+        return query
     }
 }

@@ -17,6 +17,8 @@ final class ImportProcessingController {
     private let makeTranscriptionService: () -> any LocalTranscriptionServicing
     private let analysisService: any ConversationAnalysisServicing
     private let finalReportGenerator: (any FinalReportGenerating)?
+    private let makeDiarizationService: () -> (any DiarizationServicing)?
+    private var activeDiarizationService: (any DiarizationServicing)?
     private let fileStore: MeetingFileStore
     private let loadProject: (UUID) throws -> Project?
     private let persistProject: (Project, ProjectFieldOwnership) throws -> Void
@@ -48,6 +50,7 @@ final class ImportProcessingController {
         makeTranscriptionService: @escaping () -> any LocalTranscriptionServicing,
         analysisService: any ConversationAnalysisServicing,
         finalReportGenerator: (any FinalReportGenerating)? = nil,
+        makeDiarizationService: @escaping () -> (any DiarizationServicing)? = { nil },
         fileStore: MeetingFileStore,
         isAnalysisConfigured: @escaping () -> Bool,
         loadProject: @escaping (UUID) throws -> Project?,
@@ -57,6 +60,7 @@ final class ImportProcessingController {
         self.makeTranscriptionService = makeTranscriptionService
         self.analysisService = analysisService
         self.finalReportGenerator = finalReportGenerator
+        self.makeDiarizationService = makeDiarizationService
         self.fileStore = fileStore
         self.isAnalysisConfigured = isAnalysisConfigured
         self.loadProject = loadProject
@@ -79,6 +83,7 @@ final class ImportProcessingController {
             }
         }
         let info = try await importService.inspect(url: url)
+        try Task.checkCancellation()
 
         let project = Project(
             title: ImportPlanner.defaultTitle(forFileName: info.fileName),
@@ -89,7 +94,8 @@ final class ImportProcessingController {
             durationMs: info.durationMs,
             processingJobs: ImportPlanner.planJobs(
                 analysisConfigured: isAnalysisConfigured(),
-                finalReportConfigured: finalReportGenerator != nil
+                finalReportConfigured: finalReportGenerator != nil,
+                diarizationConfigured: makeDiarizationService() != nil
             )
         )
         try persistProject(project, .importPipeline)
@@ -106,6 +112,28 @@ final class ImportProcessingController {
         startPipeline(projectID: projectID, sourceURL: nil)
     }
 
+    func retranscribe(projectID: UUID) throws {
+        guard pipelineTask == nil else { throw ImportBusyError() }
+        guard let project = try loadProject(projectID),
+              let path = project.runtimeAssetRelativePath,
+              FileManager.default.isReadableFile(
+                atPath: try fileStore.absoluteURL(forRelativePath: path).path
+              ) else { throw AudioImportError.fileNotReadable }
+        project.processingJobs = ImportPlanner.planJobs(
+            analysisConfigured: isAnalysisConfigured(),
+            finalReportConfigured: finalReportGenerator != nil,
+            diarizationConfigured: makeDiarizationService() != nil
+        )
+        if let index = project.processingJobs.firstIndex(where: { $0.kind == .audioExtraction }) {
+            project.processingJobs[index].status = .completed
+            project.processingJobs[index].progress = 1
+        }
+        project.status = .processing
+        try persistProject(project, .importPipeline)
+        lastErrorMessage = nil
+        startPipeline(projectID: projectID, sourceURL: nil)
+    }
+
     /// 取消当前流水线：执行中的 Job 回退为 pending（非失败，可续跑），项目保持 processing
     func cancel() {
         pipelineTask?.cancel()
@@ -115,6 +143,7 @@ final class ImportProcessingController {
 
     private func startPipeline(projectID: UUID, sourceURL: URL?) {
         pendingFinalReportCompletion = nil
+        latestFinalReportCompletion = nil
         activeProjectID = projectID
         pipelineTask = Task { [weak self] in
             await self?.runPipeline(projectID: projectID, sourceURL: sourceURL)
@@ -129,23 +158,36 @@ final class ImportProcessingController {
             return
         }
         activeProject = project
-        defer { activeProject = nil }
+        activeDiarizationService = makeDiarizationService()
+        defer {
+            activeProject = nil
+            activeDiarizationService = nil
+            activeProjectID = nil
+        }
         // 续跑准备：running/failedRetryable 回 pending；分析 Key 补配置则补建分析 Job
         project.processingJobs = ImportPlanner.jobsForResume(
             project.processingJobs,
             analysisConfigured: isAnalysisConfigured(),
-            finalReportConfigured: finalReportGenerator != nil
+            finalReportConfigured: finalReportGenerator != nil,
+            diarizationConfigured: activeDiarizationService != nil
         )
         project.status = .processing
-        persistQuietly(project)
+        guard persistQuietly(project) else { return }
 
         while let job = ImportPlanner.nextPendingJob(project.processingJobs) {
             if Task.isCancelled { break }
-            setJob(job.kind, status: .running, progress: 0, in: project)
+            guard setJob(job.kind, status: .running, progress: 0, in: project) else { return }
             let outcome = await run(job.kind, for: project, sourceURL: sourceURL)
-            switch outcome {
+            guard (try? loadProject(projectID)) != nil else {
+                pendingFinalReportCompletion = nil
+                return
+            }
+            switch Task.isCancelled ? .cancelled : outcome {
             case .completed:
-                setJob(job.kind, status: .completed, progress: 1, in: project)
+                guard setJob(job.kind, status: .completed, progress: 1, in: project) else {
+                    pendingFinalReportCompletion = nil
+                    return
+                }
                 if job.kind == .finalReport,
                    let completion = pendingFinalReportCompletion {
                     latestFinalReportCompletion = completion
@@ -197,7 +239,9 @@ final class ImportProcessingController {
             return await runAnalysis(for: project)
         case .finalReport:
             return await runFinalReport(for: project)
-        case .diarization, .knowledgeExpansion, .obsidianArchive:
+        case .diarization:
+            return await runDiarization(for: project)
+        case .knowledgeExpansion, .obsidianArchive:
             // 阶段 C 不创建这些 Job；出现即为编排错误，如实失败而非静默跳过
             return .failed(category: "unsupported_stage", retryable: false, message: "该处理阶段尚未支持")
         }
@@ -231,6 +275,7 @@ final class ImportProcessingController {
                     self?.updateJobProgress(.audioExtraction, progress: progress)
                 }
             }
+            _ = try requireActiveProject(project.id)
             project.runtimeAssetRelativePath = fileStore.relativeAudioPath(for: project.id)
             persistQuietly(project)
             return .completed
@@ -253,6 +298,7 @@ final class ImportProcessingController {
     private func runTranscription(for project: Project) async -> JobOutcome {
         let service = makeTranscriptionService()
         let availability = await service.checkMandarinAvailability()
+        guard (try? requireActiveProject(project.id)) != nil else { return .cancelled }
         guard availability.isReady else {
             return .failed(category: "transcription_unavailable", retryable: true,
                            message: availability.issueSummary ?? "本地转写暂不可用")
@@ -273,20 +319,199 @@ final class ImportProcessingController {
                     self?.updateJobProgress(.transcription, progress: progress)
                 }
             }
+            _ = try requireActiveProject(project.id)
             for segment in segments {
+                segment.startMs = HistoricalSpeakerRelabeler.wallMs(
+                    forAudioMs: segment.startMs, pauseIntervals: project.pauseIntervals
+                )
+                segment.endMs = HistoricalSpeakerRelabeler.wallMs(
+                    forAudioMs: segment.endMs, pauseIntervals: project.pauseIntervals
+                )
                 segment.text = TranscriptCorrector.autoCorrect(segment.text, rules: rules)
             }
-            project.segments = segments
+            guard !segments.isEmpty else {
+                return .failed(category: "transcription_no_speech", retryable: true,
+                               message: "未识别到可转写语音，原录音与原文稿已保留；请检查音轨后重新转写")
+            }
+            project.segments = try preservingManualSegments(segments, for: project)
             persistQuietly(project)
             return .completed
         } catch is CancellationError {
             return .cancelled
+        } catch let failure as FileTranscriptionRunner.Failure {
+            guard (try? requireActiveProject(project.id)) != nil else { return .cancelled }
+            let partial = FileTranscriptionRunner.reconciledSegments(from: failure.partialResults)
+            for segment in partial {
+                segment.startMs = HistoricalSpeakerRelabeler.wallMs(
+                    forAudioMs: segment.startMs, pauseIntervals: project.pauseIntervals
+                )
+                segment.endMs = HistoricalSpeakerRelabeler.wallMs(
+                    forAudioMs: segment.endMs, pauseIntervals: project.pauseIntervals
+                )
+            }
+            if !partial.isEmpty {
+                do {
+                    project.segments = try preservingManualSegments(
+                        partial, for: project, preserveAllExisting: true
+                    )
+                    try persistProject(project, .importPipeline)
+                } catch {
+                    return .failed(category: "transcription_partial_save_failed", retryable: true,
+                                   message: "转写已中断，部分文稿保存失败；原录音仍可重新转写")
+                }
+            }
+            return .failed(category: "transcription_interrupted", retryable: true,
+                           message: failure.cause.localizedDescription)
         } catch let error as AudioImportError {
             return .failed(category: String(describing: error), retryable: true,
                            message: error.userMessage)
         } catch {
             return .failed(category: String(describing: type(of: error)), retryable: true,
                            message: "转写失败，可重试")
+        }
+    }
+
+    private func preservingManualSegments(
+        _ incoming: [TranscriptSegment], for project: Project,
+        preserveAllExisting: Bool = false
+    ) throws -> [TranscriptSegment] {
+        let existing = try requireActiveProject(project.id).segments
+        let protected = existing.filter {
+            preserveAllExisting || $0.state == .edited || $0.textWasUserEdited == true
+                || $0.speakerWasUserConfirmed == true || $0.isStarred
+        }
+        let automatic = incoming.filter { candidate in
+            !protected.contains { existing in
+                TranscriptReconciler.overlapMs(
+                    startA: candidate.startMs, endA: candidate.endMs,
+                    startB: existing.startMs, endB: existing.endMs
+                ) > 0
+            }
+        }
+        return (automatic + protected).sorted { $0.startMs < $1.startMs }
+    }
+
+    private func runDiarization(for project: Project) async -> JobOutcome {
+        guard let service = activeDiarizationService else {
+            return .failed(category: "diarization_unconfigured", retryable: true,
+                           message: "分人服务未配置，文稿已保留；配置后可继续处理")
+        }
+        guard let path = project.runtimeAssetRelativePath,
+              let audioURL = try? fileStore.absoluteURL(forRelativePath: path) else {
+            return .failed(category: "audio_missing", retryable: true,
+                           message: "分人所需原录音缺失，文稿已保留")
+        }
+        do {
+            let duration = try AudioChunkExtractor.durationMs(of: audioURL)
+            let planner = ChunkPlanner()
+            var windows = planner.pendingWindows(uptoAudioMs: duration, nextIndex: 0)
+            if let tail = planner.finalWindow(uptoAudioMs: duration, nextIndex: windows.count) {
+                windows.append(tail)
+            }
+            if windows.isEmpty, duration > 0 {
+                windows.append(ChunkWindow(index: 0, audioStartMs: 0, audioEndMs: duration))
+            }
+            let directory = FileManager.default.temporaryDirectory.appending(
+                path: "bwfx-import-diarization-\(UUID().uuidString)", directoryHint: .isDirectory
+            )
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            for (index, window) in windows.enumerated() {
+                let latest = try requireActiveProject(project.id)
+                project.segments = latest.segments
+                project.speakers = latest.speakers
+                var references: [KnownSpeakerReference] = []
+                if case .supported(let maximum) = service.knownSpeakerMatchingCapability {
+                    for speaker in project.speakers {
+                        guard let samplePath = speaker.voiceSamplePath
+                            ?? speaker.legacyVoiceReferencePath else { continue }
+                        references.append(KnownSpeakerReference(
+                            alias: speaker.cloudAlias,
+                            sampleURL: try fileStore.absoluteURL(forRelativePath: samplePath),
+                            iflytekFeatureID: speaker.iflytekFeatureID
+                        ))
+                    }
+                    guard references.count <= maximum else {
+                        throw DiarizationAPIError.tooManyKnownSpeakers(
+                            maximum: maximum, actual: references.count
+                        )
+                    }
+                }
+                let aliases = Set(references.map(\.alias))
+                let known = Dictionary(
+                    project.speakers.filter { aliases.contains($0.cloudAlias) }
+                        .map { ($0.cloudAlias, $0.id) },
+                    uniquingKeysWith: { first, _ in first }
+                )
+                let chunkURL = directory.appending(path: "chunk-\(window.index).wav")
+                try AudioChunkExtractor.extract(
+                    from: audioURL, startMs: window.audioStartMs,
+                    endMs: window.audioEndMs, to: chunkURL
+                )
+                let response = try await service.transcribeChunk(at: chunkURL, knownSpeakers: references)
+                let current = try requireActiveProject(project.id)
+                let wallStart = HistoricalSpeakerRelabeler.wallMs(
+                    forAudioMs: window.audioStartMs, pauseIntervals: project.pauseIntervals
+                )
+                let result = DiarizationChunkResult(
+                    durationMs: response.durationMs,
+                    segments: response.segments.map { remote in
+                        var mapped = remote
+                        mapped.startMs = HistoricalSpeakerRelabeler.wallMs(
+                            forAudioMs: window.audioStartMs + remote.startMs,
+                            pauseIntervals: project.pauseIntervals
+                        ) - wallStart
+                        mapped.endMs = HistoricalSpeakerRelabeler.wallMs(
+                            forAudioMs: window.audioStartMs + remote.endMs,
+                            pauseIntervals: project.pauseIntervals
+                        ) - wallStart
+                        return mapped
+                    }
+                )
+                project.segments = current.segments
+                var reconciler = TranscriptReconciler()
+                reconciler.reset(finalized: project.segments)
+                let labels = SpeakerMapper.stitchedRemoteLabels(
+                    for: result.segments.filter { !aliases.contains($0.speakerLabel ?? "") },
+                    chunkIndex: window.index, wallStartMs: wallStart,
+                    existingSegments: project.segments
+                )
+                let rules = correctionRulesProvider()
+                for remote in result.segments {
+                    let start = wallStart + remote.startMs
+                    let end = wallStart + remote.endMs
+                    guard !project.segments.contains(where: {
+                        $0.speakerWasUserConfirmed == true
+                            && TranscriptReconciler.overlapMs(
+                                startA: start, endA: end,
+                                startB: $0.startMs, endB: $0.endMs
+                            ) > 0
+                    }) else { continue }
+                    let rawLabel = remote.speakerLabel
+                    let participantID = rawLabel.flatMap { known[$0] }
+                    let label = rawLabel.map {
+                        participantID == nil
+                            ? labels[$0] ?? SpeakerMapper.scopedRemoteLabel($0, chunkIndex: window.index)
+                            : $0
+                    }
+                    reconciler.applyCloudFinal(
+                        startMs: start, endMs: end,
+                        text: TranscriptCorrector.autoCorrect(remote.text, rules: rules),
+                        participantId: participantID, remoteSpeakerLabel: label
+                    )
+                }
+                project.segments = reconciler.finalized
+                try persistProject(project, .importPipeline)
+                updateJobProgress(.diarization, progress: Double(index + 1) / Double(windows.count))
+                try? FileManager.default.removeItem(at: chunkURL)
+            }
+            return .completed
+        } catch is CancellationError {
+            return .cancelled
+        } catch {
+            if Task.isCancelled { return .cancelled }
+            return .failed(category: "diarization_failed", retryable: true,
+                           message: "分人未完成，文稿已保留：\(error.localizedDescription)")
         }
     }
 
@@ -305,7 +530,7 @@ final class ImportProcessingController {
         }
         controller.attach(to: project)
         await controller.generateFinalAnalysis()
-        if Task.isCancelled { return .cancelled }
+        guard (try? requireActiveProject(project.id)) != nil else { return .cancelled }
         if let failure = controller.lastFailureKind {
             return .failed(category: "analysis_failed", retryable: true,
                            message: "分析失败（\(failure)），可重试")
@@ -341,6 +566,7 @@ final class ImportProcessingController {
                 },
                 version: (latestReport?.version ?? 0) + 1
             )
+            _ = try requireActiveProject(project.id)
             let markdown = FinalReportMarkdownRenderer.makeMarkdown(
                 report: report,
                 project: project
@@ -403,6 +629,7 @@ final class ImportProcessingController {
         fileSnapshot: FinalReportFileWriter.Snapshot?
     ) {
         project.finalReportSnapshots = previousReports
+        guard (try? loadProject(project.id)) != nil else { return }
         guard let fileSnapshot else { return }
         do {
             try fileWriter.restore(fileSnapshot, projectID: project.id)
@@ -419,10 +646,11 @@ final class ImportProcessingController {
 
     // MARK: - Job 状态与持久化
 
+    @discardableResult
     private func setJob(_ kind: ProcessingJobKind, status: ProcessingJobStatus,
                         progress: Double? = nil, errorCategory: String? = nil,
-                        in project: Project) {
-        guard let index = project.processingJobs.firstIndex(where: { $0.kind == kind }) else { return }
+                        in project: Project) -> Bool {
+        guard let index = project.processingJobs.firstIndex(where: { $0.kind == kind }) else { return false }
         project.processingJobs[index].status = status
         project.processingJobs[index].progress = progress
         if let errorCategory {
@@ -431,27 +659,40 @@ final class ImportProcessingController {
         }
         project.processingJobs[index].updatedAt = Date()
         project.lastActivityAt = Date()
-        persistQuietly(project)
+        return persistQuietly(project)
     }
 
     /// 进度只更新内存镜像（高频回调不落盘；阶段完成时才持久化）
     private func updateJobProgress(_ kind: ProcessingJobKind, progress: Double) {
         guard let project = activeProject,
-              let index = project.processingJobs.firstIndex(where: { $0.kind == kind }) else { return }
+              pipelineTask?.isCancelled != true,
+              (try? loadProject(project.id)) != nil,
+              let index = project.processingJobs.firstIndex(where: { $0.kind == kind }),
+              project.processingJobs[index].status == .running else { return }
         project.processingJobs[index].progress = progress
         jobs = project.processingJobs
     }
 
     /// 流水线只提交自己拥有的字段，合并规则由统一持久层维护。
-    private func persistQuietly(_ project: Project) {
+    @discardableResult
+    private func persistQuietly(_ project: Project) -> Bool {
+        guard (try? loadProject(project.id)) != nil else { return false }
         do {
             try persistProject(project, .importPipeline)
         } catch {
             AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent(
                 "import_persist_failed", error: String(describing: type(of: error))))
             lastErrorMessage = "处理进度保存失败：\(error.localizedDescription)"
+            return false
         }
         jobs = project.processingJobs
+        return true
+    }
+
+    private func requireActiveProject(_ id: UUID) throws -> Project {
+        try Task.checkCancellation()
+        guard let project = try loadProject(id) else { throw CancellationError() }
+        return project
     }
 
     /// 项目目录中留存的原件副本（续跑用）

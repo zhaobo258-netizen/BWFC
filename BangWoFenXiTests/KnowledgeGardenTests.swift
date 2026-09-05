@@ -22,6 +22,7 @@ private actor CapturingKnowledgeExpansionService:
 {
     private var capturedUserContext: [String] = []
     private var capturedNote: String?
+    private(set) var requestCount = 0
 
     func expand(
         seedText: String,
@@ -31,6 +32,7 @@ private actor CapturingKnowledgeExpansionService:
         userContext: [String],
         noteMarkdown: String?
     ) async throws -> KnowledgeExpansionResult {
+        requestCount += 1
         capturedUserContext = userContext
         capturedNote = noteMarkdown
         return KnowledgeExpansionResult(
@@ -47,6 +49,22 @@ private actor CapturingKnowledgeExpansionService:
 
     func captured() -> (userContext: [String], note: String?) {
         (capturedUserContext, capturedNote)
+    }
+}
+
+private actor CapturingExternalKnowledgeProvider: KnowledgeProvider {
+    nonisolated let kind: KnowledgeProviderKind = .internet
+    nonisolated let providerID = "internet:query-boundary"
+    nonisolated let displayName = "测试来源"
+    private(set) var queries: [String] = []
+
+    func healthCheck() async -> KnowledgeProviderHealth {
+        KnowledgeProviderHealth(isAvailable: true, message: "测试")
+    }
+
+    func search(_ query: String, limit: Int) async throws -> [KnowledgeConnection] {
+        queries.append(query)
+        return []
     }
 }
 
@@ -142,6 +160,46 @@ private struct FixedKnowledgeKimiCredentials: KimiCredentialProviding {
 
 @Suite("知识开花", .serialized)
 struct KnowledgeGardenTests {
+    @Test("历史 attach 不触发开花请求，显式开花才调用模型")
+    @MainActor
+    func historyAttachDoesNotBloom() async {
+        let segment = TranscriptSegment(
+            startMs: 0, endMs: 1_000, text: "这是一条用于检查历史查看边界的原话。",
+            source: .local, state: .final
+        )
+        let project = Project(title: "历史", sourceType: .importedAudio, segments: [segment])
+        let expansion = CapturingKnowledgeExpansionService()
+        let controller = KnowledgeGardenController(
+            expansionService: expansion, providerFactory: { [] }, automaticallyBloomNewSeeds: true
+        )
+        controller.attach(to: project)
+        for _ in 0..<20 { await Task.yield() }
+        #expect(await expansion.requestCount == 0)
+        await controller.bloomSelected()
+        #expect(await expansion.requestCount == 1)
+    }
+
+    @Test("外部开花检索仅接收生成的短词，不发送种子原文或截断段落")
+    func bloomSearchNeverUsesRawSeed() async {
+        let raw = "这是一条包含客户信息的完整对话原文，不能直接作为搜索词发送。"
+        let provider = CapturingExternalKnowledgeProvider()
+        _ = await KnowledgeBloomAgent(expansionService: MockKnowledgeExpansionService(
+            result: KnowledgeExpansionResult(branches: [], searchQueries: [raw, String(raw.prefix(18)), "库存治理"])
+        )).bloom(seedText: raw, whyItMatters: "测试", evidence: [.init(segmentId: UUID(), text: raw)],
+                 scenario: nil, userContext: [], noteMarkdown: nil, providers: [provider])
+        #expect(await provider.queries == ["库存治理"])
+    }
+
+    @Test("互联网拒绝超长原文且不会发出网络请求")
+    func internetRejectsRawParagraphBeforeRequest() async {
+        KnowledgeInternetMockURLProtocol.storage.reset()
+        let provider = InternetKnowledgeProvider(session: KnowledgeInternetMockURLProtocol.makeSession())
+        await #expect(throws: KnowledgeProviderError.invalidSearchQuery) {
+            try await provider.search(String(repeating: "客户原文", count: 30), limit: 3)
+        }
+        #expect(KnowledgeInternetMockURLProtocol.storage.capturedRequests.isEmpty)
+    }
+
     @Test("Project 新旧 JSON 均兼容知识种子")
     func projectPersistenceCompatibility() throws {
         let segmentID = UUID()
@@ -413,7 +471,7 @@ struct KnowledgeGardenTests {
             expansionService: MockKnowledgeExpansionService(
                 result: KnowledgeExpansionResult(
                     branches: [],
-                    searchQueries: []
+                    searchQueries: ["库存口径治理"]
                 )
             ),
             providerFactory: {
@@ -454,9 +512,7 @@ struct KnowledgeGardenTests {
         )
         let project = Project(
             title: "实时开花",
-            sourceType: .liveRecording,
-            segments: [segment],
-            analysisSnapshots: [snapshot]
+            sourceType: .liveRecording
         )
         let controller = KnowledgeGardenController(
             expansionService: MockKnowledgeExpansionService(
@@ -476,6 +532,10 @@ struct KnowledgeGardenTests {
         )
 
         controller.attach(to: project)
+        #expect(controller.state == .idle)
+        project.segments = [segment]
+        project.analysisSnapshots = [snapshot]
+        controller.refreshCandidates()
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
         while ContinuousClock.now < deadline,
               controller.seeds.first?.branches.isEmpty == true {
@@ -790,14 +850,7 @@ struct KnowledgeGardenTests {
                 #expect(params["name"] as? String == "search_notes")
                 let arguments = try #require(params["arguments"] as? [String: Any])
                 let query = try #require(arguments["query"] as? String)
-                #expect(query.count == 24)
-                #expect(
-                    query
-                        == String(
-                            "这是一整段不应该发送给 MCP 的完整逐字稿内容，长度明显超过二十四个字符。"
-                                .prefix(24)
-                        )
-                )
+                #expect(query == "库存 口径治理")
                 responseObject = [
                     "jsonrpc": "2.0",
                     "id": 3,
@@ -847,7 +900,7 @@ struct KnowledgeGardenTests {
         )
         try tokenStore.saveKey("token-after-start")
         let results = try await provider.search(
-            "这是一整段不应该发送给 MCP 的完整逐字稿内容，长度明显超过二十四个字符。",
+            "库存 口径治理",
             limit: 5
         )
         #expect(results.count == 1)
@@ -910,8 +963,8 @@ struct KnowledgeGardenTests {
     func refinedEmptyResultKeepsInitialSuccess() async throws {
         /// 初次查询返回结果、refined 查询返回空的 provider
         struct QueryAwareProvider: KnowledgeProvider {
-            let kind: KnowledgeProviderKind = .internet
-            let providerID = "internet:test"
+            let kind: KnowledgeProviderKind = .obsidian
+            let providerID = "obsidian:test"
             let displayName = "互联网"
             let initialQuery: String
 
@@ -922,7 +975,7 @@ struct KnowledgeGardenTests {
             func search(_ query: String, limit: Int) async throws -> [KnowledgeConnection] {
                 guard query == initialQuery else { return [] }
                 return [KnowledgeConnection(
-                    provider: .internet,
+                    provider: .obsidian,
                     sourceId: "initial-hit",
                     title: "初次命中",
                     excerpt: "初次检索的真实结果",
@@ -966,7 +1019,7 @@ struct KnowledgeGardenTests {
         let bloomed = try #require(refinedController.selectedSeed)
         #expect(bloomed.connections.count == 1, "初次检索结果必须保留")
         #expect(
-            refinedController.providerMessages["internet:test"] == nil,
+            refinedController.providerMessages["obsidian:test"] == nil,
             "已有真实结果时不得显示「没有找到相关内容」"
         )
     }

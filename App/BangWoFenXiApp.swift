@@ -45,7 +45,9 @@ struct RootView: View {
                 ProjectWorkspaceView(projectID: id, autoStart: autoStart)
                     .id(id)
             case .peopleLibrary:
-                HistoricalPeopleLibraryPage()
+                PersonLibraryPage()
+            case .businessProjects:
+                BusinessProjectPage()
             case .meetingList:
                 MeetingListView()
             case .meetingSetup(let id):

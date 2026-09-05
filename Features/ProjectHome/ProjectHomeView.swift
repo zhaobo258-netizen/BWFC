@@ -130,9 +130,16 @@ struct ProjectHomeView: View {
             }
             Spacer()
             Button {
+                router.showBusinessProjects()
+            } label: {
+                Label("业务项目", systemImage: "briefcase")
+            }
+            .buttonStyle(.bordered)
+            .help("人物、录音与已确认跟进的业务项目闭环")
+            Button {
                 router.showPeopleLibrary()
             } label: {
-                Label("历史人物库", systemImage: "person.2.wave.2")
+                Label("人物库", systemImage: "person.2.wave.2")
             }
             .buttonStyle(.bordered)
             Button {
@@ -454,11 +461,15 @@ struct ProjectHomeView: View {
 
     /// 开始录音：立即创建临时项目并直达工作台开录（两次交互内）
     private func startRecordingProject() {
+        guard !environment.isPersistentStorageUnavailable else {
+            loadError = ProjectWriteError.storageUnavailable.localizedDescription
+            return
+        }
         let now = Date()
         let speakers: [Speaker]
         let voiceProfileWarning: String?
         do {
-            speakers = try environment.speakerVoiceProfileStore.automaticSpeakers()
+            speakers = try environment.automaticSpeakersWithPeople()
             voiceProfileWarning = nil
         } catch {
             speakers = []
@@ -471,6 +482,17 @@ struct ProjectHomeView: View {
                 speakers: speakers
             )
             try environment.persist(project)
+            for speaker in project.speakers {
+                guard let personID = speaker.personId else { continue }
+                do {
+                    _ = try environment.personLibraryStore.linkSpeaker(
+                        personID: personID, projectID: project.id, speakerID: speaker.id,
+                        speakerDisplayName: speaker.displayName
+                    )
+                } catch {
+                    environment.setPendingWarning("录音已创建，人物关联账本暂未更新，可在人物库重新关联。", for: project.id)
+                }
+            }
             if let voiceProfileWarning {
                 environment.setPendingWarning(voiceProfileWarning, for: project.id)
             }
@@ -670,6 +692,10 @@ struct ProjectHomeView: View {
     }
 
     private func beginImport(url: URL) {
+        guard !environment.isPersistentStorageUnavailable else {
+            importErrorMessage = ProjectWriteError.storageUnavailable.localizedDescription
+            return
+        }
         Task {
             do {
                 let projectID = try await environment.importProcessing.beginImport(url: url)
@@ -809,6 +835,11 @@ private struct ProjectHomeRow: View {
     let onRevealInFinder: () -> Void
     let onDelete: () -> Void
 
+    private var statusText: String {
+        if case .normal = display { return project.processingStatusText }
+        return display.text
+    }
+
     @State private var isHovering = false
 
     var body: some View {
@@ -827,7 +858,7 @@ private struct ProjectHomeRow: View {
                                 .font(.callout)
                                 .fontWeight(.medium)
                                 .lineLimit(1)
-                            BWBadge(text: display.text, color: Self.badgeColor(display))
+                            BWBadge(text: statusText, color: Self.badgeColor(display))
                         }
                         Text(ProjectHomeSupport.summary(for: project))
                             .font(.caption)
@@ -860,7 +891,7 @@ private struct ProjectHomeRow: View {
             }
             .buttonStyle(.plain)
             .disabled(isMergeSelectionMode && !isEligibleForMerge)
-            .accessibilityLabel("\(project.title)，\(display.text)，时长 \(LiveMeetingView.formatDuration(ms: project.durationMs))")
+            .accessibilityLabel("\(project.title)，\(statusText)，时长 \(LiveMeetingView.formatDuration(ms: project.durationMs))")
             .help("打开「\(project.title)」")
 
             if !isMergeSelectionMode {

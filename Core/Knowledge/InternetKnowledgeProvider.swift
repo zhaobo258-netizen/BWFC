@@ -42,8 +42,9 @@ struct InternetKnowledgeProvider: KnowledgeProvider {
     }
 
     func search(_ query: String, limit: Int = 5) async throws -> [KnowledgeConnection] {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
+        guard let trimmed = KnowledgeSearchQueryPolicy.keywords(query) else {
+            throw KnowledgeProviderError.invalidSearchQuery
+        }
         if credentials != nil {
             do {
                 let results = try await searchWeb(

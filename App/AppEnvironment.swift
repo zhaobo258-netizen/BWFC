@@ -13,9 +13,11 @@ enum ProjectFieldOwnership: Sendable, Equatable {
     case userScenario
     case speakers
     case manualSegments
+    case recordingRuntime
     case analysis
     case legacyAnalysis
     case transcriptReview
+    case memoryCandidates
     case finalReport
     case knowledgeGarden
     case aiContext
@@ -57,6 +59,8 @@ enum ProjectPersistence {
         "analysisSnapshots": .runtime,
         "analysisSpeakerOverrides": .workspace,
         "transcriptReviewCandidates": .workspace,
+        "businessMemoryCandidates": .workspace,
+        "followUpCandidates": .workspace,
         "finalReportSnapshots": .runtime,
         "knowledgeSeeds": .workspace,
         "aiChatMessages": .workspace,
@@ -107,6 +111,18 @@ enum ProjectPersistence {
         case .manualSegments:
             mergeManualSegments(incoming.segments, into: stored)
             stored.lastActivityAt = incoming.lastActivityAt
+        case .recordingRuntime:
+            stored.status = incoming.status
+            stored.startedAt = incoming.startedAt
+            stored.endedAt = incoming.endedAt
+            stored.runtimeAssetRelativePath = incoming.runtimeAssetRelativePath
+            stored.durationMs = incoming.durationMs
+            stored.preferredInputDeviceID = incoming.preferredInputDeviceID
+            stored.pauseIntervals = incoming.pauseIntervals
+            stored.legacyMetadata = incoming.legacyMetadata
+            stored.legacySnapshots = incoming.legacySnapshots
+            mergePipelineSegments(incoming.segments, into: stored)
+            stored.lastActivityAt = incoming.lastActivityAt
         case .analysis:
             stored.analysisSnapshots = incoming.analysisSnapshots
             stored.analysisSpeakerOverrides = incoming.analysisSpeakerOverrides
@@ -118,9 +134,14 @@ enum ProjectPersistence {
             stored.legacySnapshots = incoming.legacySnapshots
         case .transcriptReview:
             stored.transcriptReviewCandidates = incoming.transcriptReviewCandidates
+        case .memoryCandidates:
+            stored.businessMemoryCandidates = incoming.businessMemoryCandidates
+            stored.followUpCandidates = incoming.followUpCandidates
         case .finalReport:
+            let reportJobs = incoming.processingJobs.filter { $0.kind == .finalReport }
             stored.finalReportSnapshots = incoming.finalReportSnapshots
-            stored.processingJobs = incoming.processingJobs
+            stored.processingJobs.removeAll { $0.kind == .finalReport }
+            stored.processingJobs.append(contentsOf: reportJobs)
             stored.lastActivityAt = incoming.lastActivityAt
         case .knowledgeGarden:
             stored.knowledgeSeeds = incoming.knowledgeSeeds
@@ -216,6 +237,14 @@ final class AppEnvironment {
     let fileStore: MeetingFileStore
     /// 应用级永久声纹库；与单个项目目录分离，供后续录音复用。
     let speakerVoiceProfileStore: SpeakerVoiceProfileStore
+    /// 独立人物库（12 号 §5）：跨录音身份权威，声纹只是可选附件。
+    let personLibraryStore: PersonLibraryStore
+    /// 轻 CRM 业务项目库（12 号 §7）
+    let businessProjectStore: BusinessProjectStore
+    /// 业务记忆与跟进候选提取（12 号 §6.3 / §7.3）
+    let businessMemoryCandidateAgent: BusinessMemoryCandidateAgent
+    /// AI 回答语音外放（12 号 §10：点击播放、可取消）
+    let answerSpeechController: AnswerSpeechController
     /// 已授权的 Obsidian Vault；为 nil 时使用 App Sandbox 内的安全回退目录。
     let obsidianVaultURL: URL?
     /// Vault 失权等情况下向设置页展示的可恢复提示。
@@ -261,26 +290,17 @@ final class AppEnvironment {
             projects: projects
         )
         guard evidence.count >= 2 else { return nil }
-        let profiles = try speakerVoiceProfileStore.loadForManagement()
-        guard let current = profiles.first(where: { $0.id == profileID }) else {
-            throw SpeakerVoiceProfileStoreError.profileNotFound
-        }
-        let generated = try await SpeakerCommunicationProfileAgent(
+        _ = try await HistoricalPersonLibrary.updateCommunicationProfile(
+            profileID: profileID,
+            profileStore: speakerVoiceProfileStore,
+            projectStore: projectStore,
             generationService: aiProviderRegistry
-        ).analyze(
-            profileID: profileID,
-            backgroundContext: current.backgroundContext,
-            previousProfile: current.communicationProfile,
-            evidence: evidence
         )
-        try speakerVoiceProfileStore.updateContext(
-            profileID: profileID,
-            backgroundContext: current.backgroundContext,
-            communicationProfile: generated
-        )
-        speaker.backgroundContext = current.backgroundContext
-        speaker.communicationProfile = generated
-        try persist(project, fields: .speakers)
+        if let current = try speakerVoiceProfileStore.loadForManagement().first(where: { $0.id == profileID }) {
+            speaker.backgroundContext = current.backgroundContext
+            speaker.communicationProfile = current.communicationProfile
+            speaker.isCurrentUser = current.isCurrentUser
+        }
         return evidence.count
     }
 
@@ -316,6 +336,10 @@ final class AppEnvironment {
             makeTranscriptionService: makeImportTranscriptionService,
             analysisService: conversationAnalysis,
             finalReportGenerator: finalReportGenerator,
+            makeDiarizationService: { [weak self] in
+                guard let self, self.isDiarizationConfigured else { return nil }
+                return self.makeDiarizationService(for: self.diarizationConfigurationSnapshot())
+            },
             fileStore: fileStore,
             isAnalysisConfigured: { [weak self] in self?.isAnalysisConfigured ?? false },
             loadProject: { [weak self] id in
@@ -332,6 +356,7 @@ final class AppEnvironment {
     }
 
     private var _finalReportCoordinator: FinalReportCoordinator?
+    private var deletedProjectIDs: Set<UUID> = []
     var finalReportCoordinator: FinalReportCoordinator {
         if let existing = _finalReportCoordinator { return existing }
         let coordinator = FinalReportCoordinator(
@@ -473,6 +498,14 @@ final class AppEnvironment {
         self.meetingStore = meetingStore
         self.fileStore = fileStore
         self.speakerVoiceProfileStore = SpeakerVoiceProfileStore(baseDirectory: fileStore.baseDirectory)
+        let writeIndex: (Data, URL) throws -> Void = { data, url in
+            guard !isPersistentStorageUnavailable else { throw ProjectWriteError.storageUnavailable }
+            try data.write(to: url, options: .atomic)
+        }
+        self.personLibraryStore = PersonLibraryStore(baseDirectory: fileStore.baseDirectory, indexWriter: writeIndex)
+        self.businessProjectStore = BusinessProjectStore(baseDirectory: fileStore.baseDirectory, indexWriter: writeIndex)
+        self.businessMemoryCandidateAgent = BusinessMemoryCandidateAgent(generationService: providerRegistry)
+        self.answerSpeechController = AnswerSpeechController(player: SystemAnswerSpeechPlayer())
         self.projectStore = projectStore ?? InMemoryProjectStore()
         self.obsidianVaultURL = obsidianVaultURL
         self.storageWarning = storageWarning
@@ -839,6 +872,8 @@ final class AppEnvironment {
         _ project: Project,
         fields: ProjectFieldOwnership = .all
     ) throws {
+        guard !isPersistentStorageUnavailable else { throw ProjectWriteError.storageUnavailable }
+        guard !deletedProjectIDs.contains(project.id) else { throw ProjectWriteError.projectDeleted }
         var projects = try projectStore.loadProjects()
         ProjectPersistence.upsert(project, into: &projects, fields: fields)
         try projectStore.saveProjects(projects)
@@ -852,7 +887,172 @@ final class AppEnvironment {
         var projects = try projectStore.loadProjects()
         projects.removeAll { $0.id == project.id }
         try projectStore.saveProjects(projects)
+        deletedProjectIDs.insert(project.id)
+        _finalReportCoordinator?.cancel(projectID: project.id)
+        if _importProcessing?.activeProjectID == project.id { _importProcessing?.cancel() }
+        try propagatePersonCleanup(forDeletedProject: project)
         try fileStore.deleteMeetingFiles(for: project.id)
+    }
+
+    /// 删除录音后的人物侧清理（12 号 §5.3 / §6.5）：
+    /// 解除该录音的说话人关联账本；来源指向该录音的记忆标记需复核（不静默删）。
+    private func propagatePersonCleanup(forDeletedProject project: Project) throws {
+        let persons = try personLibraryStore.load()
+        for person in persons {
+            let hasLink = person.speakerLinks.contains { $0.projectID == project.id }
+            let hasMemory = person.memoryEntries.contains {
+                $0.source?.recordingID == project.id
+            }
+            guard hasLink || hasMemory else { continue }
+            var updated = person
+            updated.speakerLinks.removeAll { $0.projectID == project.id }
+            for index in updated.memoryEntries.indices
+            where updated.memoryEntries[index].source?.recordingID == project.id
+                && (updated.memoryEntries[index].status == .active
+                    || updated.memoryEntries[index].status == .candidate) {
+                updated.memoryEntries[index].status = .needsReview
+                updated.memoryEntries[index].reviewReason = "来源录音已删除；请撤回或改为人工背景"
+                updated.memoryEntries[index].updatedAt = Date()
+            }
+            _ = try personLibraryStore.updatePerson(updated)
+        }
+        // 业务项目：解除录音关联，跟进不自动删除（来源失效由页面提示）
+        let businessProjects = try businessProjectStore.load()
+        for businessProject in businessProjects {
+            var updated = businessProject
+            updated.linkedProjectIDs.removeAll { $0 == project.id }
+            for index in updated.memoryEntries.indices
+            where updated.memoryEntries[index].source?.recordingID == project.id
+                && (updated.memoryEntries[index].status == .active
+                    || updated.memoryEntries[index].status == .candidate) {
+                updated.memoryEntries[index].status = .needsReview
+                updated.memoryEntries[index].reviewReason = "来源录音已删除"
+                updated.memoryEntries[index].updatedAt = Date()
+            }
+            if updated != businessProject { _ = try businessProjectStore.update(updated) }
+        }
+    }
+
+    // MARK: - 业务记忆上下文（12 号 §6.1：回答时使用相关已确认记忆并说明来源）
+
+    /// 适用于某场录音的有效记忆：本场说话人关联人物的有效记忆 +
+    /// 关联到本场录音的业务项目记忆；按更新时间排序、条数封顶。
+    func applicableMemories(
+        for project: Project,
+        maximumCount: Int = 12
+    ) throws -> [MemoryEntry] {
+        let personIDs = Set(project.speakers.compactMap(\.personId))
+        let businessProjects = try businessProjectStore.load().filter {
+            $0.status == .active && $0.linkedProjectIDs.contains(project.id)
+        }
+        let businessIDs = Set(businessProjects.map(\.id))
+        let sources = try projectStore.loadProjects()
+        let persons = try personLibraryStore.load()
+        let entries = persons.filter { personIDs.contains($0.id) }.flatMap(\.activeMemories)
+            + businessProjects.flatMap(\.activeMemories)
+        var seen = Set<UUID>()
+        return Array(entries.filter { entry in
+            guard entry.scope.personID.map({ personIDs.contains($0) }) ?? true,
+                  entry.scope.businessProjectID.map({ businessIDs.contains($0) }) ?? true,
+                  entry.effectiveFrom.map({ $0 <= Date() }) ?? true else { return false }
+            if let source = entry.source {
+                guard let recording = sources.first(where: { $0.id == source.recordingID }),
+                      let segment = recording.segments.first(where: { $0.id == source.segmentID }),
+                      segment.state == .final || segment.state == .edited,
+                      segment.speakerWasUserConfirmed == true,
+                      let speakerID = segment.participantId,
+                      let speaker = recording.speakers.first(where: { $0.id == speakerID }),
+                      entry.scope.personID.map({ $0 == speaker.personId }) ?? true,
+                      source.sourceVersion == BusinessMemoryCandidateBuilder.sourceVersion(
+                        project: recording, segment: segment
+                      ) else { return false }
+            } else if !entry.isManuallyAuthored {
+                return false
+            }
+            return seen.insert(entry.id).inserted
+        }.sorted { $0.updatedAt > $1.updatedAt }.prefix(max(0, maximumCount)))
+    }
+
+    func activeMemoryContents(for project: Project) throws -> [String] {
+        try applicableMemories(for: project, maximumCount: 100).map(\.content)
+    }
+
+    /// 按显示名精确找人（跟进责任人默认猜测用；姓名只是显示字段，
+    /// 找不到就留空，业务项目页可再人工指定）。
+    func personByExactDisplayName(_ name: String) -> Person? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let matches = ((try? personLibraryStore.load()) ?? [])
+            .filter { $0.displayName == trimmed }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    func automaticSpeakersWithPeople() throws -> [Speaker] {
+        let persons = try personLibraryStore.load()
+        let speakers = try speakerVoiceProfileStore.automaticSpeakers()
+        for speaker in speakers {
+            guard let profileID = speaker.voiceProfileId,
+                  let person = persons.first(where: { $0.voiceProfileIDs.contains(profileID) }) else { continue }
+            speaker.personId = person.id
+            speaker.displayName = person.displayName
+            speaker.role = person.role
+            speaker.backgroundContext = person.backgroundContext
+            speaker.isCurrentUser = person.isCurrentUser
+        }
+        return speakers
+    }
+
+    func updateLibraryPersonMetadata(
+        personID: UUID, displayName: String, role: String?, backgroundContext: String?
+    ) throws {
+        guard !isPersistentStorageUnavailable else { throw ProjectWriteError.storageUnavailable }
+        let name = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { throw PersonLibraryStoreError.personNotFound }
+        try personLibraryStore.changeIdentity(
+            projectStore: projectStore, businessProjectStore: businessProjectStore,
+            profileStore: speakerVoiceProfileStore
+        ) { persons, projects, _ in
+            guard let index = persons.firstIndex(where: { $0.id == personID }) else {
+                throw PersonLibraryStoreError.personNotFound
+            }
+            persons[index].displayName = name
+            persons[index].role = role
+            persons[index].backgroundContext = backgroundContext
+            persons[index].updatedAt = Date()
+            for project in projects {
+                for speaker in project.speakers where speaker.personId == personID {
+                    speaker.displayName = name
+                    speaker.role = role
+                    speaker.backgroundContext = backgroundContext
+                }
+            }
+        }
+    }
+
+    /// 首次人物迁移前的权威数据备份（12 号 §9.4 合同第 1 条）：
+    /// 把 projects.json 与 speaker-profiles.json 复制到 MigrationBackups/<时间戳>/。
+    static func backupAuthorityFilesBeforeMigration(
+        in directory: URL,
+        fileManager: FileManager
+    ) throws {
+        let files = ["projects.json", "speaker-profiles.json", "persons.json", "business-projects.json"]
+        let existing = files
+            .map { directory.appending(path: $0, directoryHint: .notDirectory) }
+            .filter { fileManager.fileExists(atPath: $0.path) }
+        guard !existing.isEmpty else { return }
+        let stamp = ISO8601DateFormatter().string(from: Date())
+            .replacingOccurrences(of: ":", with: "-")
+        let backupDirectory = directory.appending(
+            path: "MigrationBackups/\(stamp)-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try fileManager.createDirectory(at: backupDirectory, withIntermediateDirectories: true)
+        for source in existing {
+            try fileManager.copyItem(
+                at: source,
+                to: backupDirectory.appending(path: source.lastPathComponent, directoryHint: .notDirectory)
+            )
+        }
     }
 
     /// 生产环境：默认 JSON 持久化 + 文件存储
@@ -879,15 +1079,44 @@ final class AppEnvironment {
                     AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent("project_asset_repair_failed", error: String(describing: type(of: error))))
                 }
             }
-            let environment = AppEnvironment(
-                meetingStore: store,
-                fileStore: fileStore,
-                projectStore: projectStore,
-                obsidianVaultURL: storage.obsidianVaultURL,
-                storageWarning: storage.warning,
-                securityScopedStorageAccess: storage.securityScopedAccess
-            )
-            return environment
+            // 阶段 B 人物迁移（12 号 §9.4）：声纹档案 → Person，回填 Speaker.personId。
+            // 幂等可重跑；失败只脱敏记录，不阻断启动。
+            do {
+                // 迁移合同第 1 条：写入前备份当前权威数据（仅首次无标记时执行）
+                if !FileManager.default.fileExists(
+                    atPath: PersonMigrationCoordinator.markerURL(in: directory).path
+                ) {
+                    try Self.backupAuthorityFilesBeforeMigration(
+                        in: directory,
+                        fileManager: .default
+                    )
+                }
+                let environment = AppEnvironment(
+                    meetingStore: store,
+                    fileStore: fileStore,
+                    projectStore: projectStore,
+                    obsidianVaultURL: storage.obsidianVaultURL,
+                    storageWarning: storage.warning,
+                    securityScopedStorageAccess: storage.securityScopedAccess
+                )
+                _ = try PersonMigrationCoordinator.migrateIfNeeded(
+                    personStore: environment.personLibraryStore,
+                    profileStore: environment.speakerVoiceProfileStore,
+                    projectStore: projectStore,
+                    baseDirectory: directory
+                )
+                return environment
+            } catch {
+                AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent("person_migration_failed", error: String(describing: type(of: error))))
+                return AppEnvironment(
+                    meetingStore: store,
+                    fileStore: fileStore,
+                    projectStore: projectStore,
+                    obsidianVaultURL: storage.obsidianVaultURL,
+                    storageWarning: "人物迁移未完成，原始资料已保留。请检查存储位置后重启重试。",
+                    securityScopedStorageAccess: storage.securityScopedAccess
+                )
+            }
         } catch {
             // 持久化初始化失败：降级为内存库，保证界面可用；
             // 仅记录脱敏错误，不含路径与正文
@@ -896,9 +1125,22 @@ final class AppEnvironment {
                 meetingStore: InMemoryMeetingStore(),
                 fileStore: MeetingFileStore(baseDirectory: FileManager.default.temporaryDirectory),
                 projectStore: InMemoryProjectStore(),
+                storageWarning: "原存储位置暂不可用，录音与导入已停用。请重新连接原知识库后重启应用。",
                 isPersistentStorageUnavailable: true
             )
             return environment
+        }
+    }
+}
+
+enum ProjectWriteError: LocalizedError {
+    case storageUnavailable
+    case projectDeleted
+
+    var errorDescription: String? {
+        switch self {
+        case .storageUnavailable: return "存储位置不可用，请重新连接原知识库后重试。"
+        case .projectDeleted: return "录音已删除，后台结果未保存。"
         }
     }
 }

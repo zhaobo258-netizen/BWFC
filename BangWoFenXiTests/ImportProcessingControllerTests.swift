@@ -10,6 +10,14 @@ private final class ImportFinalReportGenerator:
 {
     var error: AnalysisAPIError?
     private(set) var callCount = 0
+    var suspendGeneration = false
+    private(set) var generationSuspended = false
+    private var generationContinuation: CheckedContinuation<Void, Never>?
+
+    func resumeGeneration() {
+        generationContinuation?.resume()
+        generationContinuation = nil
+    }
 
     func generate(
         project: Project,
@@ -19,6 +27,12 @@ private final class ImportFinalReportGenerator:
         version: Int
     ) async throws -> FinalReportSnapshot {
         callCount += 1
+        if suspendGeneration {
+            await withCheckedContinuation { continuation in
+                generationContinuation = continuation
+                generationSuspended = true
+            }
+        }
         if let error {
             throw error
         }
@@ -79,7 +93,8 @@ final class ImportProcessingControllerTests {
     }
 
     private func makeController(
-        finalReportGenerator: (any FinalReportGenerating)? = nil
+        finalReportGenerator: (any FinalReportGenerating)? = nil,
+        diarizationService: (any DiarizationServicing)? = nil
     ) -> ImportProcessingController {
         let factory = transcriptionMockFactory
         return ImportProcessingController(
@@ -87,6 +102,7 @@ final class ImportProcessingControllerTests {
             makeTranscriptionService: { factory() },
             analysisService: analysisMock,
             finalReportGenerator: finalReportGenerator,
+            makeDiarizationService: { diarizationService },
             fileStore: fileStore,
             isAnalysisConfigured: { [self] in analysisConfigured },
             loadProject: { [store] id in
@@ -305,6 +321,132 @@ final class ImportProcessingControllerTests {
         #expect(project.processingJobs.first { $0.kind == .audioExtraction }?.lastErrorCategory == nil,
                 "取消不是失败，不得记错误")
     }
+    @Test("项目删除后晚返回的完整总结不得重建目录或通知成功")
+    func deletedProjectRejectsLateFinalReport() async throws {
+        analysisConfigured = true
+        for requestCancellation in [false, true] {
+            let generator = ImportFinalReportGenerator()
+            generator.suspendGeneration = true
+            let controller = makeController(finalReportGenerator: generator)
+            let id = try await controller.beginImport(
+                url: importMock.fakeSourceURL(named: "晚返回-\(requestCancellation).m4a")
+            )
+            await waitFor { generator.generationSuspended }
+            #expect(generator.generationSuspended)
+            if requestCancellation { controller.cancel() }
+            var projects = try store.loadProjects()
+            projects.removeAll { $0.id == id }
+            try store.saveProjects(projects)
+            let directory = fileStore.meetingDirectory(for: id)
+            try FileManager.default.removeItem(at: directory)
+            generator.resumeGeneration()
+            await waitFor { !controller.isRunning }
+            #expect(!controller.isRunning)
+            #expect(controller.activeProjectID == nil)
+            #expect(try storedProject(id) == nil)
+            #expect(!FileManager.default.fileExists(atPath: directory.path))
+            #expect(controller.latestFinalReportCompletion == nil)
+            #expect(controller.finalReportNotificationRevision == 0)
+        }
+    }
+
+    @Test("导入配置分人后执行匿名分人，失败仅重试该阶段")
+    func importedDiarizationRetriesWithoutRepeatingTranscription() async throws {
+        let transcription = MockLocalTranscriptionService()
+        transcription.finishEndsStream = true
+        transcription.emit(.init(startAudioMs: 0, endAudioMs: 150,
+                                 text: "导入语音", isFinal: true))
+        transcriptionMockFactory = { transcription }
+        let cloud = MockDiarizationService()
+        cloud.persistentError = DiarizationAPIError.network
+        let controller = makeController(diarizationService: cloud)
+        let id = try await controller.beginImport(url: importMock.fakeSourceURL(named: "分人.m4a"))
+        await waitFor { !controller.isRunning }
+        let failed = try #require(try storedProject(id))
+        #expect(failed.processingJobs.first { $0.kind == .diarization }?.status == .failedRetryable)
+        #expect(failed.segments.map(\.text) == ["导入语音"])
+        #expect(failed.status == .readyWithWarnings)
+        #expect(cloud.calls.count == 1)
+        cloud.persistentError = nil
+        cloud.resultQueue = [.init(durationMs: 200, segments: [
+            .init(startMs: 0, endMs: 150, text: "导入语音", speakerLabel: "speaker_0")
+        ])]
+        controller.resume(projectID: id)
+        await waitFor { !controller.isRunning }
+        let completed = try #require(try storedProject(id))
+        #expect(completed.status == .ready)
+        #expect(completed.processingJobs.first { $0.kind == .diarization }?.status == .completed)
+        #expect(completed.segments.first?.source == .cloud)
+        #expect(completed.segments.first?.remoteSpeakerLabel == "chunk:0:speaker_0")
+        #expect(transcription.startSessionCalls.count == 1)
+        #expect(cloud.calls.count == 2)
+        #expect(cloud.calls.allSatisfy { $0.speakers.isEmpty })
+    }
+
+    @Test("无语音或收尾失败不触发分析，部分原话保存可重试")
+    func emptyOrFailedTranscriptionDoesNotAnalyze() async throws {
+        analysisConfigured = true
+        let empty = MockLocalTranscriptionService()
+        empty.finishEndsStream = true
+        transcriptionMockFactory = { empty }
+        let controller = makeController()
+        let emptyID = try await controller.beginImport(url: importMock.fakeSourceURL(named: "无语音.m4a"))
+        await waitFor { !controller.isRunning }
+        let emptyProject = try #require(try storedProject(emptyID))
+        #expect(emptyProject.processingJobs.first { $0.kind == .transcription }?.status == .failedRetryable)
+        #expect(analysisMock.calls.isEmpty)
+
+        let partial = MockLocalTranscriptionService()
+        partial.finishEndsStream = true
+        partial.finishError = .finalizationFailed
+        partial.finalResultsOnFinish = [
+            .init(startAudioMs: 0, endAudioMs: 150, text: "中断前的原话", isFinal: true)
+        ]
+        transcriptionMockFactory = { partial }
+        let retryController = makeController()
+        let partialID = try await retryController.beginImport(url: importMock.fakeSourceURL(named: "中断.m4a"))
+        await waitFor { !retryController.isRunning }
+        let partialProject = try #require(try storedProject(partialID))
+        #expect(partialProject.segments.map(\.text) == ["中断前的原话"])
+        #expect(partialProject.processingJobs.first { $0.kind == .transcription }?.status == .failedRetryable)
+        #expect(analysisMock.calls.isEmpty)
+    }
+
+    @Test("历史现场录音重转写保留原音和人工标注，并映射暂停时间")
+    func retranscribeLiveRecordingPreservesAudioAndManualWork() async throws {
+        let project = Project(title: "历史录音", sourceType: .liveRecording, status: .ready)
+        let audio = try await importMock.prepareAudio(
+            from: importMock.fakeSourceURL(named: "原录音.m4a"), for: project.id,
+            onProgress: { _ in }
+        )
+        project.runtimeAssetRelativePath = fileStore.relativeAudioPath(for: project.id)
+        project.pauseIntervals = [PauseInterval(startMs: 50, endMs: 150)]
+        let manual = TranscriptSegment(startMs: 0, endMs: 40, text: "人工纠正",
+                                       participantId: UUID(), source: .manual, state: .edited,
+                                       isStarred: true, speakerWasUserConfirmed: true)
+        project.segments = [manual]
+        try store.saveProjects([project])
+        let original = try Data(contentsOf: audio)
+        let mock = MockLocalTranscriptionService()
+        mock.finishEndsStream = true
+        mock.emit(.init(startAudioMs: 0, endAudioMs: 40, text: "自动文字", isFinal: true))
+        mock.emit(.init(startAudioMs: 60, endAudioMs: 180, text: "暂停后的话", isFinal: true))
+        transcriptionMockFactory = { mock }
+        let controller = makeController()
+        try controller.retranscribe(projectID: project.id)
+        await waitFor { !controller.isRunning }
+        let saved = try #require(try storedProject(project.id))
+        #expect(saved.sourceType == .liveRecording)
+        #expect(saved.status == .ready)
+        #expect(saved.segments.first?.id == manual.id)
+        #expect(saved.segments.first?.text == "人工纠正")
+        #expect(saved.segments.first?.isStarred == true)
+        #expect(saved.segments.first?.speakerWasUserConfirmed == true)
+        #expect(saved.segments.last?.startMs == 160)
+        #expect(saved.segments.last?.endMs == 280)
+        #expect(try Data(contentsOf: audio) == original)
+    }
+
 }
 
 /// Mock 导入服务：inspect/prepare 按脚本成败；prepare 成功时真实写出可读的 48kHz caf

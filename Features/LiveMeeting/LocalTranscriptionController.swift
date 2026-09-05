@@ -144,12 +144,14 @@ final class LocalTranscriptionController {
             throw error
         }
 
+        lastErrorDescription = nil
         runState = .running
         collectTask = Task { [weak self] in
             guard let self else { return }
             for await result in service.results {
                 self.consume(result)
             }
+            self.publishSessionFailure()
         }
     }
 
@@ -173,7 +175,19 @@ final class LocalTranscriptionController {
         collectTask = nil
         reconciler.dropProvisional()
         publishSegments()
-        runState = .idle
+        if !publishSessionFailure() { runState = .idle }
+    }
+
+    @discardableResult
+    private func publishSessionFailure() -> Bool {
+        guard let error = service.sessionError else { return false }
+        pendingFlushTask?.cancel()
+        pendingFlushTask = nil
+        reconciler.dropProvisional()
+        publishSegments()
+        lastErrorDescription = error.localizedDescription
+        runState = .unavailable(error.localizedDescription)
+        return true
     }
 
     /// 立即取消（录音异常中止等场景）

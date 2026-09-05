@@ -64,6 +64,18 @@ final class FinalReportCoordinator {
         states[projectID] ?? .idle
     }
 
+    func cancel(projectID: UUID) {
+        refreshRequestedWhileRunning.remove(projectID)
+        tasks[projectID]?.cancel()
+        states[projectID] = .idle
+        if latestCompletion?.projectID == projectID { latestCompletion = nil }
+        revision += 1
+    }
+
+    private func canWrite(projectID: UUID) -> Bool {
+        !Task.isCancelled && ((try? loadProject(projectID)) ?? nil) != nil
+    }
+
     func start(
         projectID: UUID,
         refreshIfRunning: Bool = false
@@ -91,6 +103,10 @@ final class FinalReportCoordinator {
             states[projectID] = .failed(message: "项目读取失败，无法生成完整总结")
             return
         }
+        guard project.hasUsableTranscript else {
+            fail(project: project, projectID: projectID, message: "没有可用文稿，请先回听原音频或重新转写。")
+            return
+        }
         setJob(.running, in: project)
         persistQuietly(project, fields: .finalReport)
 
@@ -105,6 +121,7 @@ final class FinalReportCoordinator {
             )
             return
         }
+        guard canWrite(projectID: projectID) else { return }
 
         let analysisController = ConversationAnalysisController(service: analysisService)
         analysisController.knownTermsProvider = knownTermsProvider
@@ -115,12 +132,7 @@ final class FinalReportCoordinator {
         }
         analysisController.attach(to: project)
         await analysisController.generateFinalAnalysis()
-        guard !Task.isCancelled else {
-            setJob(.pending, in: project)
-            persistQuietly(project, fields: .finalReport)
-            states[projectID] = .idle
-            return
-        }
+        guard canWrite(projectID: projectID) else { return }
         let snapshot: ConversationAnalysisSnapshot
         if analysisController.lastFailureKind == nil,
            let generatedSnapshot = analysisController.currentSnapshot {
@@ -170,6 +182,7 @@ final class FinalReportCoordinator {
                 analysis: snapshot,
                 version: (latestReport?.version ?? 0) + 1
             )
+            guard canWrite(projectID: projectID) else { return }
             let markdown = FinalReportMarkdownRenderer.makeMarkdown(
                 report: report,
                 project: project
@@ -194,6 +207,7 @@ final class FinalReportCoordinator {
             )
             revision += 1
         } catch {
+            guard canWrite(projectID: projectID) else { return }
             project.finalReportSnapshots = previousReports
             if let fileSnapshot {
                 do {
@@ -226,6 +240,8 @@ final class FinalReportCoordinator {
     ) async throws -> FinalReportSnapshot {
         var attempt = 0
         while true {
+            try Task.checkCancellation()
+            guard canWrite(projectID: project.id) else { throw CancellationError() }
             do {
                 return try await finalReportGenerator.generate(
                     project: project,
@@ -266,6 +282,7 @@ final class FinalReportCoordinator {
         message: String,
         error: Error? = nil
     ) {
+        guard canWrite(projectID: projectID) else { return }
         setJob(
             .failedRetryable,
             in: project,

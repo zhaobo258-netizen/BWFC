@@ -43,22 +43,28 @@ struct KnowledgeBloomAgent: Sendable {
             noteMarkdown: noteMarkdown
         )
         async let initialSearch = KnowledgeProviderSearch.search(
-            providers: providers,
+            providers: providers.filter { $0.kind == .obsidian },
             query: seedText
         )
 
         let expansion = await expansionAttempt
         let initialOutcomes = await initialSearch
         var refinedOutcomes: [KnowledgeProviderSearchOutcome] = []
-        if case .success(let result) = expansion,
-           let refinedQuery = result.searchQueries.first(where: {
-               Self.normalized($0) != Self.normalized(seedText)
-           }) {
-            refinedOutcomes = await KnowledgeProviderSearch.search(
-                providers: providers,
-                query: refinedQuery,
-                limit: 4
-            )
+        if case .success(let result) = expansion {
+            let sourceTexts = evidence.map(\.text) + userContext
+                + [noteMarkdown].compactMap { $0 }
+            var seen = Set<String>()
+            let queries = result.searchQueries.compactMap {
+                KnowledgeSearchQueryPolicy.keywords($0, excluding: sourceTexts)
+            }.filter { seen.insert(Self.normalized($0)).inserted }.prefix(2)
+            for query in queries {
+                guard !Task.isCancelled else { break }
+                refinedOutcomes += await KnowledgeProviderSearch.search(
+                    providers: providers,
+                    query: query,
+                    limit: 4
+                )
+            }
         }
         let sources = Self.sourceInputs(
             from: initialOutcomes + refinedOutcomes

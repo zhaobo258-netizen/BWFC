@@ -48,6 +48,7 @@ private final class CoordinatorFinalReportGenerator:
 {
     var error: AnalysisAPIError?
     var delay: Duration = .zero
+    var ignoresCancellation = false
     /// 前 N 次调用抛 error，之后成功（瞬时重试测试用）
     var failuresBeforeSuccess = Int.max
     private(set) var callCount = 0
@@ -61,7 +62,11 @@ private final class CoordinatorFinalReportGenerator:
     ) async throws -> FinalReportSnapshot {
         callCount += 1
         if delay > .zero {
-            try await Task.sleep(for: delay)
+            if ignoresCancellation {
+                try? await Task.sleep(for: delay)
+            } else {
+                try await Task.sleep(for: delay)
+            }
         }
         if let error, callCount <= failuresBeforeSuccess {
             throw error
@@ -962,6 +967,49 @@ struct FinalReportTests {
             stored.processingJobs.first { $0.kind == .finalReport }?.status
                 == .failedRetryable
         )
+    }
+
+    @Test("删除时取消报告，模型迟到成功不得重建项目或文件")
+    func deletedProjectRejectsLateReport() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "bwfx-deleted-report-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileStore = MeetingFileStore(baseDirectory: directory)
+        let store = InMemoryProjectStore()
+        let project = Project(title: "临时测试", sourceType: .liveRecording, status: .ready,
+                              segments: [TranscriptSegment(startMs: 0, endMs: 1_000, text: "合成测试文稿", source: .local, state: .final)])
+        try store.saveProjects([project])
+        let generator = CoordinatorFinalReportGenerator()
+        generator.delay = .seconds(30)
+        generator.ignoresCancellation = true
+        let coordinator = makeCoordinator(analysis: MockConversationAnalysisService(), generator: generator,
+                                          fileStore: fileStore, store: store)
+        coordinator.start(projectID: project.id)
+        await waitUntil { generator.callCount == 1 }
+        #expect(generator.callCount == 1)
+        try store.saveProjects([])
+        coordinator.cancel(projectID: project.id)
+        await waitUntil { !coordinator.hasActiveTasks }
+        #expect(!coordinator.hasActiveTasks)
+        #expect(try store.loadProjects().isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: fileStore.meetingDirectory(for: project.id).path))
+        #expect(coordinator.latestCompletion == nil)
+        #expect(coordinator.state(for: project.id) == .idle)
+    }
+
+    @Test("空文稿不调用模型并显示恢复提示")
+    func emptyTranscriptDoesNotGenerate() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "bwfx-empty-report-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = InMemoryProjectStore()
+        let project = Project(title: "空文稿", sourceType: .liveRecording, status: .ready)
+        try store.saveProjects([project])
+        let generator = CoordinatorFinalReportGenerator()
+        let coordinator = makeCoordinator(analysis: MockConversationAnalysisService(), generator: generator,
+                                          fileStore: MeetingFileStore(baseDirectory: directory), store: store)
+        coordinator.start(projectID: project.id)
+        await waitUntil { !coordinator.hasActiveTasks }
+        #expect(generator.callCount == 0)
+        #expect(coordinator.state(for: project.id) == .failed(message: "没有可用文稿，请先回听原音频或重新转写。"))
     }
 
     private func makeCoordinator(

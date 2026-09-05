@@ -127,8 +127,173 @@ private actor ProjectAIChatRetryService: ProjectAIChatServing {
     }
 }
 
+private actor SuspendedProjectAIChatService: ProjectAIChatServing {
+    private var continuation: CheckedContinuation<ProjectAIChatResponse, Never>?
+    var isWaiting: Bool { continuation != nil }
+
+    func reply(to request: ProjectAIChatRequest) async throws -> ProjectAIChatResponse {
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func resolve() {
+        continuation?.resume(returning: ProjectAIChatResponse(
+            reply: "这是清空前请求的晚到回复。",
+            provider: AIProviderDescriptor(id: "mock", displayName: "测试", modelID: "test")
+        ))
+        continuation = nil
+    }
+}
+
 @Suite("项目 AI 对话")
 struct ProjectAIChatTests {
+    @Test("对照讨论和明确禁止修改不能触发全文纠错")
+    func correctionRequiresExplicitIntent() {
+        let correction = ProjectAIChatTranscriptCorrection(
+            wrong: "甲方", right: "乙方", evidenceSegmentIDs: [UUID()]
+        )
+        #expect(!ProjectAIChatCorrectionIntent.explicitlyAuthorizes(correction, in: "甲方和乙方有什么区别？"))
+        #expect(!ProjectAIChatCorrectionIntent.explicitlyAuthorizes(correction, in: "不要把甲方改成乙方"))
+        #expect(!ProjectAIChatCorrectionIntent.explicitlyAuthorizes(correction, in: "请解释“把甲方改成乙方”的影响"))
+        #expect(ProjectAIChatCorrectionIntent.explicitlyAuthorizes(correction, in: "把“甲方”改为“乙方”"))
+    }
+
+    @Test("重开项目后末条未答消息仍可原位重试")
+    @MainActor
+    func unansweredMessageRetriesAfterReattach() async {
+        let service = ProjectAIChatRetryService()
+        let project = Project(title: "重开重试", sourceType: .liveRecording)
+        let first = ProjectAIChatController(service: service, persist: { _ in })
+        first.attach(to: project)
+        first.draft = "请解释当前讨论"
+        await first.send()
+        let reopened = ProjectAIChatController(service: service, persist: { _ in })
+        reopened.attach(to: project)
+        #expect(reopened.canRetryLastMessage)
+        await reopened.retryLastMessage()
+        #expect(project.aiChatMessages.map(\.role) == [.user, .assistant])
+    }
+
+    @Test("清空共创后晚到回复不能重新写回或执行纠错")
+    @MainActor
+    func clearedConversationRejectsLateReply() async {
+        let service = SuspendedProjectAIChatService()
+        let project = Project(title: "清空竞态", sourceType: .liveRecording)
+        var saves = 0
+        let controller = ProjectAIChatController(service: service, persist: { _ in saves += 1 })
+        controller.attach(to: project)
+        controller.draft = "请解释讨论"
+        let sending = Task { await controller.send() }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !(await service.isWaiting), ContinuousClock.now < deadline { await Task.yield() }
+        #expect(await service.isWaiting)
+        controller.clearConversation()
+        #expect(!controller.isSending)
+        await service.resolve()
+        await sending.value
+        #expect(project.aiChatMessages.isEmpty)
+        #expect(controller.messages.isEmpty)
+        #expect(saves == 2)
+    }
+
+    @Test("长录音按问题找回开头原文并披露覆盖范围")
+    func longTranscriptFindsEarlyEvidence() throws {
+        var segments: [TranscriptSegment] = []
+        for index in 0..<80 {
+            let start = Int64(index) * 1_000
+            let text: String = index == 0 ? "期初库存是三千箱，月底复核。" : String(repeating: "日常讨论。", count: 180)
+            segments.append(TranscriptSegment(startMs: start, endMs: start + 1_000,
+                                              text: text, source: .local, state: .final))
+        }
+        let project = Project(title: "长录音", sourceType: .importedAudio, segments: segments)
+        let request = ProjectAIChatRequestBuilder.make(
+            project: project, currentRequest: "期初库存是多少？", noteMarkdown: nil
+        )
+        #expect(request.transcript.contains { $0.id == segments[0].id.uuidString })
+        #expect(request.transcript.reduce(0) { $0 + $1.text.count } <= 30_000)
+        #expect(request.transcriptCoverage?.isPartial == true)
+        let payload = try ProjectAIChatAgent.inputJSON(request)
+        #expect(payload.contains("transcript_coverage"))
+        #expect(payload.contains("没有覆盖全文"))
+    }
+
+    @Test("超长单片段按问题保留命中附近原文")
+    func longSegmentIncludesMatchingPassage() {
+        let segment = TranscriptSegment(
+            startMs: 0, endMs: 5_000,
+            text: String(repeating: "背景。", count: 600) + "项目代号 ZXQAlpha 的期初库存是三千箱。",
+            source: .local, state: .final
+        )
+        let project = Project(title: "长片段", sourceType: .importedAudio, segments: [segment])
+        let request = ProjectAIChatRequestBuilder.make(
+            project: project, currentRequest: "ZXQAlpha 的期初库存是多少？", noteMarkdown: nil
+        )
+        #expect(request.transcript.first?.text.contains("三千箱") == true)
+        #expect(request.transcriptCoverage?.isPartial == true)
+    }
+
+    @Test("历史原稿更正后不再复用过期摘要并使关联报告过期")
+    func relatedSummaryTracksInputChanges() {
+        let segment = TranscriptSegment(
+            startMs: 0, endMs: 1_000, text: "期初库存三千箱。", source: .local, state: .final
+        )
+        let related = Project(title: "第一场", sourceType: .importedAudio, segments: [segment])
+        related.finalReportSnapshots = [FinalReportSnapshot(
+            version: 1, providerID: "mock", providerName: "测试", modelID: "test", promptVersion: "test",
+            inputFingerprint: FinalReportFingerprint.make(for: related),
+            headline: "库存确认", overview: "期初库存三千箱。", items: []
+        )]
+        let project = Project(title: "第二场", sourceType: .importedAudio)
+        project.relatedProjectIDs = [related.id]
+        let fingerprint = FinalReportFingerprint.make(for: project, relatedProjects: [related])
+        let report = FinalReportSnapshot(
+            version: 1, providerID: "mock", providerName: "测试", modelID: "test", promptVersion: "test",
+            inputFingerprint: fingerprint, headline: "关联确认", overview: "引用第一场背景", items: []
+        )
+        let valid = RelatedProjectContextBuilder.make(for: project, from: [related])
+        #expect(valid.first?.latestSummary?.contains("三千箱") == true)
+        #expect(!FinalReportFingerprint.isStale(report, for: project, relatedProjects: [related]))
+        segment.text = "人工更正：期初库存五千箱。"
+        let stale = RelatedProjectContextBuilder.make(for: project, from: [related])
+        #expect(stale.first?.latestSummary == nil)
+        #expect(stale.first?.summaryStatus == "stale_summary_omitted")
+        #expect(FinalReportFingerprint.isStale(report, for: project, relatedProjects: [related]))
+    }
+
+    @Test("当前用户身份变化使报告过期，问答只用有效完整总结作导航")
+    func chatSummaryRequiresCurrentInputs() {
+        let speaker = Speaker(cloudAlias: "p_01", displayName: "演示人物")
+        let project = Project(title: "摘要导航", sourceType: .liveRecording, speakers: [speaker])
+        let fingerprint = FinalReportFingerprint.make(for: project)
+        project.finalReportSnapshots = [FinalReportSnapshot(
+            version: 1, providerID: "mock", providerName: "测试", modelID: "test", promptVersion: "test",
+            inputFingerprint: fingerprint, headline: "完整总结导航", overview: "讨论从库存转到配送。", items: []
+        )]
+        let request = ProjectAIChatRequestBuilder.make(project: project, currentRequest: "回顾讨论", noteMarkdown: nil)
+        #expect(request.finalReportOverview?.contains("从库存转到配送") == true)
+        speaker.isCurrentUser = true
+        #expect(FinalReportFingerprint.make(for: project) != fingerprint)
+        let changed = ProjectAIChatRequestBuilder.make(project: project, currentRequest: "回顾讨论", noteMarkdown: nil)
+        #expect(changed.finalReportOverview == nil)
+    }
+
+    @Test("搜索规划失败时不把用户整段消息截断外发")
+    func failedSearchPlanDoesNotForwardRawRequest() async throws {
+        let recorder = ProjectAIChatWebSearchRecorder()
+        let generation = ProjectAIChatGenerationService(responseTexts: [
+            "无法生成检索计划", #"{"reply":"当前只能依据项目资料解释。"}"#
+        ])
+        let agent = ProjectAIChatAgent(generationService: generation,
+            webSearchProvider: ProjectAIChatWebSearchProvider(recorder: recorder, results: []))
+        let request = ProjectAIChatRequest(
+            scenario: "freeform", speakers: [], transcript: [], analysisHeadline: nil,
+            analysisItems: [], conversationHistory: [],
+            currentRequest: "请搜索：这是带有客户内部信息的整段话，不能直接转发给搜索引擎。"
+        )
+        let response = try await agent.reply(to: request)
+        #expect(await recorder.capturedQueries().isEmpty)
+        #expect(response.reply.contains("联网搜索暂未返回可用来源"))
+    }
+
     @Test("旧对话消息缺少引用文档和联网来源字段时安全回退")
     func messageAttachmentCompatibility() throws {
         let message = ProjectAIChatMessage(

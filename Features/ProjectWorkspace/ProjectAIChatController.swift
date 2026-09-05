@@ -11,6 +11,8 @@ final class ProjectAIChatController {
     private let persist: (Project) throws -> Void
     private weak var project: Project?
     private var draftAutosaveTask: Task<Void, Never>?
+    private var responseTask: Task<ProjectAIChatResponse, Error>?
+    private var activeRequestID: UUID?
     private var isRestoringDraft = false
 
     private(set) var messages: [ProjectAIChatMessage] = []
@@ -26,9 +28,12 @@ final class ProjectAIChatController {
     private(set) var errorMessage: String?
     private(set) var lastDraftSavedAt: Date?
     private(set) var draftSaveError: String?
+    private(set) var contextCoverageMessage: String?
     var isWebSearchEnabled = true
     var noteContextProvider: () -> String? = { nil }
     var relatedProjectsProvider: () -> [Project] = { [] }
+    /// 本场适用的已确认业务记忆（12 号 §6.1：回答时使用并说明来源）
+    var confirmedMemoriesProvider: () -> [MemoryEntry] = { [] }
     var prepareRequestContext: (() -> Bool)?
     var onConversationUpdated: () -> Void = {}
     var onTranscriptCorrection:
@@ -58,13 +63,16 @@ final class ProjectAIChatController {
     }
 
     func attach(to project: Project) {
+        invalidateResponse()
         draftAutosaveTask?.cancel()
         self.project = project
         messages = project.aiChatMessages
         setDraftWithoutAutosave(project.aiChatDraft)
         pendingAttachments = []
-        errorMessage = nil
+        errorMessage = messages.last?.role == .user
+            ? "上次消息尚未获得回答，可直接重试。" : nil
         draftSaveError = nil
+        contextCoverageMessage = nil
     }
 
     func addReferenceDocuments(from urls: [URL]) async {
@@ -140,6 +148,7 @@ final class ProjectAIChatController {
             noteMarkdown: noteContextProvider(),
             currentAttachments: attachments,
             relatedProjects: relatedProjectsProvider(),
+            confirmedMemories: confirmedMemoriesProvider(),
             webSearchEnabled: isWebSearchEnabled
         )
         let previousMessages = project.aiChatMessages
@@ -184,6 +193,7 @@ final class ProjectAIChatController {
             noteMarkdown: noteContextProvider(),
             currentAttachments: message.attachments,
             relatedProjects: relatedProjectsProvider(),
+            confirmedMemories: confirmedMemoriesProvider(),
             webSearchEnabled: isWebSearchEnabled,
             excludingMessageID: message.id
         )
@@ -194,14 +204,31 @@ final class ProjectAIChatController {
         _ request: ProjectAIChatRequest,
         project: Project
     ) async {
+        let requestID = UUID()
+        activeRequestID = requestID
+        contextCoverageMessage = request.transcriptCoverage.flatMap {
+            $0.isPartial ? $0.notice : nil
+        }
         errorMessage = nil
         draftSaveError = nil
         isSending = true
-        defer { isSending = false }
+        defer {
+            if activeRequestID == requestID {
+                activeRequestID = nil
+                responseTask = nil
+                isSending = false
+            }
+        }
 
         do {
-            let response = try await service.reply(to: request)
-            let reply = replyWithCorrectionStatus(response)
+            let service = self.service
+            let task = Task { try await service.reply(to: request) }
+            responseTask = task
+            let response = try await task.value
+            guard activeRequestID == requestID,
+                  self.project?.id == project.id else { return }
+            let reply = replyWithCorrectionStatus(response, request: request)
+                + (contextCoverageMessage.map { "\n\n" + $0 } ?? "")
             project.aiChatMessages.append(ProjectAIChatMessage(
                 role: .assistant,
                 text: reply,
@@ -220,20 +247,27 @@ final class ProjectAIChatController {
                 errorMessage = "AI 已回应，但本地保存失败，请先复制回应内容。"
             }
         } catch let error as AnalysisAPIError {
+            guard activeRequestID == requestID else { return }
             errorMessage = Self.message(for: error)
         } catch {
+            guard activeRequestID == requestID else { return }
             errorMessage = "AI 共创暂不可用，消息已保存，可直接重试。"
         }
     }
 
     private func replyWithCorrectionStatus(
-        _ response: ProjectAIChatResponse
+        _ response: ProjectAIChatResponse,
+        request: ProjectAIChatRequest
     ) -> String {
-        guard !response.transcriptCorrections.isEmpty,
-              let onTranscriptCorrection else {
-            return response.reply
+        let corrections = response.transcriptCorrections.filter {
+            ProjectAIChatCorrectionIntent.explicitlyAuthorizes($0, in: request.currentRequest)
         }
-        let changed = response.transcriptCorrections.reduce(into: 0) {
+        guard !corrections.isEmpty,
+              let onTranscriptCorrection else {
+            return response.reply + (response.transcriptCorrections.isEmpty ? ""
+                : "\n\n未执行自动纠错；如需修改，请明确说“把原词改为新词”。")
+        }
+        let changed = corrections.reduce(into: 0) {
             $0 += onTranscriptCorrection($1)
         }
         if changed > 0 {
@@ -251,14 +285,23 @@ final class ProjectAIChatController {
         project.aiChatMessages = []
         do {
             try persist(project)
+            invalidateResponse()
             messages = []
             errorMessage = nil
+            contextCoverageMessage = nil
             onConversationUpdated()
         } catch {
             project.aiChatMessages = previous
             messages = previous
             errorMessage = "清空失败，原对话仍保留。"
         }
+    }
+
+    private func invalidateResponse() {
+        activeRequestID = nil
+        responseTask?.cancel()
+        responseTask = nil
+        isSending = false
     }
 
     @discardableResult

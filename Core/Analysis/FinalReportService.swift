@@ -177,7 +177,7 @@ enum ProjectAIContextBuilder {
             ),
             localSpeakerIDByAlias: localSpeakerIDByAlias,
             validSegmentIDs: eligibleSegmentIDs,
-            inputFingerprint: FinalReportFingerprint.make(for: project)
+            inputFingerprint: FinalReportFingerprint.make(for: project, relatedProjects: relatedProjects)
         )
     }
 

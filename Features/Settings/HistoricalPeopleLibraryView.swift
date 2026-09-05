@@ -68,21 +68,21 @@ struct HistoricalPeopleLibraryView: View {
             }
         }
         .confirmationDialog(
-            "删除这个历史人物？",
+            "删除这个声音档案？",
             isPresented: Binding(
                 get: { pendingDelete != nil },
                 set: { if !$0 { pendingDelete = nil } }
             ),
             titleVisibility: .visible
         ) {
-            Button("删除人物档案与声纹", role: .destructive) {
+            Button("删除声音档案与声纹", role: .destructive) {
                 if let profile = pendingDelete {
                     deleteProfile(profile)
                 }
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("会删除本机永久声纹、人工背景和表达画像；历史录音和文稿保留。")
+            Text("会删除本机声音样本及附属表达画像；独立人物、人工背景、历史录音和文稿保留。")
         }
         .confirmationDialog(
             "将历史语音注册为讯飞声纹？",
@@ -363,7 +363,7 @@ struct HistoricalPeopleLibraryView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("删除人物", role: .destructive) {
+                Button("删除声音档案", role: .destructive) {
                     pendingDelete = profile
                 }
                 .disabled(!managementEnabled)
@@ -407,19 +407,8 @@ struct HistoricalPeopleLibraryView: View {
 
     private func setCurrentUser(_ profile: SpeakerVoiceProfile) {
         do {
-            try environment.speakerVoiceProfileStore.setCurrentUser(
-                profileID: profile.id
-            )
-            let updatedProfiles = try environment.speakerVoiceProfileStore
-                .loadForManagement()
-            let projects = try environment.projectStore.loadProjects()
-            for updated in updatedProfiles {
-                _ = HistoricalPersonLibrary.applyProfile(
-                    updated,
-                    to: projects
-                )
-            }
-            try environment.projectStore.saveProjects(projects)
+            let person = try environment.personLibraryStore.ensurePerson(for: profile)
+            try environment.setCurrentPerson(personID: person.id)
             notice = "已设为“我”；人工背景与可核验表达画像会用于后续 AI 对话。"
             reload()
         } catch {
@@ -445,6 +434,21 @@ struct HistoricalPeopleLibraryView: View {
         role: String?,
         backgroundContext: String?
     ) -> String? {
+        do {
+            if let person = try environment.personLibraryStore.load().first(where: {
+                $0.voiceProfileIDs.contains(original.id)
+            }) {
+                try environment.updateLibraryPersonMetadata(
+                    personID: person.id, displayName: displayName, role: role,
+                    backgroundContext: backgroundContext
+                )
+                notice = "人物档案已更新，并同步到关联录音。"
+                reload()
+                return nil
+            }
+        } catch {
+            return "人物档案未保存：\(error.localizedDescription)"
+        }
         var projects: [Project]?
         var speakerSnapshots: [ProjectSpeakerSnapshot] = []
         var profileWriteAttempted = false
@@ -496,78 +500,23 @@ struct HistoricalPeopleLibraryView: View {
     }
 
     private func updateCommunicationProfile(_ profile: SpeakerVoiceProfile) {
-        let projects: [Project]
-        do {
-            projects = try environment.projectStore.loadProjects()
-        } catch {
-            notice = "无法读取历史会议：\(error.localizedDescription)"
-            return
-        }
-        let evidence = HistoricalPersonLibrary.communicationEvidence(
-            profileID: profile.id,
-            projects: projects
-        )
-        guard evidence.count >= 2 else {
-            notice = "至少需要 2 条已确认属于此人的发言。"
-            return
-        }
         analyzingProfileID = profile.id
         notice = nil
         Task {
             defer { analyzingProfileID = nil }
-            var persistedOriginal: SpeakerVoiceProfile?
-            var speakerSnapshots: [ProjectSpeakerSnapshot] = []
-            var profileWriteAttempted = false
             do {
-                let generated = try await SpeakerCommunicationProfileAgent(
+                let count = try await HistoricalPersonLibrary.updateCommunicationProfile(
+                    profileID: profile.id,
+                    profileStore: environment.speakerVoiceProfileStore,
+                    projectStore: environment.projectStore,
                     generationService: environment.aiProviderRegistry
-                ).analyze(
-                    profileID: profile.id,
-                    backgroundContext: profile.backgroundContext,
-                    previousProfile: profile.communicationProfile,
-                    evidence: evidence
                 )
-                guard let current = try environment.speakerVoiceProfileStore
-                    .loadForManagement()
-                    .first(where: { $0.id == profile.id }) else {
-                    throw SpeakerVoiceProfileStoreError.profileNotFound
-                }
-                persistedOriginal = current
-                profileWriteAttempted = true
-                try environment.speakerVoiceProfileStore.updateContext(
-                    profileID: profile.id,
-                    backgroundContext: current.backgroundContext,
-                    communicationProfile: generated
-                )
-                guard let updated = try environment.speakerVoiceProfileStore
-                    .loadForManagement()
-                    .first(where: { $0.id == profile.id }) else {
-                    throw SpeakerVoiceProfileStoreError.profileNotFound
-                }
-                speakerSnapshots = captureSpeakerSnapshots(
-                    profileID: profile.id,
-                    projects: projects
-                )
-                _ = HistoricalPersonLibrary.applyProfile(updated, to: projects)
-                try environment.projectStore.saveProjects(projects)
-                notice = "已基于 \(evidence.count) 条历史发言更新表达与沟通画像。"
+                notice = "已基于 \(count) 条历史发言更新表达与沟通画像。"
                 reload()
             } catch {
-                var rollbackFailures: [String] = []
-                if profileWriteAttempted,
-                   let persistedOriginal,
-                   let failure = restoreProfileContext(persistedOriginal) {
-                    rollbackFailures.append(failure)
-                }
-                if let failure = restoreProjectSpeakers(speakerSnapshots, in: projects) {
-                    rollbackFailures.append(failure)
-                }
-                let baseMessage = (error as? AnalysisAPIError) == .invalidResponse
-                    ? "模型没有返回可由原话核验的画像。"
+                notice = (error as? AnalysisAPIError) == .invalidResponse
+                    ? "没有足够的人工确认证据，或模型未返回可核验画像。"
                     : "表达画像更新失败：\(error.localizedDescription)"
-                notice = rollbackFailures.isEmpty
-                    ? baseMessage
-                    : "\(baseMessage) 自动恢复未完成（\(rollbackFailures.joined(separator: "；"))），请重新打开人物库确认。"
             }
         }
     }
@@ -727,8 +676,9 @@ struct HistoricalPeopleLibraryView: View {
             .first(where: { $0.id == profile.id }) else {
             throw SpeakerVoiceProfileStoreError.profileNotFound
         }
-        _ = HistoricalPersonLibrary.applyProfile(updated, to: projects)
-        try environment.projectStore.saveProjects(projects)
+        let currentProjects = try environment.projectStore.loadProjects()
+        _ = HistoricalPersonLibrary.applyProfile(updated, to: currentProjects)
+        try environment.projectStore.saveProjects(currentProjects)
         return IFlytekVoiceprintSyncOutcome(automaticallyEnabled: automaticallyEnabled)
     }
 
@@ -749,41 +699,24 @@ struct HistoricalPeopleLibraryView: View {
     }
 
     private func deleteProfile(_ profile: SpeakerVoiceProfile) {
-        let projects: [Project]
         do {
-            projects = try environment.projectStore.loadProjects()
-        } catch {
-            notice = "人物档案未删除：\(error.localizedDescription)"
-            return
-        }
-        let speakerSnapshots = captureSpeakerSnapshots(
-            profileID: profile.id,
-            projects: projects
-        )
-        _ = HistoricalPersonLibrary.unlinkProfile(profile, from: projects)
-        do {
-            try environment.projectStore.saveProjects(projects)
-        } catch {
-            let rollbackFailure = restoreProjectSpeakers(speakerSnapshots, in: projects)
-            notice = transactionFailureMessage(
-                prefix: "人物档案未删除",
-                error: error,
-                rollbackFailures: [rollbackFailure].compactMap { $0 }
-            )
-            return
-        }
-        do {
-            try environment.speakerVoiceProfileStore.delete(profileID: profile.id)
+            try environment.detachPersonVoiceProfile(profileID: profile.id)
+            do {
+                try environment.speakerVoiceProfileStore.delete(profileID: profile.id)
+            } catch {
+                do {
+                    try environment.undoPersonChange()
+                } catch {
+                    notice = "声音档案删除未完成，关联恢复失败；请检查存储位置，录音和人物资料仍保留。"
+                    return
+                }
+                throw error
+            }
             pendingDelete = nil
-            notice = "已删除 \(profile.displayName) 的人物档案和永久声纹；历史录音与文稿保留。"
+            notice = "已删除声音样本；人物、人工背景、历史录音与文稿保留。"
             reload()
         } catch {
-            let rollbackFailure = restoreProjectSpeakers(speakerSnapshots, in: projects)
-            notice = transactionFailureMessage(
-                prefix: "人物档案未删除",
-                error: error,
-                rollbackFailures: [rollbackFailure].compactMap { $0 }
-            )
+            notice = "声音档案未删除：\(error.localizedDescription)"
         }
     }
 
@@ -799,6 +732,7 @@ struct HistoricalPeopleLibraryView: View {
         var iflytekFeatureID: String?
         var backgroundContext: String?
         var communicationProfile: SpeakerCommunicationProfile?
+        var isCurrentUser: Bool?
     }
 
     private func captureSpeakerSnapshots(
@@ -819,7 +753,8 @@ struct HistoricalPeopleLibraryView: View {
                     voiceProfileID: speaker.voiceProfileId,
                     iflytekFeatureID: speaker.iflytekFeatureID,
                     backgroundContext: speaker.backgroundContext,
-                    communicationProfile: speaker.communicationProfile
+                    communicationProfile: speaker.communicationProfile,
+                    isCurrentUser: speaker.isCurrentUser
                 )
             }
         }
@@ -845,6 +780,7 @@ struct HistoricalPeopleLibraryView: View {
             speaker.iflytekFeatureID = snapshot.iflytekFeatureID
             speaker.backgroundContext = snapshot.backgroundContext
             speaker.communicationProfile = snapshot.communicationProfile
+            speaker.isCurrentUser = snapshot.isCurrentUser
         }
         do {
             try environment.projectStore.saveProjects(projects)

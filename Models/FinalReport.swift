@@ -126,7 +126,31 @@ enum FinalReportSnapshotRetention {
 }
 
 enum FinalReportFingerprint {
-    static func make(for project: Project) -> String {
+    static func make(for project: Project, relatedProjects: [Project] = []) -> String {
+        let local = localFingerprint(for: project)
+        guard !project.relatedProjectIDs.isEmpty else { return local }
+        let byID = Dictionary(relatedProjects.map { ($0.id, $0) },
+                              uniquingKeysWith: { first, _ in first })
+        let dependencies = project.relatedProjectIDs.map { id -> String in
+            guard let related = byID[id] else { return id.uuidString + "|unavailable" }
+            let report = related.finalReportSnapshots.max { $0.version < $1.version }
+            let analysis = related.analysisSnapshots.max { $0.version < $1.version }
+            return [
+                id.uuidString, related.title, related.businessCategory ?? "",
+                localFingerprint(for: related),
+                report.map { "\($0.version)|\($0.inputFingerprint)|\($0.headline)|\($0.overview)" }
+                    ?? analysis.map { snapshot in
+                        "analysis:\(snapshot.version)|\(snapshot.headline ?? "")|"
+                            + snapshot.items.map(\.text).joined(separator: "\u{1F}")
+                    } ?? "no_summary"
+            ].joined(separator: "\u{1F}")
+        }
+        let relatedHash = SHA256.hash(data: Data(dependencies.joined(separator: "\u{1E}").utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        return local + "." + relatedHash
+    }
+
+    private static func localFingerprint(for project: Project) -> String {
         var lines: [String] = [
             project.scenario.map(ConversationAnalysisTaxonomy.wireName(for:)) ?? "auto",
             project.scenarioWasUserSelected ? "user" : "automatic",
@@ -143,7 +167,8 @@ enum FinalReportFingerprint {
                     $0.displayName,
                     $0.role ?? "",
                     $0.backgroundContext ?? "",
-                    $0.communicationProfile?.summary ?? ""
+                    $0.communicationProfile?.summary ?? "",
+                    $0.isCurrentUser == true ? "current_user" : "other_person"
                 ].joined(separator: "\u{1F}")
             })
         lines.append(contentsOf: project.segments
@@ -186,8 +211,13 @@ enum FinalReportFingerprint {
 
     static func isStale(
         _ report: FinalReportSnapshot,
-        for project: Project
+        for project: Project,
+        relatedProjects: [Project]? = nil
     ) -> Bool {
-        report.inputFingerprint != make(for: project)
+        if let relatedProjects {
+            return report.inputFingerprint != make(for: project, relatedProjects: relatedProjects)
+        }
+        return report.inputFingerprint.split(separator: ".").first.map(String.init)
+            != localFingerprint(for: project)
     }
 }

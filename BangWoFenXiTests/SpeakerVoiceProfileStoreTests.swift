@@ -89,6 +89,62 @@ struct SpeakerVoiceProfileStoreTests {
         }
     }
 
+    @Test("人物事务仅更新声纹元数据，拒绝替换样本与声纹特征")
+    func personMetadataPreservesVoiceEvidence() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SpeakerVoiceProfileStore(baseDirectory: root)
+        let original = try store.enroll(
+            displayName: "原姓名", role: nil, colorToken: "blue",
+            sourceSampleURL: try sample(in: root), durationMs: 3_000,
+            now: Date(timeIntervalSince1970: 1_000)
+        )
+        let originalAudio = try Data(contentsOf: storedSampleURL(for: original, root: root))
+        var updated = original
+        updated.displayName = "修正姓名"
+        updated.backgroundContext = "人物背景"
+        updated.isCurrentUser = true
+        updated.isAutoEnabled = false
+        try store.replacePersonLinkedMetadata([updated])
+        #expect(try store.loadForManagement() == [updated])
+        #expect(try Data(contentsOf: storedSampleURL(for: original, root: root)) == originalAudio)
+        var changedVoice = updated
+        changedVoice.iflytekFeatureID = "different-feature"
+        #expect(throws: SpeakerVoiceProfileStoreError.invalidSample) {
+            try store.replacePersonLinkedMetadata([changedVoice])
+        }
+        var changedSample = updated
+        changedSample.sampleDurationMs += 1_000
+        #expect(throws: SpeakerVoiceProfileStoreError.invalidSample) {
+            try store.replacePersonLinkedMetadata([changedSample])
+        }
+        #expect(throws: SpeakerVoiceProfileStoreError.profileNotFound) {
+            try store.replacePersonLinkedMetadata([])
+        }
+        #expect(try store.loadForManagement() == [updated])
+    }
+
+    @Test("人物元数据写入中途失败恢复旧索引，不碰声音样本")
+    func personMetadataFailureRestoresIndex() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gate = IndexWriteGate()
+        let store = SpeakerVoiceProfileStore(baseDirectory: root, indexWriter: { try gate.write($0, to: $1) })
+        let original = try store.enroll(
+            displayName: "原姓名", role: nil, colorToken: "blue",
+            sourceSampleURL: try sample(in: root), durationMs: 3_000,
+            now: Date(timeIntervalSince1970: 1_000)
+        )
+        let originalAudio = try Data(contentsOf: storedSampleURL(for: original, root: root))
+        var updated = original
+        updated.isCurrentUser = true
+        gate.shouldFail = true
+        gate.writesBeforeFailure = true
+        #expect(throws: InjectedFailure.indexWrite) { try store.replacePersonLinkedMetadata([updated]) }
+        #expect(try store.loadForManagement() == [original])
+        #expect(try Data(contentsOf: storedSampleURL(for: original, root: root)) == originalAudio)
+    }
+
     @Test("确认样本复制进独立目录，删除会议目录不影响跨会议复用")
     func enrollmentOwnsIndependentCopy() throws {
         let root = try temporaryDirectory()
@@ -293,7 +349,7 @@ struct SpeakerVoiceProfileStoreTests {
         }
     }
 
-    @Test("坏样本仍可管理且不阻塞指定 profile 更新")
+    @Test("坏样本仍可管理且不阻塞其他人物自动带入和更新")
     func damagedSamplesRemainRecoverable() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -308,9 +364,7 @@ struct SpeakerVoiceProfileStoreTests {
         )
         try FileManager.default.removeItem(at: storedSampleURL(for: damaged, root: root))
 
-        #expect(throws: SpeakerVoiceProfileStoreError.invalidSample) {
-            try store.automaticSpeakers()
-        }
+        #expect(try store.automaticSpeakers().map(\.voiceProfileId) == [healthy.id])
         #expect(try store.loadForManagement().map(\.id) == [damaged.id, healthy.id])
 
         let updatedHealthy = try store.enroll(
@@ -330,6 +384,26 @@ struct SpeakerVoiceProfileStoreTests {
             durationMs: 3_000
         )
         #expect(try store.load().count == 2)
+    }
+
+    @Test("已停用人物的坏样本不影响健康声纹")
+    func inactiveDamagedSampleDoesNotBlockHealthyProfiles() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SpeakerVoiceProfileStore(baseDirectory: root)
+        let inactive = try store.enroll(
+            displayName: "已停用", role: nil, colorToken: "red",
+            sourceSampleURL: try sample(in: root), durationMs: 3_000
+        )
+        let healthy = try store.enroll(
+            displayName: "有效", role: nil, colorToken: "blue",
+            sourceSampleURL: try sample(in: root), durationMs: 3_000
+        )
+        try store.setAutoEnabled(false, profileID: inactive.id)
+        try Data([1, 2, 3]).write(to: storedSampleURL(for: inactive, root: root))
+
+        #expect(try store.automaticSpeakers().map(\.voiceProfileId) == [healthy.id])
+        #expect(throws: SpeakerVoiceProfileStoreError.invalidSample) { try store.load() }
     }
 
     @Test("拒绝相对路径越界及样本 symlink 逃逸")

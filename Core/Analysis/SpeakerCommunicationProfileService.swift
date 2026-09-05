@@ -67,6 +67,7 @@ struct SpeakerCommunicationProfileAgent: Sendable {
         let eligible = segments
             .filter {
                 $0.participantId == speaker.id
+                    && $0.speakerWasUserConfirmed == true
                     && ($0.state == .final || $0.state == .edited)
                     && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             }

@@ -81,6 +81,37 @@ final class SpeakerVoiceProfileStore: @unchecked Sendable {
         return try loadUnlocked(sampleValidation: .structure)
     }
 
+    func replacePersonLinkedMetadata(_ profiles: [SpeakerVoiceProfile]) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        let stored = try loadUnlocked(sampleValidation: .structure)
+        guard profiles.count == stored.count,
+              Set(profiles.map(\.id)).count == profiles.count,
+              Set(profiles.map(\.id)) == Set(stored.map(\.id)) else {
+            throw SpeakerVoiceProfileStoreError.profileNotFound
+        }
+        for profile in profiles {
+            guard let original = stored.first(where: { $0.id == profile.id }) else {
+                throw SpeakerVoiceProfileStoreError.profileNotFound
+            }
+            var immutableFields = profile
+            immutableFields.displayName = original.displayName
+            immutableFields.role = original.role
+            immutableFields.colorToken = original.colorToken
+            immutableFields.backgroundContext = original.backgroundContext
+            immutableFields.isCurrentUser = original.isCurrentUser
+            immutableFields.isAutoEnabled = original.isAutoEnabled
+            immutableFields.updatedAt = original.updatedAt
+            guard immutableFields == original else {
+                throw SpeakerVoiceProfileStoreError.invalidSample
+            }
+        }
+        guard profiles.filter(\.isAutoEnabled).count <= Self.maximumAutoEnabledProfiles else {
+            throw SpeakerVoiceProfileStoreError.autoRecognitionLimitReached
+        }
+        try saveUnlocked(profiles)
+    }
+
     func enroll(
         profileID: UUID? = nil,
         displayName: String,
@@ -357,8 +388,22 @@ final class SpeakerVoiceProfileStore: @unchecked Sendable {
     }
 
     func automaticSpeakers() throws -> [Speaker] {
-        try load()
+        lock.lock()
+        defer { lock.unlock() }
+        let candidates = try loadUnlocked(sampleValidation: .none)
             .filter { $0.isAutoEnabled || $0.isCurrentUser == true }
+        let healthy = candidates.filter { profile in
+            do {
+                try validateStoredSample(for: profile)
+                return true
+            } catch {
+                return false
+            }
+        }
+        guard candidates.isEmpty || !healthy.isEmpty else {
+            throw SpeakerVoiceProfileStoreError.invalidSample
+        }
+        return healthy
             .sorted {
                 if ($0.isCurrentUser == true) != ($1.isCurrentUser == true) {
                     return $0.isCurrentUser == true

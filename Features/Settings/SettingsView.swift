@@ -838,9 +838,11 @@ struct SettingsView: View {
             }
             HStack {
                 Button(
-                    environment.obsidianVaultURL == nil
-                        ? "选择 Obsidian Vault…"
-                        : "重新选择 Obsidian Vault…"
+                    environment.isPersistentStorageUnavailable
+                        ? "重新授权原 Obsidian Vault…"
+                        : (environment.obsidianVaultURL == nil
+                            ? "选择 Obsidian Vault…"
+                            : "重新选择 Obsidian Vault…")
                 ) {
                     chooseObsidianVault()
                 }
@@ -850,9 +852,12 @@ struct SettingsView: View {
                         [environment.fileStore.baseDirectory]
                     )
                 }
+                .disabled(environment.isPersistentStorageUnavailable)
                 if isMigratingStorage {
                     ProgressView().controlSize(.small)
-                    Text("正在复制并校验现有数据…")
+                    Text(environment.isPersistentStorageUnavailable
+                         ? "正在验证原项目库…"
+                         : "正在复制并校验现有数据…")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -867,7 +872,9 @@ struct SettingsView: View {
             } else if let storageWarning = environment.storageWarning {
                 statusText(storageWarning)
             }
-            Text("选择 Vault 根目录后，应用在其中使用“帮我分析”子文件夹。切换会先复制并校验，旧目录保留。")
+            Text(environment.isPersistentStorageUnavailable
+                 ? "请重新选择此前使用的 Vault。恢复只验证原项目库并保存授权，完成后请重新启动应用。"
+                 : "选择 Vault 根目录后，应用在其中使用“帮我分析”子文件夹。切换会先复制并校验，旧目录保留。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -1492,6 +1499,9 @@ struct SettingsView: View {
     }
 
     private var displayedStoragePath: String {
+        guard !environment.isPersistentStorageUnavailable else {
+            return "原存储位置暂不可用"
+        }
         let path = environment.fileStore.baseDirectory.standardizedFileURL.path
         let homePath = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
         guard path == homePath || path.hasPrefix(homePath + "/") else {
@@ -1503,7 +1513,9 @@ struct SettingsView: View {
     private func chooseObsidianVault() {
         let panel = NSOpenPanel()
         panel.title = "选择 Obsidian Vault"
-        panel.message = "应用将在所选 Vault 下建立“帮我分析”子文件夹。"
+        panel.message = environment.isPersistentStorageUnavailable
+            ? "请选择此前保存录音的原 Vault；仅重新授权和验证项目库，不迁移数据。"
+            : "应用将在所选 Vault 下建立“帮我分析”子文件夹。"
         panel.prompt = "选择"
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -1521,7 +1533,8 @@ struct SettingsView: View {
             storageMessage = "无法保存文件夹授权：\(error.localizedDescription)"
             return
         }
-        let sourceDirectory = environment.fileStore.baseDirectory
+        let sourceDirectory = environment.isPersistentStorageUnavailable
+            ? nil : environment.fileStore.baseDirectory
         isMigratingStorage = true
         storageMessage = nil
         Task { @MainActor in
@@ -1531,14 +1544,21 @@ struct SettingsView: View {
             }
             do {
                 _ = try await Task.detached(priority: .userInitiated) {
-                    try AppStorageLocation.prepareVault(
-                        vaultURL,
-                        migratingFrom: sourceDirectory
-                    )
+                    if let sourceDirectory {
+                        return try AppStorageLocation.prepareVault(
+                            vaultURL,
+                            migratingFrom: sourceDirectory
+                        )
+                    }
+                    return try AppStorageLocation.validateExistingVault(vaultURL)
                 }.value
                 AppStorageLocation.saveBookmarkData(bookmarkData)
-                storageMessage = "已切换到 Obsidian Vault。"
-                onStorageLocationChanged()
+                if sourceDirectory == nil {
+                    storageMessage = "原项目库验证通过，授权已保存。请退出并重新打开应用以恢复录音与项目。"
+                } else {
+                    storageMessage = "已切换到 Obsidian Vault。"
+                    onStorageLocationChanged()
+                }
             } catch {
                 storageMessage = "切换失败：\(error.localizedDescription)"
             }

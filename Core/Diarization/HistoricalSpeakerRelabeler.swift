@@ -95,6 +95,7 @@ struct HistoricalSpeakerRelabeler: @unchecked Sendable {
             uniqueKeysWithValues: speakerReferences.map { ($0.alias, $0.speakerID) }
         )
         var assignments: [UUID: UUID] = [:]
+        var conflicted = Set<UUID>()
         var processed = 0
         for window in windows {
             try Task.checkCancellation()
@@ -112,17 +113,34 @@ struct HistoricalSpeakerRelabeler: @unchecked Sendable {
                 at: chunkURL,
                 knownSpeakers: knownSpeakers
             )
+            let mapped = DiarizationChunkResult(
+                durationMs: result.durationMs,
+                segments: result.segments.map { segment in
+                    var mapped = segment
+                    mapped.startMs = Self.wallMs(
+                        forAudioMs: window.audioStartMs + segment.startMs,
+                        pauseIntervals: pauseIntervals
+                    )
+                    mapped.endMs = Self.wallMs(
+                        forAudioMs: window.audioStartMs + segment.endMs,
+                        pauseIntervals: pauseIntervals
+                    )
+                    return mapped
+                }
+            )
             let chunkAssignments = HistoricalSpeakerRelabelMatcher.assignments(
-                result: result,
-                chunkWallStartMs: Self.wallMs(
-                    forAudioMs: window.audioStartMs,
-                    pauseIntervals: pauseIntervals
-                ),
+                result: mapped,
+                chunkWallStartMs: 0,
                 knownSpeakerIDs: knownSpeakerIDs,
                 existingSegments: existingSegments
             )
-            for (segmentID, speakerID) in chunkAssignments where assignments[segmentID] == nil {
-                assignments[segmentID] = speakerID
+            for (segmentID, speakerID) in chunkAssignments where !conflicted.contains(segmentID) {
+                if let previous = assignments[segmentID], previous != speakerID {
+                    assignments.removeValue(forKey: segmentID)
+                    conflicted.insert(segmentID)
+                } else {
+                    assignments[segmentID] = speakerID
+                }
             }
             processed += 1
         }
@@ -151,44 +169,36 @@ enum HistoricalSpeakerRelabelMatcher {
         existingSegments: [HistoricalSpeakerRelabeler.SegmentSnapshot]
     ) -> [UUID: UUID] {
         var assignments: [UUID: UUID] = [:]
-        for remote in result.segments {
-            guard let label = remote.speakerLabel,
-                  let speakerID = knownSpeakerIDs[label] else {
-                continue
+        for segment in existingSegments where !segment.speakerWasUserConfirmed {
+            let duration = max(1, segment.endMs - segment.startMs)
+            let overlapping = result.segments.filter { remote in
+                let overlap = TranscriptReconciler.overlapMs(
+                    startA: chunkWallStartMs + remote.startMs,
+                    endA: chunkWallStartMs + remote.endMs,
+                    startB: segment.startMs,
+                    endB: segment.endMs
+                )
+                return overlap >= min(200, duration / 2)
+                    && overlap > 0
+            }.sorted { $0.startMs < $1.startMs }
+            let labels = Set(overlapping.map { $0.speakerLabel ?? "" })
+            guard labels.count == 1,
+                  let label = labels.first,
+                  let speakerID = knownSpeakerIDs[label] else { continue }
+
+            var covered: Int64 = 0
+            var coveredUntil = segment.startMs
+            for remote in overlapping {
+                let start = max(segment.startMs, chunkWallStartMs + remote.startMs)
+                let end = min(segment.endMs, chunkWallStartMs + remote.endMs)
+                covered += max(0, end - max(start, coveredUntil))
+                coveredUntil = max(coveredUntil, end)
             }
-            let remoteStart = chunkWallStartMs + remote.startMs
-            let remoteEnd = chunkWallStartMs + remote.endMs
-            let candidate = existingSegments
-                .filter { segment in
-                    !segment.speakerWasUserConfirmed
-                        && TranscriptReconciler.overlapMs(
-                            startA: remoteStart,
-                            endA: remoteEnd,
-                            startB: segment.startMs,
-                            endB: segment.endMs
-                        ) > 0
-                }
-                .map { segment -> (HistoricalSpeakerRelabeler.SegmentSnapshot, Double) in
-                    let overlap = TranscriptReconciler.overlapMs(
-                        startA: remoteStart,
-                        endA: remoteEnd,
-                        startB: segment.startMs,
-                        endB: segment.endMs
-                    )
-                    let shorter = max(
-                        1,
-                        min(remoteEnd - remoteStart, segment.endMs - segment.startMs)
-                    )
-                    let overlapRatio = Double(overlap) / Double(shorter)
-                    let similarity = TranscriptText.similarity(remote.text, segment.text)
-                    return (segment, overlapRatio * 0.7 + similarity * 0.3)
-                }
-                .filter { $0.1 >= 0.5 }
-                .max { $0.1 < $1.1 }?
-                .0
-            if let candidate, assignments[candidate.id] == nil {
-                assignments[candidate.id] = speakerID
-            }
+            guard Double(covered) / Double(duration) >= 0.8,
+                  TranscriptText.similarity(
+                    overlapping.map(\.text).joined(), segment.text
+                  ) >= 0.45 else { continue }
+            assignments[segment.id] = speakerID
         }
         return assignments
     }

@@ -37,6 +37,19 @@ enum SpeakerPanelLogic {
             || activeVoiceReferenceCount(in: speakers) < KnownSpeakerReference.maximumCount
     }
 
+    static func speaker(for person: Person, existing: [Speaker]) -> Speaker {
+        Speaker(
+            cloudAlias: nextCloudAlias(existing: existing),
+            displayName: person.displayName,
+            role: person.role,
+            colorToken: person.colorToken,
+            isUserConfirmed: true,
+            personId: person.id,
+            backgroundContext: person.backgroundContext,
+            isCurrentUser: person.isCurrentUser
+        )
+    }
+
     /// 把 V2 说话人同步进运行时参会人列表（id 对齐；样本路径 V2 优先）。
     /// 已有片段的 participantId 不动，后续分片按新列表解析。
     static func syncRuntimeParticipants(speakers: [Speaker], meeting: Meeting) {
@@ -76,6 +89,7 @@ struct SpeakerPanelView: View {
     @State private var editingSpeaker: Speaker?
     @State private var refreshTick = 0
     @State private var voiceProfiles: [SpeakerVoiceProfile] = []
+    @State private var persons: [Person] = []
     @State private var pendingPermanentSpeaker: Speaker?
     @State private var pendingDeleteProfile: SpeakerVoiceProfile?
     @State private var editingProfile: SpeakerVoiceProfile?
@@ -130,9 +144,29 @@ struct SpeakerPanelView: View {
                     }
                     .padding(.top, 4)
 
+                    if !persons.isEmpty {
+                        Divider().padding(.vertical, 4)
+                        Text("人物库（无需声纹也可加入）")
+                            .font(.subheadline).fontWeight(.semibold)
+                        ForEach(persons) { person in
+                            HStack {
+                                Text(person.displayName)
+                                if let role = person.role, !role.isEmpty {
+                                    Text(role).font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if project.speakers.contains(where: { $0.personId == person.id }) {
+                                    Text("已加入本场").font(.caption).foregroundStyle(.secondary)
+                                } else {
+                                    Button("加入本场") { addPersonToCurrentMeeting(person) }
+                                }
+                            }
+                            .bwCard(padding: 9)
+                        }
+                    }
                     if !voiceProfiles.isEmpty {
                         Divider().padding(.vertical, 4)
-                        Text("人物库（跨录音复用）")
+                        Text("声音样本（可选附件）")
                             .font(.subheadline)
                             .fontWeight(.semibold)
                         Text("当前服务每场最多自动匹配 4 个永久声纹。关闭自动使用不会删除样本。")
@@ -146,7 +180,7 @@ struct SpeakerPanelView: View {
                 .padding(16)
             }
         }
-        .frame(width: 520, height: 460)
+        .frame(width: 700, height: 560)
         .onDisappear {
             sampleRecorder?.cancelRecording()
             if samplePlayer.isPlaying { samplePlayer.togglePlay() }
@@ -209,7 +243,7 @@ struct SpeakerPanelView: View {
             ),
             titleVisibility: .visible
         ) {
-            Button("删除样本与资料", role: .destructive) {
+            Button("删除声音样本", role: .destructive) {
                 if let profile = pendingDeleteProfile {
                     deleteProfile(profile)
                 }
@@ -217,7 +251,7 @@ struct SpeakerPanelView: View {
             }
             Button("取消", role: .cancel) { pendingDeleteProfile = nil }
         } message: {
-            Text("会从本机永久删除该人的声音样本和资料；已有会议文稿不会被删除。")
+            Text("会从本机永久删除此声音样本并解除声纹关联；人物、人工背景和已有会议文稿保留。")
         }
     }
 
@@ -256,6 +290,16 @@ struct SpeakerPanelView: View {
                     .buttonStyle(.borderedProminent)
                     .tint(.red)
             } else {
+                if !persons.isEmpty {
+                    Menu(speaker.personId == nil ? "指认人物" : "更正人物") {
+                        ForEach(persons) { person in
+                            Button(person.displayName + (person.role.map { " · \($0)" } ?? "")) {
+                                assignPerson(person, to: speaker)
+                            }
+                        }
+                    }
+                    .fixedSize()
+                }
                 if SpeakerPanelLogic.voiceReferencePath(for: speaker) != nil {
                     Button {
                         playSample(speaker)
@@ -302,7 +346,7 @@ struct SpeakerPanelView: View {
                 .font(.caption2)
                 .foregroundStyle(.green)
         } else {
-            Text("未录声纹样本 · 该说话人的发言将显示为「待识别」")
+            Text("未录声纹样本 · 可在文稿中人工指认发言")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
@@ -449,6 +493,11 @@ struct SpeakerPanelView: View {
 
     private func reloadProfiles() {
         do {
+            persons = try environment.personLibraryStore.load()
+        } catch {
+            profileNotice = "人物库读取失败：\(error.localizedDescription)"
+        }
+        do {
             voiceProfiles = try environment.speakerVoiceProfileStore.load()
                 .sorted { $0.updatedAt > $1.updatedAt }
             profileLibraryHasValidationFailure = false
@@ -489,6 +538,23 @@ struct SpeakerPanelView: View {
             speaker.communicationProfile = profile.communicationProfile
             speaker.isCurrentUser = profile.isCurrentUser
             speaker.iflytekFeatureID = profile.iflytekFeatureID
+            do {
+                let person = try environment.personLibraryStore.ensurePerson(
+                    for: profile, preferredPersonID: speaker.personId
+                )
+                try environment.linkPerson(
+                    personID: person.id, projectID: project.id,
+                    speakerID: speaker.id, currentProject: project
+                )
+                speaker.personId = person.id
+                speaker.isCurrentUser = person.isCurrentUser
+                speaker.backgroundContext = person.backgroundContext
+            } catch {
+                changed()
+                reloadProfiles()
+                profileNotice = "声纹已保存，但人物关联未完成：\(error.localizedDescription)。请重试永久保存。"
+                return
+            }
             profileNotice = profile.isAutoEnabled
                 ? "已保存为永久声纹，后续新录音会自动带入。"
                 : "已保存；自动名额已满，可先关闭一个现有声纹再启用。"
@@ -511,11 +577,17 @@ struct SpeakerPanelView: View {
 
     private func setCurrentUser(_ profile: SpeakerVoiceProfile) {
         do {
-            try environment.speakerVoiceProfileStore.setCurrentUser(
-                profileID: profile.id
-            )
+            let person = try environment.personLibraryStore.ensurePerson(for: profile)
+            for speaker in project.speakers where speaker.voiceProfileId == profile.id && speaker.personId != person.id {
+                try environment.linkPerson(
+                    personID: person.id, projectID: project.id,
+                    speakerID: speaker.id, currentProject: project
+                )
+                speaker.personId = person.id
+            }
+            try environment.setCurrentPerson(personID: person.id)
             for speaker in project.speakers {
-                speaker.isCurrentUser = speaker.voiceProfileId == profile.id
+                speaker.isCurrentUser = speaker.personId == person.id
             }
             changed()
             reloadProfiles()
@@ -526,7 +598,16 @@ struct SpeakerPanelView: View {
     }
 
     private func addProfileToCurrentMeeting(_ profile: SpeakerVoiceProfile) {
-        if let linked = project.speakers.first(where: { $0.voiceProfileId == profile.id }) {
+        let person: Person
+        do {
+            person = try environment.personLibraryStore.ensurePerson(for: profile)
+        } catch {
+            profileNotice = "人物库关联失败：\(error.localizedDescription)"
+            return
+        }
+        if let linked = project.speakers.first(where: {
+            $0.voiceProfileId == profile.id || $0.personId == person.id
+        }) {
             activateProfile(profile, for: linked)
             return
         }
@@ -550,8 +631,69 @@ struct SpeakerPanelView: View {
             isCurrentUser: profile.isCurrentUser
         )
         project.speakers.append(speaker)
+        do {
+            try environment.linkPerson(
+                personID: person.id, projectID: project.id,
+                speakerID: speaker.id, currentProject: project
+            )
+            speaker.personId = person.id
+            speaker.isCurrentUser = person.isCurrentUser
+            speaker.backgroundContext = person.backgroundContext
+        } catch {
+            project.speakers.removeAll { $0.id == speaker.id }
+            profileNotice = "人物未加入：\(error.localizedDescription)"
+            reloadProfiles()
+            return
+        }
         changed()
+        reloadProfiles()
         profileNotice = "已将 \(profile.displayName) 加入本场识别。"
+    }
+
+    private func addPersonToCurrentMeeting(_ person: Person) {
+        guard !project.speakers.contains(where: { $0.personId == person.id }) else { return }
+        let speaker = SpeakerPanelLogic.speaker(for: person, existing: project.speakers)
+        project.speakers.append(speaker)
+        do {
+            try environment.linkPerson(
+                personID: person.id, projectID: project.id,
+                speakerID: speaker.id, currentProject: project
+            )
+            changed()
+            reloadProfiles()
+            profileNotice = "已加入 \(person.displayName)，可在文稿中指认其发言，无需声音样本。"
+        } catch {
+            project.speakers.removeAll { $0.id == speaker.id }
+            profileNotice = "人物未加入：\(error.localizedDescription)"
+        }
+    }
+
+    private func assignPerson(_ person: Person, to speaker: Speaker) {
+        do {
+            try environment.linkPerson(
+                personID: person.id, projectID: project.id,
+                speakerID: speaker.id, currentProject: project
+            )
+            if let stored = try environment.allProjects().first(where: { $0.id == project.id })?
+                .speakers.first(where: { $0.id == speaker.id }) {
+                speaker.personId = stored.personId
+                speaker.isCurrentUser = stored.isCurrentUser
+                speaker.voiceProfileId = stored.voiceProfileId
+                speaker.voiceSamplePath = stored.voiceSamplePath
+                speaker.voiceSampleDurationMs = stored.voiceSampleDurationMs
+                speaker.legacyVoiceReferencePath = stored.legacyVoiceReferencePath
+                speaker.legacyVoiceReferenceDurationMs = stored.legacyVoiceReferenceDurationMs
+                speaker.iflytekFeatureID = stored.iflytekFeatureID
+            }
+            speaker.displayName = person.displayName
+            speaker.role = person.role
+            speaker.backgroundContext = person.backgroundContext
+            changed()
+            reloadProfiles()
+            profileNotice = "已指认为 \(person.displayName)。"
+        } catch {
+            profileNotice = "人物指认未完成：\(error.localizedDescription)"
+        }
     }
 
     private func permanentActionTitle(for speaker: Speaker) -> String {
@@ -603,12 +745,20 @@ struct SpeakerPanelView: View {
         colorToken: String
     ) -> String? {
         do {
-            try environment.speakerVoiceProfileStore.updateMetadata(
-                profileID: profile.id,
-                displayName: displayName,
-                role: role,
-                colorToken: colorToken
-            )
+            let person = try environment.personLibraryStore.ensurePerson(for: profile)
+            try environment.personLibraryStore.changeIdentity(
+                projectStore: environment.projectStore,
+                businessProjectStore: environment.businessProjectStore,
+                profileStore: environment.speakerVoiceProfileStore
+            ) { persons, _, _ in
+                guard let index = persons.firstIndex(where: { $0.id == person.id }) else {
+                    throw PersonLibraryStoreError.personNotFound
+                }
+                persons[index].displayName = displayName
+                persons[index].role = role
+                persons[index].colorToken = colorToken
+                persons[index].updatedAt = Date()
+            }
             if let linked = project.speakers.first(where: { $0.voiceProfileId == profile.id }) {
                 linked.displayName = displayName
                 linked.role = role
@@ -629,11 +779,29 @@ struct SpeakerPanelView: View {
         communicationProfile: SpeakerCommunicationProfile?
     ) -> String? {
         do {
+            let person = try environment.personLibraryStore.ensurePerson(for: profile)
+            let previous = try environment.speakerVoiceProfileStore.loadForManagement()
+                .first(where: { $0.id == profile.id })
             try environment.speakerVoiceProfileStore.updateContext(
                 profileID: profile.id,
                 backgroundContext: backgroundContext,
                 communicationProfile: communicationProfile
             )
+            do {
+                try environment.updateLibraryPersonMetadata(
+                    personID: person.id, displayName: person.displayName,
+                    role: person.role, backgroundContext: backgroundContext
+                )
+            } catch {
+                if let previous {
+                    try environment.speakerVoiceProfileStore.updateContext(
+                        profileID: profile.id,
+                        backgroundContext: previous.backgroundContext,
+                        communicationProfile: previous.communicationProfile
+                    )
+                }
+                throw error
+            }
             if let linked = project.speakers.first(where: { $0.voiceProfileId == profile.id }) {
                 let trimmed = backgroundContext?
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -665,39 +833,56 @@ struct SpeakerPanelView: View {
 
     private func deleteProfile(_ profile: SpeakerVoiceProfile) {
         do {
-            try environment.speakerVoiceProfileStore.delete(profileID: profile.id)
-            if let linked = project.speakers.first(where: { $0.voiceProfileId == profile.id }) {
-                linked.voiceProfileId = nil
-                if linked.voiceSamplePath == profile.sampleRelativePath {
-                    linked.voiceSamplePath = nil
-                    linked.voiceSampleDurationMs = nil
-                }
-                linked.backgroundContext = nil
-                linked.communicationProfile = nil
-                linked.isCurrentUser = nil
-                linked.iflytekFeatureID = nil
-                changed()
+            try environment.detachPersonVoiceProfile(profileID: profile.id)
+            do {
+                try environment.speakerVoiceProfileStore.delete(profileID: profile.id)
+            } catch {
+                try environment.undoPersonChange()
+                throw error
             }
+            for linked in project.speakers where linked.voiceProfileId == profile.id {
+                linked.voiceProfileId = nil
+                linked.voiceSamplePath = nil
+                linked.voiceSampleDurationMs = nil
+                linked.legacyVoiceReferencePath = nil
+                linked.legacyVoiceReferenceDurationMs = nil
+                linked.iflytekFeatureID = nil
+            }
+            changed()
             reloadProfiles()
-            profileNotice = "已删除 \(profile.displayName) 的永久声纹与资料。"
+            profileNotice = "已删除 \(profile.displayName) 的声音样本，人物与人工背景保留。"
         } catch {
             profileNotice = "永久声纹未删除（\(profileErrorText(error))）"
         }
     }
 
     private func activateProfile(_ profile: SpeakerVoiceProfile, for speaker: Speaker) {
-        guard SpeakerPanelLogic.activeVoiceReferenceCount(in: project.speakers)
-                < SpeakerVoiceProfileStore.maximumAutoEnabledProfiles else {
+        guard SpeakerPanelLogic.canActivateVoiceReference(for: speaker.id, in: project.speakers) else {
             profileNotice = "本场已有 4 个声纹样本；请先停用一人再替换。"
             return
         }
+        do {
+            let person = try environment.personLibraryStore.ensurePerson(
+                for: profile, preferredPersonID: speaker.personId
+            )
+            try environment.linkPerson(
+                personID: person.id, projectID: project.id,
+                speakerID: speaker.id, currentProject: project
+            )
+            speaker.personId = person.id
+            speaker.isCurrentUser = person.isCurrentUser
+            speaker.backgroundContext = person.backgroundContext
+        } catch {
+            profileNotice = "人物关联未完成：\(error.localizedDescription)"
+            return
+        }
+        speaker.voiceProfileId = profile.id
         speaker.voiceSamplePath = profile.sampleRelativePath
         speaker.voiceSampleDurationMs = profile.sampleDurationMs
-        speaker.backgroundContext = profile.backgroundContext
         speaker.communicationProfile = profile.communicationProfile
-        speaker.isCurrentUser = profile.isCurrentUser
         speaker.iflytekFeatureID = profile.iflytekFeatureID
         changed()
+        reloadProfiles()
         profileNotice = "已将 \(profile.displayName) 加入本场识别。"
     }
 
@@ -707,6 +892,9 @@ struct SpeakerPanelView: View {
         }
         speaker.voiceSamplePath = nil
         speaker.voiceSampleDurationMs = nil
+        speaker.legacyVoiceReferencePath = nil
+        speaker.legacyVoiceReferenceDurationMs = nil
+        speaker.iflytekFeatureID = nil
         changed()
         profileNotice = "已在本场停用 \(profile.displayName)；永久样本未删除。"
     }
@@ -831,6 +1019,14 @@ private struct SpeakerCommunicationProfileSheet: View {
     private func analyzeCurrentProject() {
         guard let speaker else {
             message = "请先把这个人物加入本场并完成发言标注。"
+            return
+        }
+        guard project.segments.filter({
+            $0.participantId == speaker.id && $0.speakerWasUserConfirmed == true
+                && ($0.state == .final || $0.state == .edited)
+                && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }).count >= 2 else {
+            message = "至少需要两条已人工确认属于此人的发言。"
             return
         }
         let normalized = backgroundContext

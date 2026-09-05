@@ -56,6 +56,8 @@ enum LocalTranscriptionError: Error, Equatable {
     case noCompatibleAudioFormat
     /// 本设备不支持中文语言资源（无法下载）
     case assetInstallUnsupported
+    case recognitionFailed
+    case finalizationFailed
 }
 
 extension LocalTranscriptionError: LocalizedError {
@@ -66,6 +68,8 @@ extension LocalTranscriptionError: LocalizedError {
         case .sessionAlreadyRunning: return "转写会话已在运行"
         case .noCompatibleAudioFormat: return "找不到与语音识别兼容的音频格式"
         case .assetInstallUnsupported: return "本设备不支持下载中文语言资源"
+        case .recognitionFailed: return "本地转写中断，已保留原录音与已有文稿，请重新转写"
+        case .finalizationFailed: return "本地转写收尾失败，已有文稿可能不完整，请重新转写"
         }
     }
 }
@@ -75,6 +79,7 @@ extension LocalTranscriptionError: LocalizedError {
 protocol LocalTranscriptionServicing: AnyObject, Sendable {
     /// 结果流（临时 + 最终，按产生顺序）
     var results: AsyncStream<LocalTranscriptResult> { get }
+    var sessionError: LocalTranscriptionError? { get }
     /// 检查普通话转写可用性（不静默降级；返回真实原因）
     func checkMandarinAvailability() async -> TranscriptionAvailability
     /// 触发中文语言资源下载安装（AssetInventory.assetInstallationRequest +
@@ -93,6 +98,10 @@ protocol LocalTranscriptionServicing: AnyObject, Sendable {
     func cancelSession() async
 }
 
+extension LocalTranscriptionServicing {
+    var sessionError: LocalTranscriptionError? { nil }
+}
+
 /// 基于 Apple SpeechAnalyzer / SpeechTranscriber 的本地转写实现（阶段 2）。
 /// 使用带时间范围的渐进式转写 preset（timeIndexedProgressiveTranscription），
 /// 临时结果与最终结果都带 CMTimeRange。
@@ -108,6 +117,13 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
     private var targetFormat: AVAudioFormat?
     private var collectorTask: Task<Void, Never>?
     private var running = false
+    private var failure: LocalTranscriptionError?
+    private var isCancelling = false
+    private var sessionGeneration = 0
+
+    var sessionError: LocalTranscriptionError? {
+        lock.withLock { failure }
+    }
 
     private var resultsContinuation: AsyncStream<LocalTranscriptResult>.Continuation?
     /// 当前会话的结果流。每次 startSession 新建，会话结束时显式 finish——
@@ -266,7 +282,7 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
             analysisContext: context
         )
 
-        lock.withLock {
+        let generation = lock.withLock {
             self.transcriber = transcriber
             self.analyzer = analyzer
             self.inputContinuation = inputContinuation
@@ -275,6 +291,10 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
             self.converter = nil
             self.targetFormat = nil
             self.running = true
+            self.failure = nil
+            self.isCancelling = false
+            self.sessionGeneration += 1
+            return self.sessionGeneration
         }
 
         // 收集转写结果 → LocalTranscriptResult 流
@@ -311,13 +331,14 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
                     sessionContinuation.yield(fallback)
                 }
             } catch {
-                // 结果流异常：只记录脱敏错误类型
+                self.failSession(.recognitionFailed, generation: generation)
                 AppLog.logError(AppLog.transcription, LogSanitizer.formatEvent("transcriber_results_failed", error: String(describing: type(of: error))))
             }
         }
     }
 
     func feed(_ buffer: AVAudioPCMBuffer) async {
+        guard sessionError == nil else { return }
         guard let input = lock.withLock({ inputContinuation }) else { return }
 
         // 首个缓冲到达时确定目标格式并按需建立转换器。
@@ -424,6 +445,7 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
         let input = lock.withLock { inputContinuation }
         let analyzer = lock.withLock { self.analyzer }
         let collectTask = lock.withLock { collectorTask }
+        let generation = lock.withLock { sessionGeneration }
         defer { cleanup() }
         input?.finish()
         // 有限输入结束后等待剩余音频被消费并产出最终结果。
@@ -432,6 +454,8 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
             do {
                 try await analyzer.finalizeAndFinishThroughEndOfInput()
             } catch {
+                failSession(.finalizationFailed, generation: generation)
+                await analyzer.cancelAndFinishNow()
                 AppLog.logError(
                     AppLog.transcription,
                     LogSanitizer.formatEvent(
@@ -447,9 +471,19 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
     }
 
     func cancelSession() async {
+        lock.withLock { isCancelling = true }
         let analyzer = lock.withLock { self.analyzer }
         await analyzer?.cancelAndFinishNow()
         cleanup()
+    }
+
+    private func failSession(_ error: LocalTranscriptionError, generation: Int) {
+        lock.withLock {
+            guard !isCancelling, generation == sessionGeneration else { return }
+            if failure == nil { failure = error }
+            inputContinuation?.finish()
+            resultsContinuation?.finish()
+        }
     }
 
     private func cleanup() {

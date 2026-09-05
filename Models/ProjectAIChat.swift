@@ -144,6 +144,24 @@ struct ProjectAIChatTranscriptCorrection: Codable, Sendable, Equatable {
     }
 }
 
+enum ProjectAIChatCorrectionIntent {
+    static func explicitlyAuthorizes(_ correction: ProjectAIChatTranscriptCorrection, in request: String) -> Bool {
+        guard request.range(of: #"不要|不得|禁止|别.{0,8}(改|纠|替换)|不.{0,4}(修改|改写|纠正|替换)"#,
+                            options: .regularExpression) == nil else { return false }
+        let wrong = NSRegularExpression.escapedPattern(for: correction.wrong)
+        let right = NSRegularExpression.escapedPattern(for: correction.right)
+        let quote = #"[\s\"“”‘’「」『』]*"#
+        let start = #"(?:^|[。；;\n])\s*(?:请|请你|纠正一下[：:]?)?\s*"#
+        let end = quote + #"(?:[。；;！!\n]|$)"#
+        let patterns = [
+            "不是" + quote + wrong + quote + "[，,；;]?\\s*(而)?是" + quote + right,
+            "(?:把|将)" + quote + wrong + quote + "(?:全部|统一|全局)?\\s*(?:改为|改成|替换为|替换成|纠正为)" + quote + right,
+            wrong + quote + "(?:改为|改成|替换为|替换成|纠正为)" + quote + right
+        ]
+        return patterns.contains { request.range(of: start + $0 + end, options: .regularExpression) != nil }
+    }
+}
+
 enum ProjectAIChatRetention {
     static let maximumCount = 60
 

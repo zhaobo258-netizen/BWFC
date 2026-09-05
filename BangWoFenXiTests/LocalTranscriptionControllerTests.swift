@@ -217,4 +217,34 @@ final class LocalTranscriptionControllerTests {
         #expect(controller.runState != .running)
         #expect(controller.lastErrorDescription != nil)
     }
+    @Test("启动失败后重试成功清除旧错误，结束不再误报失败")
+    func successfulRetryClearsPreviousFailure() async throws {
+        let meeting = try makeMeeting()
+        mock.startError = LocalTranscriptionError.noCompatibleAudioFormat
+        do { try await controller.start(for: meeting) { nil } } catch {}
+        #expect(controller.lastErrorDescription != nil)
+        mock.startError = nil
+        mock.finishEndsStream = true
+        try await controller.start(for: meeting) { nil }
+        #expect(controller.lastErrorDescription == nil)
+        await controller.finish()
+        #expect(controller.runState == .idle)
+        #expect(controller.lastErrorDescription == nil)
+    }
+
+    @Test("运行期失败结束结果消费并保留已确认文稿，finish 不抹掉错误")
+    func runtimeFailureRemainsVisibleAfterFinish() async throws {
+        let meeting = try makeMeeting()
+        try await controller.start(for: meeting) { nil }
+        mock.emit(.init(startAudioMs: 0, endAudioMs: 1000, text: "有效原话", isFinal: true))
+        await waitFor { meeting.segments.contains { $0.text == "有效原话" } }
+        mock.fail(.recognitionFailed)
+        await waitFor { self.controller.lastErrorDescription != nil }
+        #expect(controller.runState == .unavailable(LocalTranscriptionError.recognitionFailed.localizedDescription))
+        await controller.finish()
+        #expect(controller.runState == .unavailable(LocalTranscriptionError.recognitionFailed.localizedDescription))
+        #expect(meeting.segments.map(\.text) == ["有效原话"])
+    }
+
+
 }

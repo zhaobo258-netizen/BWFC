@@ -16,12 +16,16 @@ enum ImportPlanner {
     static func planJobs(
         analysisConfigured: Bool,
         finalReportConfigured: Bool = false,
+        diarizationConfigured: Bool = false,
         now: Date = Date()
     ) -> [ProcessingJob] {
         var jobs: [ProcessingJob] = [
             ProcessingJob(kind: .audioExtraction, updatedAt: now),
             ProcessingJob(kind: .transcription, updatedAt: now)
         ]
+        if diarizationConfigured {
+            jobs.append(ProcessingJob(kind: .diarization, updatedAt: now))
+        }
         if analysisConfigured {
             jobs.append(ProcessingJob(kind: .analysis, updatedAt: now))
             if finalReportConfigured {
@@ -38,6 +42,7 @@ enum ImportPlanner {
     static func jobsForResume(_ existing: [ProcessingJob],
                               analysisConfigured: Bool,
                               finalReportConfigured: Bool = false,
+                              diarizationConfigured: Bool = false,
                               now: Date = Date()) -> [ProcessingJob] {
         var jobs = existing.map { job -> ProcessingJob in
             var job = job
@@ -47,6 +52,14 @@ enum ImportPlanner {
                 job.updatedAt = now
             }
             return job
+        }
+        if diarizationConfigured, !jobs.contains(where: { $0.kind == .diarization }) {
+            jobs.append(ProcessingJob(kind: .diarization, updatedAt: now))
+            for index in jobs.indices where jobs[index].kind == .analysis
+                || jobs[index].kind == .finalReport {
+                jobs[index].status = .pending
+                jobs[index].progress = nil
+            }
         }
         if analysisConfigured, !jobs.contains(where: { $0.kind == .analysis }) {
             jobs.append(ProcessingJob(kind: .analysis, updatedAt: now))

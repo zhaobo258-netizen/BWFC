@@ -215,6 +215,7 @@ enum ProjectHomeSupport {
         var references: [SourceRecordingReference] = []
         var segments: [TranscriptSegment] = []
         var speakerByID: [UUID: Speaker] = [:]
+        var canonicalIDByProfile: [UUID: UUID] = [:]
         var timelineOffset: Int64 = 0
         for source in ordered {
             let accepted = source.segments.filter {
@@ -232,15 +233,31 @@ enum ProjectHomeSupport {
                 timelineOffsetMs: timelineOffset,
                 durationMs: sourceDuration
             ))
+            var canonicalIDBySpeaker: [UUID: UUID] = [:]
+            for speaker in source.speakers {
+                if let profileID = speaker.voiceProfileId,
+                   let canonicalID = canonicalIDByProfile[profileID] {
+                    canonicalIDBySpeaker[speaker.id] = canonicalID
+                } else {
+                    canonicalIDBySpeaker[speaker.id] = speaker.id
+                    if speakerByID[speaker.id] == nil {
+                        speakerByID[speaker.id] = copy(speaker)
+                    }
+                    if let profileID = speaker.voiceProfileId {
+                        canonicalIDByProfile[profileID] = speaker.id
+                    }
+                }
+            }
             for segment in accepted {
-                segments.append(copy(
+                let combinedSegment = copy(
                     segment,
                     sourceProjectID: source.id,
                     timelineOffsetMs: timelineOffset
-                ))
-            }
-            for speaker in source.speakers where speakerByID[speaker.id] == nil {
-                speakerByID[speaker.id] = copy(speaker)
+                )
+                if let speakerID = segment.participantId {
+                    combinedSegment.participantId = canonicalIDBySpeaker[speakerID] ?? speakerID
+                }
+                segments.append(combinedSegment)
             }
             timelineOffset += sourceDuration + 1_000
         }
@@ -389,6 +406,9 @@ enum ProjectHomeSupport {
         for project: Project,
         liveProjectIDs: Set<UUID>
     ) -> DisplayStatus {
+        if project.status == .processing, project.hasFailedProcessingJobs {
+            return .normal(project.status)
+        }
         guard project.status.isAbnormalIfAppRelaunched else {
             return .normal(project.status)
         }
