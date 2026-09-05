@@ -383,6 +383,127 @@ final class ImportProcessingControllerTests {
         #expect(cloud.calls.allSatisfy { $0.speakers.isEmpty })
     }
 
+    @Test("导入准备声纹后只发一次整场请求，已知人物和跨20秒匿名标签保持一致")
+    func recordingDiarizationUsesPreparedReferencesOnce() async throws {
+        importMock.audioDurationMs = 45_000
+        let transcription = MockLocalTranscriptionService()
+        transcription.finishEndsStream = true
+        transcription.emit(.init(startAudioMs: 0, endAudioMs: 45_000,
+                                 text: "本地整段粗略文字，等待按不同说话人细分。", isFinal: true))
+        transcriptionMockFactory = { transcription }
+        let response = DiarizationChunkResult(durationMs: 45_000, segments: [
+            .init(startMs: 0, endMs: 1_000, text: "已登记人物先确认验收。", speakerLabel: "p_07"),
+            .init(startMs: 21_000, endMs: 22_000, text: "另一人提出付款条件。", speakerLabel: "speaker_0"),
+            .init(startMs: 41_000, endMs: 42_000, text: "同一个人补充交货条件。", speakerLabel: "speaker_0")
+        ])
+        let cloud = ImportRecordingDiarizationMock(response: response)
+        let controller = makeController(diarizationService: cloud)
+        let sampleURL = tempDirectory.appending(path: "synthetic-reference.wav")
+        let format = try #require(AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1))
+        let buffer = try #require(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 48_000))
+        buffer.frameLength = 48_000
+        let channel = try #require(buffer.floatChannelData?[0])
+        for frame in 0..<48_000 {
+            channel[frame] = sin(2 * Float.pi * 220 * Float(frame) / 16_000) * 0.2
+        }
+        do {
+            let file = try AVAudioFile(forWriting: sampleURL, settings: AudioRecordingSettings.fileSettings(for: format))
+            try file.write(from: buffer)
+        }
+        let known = Speaker(cloudAlias: "p_07", displayName: "合成已登记人物",
+                            voiceSamplePath: "synthetic-reference.wav", voiceSampleDurationMs: 3_000,
+                            iflytekFeatureID: "synthetic-feature")
+        var prepared = 0
+        controller.prepareSpeakerReferences = { [store] project in
+            prepared += 1
+            project.speakers = [known]
+            try store.saveProjects([project])
+        }
+        let id = try await controller.beginImport(url: importMock.fakeSourceURL(named: "整场分人.m4a"))
+        await waitFor { !controller.isRunning }
+        let project = try #require(try storedProject(id))
+        #expect(prepared == 1)
+        #expect(cloud.recordingCalls.count == 1)
+        #expect(cloud.chunkCallCount == 0)
+        #expect(cloud.recordingCalls.first?.map(\.alias) == ["p_07"])
+        #expect(cloud.recordingCalls.first?.first?.iflytekFeatureID == "synthetic-feature")
+        #expect(project.processingJobs.first { $0.kind == .diarization }?.status == .completed)
+        #expect(project.segments.map(\.text) == response.segments.map(\.text))
+        #expect(project.segments.first?.participantId == known.id)
+        let anonymous = project.segments.filter { $0.participantId == nil }
+        #expect(anonymous.count == 2)
+        #expect(anonymous.first?.remoteSpeakerLabel == anonymous.last?.remoteSpeakerLabel)
+        #expect(anonymous.first?.remoteSpeakerLabel?.hasPrefix("recording:") == true)
+        #expect(anonymous.first?.remoteSpeakerLabel?.hasSuffix(":speaker_0") == true)
+    }
+
+    @Test("整场分人保护人工文字和身份，也不覆盖请求期间后来保存的段落与笔记")
+    func recordingDiarizationPreservesManualAndLatestSegments() async throws {
+        let manualSpeaker = Speaker(cloudAlias: "p_01", displayName: "合成人工人物")
+        let manualText = TranscriptSegment(startMs: 0, endMs: 50, text: "人工更正文稿。",
+                                          source: .manual, state: .edited, textWasUserEdited: true)
+        let manualIdentity = TranscriptSegment(startMs: 50, endMs: 100, text: "人工指定人物。",
+            participantId: manualSpeaker.id, source: .local, state: .final, speakerWasUserConfirmed: true)
+        let changing = TranscriptSegment(startMs: 100, endMs: 150, text: "请求前的文字。", source: .local, state: .final)
+        let cloud = ImportRecordingDiarizationMock(response: .init(durationMs: 200, segments: [
+            .init(startMs: 0, endMs: 50, text: "云端误写一。", speakerLabel: "speaker_0"),
+            .init(startMs: 50, endMs: 100, text: "云端误写二。", speakerLabel: "speaker_0"),
+            .init(startMs: 100, endMs: 150, text: "迟到的云端原文。", speakerLabel: "speaker_0")
+        ]))
+        cloud.suspendRecording = true
+        let controller = makeController(diarizationService: cloud)
+        controller.prepareSpeakerReferences = { [store] project in
+            project.speakers = [manualSpeaker]
+            project.segments = [manualText, manualIdentity, changing]
+            try store.saveProjects([project])
+        }
+        let id = try await controller.beginImport(url: importMock.fakeSourceURL(named: "整场保护.m4a"))
+        await waitFor { cloud.recordingSuspended }
+        #expect(cloud.recordingSuspended)
+        let current = try #require(try storedProject(id))
+        changing.text = "请求期间后来保存的文字。"
+        let added = TranscriptSegment(startMs: 150, endMs: 200, text: "新增的段落。", source: .local, state: .final)
+        current.segments.append(added)
+        current.note.markdown = "后来保存的笔记。"
+        try store.saveProjects([current])
+        cloud.resumeRecording()
+        await waitFor { !controller.isRunning }
+        let saved = try #require(try storedProject(id))
+        #expect(saved.segments.map(\.id) == [manualText.id, manualIdentity.id, changing.id, added.id])
+        #expect(saved.segments.map(\.text) == ["人工更正文稿。", "人工指定人物。", "请求期间后来保存的文字。", "新增的段落。"])
+        #expect(saved.segments.first { $0.id == manualIdentity.id }?.participantId == manualSpeaker.id)
+        #expect(saved.segments.first { $0.id == manualIdentity.id }?.speakerWasUserConfirmed == true)
+        #expect(saved.note.markdown == "后来保存的笔记。")
+    }
+
+    @Test("整场识别响应晚于取消或删除时，不写回识别结果", arguments: [false, true])
+    func recordingDiarizationDropsLateResponse(deleteProject: Bool) async throws {
+        let cloud = ImportRecordingDiarizationMock(response: .init(durationMs: 200, segments: [
+            .init(startMs: 0, endMs: 150, text: "迟到结果不得落盘。", speakerLabel: "speaker_0")
+        ]))
+        cloud.suspendRecording = true
+        let controller = makeController(diarizationService: cloud)
+        let id = try await controller.beginImport(url: importMock.fakeSourceURL(named: "取消整场.m4a"))
+        await waitFor { cloud.recordingSuspended }
+        #expect(cloud.recordingSuspended)
+        if deleteProject {
+            try store.saveProjects([])
+        } else {
+            controller.cancel()
+        }
+        cloud.resumeRecording()
+        await waitFor { !controller.isRunning }
+        #expect(!controller.isRunning)
+        if deleteProject {
+            #expect(try storedProject(id) == nil)
+        } else {
+            let saved = try #require(try storedProject(id))
+            #expect(saved.segments.map(\.text) == ["导入音频的第一句。"])
+            #expect(saved.processingJobs.first { $0.kind == .diarization }?.status == .pending)
+            #expect(saved.segments.allSatisfy { $0.remoteSpeakerLabel == nil })
+        }
+    }
+
     @Test("无语音或收尾失败不触发分析，部分原话保存可重试")
     func emptyOrFailedTranscriptionDoesNotAnalyze() async throws {
         analysisConfigured = true
@@ -456,6 +577,7 @@ final class MockAudioImportService: AudioImportServicing, @unchecked Sendable {
     private let lock = NSLock()
 
     var inspectError: AudioImportError?
+    var audioDurationMs: Int64 = 200
     var prepareError: AudioImportError?
     /// prepare 挂起等待放行（测试并发与取消窗口）
     var prepareGateEnabled = false
@@ -521,10 +643,57 @@ final class MockAudioImportService: AudioImportServicing, @unchecked Sendable {
                                    channels: 1, interleaved: false)!
         let file = try AVAudioFile(forWriting: output, settings: format.settings,
                                    commonFormat: .pcmFormatFloat32, interleaved: false)
-        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 9_600)!
-        buffer.frameLength = 9_600
+        let frameCount = AVAudioFrameCount(audioDurationMs * 48)
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount)!
+        buffer.frameLength = frameCount
         try file.write(from: buffer)
         onProgress(1.0)
         return output
     }
+}
+
+private final class ImportRecordingDiarizationMock: DiarizationServicing, @unchecked Sendable {
+    let recordingLimits: DiarizationRecordingLimits? = .init(maximumBytes: 25_000_000, maximumDurationMs: nil)
+    let knownSpeakerMatchingCapability: KnownSpeakerMatchingCapability = .supported(maximumSpeakers: 4)
+    let response: DiarizationChunkResult
+    var suspendRecording = false
+    private let lock = NSLock()
+    private var recordedReferences: [[KnownSpeakerReference]] = []
+    private var chunks = 0
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var suspended = false
+
+    init(response: DiarizationChunkResult) { self.response = response }
+    var recordingCalls: [[KnownSpeakerReference]] { lock.withLock { recordedReferences } }
+    var chunkCallCount: Int { lock.withLock { chunks } }
+    var recordingSuspended: Bool { lock.withLock { suspended } }
+
+    func resumeRecording() {
+        let pending = lock.withLock {
+            let pending = continuation
+            continuation = nil
+            return pending
+        }
+        pending?.resume()
+    }
+
+    func transcribeRecording(at audioURL: URL, knownSpeakers: [KnownSpeakerReference]) async throws -> DiarizationChunkResult {
+        lock.withLock { recordedReferences.append(knownSpeakers) }
+        if suspendRecording {
+            await withCheckedContinuation { continuation in
+                lock.withLock {
+                    self.continuation = continuation
+                    suspended = true
+                }
+            }
+        }
+        return response
+    }
+
+    func transcribeChunk(at chunkURL: URL, knownSpeakers: [KnownSpeakerReference]) async throws -> DiarizationChunkResult {
+        lock.withLock { chunks += 1 }
+        return response
+    }
+
+    func testConnection() async throws -> Bool { true }
 }

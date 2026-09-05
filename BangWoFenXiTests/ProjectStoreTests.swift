@@ -895,4 +895,138 @@ final class ProjectStoreTests {
 
         #expect(try environment.allProjects().isEmpty)
     }
+
+    @Test("识别人保留人工文字、星标和已确认归属")
+    @MainActor
+    func speakerRecognitionPreservesUserEditsAndConfirmedIdentity() {
+        let confirmedSpeakerID = UUID()
+        let segment = TranscriptSegment(startMs: 1_000, endMs: 3_000, text: "人工修正的交付范围",
+            participantId: confirmedSpeakerID, remoteSpeakerLabel: "旧分组", source: .manual,
+            state: .edited, isStarred: true, speakerConfidence: .medium,
+            textWasUserEdited: true, speakerWasUserConfirmed: true)
+        let snapshot = HistoricalSpeakerRelabeler.SegmentSnapshot(id: segment.id,
+            startMs: segment.startMs, endMs: segment.endMs, text: segment.text,
+            participantId: segment.participantId, speakerWasUserConfirmed: true)
+        let result = HistoricalSpeakerRelabeler.Result(assignments: [segment.id: UUID()],
+            processedChunkCount: 1, remoteLabels: [segment.id: "chunk:0:speaker_2"])
+
+        let changed = ProjectWorkspaceView.applySpeakerRecognition(result, snapshots: [snapshot], to: [segment])
+
+        #expect(changed == [segment.id])
+        #expect(segment.remoteSpeakerLabel == "chunk:0:speaker_2")
+        #expect(segment.text == "人工修正的交付范围")
+        #expect(segment.startMs == 1_000 && segment.endMs == 3_000)
+        #expect(segment.isStarred)
+        #expect(segment.source == .manual && segment.state == .edited)
+        #expect(segment.textWasUserEdited == true)
+        #expect(segment.participantId == confirmedSpeakerID)
+        #expect(segment.speakerWasUserConfirmed == true)
+        #expect(segment.speakerConfidence == .medium)
+    }
+
+    @Test("识别人为未改变片段写入匿名分组和匹配人物")
+    @MainActor
+    func speakerRecognitionAppliesLabelsAndKnownAssignments() {
+        let known = TranscriptSegment(startMs: 0, endMs: 2_000, text: "先核对费用口径", source: .local, state: .final)
+        let anonymous = TranscriptSegment(startMs: 2_000, endMs: 4_000, text: "再确认验收范围", source: .local, state: .final)
+        let segments = [known, anonymous]
+        let snapshots = segments.map {
+            HistoricalSpeakerRelabeler.SegmentSnapshot(id: $0.id, startMs: $0.startMs, endMs: $0.endMs,
+                text: $0.text, participantId: $0.participantId, speakerWasUserConfirmed: false)
+        }
+        let matchedSpeakerID = UUID()
+        let result = HistoricalSpeakerRelabeler.Result(assignments: [known.id: matchedSpeakerID],
+            processedChunkCount: 1, remoteLabels: [known.id: "chunk:0:speaker_1", anonymous.id: "chunk:0:speaker_2"])
+
+        let changed = ProjectWorkspaceView.applySpeakerRecognition(result, snapshots: snapshots, to: segments)
+
+        #expect(changed == [known.id, anonymous.id])
+        #expect(known.participantId == matchedSpeakerID)
+        #expect(known.speakerConfidence == .high)
+        #expect(known.remoteSpeakerLabel == "chunk:0:speaker_1")
+        #expect(anonymous.remoteSpeakerLabel == "chunk:0:speaker_2")
+        #expect(anonymous.participantId == nil && anonymous.speakerConfidence == nil)
+        #expect(known.speakerWasUserConfirmed != true && anonymous.speakerWasUserConfirmed != true)
+        #expect(segments.map(\.text) == ["先核对费用口径", "再确认验收范围"])
+        #expect(ProjectWorkspaceView.applySpeakerRecognition(result, snapshots: snapshots, to: segments).isEmpty)
+    }
+
+    @Test("识别人晚到结果不覆盖请求期间的文字、时间和归属修改")
+    @MainActor
+    func speakerRecognitionRejectsChangedOrNewSegments() throws {
+        var segments = (0..<5).map { index in
+            TranscriptSegment(startMs: Int64(index * 2_000), endMs: Int64(index * 2_000 + 1_000),
+                text: "合成片段 \(index)", source: .local, state: .final)
+        }
+        let snapshots = segments.map {
+            HistoricalSpeakerRelabeler.SegmentSnapshot(id: $0.id, startMs: $0.startMs, endMs: $0.endMs,
+                text: $0.text, participantId: $0.participantId, speakerWasUserConfirmed: false)
+        }
+        segments[0].text = "请求期间人工更正"
+        segments[0].textWasUserEdited = true
+        segments[1].startMs += 100
+        segments[2].endMs += 100
+        segments[3].participantId = UUID()
+        segments[4].speakerWasUserConfirmed = true
+        segments.append(TranscriptSegment(startMs: 10_000, endMs: 11_000, text: "请求后新增",
+            source: .manual, state: .edited))
+        let result = HistoricalSpeakerRelabeler.Result(
+            assignments: Dictionary(uniqueKeysWithValues: segments.map { ($0.id, UUID()) }),
+            processedChunkCount: 1,
+            remoteLabels: Dictionary(uniqueKeysWithValues: segments.map { ($0.id, "旧请求分组") }))
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        let before = try encoder.encode(segments)
+
+        let changed = ProjectWorkspaceView.applySpeakerRecognition(result, snapshots: snapshots, to: segments)
+
+        #expect(changed.isEmpty)
+        #expect(try encoder.encode(segments) == before)
+    }
+
+    @Test("识别人拒绝失效人工锚点和已删除人物，保留其他组匹配", arguments: [false, true])
+    @MainActor
+    func speakerRecognitionRejectsInvalidAnchorsAndDeletedSpeakers(deleteAnchor: Bool) {
+        let originalSpeakerID = UUID()
+        let correctedSpeakerID = UUID()
+        let deletedSpeakerID = UUID()
+        let anchor = TranscriptSegment(startMs: 0, endMs: 1_000, text: "人工确认锚点",
+            participantId: originalSpeakerID, source: .local, state: .final, speakerWasUserConfirmed: true)
+        let sameGroup = TranscriptSegment(startMs: 1_000, endMs: 2_000, text: "同组未确认片段", source: .local, state: .final)
+        let deletedPerson = TranscriptSegment(startMs: 2_000, endMs: 3_000, text: "已删除人物的旧匹配", source: .local, state: .final)
+        let unaffected = TranscriptSegment(startMs: 3_000, endMs: 4_000, text: "其他组仍可匹配", source: .local, state: .final)
+        var segments = [anchor, sameGroup, deletedPerson, unaffected]
+        let snapshots = segments.map {
+            HistoricalSpeakerRelabeler.SegmentSnapshot(id: $0.id, startMs: $0.startMs, endMs: $0.endMs,
+                text: $0.text, participantId: $0.participantId, speakerWasUserConfirmed: $0.speakerWasUserConfirmed == true)
+        }
+        let result = HistoricalSpeakerRelabeler.Result(assignments: [sameGroup.id: originalSpeakerID,
+            deletedPerson.id: deletedSpeakerID, unaffected.id: originalSpeakerID], processedChunkCount: 1,
+            remoteLabels: [anchor.id: "chunk:0:speaker_1", sameGroup.id: "chunk:0:speaker_1",
+                deletedPerson.id: "chunk:0:speaker_2", unaffected.id: "chunk:0:speaker_3"])
+        if deleteAnchor {
+            segments.removeAll { $0.id == anchor.id }
+        } else {
+            anchor.participantId = correctedSpeakerID
+        }
+
+        let changed = ProjectWorkspaceView.applySpeakerRecognition(result, snapshots: snapshots, to: segments,
+            validSpeakerIDs: Set([originalSpeakerID, correctedSpeakerID]))
+
+        #expect(changed == [sameGroup.id, deletedPerson.id, unaffected.id])
+        #expect(sameGroup.remoteSpeakerLabel == "chunk:0:speaker_1")
+        #expect(sameGroup.participantId == nil && sameGroup.speakerConfidence == nil)
+        #expect(deletedPerson.remoteSpeakerLabel == "chunk:0:speaker_2")
+        #expect(deletedPerson.participantId == nil && deletedPerson.speakerConfidence == nil)
+        #expect(unaffected.remoteSpeakerLabel == "chunk:0:speaker_3")
+        #expect(unaffected.participantId == originalSpeakerID && unaffected.speakerConfidence == .high)
+        #expect(!changed.contains(anchor.id))
+        if deleteAnchor {
+            #expect(!segments.contains { $0.id == anchor.id })
+        } else {
+            #expect(anchor.participantId == correctedSpeakerID && anchor.speakerWasUserConfirmed == true)
+            #expect(anchor.remoteSpeakerLabel == nil)
+        }
+    }
+
 }

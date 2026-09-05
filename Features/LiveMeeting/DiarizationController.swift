@@ -84,23 +84,53 @@ final class DiarizationController {
 
     // MARK: - 会话
 
+    /// 回看已有录音也恢复分组；不读取凭据、不启动转写或上传队列。
+    func attach(to meeting: Meeting) {
+        if self.meeting?.id != meeting.id {
+            mapper = SpeakerMapper(participants: [])
+        }
+        self.meeting = meeting
+        transcriptController.attach(to: meeting)
+        rebuildSpeakerMapper()
+    }
+
+    private func rebuildSpeakerMapper() {
+        guard let meeting else { return }
+        var rebuilt = SpeakerMapper(participants: meeting.participants)
+        let validIDs = Set(meeting.participants.map(\.id))
+        var confirmedAssignments: [String: Set<UUID>] = [:]
+        let previouslyRegistered = mapper.registeredUnknownLabels
+        for segment in meeting.segments.sorted(by: {
+            if $0.startMs != $1.startMs { return $0.startMs < $1.startMs }
+            if $0.endMs != $1.endMs { return $0.endMs < $1.endMs }
+            return $0.id.uuidString < $1.id.uuidString
+        }) {
+            guard let label = segment.remoteSpeakerLabel, !label.isEmpty else { continue }
+            if segment.participantId == nil || previouslyRegistered.contains(label) {
+                rebuilt.register(remoteLabel: label)
+            }
+            if segment.speakerWasUserConfirmed == true,
+               let participantID = segment.participantId, validIDs.contains(participantID) {
+                confirmedAssignments[label, default: []].insert(participantID)
+            }
+        }
+        let manual = mapper.manualAssignments.filter { validIDs.contains($0.value) }
+        rebuilt.restoreManualAssignments(manual.filter { confirmedAssignments[$0.key] == nil })
+        for (label, participants) in confirmedAssignments where participants.count == 1 {
+            if let participantID = participants.first {
+                rebuilt.assign(remoteLabel: label, to: participantID)
+            }
+        }
+        mapper = rebuilt
+    }
+
     /// 启动云端识别编排（录音已开始）。
     /// 恢复既有队列（App 重启后补传）；分人 Key 未配置时进入 unconfigured
     /// （灰色显示，绝不借用分析 Key 发请求；说话人显示为待识别，可手动标注）。
     func start(for meeting: Meeting, timelineProvider: @escaping () -> RecordingTimeline?) {
-        self.meeting = meeting
+        mapper = SpeakerMapper(participants: [])
+        attach(to: meeting)
         self.timelineProvider = timelineProvider
-        self.mapper = SpeakerMapper(participants: meeting.participants)
-        let validParticipantIDs = Set(meeting.participants.map(\.id))
-        for segment in meeting.segments {
-            guard let label = segment.remoteSpeakerLabel else { continue }
-            mapper.register(remoteLabel: label)
-            if segment.speakerWasUserConfirmed == true,
-               let participantID = segment.participantId,
-               validParticipantIDs.contains(participantID) {
-                mapper.assign(remoteLabel: label, to: participantID)
-            }
-        }
         suspensionCause = nil
 
         let store = ChunkQueueStore(fileURL: fileStore.chunkQueueFileURL(for: meeting.id))
@@ -165,12 +195,7 @@ final class DiarizationController {
     /// 后续分片按新映射解析，已确认片段不回改）。
     /// 手工指认的标签映射跨重建保留（09 号计划需求 2）。
     func refreshKnownSpeakers() {
-        guard let meeting else { return }
-        let manual = mapper.manualAssignments
-        var rebuilt = SpeakerMapper(participants: meeting.participants)
-        let validIds = Set(meeting.participants.map(\.id))
-        rebuilt.restoreManualAssignments(manual.filter { validIds.contains($0.value) })
-        mapper = rebuilt
+        rebuildSpeakerMapper()
         guard suspensionCause == .knownSpeakerConfiguration else { return }
         suspensionCause = nil
         guard isProviderConfigured else {

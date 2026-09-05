@@ -155,6 +155,14 @@ final class LocalTranscriptionController {
         }
     }
 
+    func attach(to meeting: Meeting) {
+        guard runState != .running else { return }
+        self.meeting = meeting
+        reconciler.reset(finalized: meeting.segments)
+        lastPublishedSignature = nil
+        publishSegments()
+    }
+
     /// 送入一个采集缓冲（非隔离入口：采集实时线程直接调用，
     /// 经 Sendable 盒子转发给转写服务；服务无会话时自动丢弃）。
     nonisolated func feed(_ buffer: AVAudioPCMBuffer) {
@@ -229,6 +237,9 @@ final class LocalTranscriptionController {
             hasher.combine(segment.source)
             hasher.combine(segment.isStarred)
             hasher.combine(segment.participantId)
+            hasher.combine(segment.remoteSpeakerLabel)
+            hasher.combine(segment.speakerWasUserConfirmed)
+            hasher.combine(segment.speakerConfidence)
         }
         let signature = hasher.finalize()
         guard signature != lastPublishedSignature else {
@@ -288,7 +299,17 @@ final class LocalTranscriptionController {
             syncMeetingSegmentsWithReconciler()
             onFinalSegment?()
             onNewFinalSegment?()
-        case .skippedManual, .duplicate, .discardedEmpty:
+        case .duplicate(let existing):
+            if existing.speakerWasUserConfirmed != true,
+               let participantId, existing.participantId != participantId {
+                existing.participantId = participantId
+                existing.remoteSpeakerLabel = remoteSpeakerLabel ?? existing.remoteSpeakerLabel
+                existing.updatedAt = Date()
+                syncMeetingSegmentsWithReconciler()
+                onFinalSegment?()
+                onNewFinalSegment?()
+            }
+        case .skippedManual, .discardedEmpty:
             break
         }
         PerfCounters.increment(.cloudSegmentApplied)

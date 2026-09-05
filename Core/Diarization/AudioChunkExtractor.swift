@@ -285,6 +285,80 @@ enum AudioChunkExtractor {
         return Int64(outputFrameCount)
     }
 
+    static func exportRecordingWAV(from sourceURL: URL, to destinationURL: URL) throws {
+        let source = try AVAudioFile(forReading: sourceURL)
+        guard source.length > 0,
+              let format = AVAudioFormat(commonFormat: .pcmFormatInt16,
+                                         sampleRate: 16_000, channels: 1, interleaved: true),
+              let converter = AVAudioConverter(from: source.processingFormat, to: format),
+              let input = AVAudioPCMBuffer(pcmFormat: source.processingFormat, frameCapacity: 16_384),
+              let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4_096) else {
+            throw ExtractError.incompatibleFormat
+        }
+        let destination = try AVAudioFile(forWriting: destinationURL, settings: format.settings,
+                                          commonFormat: .pcmFormatInt16, interleaved: true)
+        let reader = RecordingConversionInput(source: source, input: input)
+        var written: Int64 = 0
+        while true {
+            try Task.checkCancellation()
+            var conversionError: NSError?
+            output.frameLength = 0
+            let status = converter.convert(to: output, error: &conversionError) { requested, inputStatus in
+                reader.read(requested: requested, status: inputStatus)
+            }
+            if let readError = reader.failure { throw readError }
+            if let conversionError { throw conversionError }
+            if output.frameLength > 0 {
+                try destination.write(from: output)
+                written += Int64(output.frameLength)
+            }
+            if status == .endOfStream { break }
+            guard status != .error, output.frameLength > 0 else {
+                throw ExtractError.incompatibleFormat
+            }
+        }
+        guard written > 0, reader.finished else {
+            throw ExtractError.incompatibleFormat
+        }
+    }
+
+    // AVAudioConverter 同步消费返回的缓冲；此对象只属于一次转换，文件、缓冲和错误的访问由同一把锁串行化。
+    private final class RecordingConversionInput: @unchecked Sendable {
+        private let lock = NSLock()
+        private let source: AVAudioFile
+        private let input: AVAudioPCMBuffer
+        private var readError: Error?
+
+        init(source: AVAudioFile, input: AVAudioPCMBuffer) {
+            self.source = source
+            self.input = input
+        }
+
+        var failure: Error? { lock.withLock { readError } }
+        var finished: Bool { lock.withLock { source.framePosition == source.length } }
+
+        func read(requested: AVAudioPacketCount,
+                  status: UnsafeMutablePointer<AVAudioConverterInputStatus>) -> AVAudioBuffer? {
+            lock.withLock {
+                if source.framePosition >= source.length || readError != nil {
+                    status.pointee = .endOfStream
+                    return nil
+                }
+                do {
+                    input.frameLength = 0
+                    try source.read(into: input, frameCount: min(requested, input.frameCapacity))
+                    guard input.frameLength > 0 else { throw ExtractError.incompatibleFormat }
+                    status.pointee = .haveData
+                    return input
+                } catch {
+                    readError = error
+                    status.pointee = .endOfStream
+                    return nil
+                }
+            }
+        }
+    }
+
     /// 音频文件时长（毫秒）
     static func durationMs(of url: URL) throws -> Int64 {
         let file = try AVAudioFile(forReading: url)

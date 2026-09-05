@@ -38,6 +38,34 @@ final class LocalTranscriptionControllerTests {
         }
     }
 
+    @Test("历史云端匿名片段可升级已知人物，保留原文星标与人工归属")
+    func lateKnownSpeakerUpgradesCloudDuplicate() throws {
+        let meeting = try makeMeeting()
+        let first = TranscriptSegment(startMs: 0, endMs: 3_000, text: "库存需要盘点",
+                                      remoteSpeakerLabel: "chunk:0:speaker_0", source: .cloud,
+                                      state: .final, isStarred: true)
+        let confirmedID = UUID()
+        let confirmed = TranscriptSegment(startMs: 4_000, endMs: 7_000, text: "库存需要盘点",
+                                          participantId: confirmedID, source: .cloud, state: .final,
+                                          speakerWasUserConfirmed: true)
+        meeting.segments = [first, confirmed]
+        controller.attach(to: meeting)
+        let known = UUID()
+        for segment in [first, confirmed] {
+            controller.applyCloudSegment(wallStartMs: segment.startMs, wallEndMs: segment.endMs,
+                                         text: segment.text, participantId: known,
+                                         remoteSpeakerLabel: "p_01")
+        }
+        #expect(meeting.segments.count == 2)
+        #expect(meeting.segments.first?.id == first.id)
+        #expect(first.participantId == known)
+        #expect(first.text == "库存需要盘点")
+        #expect(first.isStarred)
+        #expect(confirmed.participantId == confirmedID)
+        #expect(mock.startSessionCalls.isEmpty)
+        #expect(controller.runState == .idle)
+    }
+
     @Test("不可用则拒绝启动并给出真实原因")
     func startRefusedWhenUnavailable() async throws {
         mock.availability = TranscriptionAvailability(

@@ -20,7 +20,7 @@ final class DiarizationControllerTests {
 
     init() throws {
         tempDirectory = FileManager.default.temporaryDirectory
-            .appending(path: "BangWoFenXiTests-\(UUID().uuidString)", directoryHint: .isDirectory)
+            .appending(path: "帮我分析 分人 % 测试-\(UUID().uuidString)", directoryHint: .isDirectory)
         fileStore = MeetingFileStore(baseDirectory: tempDirectory)
         mockDiarization = MockDiarizationService()
         mockTranscription = MockLocalTranscriptionService()
@@ -65,6 +65,58 @@ final class DiarizationControllerTests {
     deinit {
         try? FileManager.default.removeItem(at: tempDirectory)
         try? CloudAPIKeyStore.store(for: .diarization, service: credentialServiceName).deleteKey()
+    }
+
+    @Test("历史页面附着仅本地重建人物编号，刷新不遗失分组和人工锚点")
+    func attachRestoresGroupsWithoutStartingServices() async {
+        let early = TranscriptSegment(startMs: 0, endMs: 3_000, text: "先发言",
+                                      remoteSpeakerLabel: "chunk:0:speaker_b", source: .cloud, state: .final)
+        let late = TranscriptSegment(startMs: 5_000, endMs: 8_000, text: "后发言",
+                                     remoteSpeakerLabel: "chunk:1:speaker_a", source: .cloud, state: .final)
+        let local = TranscriptSegment(startMs: 9_000, endMs: 10_000, text: "仅Apple文字",
+                                      source: .local, state: .final)
+        meeting.segments = [late, early, local]
+        controller.attach(to: meeting)
+        #expect(controller.displayName(forRemoteLabel: early.remoteSpeakerLabel) == "人物 1（待识别）")
+        #expect(controller.displayName(forRemoteLabel: late.remoteSpeakerLabel) == "人物 2（待识别）")
+        #expect(local.remoteSpeakerLabel == nil)
+        early.participantId = meeting.participants[0].id
+        early.speakerWasUserConfirmed = true
+        controller.refreshKnownSpeakers()
+        #expect(controller.displayName(forRemoteLabel: early.remoteSpeakerLabel) == "")
+        #expect(controller.displayName(forRemoteLabel: late.remoteSpeakerLabel) == "人物 2（待识别）")
+        #expect(mockTranscription.startSessionCalls.isEmpty)
+        #expect(mockDiarization.calls.isEmpty)
+        #expect(controller.queue.isEmpty)
+        #expect(transcriptController.segments.count == 3)
+
+        controller.start(for: meeting) { [timeline] in timeline }
+        mockDiarization.resultQueue = [DiarizationChunkResult(durationMs: 20_000, segments: [
+            .init(startMs: 0, endMs: 3_000, text: "先发言", speakerLabel: "speaker_b"),
+            .init(startMs: 3_000, endMs: 4_000, text: "同组后续发言", speakerLabel: "speaker_b")
+        ])]
+        controller.produceChunks(uptoAudioMs: 20_000)
+        await waitUntil { self.controller.queue.first?.status == .succeeded }
+        let continuation = meeting.segments.first { $0.text == "同组后续发言" }
+        #expect(mockDiarization.calls.count == 1)
+        #expect(continuation?.participantId == meeting.participants[0].id)
+        #expect(continuation?.remoteSpeakerLabel == early.remoteSpeakerLabel)
+        #expect(early.speakerWasUserConfirmed == true)
+        #expect(mockTranscription.startSessionCalls.isEmpty)
+        controller.cancel()
+    }
+
+    @Test("整场已有已知人物不占匿名编号")
+    func knownRecordingGroupsDoNotConsumeUnknownNumbers() {
+        meeting.segments = [
+            TranscriptSegment(startMs: 0, endMs: 2_000, text: "已知人物先说话",
+                              participantId: meeting.participants[0].id,
+                              remoteSpeakerLabel: "recording:request:p_01", source: .cloud, state: .final),
+            TranscriptSegment(startMs: 3_000, endMs: 5_000, text: "未识别人物再说话",
+                              remoteSpeakerLabel: "recording:request:speaker_1", source: .cloud, state: .final)
+        ]
+        controller.attach(to: meeting)
+        #expect(controller.displayName(forRemoteLabel: "recording:request:speaker_1") == "人物 1（待识别）")
     }
 
     /// 启动转写控制器与编排（建立会议关联）
@@ -270,7 +322,7 @@ final class DiarizationControllerTests {
         let scopedUnknown = SpeakerMapper.scopedRemoteLabel("spk_unknown", chunkIndex: 1)
         #expect(segments[1].remoteSpeakerLabel == scopedUnknown)
         // 待识别展示名
-        #expect(controller.displayName(forRemoteLabel: scopedUnknown) == "待识别 A")
+        #expect(controller.displayName(forRemoteLabel: scopedUnknown) == "人物 1（待识别）")
         #expect(controller.lastConfirmedAt != nil)
     }
 
@@ -294,8 +346,8 @@ final class DiarizationControllerTests {
             SpeakerMapper.scopedRemoteLabel("speaker_0", chunkIndex: 1),
         ])
         #expect(Set(labels).count == 2)
-        #expect(controller.displayName(forRemoteLabel: labels[0]) == "待识别 A")
-        #expect(controller.displayName(forRemoteLabel: labels[1]) == "待识别 B")
+        #expect(controller.displayName(forRemoteLabel: labels[0]) == "人物 1（待识别）")
+        #expect(controller.displayName(forRemoteLabel: labels[1]) == "人物 2（待识别）")
     }
 
     @Test("分片重叠原话会把同一人稳定串起来")
@@ -332,7 +384,7 @@ final class DiarizationControllerTests {
         #expect(labels == [
             SpeakerMapper.scopedRemoteLabel("speaker_0", chunkIndex: 0)
         ])
-        #expect(controller.displayName(forRemoteLabel: labels.first) == "待识别 A")
+        #expect(controller.displayName(forRemoteLabel: labels.first) == "人物 1（待识别）")
     }
 
     @Test("未在本次请求发送样本的 alias 不得映射为已知说话人")

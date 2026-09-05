@@ -85,6 +85,7 @@ struct ProjectWorkspaceView: View {
     /// 说话人指认弹层的锚点（09 号计划需求 2；总结条目或转写行进入）
     @State private var speakerAssignRequest: SpeakerAssignRequest?
     @State private var isRelabelingHistoricalSpeakers = false
+    @State private var historicalSpeakerTask: Task<Void, Never>?
     @State private var newDeviceID: String?
     @State private var sidebarProjects: [Project] = []
     @AppStorage("bwfx.workspace.projectSidebarVisible") private var prefersProjectSidebarVisible = true
@@ -113,7 +114,7 @@ struct ProjectWorkspaceView: View {
             switch self {
             case .summary: return "录音过程中滚动更新的要点"
             case .finalReport: return "录音结束后生成的完整报告"
-            case .insights: return "对方动机与目的的推断"
+            case .insights: return "结合原话判断业务诉求、可能顾虑与待核实点"
             case .bloom: return "开花：把选中的内容展开成概念解释与延伸知识"
             }
         }
@@ -134,6 +135,9 @@ struct ProjectWorkspaceView: View {
             playback.startTicker()
         }
         .onDisappear {
+            historicalSpeakerTask?.cancel()
+            historicalSpeakerTask = nil
+            isRelabelingHistoricalSpeakers = false
             memoryProposalID = nil
             memoryProposalTask?.cancel()
             memoryProposalTask = nil
@@ -165,6 +169,7 @@ struct ProjectWorkspaceView: View {
             transcription?.correctionRules = environment.correctionRules
         }
         .onChange(of: environment.cloudConfigurationRevision) { _, _ in
+            refreshSpeakerReferences()
             diarization?.resumeAfterKeyFix()
             analysis?.resumeAfterKeyFix()
         }
@@ -180,7 +185,7 @@ struct ProjectWorkspaceView: View {
         } message: {
             Text("结束后将停止录音与转写，剩余分析在后台继续。录音与文稿已安全保存在本机。")
         }
-        .sheet(isPresented: $showSpeakerPanel) {
+        .sheet(isPresented: $showSpeakerPanel, onDismiss: refreshSpeakerReferences) {
             if let project, let meeting {
                 SpeakerPanelView(
                     project: project,
@@ -205,7 +210,7 @@ struct ProjectWorkspaceView: View {
                 .environment(environment)
             }
         }
-        .sheet(isPresented: $showPeopleLibrary) {
+        .sheet(isPresented: $showPeopleLibrary, onDismiss: refreshSpeakerReferences) {
             HistoricalPeopleLibraryView(
                 allowsProjectNavigation: false,
                 managementEnabled: !isRecordingActive
@@ -236,6 +241,7 @@ struct ProjectWorkspaceView: View {
                     anchorText: request.anchorText,
                     isAnalysisItem: request.isAnalysisItem,
                     canAlsoAssignTranscript: request.source.transcriptSegmentId != nil,
+                    groupDescription: speakerGroupDescription(for: request),
                     onPickExisting: { speaker, alsoAssignTranscript, assignAllUnconfirmed in
                         performSpeakerAssign(
                             request: request,
@@ -1000,9 +1006,19 @@ struct ProjectWorkspaceView: View {
                 .controlSize(.small)
                 Spacer(minLength: 0)
                 if project?.sourceType.isCombinedAnalysis != true {
+                    Button(isRelabelingHistoricalSpeakers ? "停止识别" : "识别说话人") {
+                        if isRelabelingHistoricalSpeakers {
+                            historicalSpeakerTask?.cancel()
+                        } else if let project, let meeting {
+                            startHistoricalSpeakerRelabel(project: project, meeting: meeting)
+                        }
+                    }
+                    .controlSize(.small)
+                    .disabled(environment.importProcessing.isRunning)
+                    .help("按整场声音分组，并自动匹配人物库中已启用的声纹")
                     Button("重新转写", action: retranscribeRecording)
                         .controlSize(.small)
-                        .disabled(environment.importProcessing.isRunning)
+                        .disabled(environment.importProcessing.isRunning || isRelabelingHistoricalSpeakers)
                 }
             }
             if playback.isLoaded {
@@ -1763,6 +1779,7 @@ struct ProjectWorkspaceView: View {
             meeting.pauseIntervals = fresh.pauseIntervals
             meeting.audioRelativePath = fresh.runtimeAssetRelativePath
             SpeakerPanelLogic.syncRuntimeParticipants(speakers: fresh.speakers, meeting: meeting)
+            diarization?.attach(to: meeting)
             meeting.snapshots = fresh.legacySnapshots
             // 分析快照刷新（导入流水线的最终分析在后台生成；V2 快照直接挂在 Project 上）
             analysis?.attach(to: project)
@@ -1873,6 +1890,7 @@ struct ProjectWorkspaceView: View {
             keyStore: environment.diarizationKeyStore(for: diarizationConfiguration),
             configurationSnapshot: diarizationConfiguration
         )
+        diarization?.attach(to: meeting)
 
         let knowledgeController = KnowledgeGardenController(
             expansionService: environment.knowledgeExpansion,
@@ -2410,91 +2428,148 @@ struct ProjectWorkspaceView: View {
         }
     }
 
+    private func refreshSpeakerReferences() {
+        guard let project, let meeting else { return }
+        do {
+            project.speakers = try environment.refreshAutomaticSpeakerReferences(for: project.id)
+            SpeakerPanelLogic.syncRuntimeParticipants(speakers: project.speakers, meeting: meeting)
+            diarization?.refreshKnownSpeakers()
+        } catch {
+            reviewNotice = "人物声纹未能刷新：\(error.localizedDescription)；录音与人工标注仍可使用。"
+        }
+    }
+
+    private func speakerGroupDescription(for request: SpeakerAssignRequest) -> String? {
+        guard !request.isAnalysisItem,
+              let id = request.source.transcriptSegmentId,
+              let anchor = meeting?.segments.first(where: { $0.id == id }) else { return nil }
+        guard let label = anchor.remoteSpeakerLabel, !label.isEmpty else {
+            return "当前原话尚未分组，本次只确认这一条；可先用“识别说话人”按声音分组。"
+        }
+        let count = meeting?.segments.filter { $0.remoteSpeakerLabel == label }.count ?? 1
+        let name = diarization?.displayName(forRemoteLabel: label) ?? "本声音组"
+        return "\(name) · 本组 \(count) 条原话，一次指认即可批量归属；已确认给其他人的原话会保留。"
+    }
+
     private func startHistoricalSpeakerRelabel(project: Project, meeting: Meeting) {
-        guard !isRelabelingHistoricalSpeakers else { return }
+        guard !isRelabelingHistoricalSpeakers,
+              meeting.status != .recording, meeting.status != .paused,
+              !environment.importProcessing.isRunning else { return }
         let configuration = environment.diarizationConfigurationSnapshot()
-        guard configuration.selectedProvider == .openAICompatible
-                || configuration.selectedProvider == .iflytek else {
-            reviewNotice = "同一分片的发言已批量标注。全场历史声纹回查需要启用 OpenAI 兼容或讯飞分人服务。"
+        let service = environment.makeDiarizationService(for: configuration)
+        guard service.recordingLimits != nil else {
+            reviewNotice = "整场声音分组与人物库匹配需要启用讯飞或 OpenAI 兼容分人服务。"
             return
         }
-        let keyStore = environment.diarizationKeyStore(for: configuration)
-        guard keyStore.hasConfiguredKey else {
-            reviewNotice = "同一分片的发言已批量标注。配置分人 Key 后可自动回查整场历史发言。"
+        guard environment.diarizationKeyStore(for: configuration).hasConfiguredKey else {
+            reviewNotice = "分人服务尚未连接，请先在设置中配置；原文与人工标注已保留。"
             return
         }
-        guard let audioURL = try? environment.fileStore.audioFileURL(for: meeting) else {
-            reviewNotice = "同一分片的发言已批量标注；当前项目没有可用于全场回查的录音。"
+        guard !meeting.segments.isEmpty,
+              let audioURL = try? environment.fileStore.audioFileURL(for: meeting) else {
+            reviewNotice = "没有可识别的文稿或原音频，请先完成转写。"
             return
         }
+        do {
+            project.speakers = try environment.refreshAutomaticSpeakerReferences(for: project.id)
+        } catch {
+            reviewNotice = "人物库读取失败，尚未开始识别：\(error.localizedDescription)"
+            return
+        }
+        SpeakerPanelLogic.syncRuntimeParticipants(speakers: project.speakers, meeting: meeting)
+        diarization?.refreshKnownSpeakers()
         let references = project.speakers.compactMap { speaker -> HistoricalSpeakerRelabeler.SpeakerReference? in
             if configuration.selectedProvider == .iflytek,
                speaker.iflytekFeatureID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
                 return nil
             }
             guard let path = SpeakerPanelLogic.voiceReferencePath(for: speaker),
-                  let url = try? environment.fileStore.absoluteURL(forRelativePath: path) else {
-                return nil
-            }
-            return .init(
-                speakerID: speaker.id,
-                alias: speaker.cloudAlias,
-                sampleURL: url,
-                iflytekFeatureID: speaker.iflytekFeatureID
-            )
-        }
-        guard !references.isEmpty else {
-            reviewNotice = "人工标注与本地样本已保存；当前没有已在所选服务登记的人物声纹，未启动全场回查。"
-            return
+                  let url = try? environment.fileStore.absoluteURL(forRelativePath: path) else { return nil }
+            return .init(speakerID: speaker.id, alias: speaker.cloudAlias, sampleURL: url,
+                         iflytekFeatureID: speaker.iflytekFeatureID)
         }
         let snapshots = meeting.segments.map {
-            HistoricalSpeakerRelabeler.SegmentSnapshot(
-                id: $0.id,
-                startMs: $0.startMs,
-                endMs: $0.endMs,
-                text: $0.text,
-                participantId: $0.participantId,
-                speakerWasUserConfirmed: $0.speakerWasUserConfirmed == true
-            )
+            HistoricalSpeakerRelabeler.SegmentSnapshot(id: $0.id, startMs: $0.startMs, endMs: $0.endMs,
+                text: $0.text, participantId: $0.participantId,
+                speakerWasUserConfirmed: $0.speakerWasUserConfirmed == true)
         }
-        let relabeler = HistoricalSpeakerRelabeler(
-            diarization: environment.makeDiarizationService(for: configuration)
-        )
+        let relabeler = HistoricalSpeakerRelabeler(diarization: service)
         isRelabelingHistoricalSpeakers = true
-        reviewNotice = "正在用已记住的声纹回查本场历史发言…"
-        Task {
-            defer { isRelabelingHistoricalSpeakers = false }
+        reviewNotice = references.isEmpty
+            ? "正在识别整场声音分组；当前没有可供此服务比对的已登记声纹。"
+            : "正在识别整场声音，并比对人物库中的 \(references.count) 位人物…"
+        historicalSpeakerTask = Task {
+            defer {
+                isRelabelingHistoricalSpeakers = false
+                historicalSpeakerTask = nil
+            }
             do {
-                let result = try await relabeler.relabel(
-                    audioURL: audioURL,
-                    pauseIntervals: meeting.pauseIntervals,
-                    existingSegments: snapshots,
-                    speakerReferences: Array(references.prefix(KnownSpeakerReference.maximumCount))
-                )
-                var changed: [UUID] = []
-                for segment in meeting.segments {
-                    guard segment.speakerWasUserConfirmed != true,
-                          let speakerID = result.assignments[segment.id],
-                          segment.participantId != speakerID else {
-                        continue
-                    }
-                    segment.participantId = speakerID
-                    segment.speakerConfidence = .high
-                    segment.updatedAt = Date()
-                    changed.append(segment.id)
-                }
+                let result = try await relabeler.diarizeRecording(audioURL: audioURL,
+                    pauseIntervals: meeting.pauseIntervals, existingSegments: snapshots,
+                    speakerReferences: Array(references.prefix(KnownSpeakerReference.maximumCount)))
+                try Task.checkCancellation()
+                guard (try environment.allProjects()).contains(where: { $0.id == project.id }) else { return }
+                let changed = Self.applySpeakerRecognition(result, snapshots: snapshots, to: meeting.segments,
+                    validSpeakerIDs: Set(project.speakers.map(\.id)))
                 if !changed.isEmpty {
-                    persistAndRefresh(meeting)
-                    transcription?.refreshSegments()
+                    guard persistAndRefresh(meeting) else {
+                        reviewNotice = "识别完成，但保存失败；请重试。"
+                        return
+                    }
+                    diarization?.attach(to: meeting)
                     analysis?.noteSpeakerContextChanged(segmentIDs: changed)
                 }
-                reviewNotice = changed.isEmpty
-                    ? "历史声纹回查完成，未发现新的可靠匹配。"
-                    : "历史声纹回查完成，已自动标注 \(changed.count) 条发言。"
+                let groups = Set(result.remoteLabels.values).count
+                reviewNotice = groups == 0
+                    ? "识别完成，未找到可可靠对齐的声音分组；原文与人工标注已保留。"
+                    : "已区分 \(groups) 个声音组，匹配人物 \(result.assignments.count) 条原话；未识别的组可一次性指认。"
+            } catch is CancellationError {
+                reviewNotice = "已停止识别，原文与人工标注已保留。"
             } catch {
-                reviewNotice = "同组发言已批量标注，但全场历史声纹回查未完成（\(error.localizedDescription)）。"
+                reviewNotice = "说话人识别未完成：\(error.localizedDescription)"
             }
         }
+    }
+
+    static func applySpeakerRecognition(
+        _ result: HistoricalSpeakerRelabeler.Result,
+        snapshots: [HistoricalSpeakerRelabeler.SegmentSnapshot],
+        to segments: [TranscriptSegment],
+        validSpeakerIDs: Set<UUID>? = nil
+    ) -> [UUID] {
+        let originals = Dictionary(snapshots.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let unchanged = Set(segments.compactMap { segment -> UUID? in
+            guard let original = originals[segment.id], original.text == segment.text,
+                  original.startMs == segment.startMs, original.endMs == segment.endMs,
+                  original.participantId == segment.participantId,
+                  original.speakerWasUserConfirmed == (segment.speakerWasUserConfirmed == true) else { return nil }
+            return segment.id
+        })
+        let invalidAnchorLabels = Set(snapshots.filter {
+            $0.speakerWasUserConfirmed && !unchanged.contains($0.id)
+        }.compactMap { result.remoteLabels[$0.id] })
+        var changed: [UUID] = []
+        for segment in segments {
+            guard unchanged.contains(segment.id) else { continue }
+            var didChange = false
+            if let label = result.remoteLabels[segment.id], label != segment.remoteSpeakerLabel {
+                segment.remoteSpeakerLabel = label
+                didChange = true
+            }
+            if segment.speakerWasUserConfirmed != true,
+               let id = result.assignments[segment.id], id != segment.participantId,
+               validSpeakerIDs?.contains(id) ?? true,
+               !invalidAnchorLabels.contains(result.remoteLabels[segment.id] ?? "") {
+                segment.participantId = id
+                segment.speakerConfidence = .high
+                didChange = true
+            }
+            if didChange {
+                segment.updatedAt = Date()
+                changed.append(segment.id)
+            }
+        }
+        return changed
     }
 
     /// 全局纠错（老板 2026-07-27 需求 2）：
@@ -2547,6 +2622,10 @@ struct ProjectWorkspaceView: View {
             operationError = ProjectWriteError.storageUnavailable.localizedDescription
             return
         }
+        guard !isRelabelingHistoricalSpeakers else {
+            operationError = "请先停止说话人识别，再继续录音。"
+            return
+        }
         guard environment.importProcessing.activeProjectID != projectID else {
             operationError = "当前录音正在重新处理，请完成后再继续录制。"
             return
@@ -2573,6 +2652,7 @@ struct ProjectWorkspaceView: View {
             }
 
             do {
+                refreshSpeakerReferences()
                 audioQuality.reset()
                 liveAudioLevel = 0
                 if let continuationOffsetMs {
@@ -3079,6 +3159,7 @@ struct ProjectWorkspaceView: View {
         projectAIChat?.saveDraftNow()
         isFinishing = true
         Task {
+            var shouldRecognizeSpeakers = false
             do {
                 environment.audioCapture.onLevel = nil
                 try recorder?.beginFinish()
@@ -3095,6 +3176,10 @@ struct ProjectWorkspaceView: View {
                 }
                 let transcriptionFailed = transcription?.lastErrorDescription != nil
                     || project?.hasUsableTranscript != true
+                let configuration = environment.diarizationConfigurationSnapshot()
+                shouldRecognizeSpeakers = !transcriptionFailed
+                    && environment.diarizationKeyStore(for: configuration).hasConfiguredKey
+                    && environment.makeDiarizationService(for: configuration).recordingLimits != nil
                 if let project {
                     project.processingJobs.removeAll { $0.kind == .transcription }
                     project.processingJobs.append(ProcessingJob(
@@ -3137,6 +3222,9 @@ struct ProjectWorkspaceView: View {
                 operationError = error.localizedDescription
             }
             isFinishing = false
+            if shouldRecognizeSpeakers, let project {
+                startHistoricalSpeakerRelabel(project: project, meeting: meeting)
+            }
         }
     }
 

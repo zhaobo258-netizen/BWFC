@@ -10,6 +10,11 @@ enum KnowledgeBloomFailure: Error, Sendable {
     case unavailable
 }
 
+enum KnowledgeBloomProgress: Sendable {
+    case expansion(KnowledgeBloomExpansionOutcome)
+    case sources([KnowledgeProviderSearchOutcome])
+}
+
 struct KnowledgeBloomAgentOutput: Sendable {
     var expansion: KnowledgeBloomExpansionOutcome
     var initialOutcomes: [KnowledgeProviderSearchOutcome]
@@ -32,7 +37,8 @@ struct KnowledgeBloomAgent: Sendable {
         scenario: ProjectScenario?,
         userContext: [String],
         noteMarkdown: String?,
-        providers: [any KnowledgeProvider]
+        providers: [any KnowledgeProvider],
+        onProgress: @Sendable (KnowledgeBloomProgress) async -> Void = { _ in }
     ) async -> KnowledgeBloomAgentOutput {
         async let expansionAttempt = expansion(
             seedText: seedText,
@@ -42,12 +48,16 @@ struct KnowledgeBloomAgent: Sendable {
             userContext: userContext,
             noteMarkdown: noteMarkdown
         )
-        async let initialSearch = KnowledgeProviderSearch.search(
-            providers: providers.filter { $0.kind == .obsidian },
-            query: seedText
-        )
+        async let initialSearch: [KnowledgeProviderSearchOutcome] = {
+            let outcomes = await KnowledgeProviderSearch.search(
+                providers: providers.filter { $0.kind == .obsidian }, query: seedText
+            )
+            if !Task.isCancelled { await onProgress(.sources(outcomes)) }
+            return outcomes
+        }()
 
         let expansion = await expansionAttempt
+        if !Task.isCancelled { await onProgress(.expansion(expansion)) }
         let initialOutcomes = await initialSearch
         var refinedOutcomes: [KnowledgeProviderSearchOutcome] = []
         if case .success(let result) = expansion {
@@ -59,11 +69,11 @@ struct KnowledgeBloomAgent: Sendable {
             }.filter { seen.insert(Self.normalized($0)).inserted }.prefix(2)
             for query in queries {
                 guard !Task.isCancelled else { break }
-                refinedOutcomes += await KnowledgeProviderSearch.search(
-                    providers: providers,
-                    query: query,
-                    limit: 4
+                let outcomes = await KnowledgeProviderSearch.search(
+                    providers: providers, query: query, limit: 4
                 )
+                refinedOutcomes += outcomes
+                if !Task.isCancelled { await onProgress(.sources(outcomes)) }
             }
         }
         let sources = Self.sourceInputs(
@@ -117,7 +127,7 @@ struct KnowledgeBloomAgent: Sendable {
         whyItMatters: String,
         sources: [KnowledgeSourceInput]
     ) async -> (value: KnowledgeSourceSynthesis?, failure: KnowledgeBloomFailure?) {
-        guard !sources.isEmpty else { return (nil, nil) }
+        guard !sources.isEmpty, !Task.isCancelled else { return (nil, nil) }
         do {
             return (
                 try await expansionService.synthesizeSources(

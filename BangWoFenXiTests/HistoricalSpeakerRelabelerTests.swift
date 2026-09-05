@@ -1,9 +1,98 @@
 import Foundation
+import AVFoundation
 import Testing
 @testable import BangWoFenXi
 
 @Suite("历史发言声纹重标")
 struct HistoricalSpeakerRelabelerTests {
+    @Test("整场只请求一次，非相邻同标签稳定，恢复暂停时间并保留人工锚点")
+    func wholeRecordingGroupsAndProtectsManualIdentity() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "中文 空格 % 整场-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audio = directory.appending(path: "原始 音频 %.caf")
+        try Self.makeSyntheticAudio(at: audio)
+        let person = UUID()
+        let existing: [HistoricalSpeakerRelabeler.SegmentSnapshot] = [
+            .init(id: UUID(), startMs: 0, endMs: 2_000, text: "库存需要盘点", participantId: person, speakerWasUserConfirmed: true),
+            .init(id: UUID(), startMs: 4_000, endMs: 6_000, text: "交付安排下周", participantId: nil, speakerWasUserConfirmed: false),
+            .init(id: UUID(), startMs: 6_000, endMs: 8_000, text: "库存需要盘点", participantId: nil, speakerWasUserConfirmed: false)
+        ]
+        let service = RecordingDiarizationFixture()
+        let result = try await HistoricalSpeakerRelabeler(diarization: service).diarizeRecording(
+            audioURL: audio, pauseIntervals: [.init(startMs: 2_000, endMs: 4_000)],
+            existingSegments: existing, speakerReferences: []
+        )
+        #expect(service.calls == 1)
+        #expect(service.receivedSampleRate == 16_000)
+        #expect(service.receivedChannels == 1)
+        #expect(result.remoteLabels[existing[0].id] == result.remoteLabels[existing[2].id])
+        #expect(result.remoteLabels[existing[0].id] != result.remoteLabels[existing[1].id])
+        #expect(result.assignments == [existing[2].id: person])
+        #expect(result.recordingSegments[1].startMs == 4_000)
+        #expect(result.speakerIDsByRemoteLabel[result.recordingSegments[2].speakerLabel ?? ""] == person)
+        #expect(FileManager.default.fileExists(atPath: audio.path))
+        #expect(service.uploadedURL.map { !FileManager.default.fileExists(atPath: $0.path) } == true)
+    }
+
+    @Test("整场限制在请求前失败，取消后不接受不配合取消的服务结果")
+    func wholeRecordingLimitsAndCancellation() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "中文 空格 % 限制-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audio = directory.appending(path: "audio.caf")
+        try Self.makeSyntheticAudio(at: audio)
+        let small = RecordingDiarizationFixture(maximumBytes: 1_000)
+        await #expect(throws: DiarizationRecordingError.exceedsProviderLimit) {
+            try await HistoricalSpeakerRelabeler(diarization: small).diarizeRecording(
+                audioURL: audio, pauseIntervals: [], existingSegments: [], speakerReferences: []
+            )
+        }
+        #expect(small.calls == 0)
+        let canceling = RecordingDiarizationFixture(cancelCurrentTask: true)
+        let task = Task {
+            try await HistoricalSpeakerRelabeler(diarization: canceling).diarizeRecording(
+                audioURL: audio, pauseIntervals: [], existingSegments: [], speakerReferences: []
+            )
+        }
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(canceling.calls == 1)
+    }
+
+    @Test("人物组内人工冲突及声纹与人工冲突均不传播")
+    func conflictingAnchorsBlockAutomaticIdentity() {
+        let first = UUID(), other = UUID()
+        let anchor = HistoricalSpeakerRelabeler.SegmentSnapshot(id: UUID(), startMs: 0, endMs: 1_000,
+            text: "甲", participantId: first, speakerWasUserConfirmed: true)
+        let target = HistoricalSpeakerRelabeler.SegmentSnapshot(id: UUID(), startMs: 2_000, endMs: 3_000,
+            text: "乙", participantId: nil, speakerWasUserConfirmed: false)
+        let conflict = HistoricalSpeakerRelabeler.SegmentSnapshot(id: UUID(), startMs: 4_000, endMs: 5_000,
+            text: "丙", participantId: other, speakerWasUserConfirmed: true)
+        let labels = [anchor.id: "speaker_0", target.id: "speaker_0", conflict.id: "speaker_0"]
+        #expect(HistoricalSpeakerRelabelMatcher.resolvedAssignments(
+            labels: labels, knownSpeakerIDs: [:], existingSegments: [anchor, target]
+        ) == [target.id: first])
+        #expect(HistoricalSpeakerRelabelMatcher.resolvedAssignments(
+            labels: labels, knownSpeakerIDs: [:], existingSegments: [anchor, target, conflict]
+        ).isEmpty)
+        #expect(HistoricalSpeakerRelabelMatcher.resolvedAssignments(
+            labels: labels, knownSpeakerIDs: ["speaker_0": other], existingSegments: [anchor, target]
+        ).isEmpty)
+    }
+
+    private static func makeSyntheticAudio(at url: URL) throws {
+        let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)!
+        let file = try AVAudioFile(forWriting: url, settings: format.settings)
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 44_100 * 6)!
+        buffer.frameLength = buffer.frameCapacity
+        for channel in 0..<2 {
+            for frame in 0..<Int(buffer.frameLength) {
+                buffer.floatChannelData![channel][frame] = sin(Float(frame) * 0.05) * 0.1
+            }
+        }
+        try file.write(from: buffer)
+    }
+
     @Test("多人或未知人命中同一原稿长段时不整段归给首人")
     func mixedSpeakersAreNotAssignedToOnePerson() {
         let first = UUID()
@@ -154,5 +243,34 @@ private final class UnsupportedKnownSpeakerDiarizationService: DiarizationServic
         throw DiarizationAPIError.invalidResponse
     }
 
+    func testConnection() async throws -> Bool { true }
+}
+
+private final class RecordingDiarizationFixture: DiarizationServicing, @unchecked Sendable {
+    let recordingLimits: DiarizationRecordingLimits?
+    let cancelCurrentTask: Bool
+    private(set) var calls = 0
+    private(set) var receivedSampleRate: Double = 0
+    private(set) var receivedChannels: AVAudioChannelCount = 0
+    private(set) var uploadedURL: URL?
+
+    init(maximumBytes: Int64 = 25_000_000, cancelCurrentTask: Bool = false) {
+        recordingLimits = .init(maximumBytes: maximumBytes, maximumDurationMs: nil)
+        self.cancelCurrentTask = cancelCurrentTask
+    }
+
+    func transcribeChunk(at chunkURL: URL, knownSpeakers: [KnownSpeakerReference]) async throws -> DiarizationChunkResult {
+        calls += 1
+        uploadedURL = chunkURL
+        let audio = try AVAudioFile(forReading: chunkURL)
+        receivedSampleRate = audio.processingFormat.sampleRate
+        receivedChannels = audio.processingFormat.channelCount
+        if cancelCurrentTask { withUnsafeCurrentTask { $0?.cancel() } }
+        return .init(durationMs: 6_000, segments: [
+            .init(startMs: 0, endMs: 2_000, text: "库存需要盘点", speakerLabel: "speaker_0"),
+            .init(startMs: 2_000, endMs: 4_000, text: "交付安排下周", speakerLabel: "speaker_1"),
+            .init(startMs: 4_000, endMs: 6_000, text: "库存需要盘点", speakerLabel: "speaker_0")
+        ])
+    }
     func testConnection() async throws -> Bool { true }
 }

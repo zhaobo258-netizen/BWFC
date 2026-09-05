@@ -108,6 +108,29 @@ struct ConversationAnalysisSchemaTests {
         #expect(snapshot.items[1].confidence == .low)
     }
 
+    @Test("可能动机不能冒充明确高置信，四行正文保留且不降低明确诉求")
+    func possibleMotiveRemainsAnInference() {
+        let evidenceID = UUID()
+        let text = "原话依据：只接受分批验收。\n可能诉求：可能希望按交付结果分担付款风险。\n其他解释：也可能只是内部验收流程限制。\n待核实：分批验收是否为现行流程的固定要求？"
+        let dto = ConversationAnalysisOutputDTO(
+            headline: nil, detectedScenario: nil, scenarioConfidence: nil, items: [
+                makeItemDTO(category: "possible_motive", text: text,
+                            epistemicStatus: "explicit", confidence: "high", evidenceSegmentIds: [evidenceID.uuidString]),
+                makeItemDTO(category: "explicit_need", text: "要求分批验收。",
+                            epistemicStatus: "explicit", confidence: "high", evidenceSegmentIds: [evidenceID.uuidString])
+            ]
+        )
+        let snapshot = ConversationAnalysisSnapshotBuilder.build(
+            from: dto, validSegmentIds: [evidenceID], speakerIdByAlias: [:], version: 1, analyzedThroughMs: 1_000
+        )
+        #expect(snapshot.items.count == 2)
+        #expect(snapshot.items[0].text == text)
+        #expect(snapshot.items[0].epistemicStatus == .inference)
+        #expect(snapshot.items[0].confidence == .medium)
+        #expect(snapshot.items[1].epistemicStatus == .explicit)
+        #expect(snapshot.items[1].confidence == .high)
+    }
+
     @Test("空白正文的条目被丢弃")
     func blankTextDropped() {
         let real = UUID()

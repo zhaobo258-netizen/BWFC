@@ -88,7 +88,7 @@ struct RetryPolicyTests {
     }
 }
 
-/// 说话人映射：已知代号、未知标签稳定分配字母（实施计划 7.5）。
+/// 说话人映射：已知代号、未知标签稳定分配编号（实施计划 7.5）。
 /// 含渲染路径纯度保证：resolve 为非 mutating 纯函数（自激死循环根因修复）。
 @Suite("说话人映射")
 struct SpeakerMapperTests {
@@ -106,14 +106,14 @@ struct SpeakerMapperTests {
         mutableMapper.register(remoteLabel: "spk_x")
         // 关键证明：let 绑定上可调用 resolve（若 resolve 是 mutating，此行无法编译）
         let frozenMapper = mutableMapper
-        #expect(frozenMapper.resolve(remoteLabel: "spk_x") == .unknown(displayName: "待识别 A"))
+        #expect(frozenMapper.resolve(remoteLabel: "spk_x") == .unknown(displayName: "人物 1（待识别）"))
         #expect(frozenMapper.resolve(remoteLabel: nil) == .unknown(displayName: "识别中"))
-        // 纯解析绝不分配字母：未登记标签返回通用「待识别」，且不改变内部状态
+        // 纯解析绝不分配编号：未登记标签返回通用「待识别」，且不改变内部状态
         #expect(frozenMapper.resolve(remoteLabel: "spk_new") == .unknown(displayName: "待识别"))
         #expect(frozenMapper.unknownCount == 1, "纯解析不得登记新标签（视图求期零写入）")
     }
 
-    @Test("未知标签：显式登记后按出现顺序分配字母，同一标签稳定")
+    @Test("未知标签：显式登记后按出现顺序分配编号，同一标签稳定")
     func registerThenResolve() {
         var mapper = SpeakerMapper(participants: [])
         // 未登记：通用「待识别」，不分配
@@ -122,12 +122,12 @@ struct SpeakerMapperTests {
         // 登记：按顺序分配
         mapper.register(remoteLabel: "spk_x")
         mapper.register(remoteLabel: "spk_y")
-        #expect(mapper.resolve(remoteLabel: "spk_x") == .unknown(displayName: "待识别 A"))
-        #expect(mapper.resolve(remoteLabel: "spk_y") == .unknown(displayName: "待识别 B"))
+        #expect(mapper.resolve(remoteLabel: "spk_x") == .unknown(displayName: "人物 1（待识别）"))
+        #expect(mapper.resolve(remoteLabel: "spk_y") == .unknown(displayName: "人物 2（待识别）"))
         // 重复登记幂等
         mapper.register(remoteLabel: "spk_x")
         #expect(mapper.unknownCount == 2)
-        #expect(mapper.resolve(remoteLabel: "spk_x") == .unknown(displayName: "待识别 A"))
+        #expect(mapper.resolve(remoteLabel: "spk_x") == .unknown(displayName: "人物 1（待识别）"))
     }
 
     @Test("空标签显示「识别中」")
@@ -137,11 +137,11 @@ struct SpeakerMapperTests {
         #expect(mapper.resolve(remoteLabel: "") == .unknown(displayName: "识别中"))
     }
 
-    @Test("字母序号：0→A，25→Z，26→AA")
-    func letters() {
-        #expect(SpeakerMapper.letter(forIndex: 0) == "A")
-        #expect(SpeakerMapper.letter(forIndex: 25) == "Z")
-        #expect(SpeakerMapper.letter(forIndex: 26) == "AA")
+    @Test("超过二十六个匿名组仍使用数字编号")
+    func numbersBeyondTwentySix() {
+        var mapper = SpeakerMapper(participants: [])
+        for index in 0..<27 { mapper.register(remoteLabel: "group-\(index)") }
+        #expect(mapper.resolve(remoteLabel: "group-26") == .unknown(displayName: "人物 27（待识别）"))
     }
 
     @Test("generic label 作用域对同一 chunk 稳定、跨 chunk 隔离")
@@ -177,6 +177,33 @@ struct SpeakerMapperTests {
         )
 
         #expect(labels["speaker_7"] == stable)
+    }
+
+    @Test("重叠原话对应多个旧组时不贪心合并身份")
+    func ambiguousOverlapDoesNotMergePeople() {
+        let existing = ["old-a", "old-b"].map { label in
+            TranscriptSegment(startMs: 19_000, endMs: 21_000, text: "这个方案可以",
+                              remoteSpeakerLabel: label, source: .cloud, state: .final)
+        }
+        let result = SpeakerMapper.stitchedRemoteLabels(
+            for: [.init(startMs: 0, endMs: 2_000, text: "这个方案可以", speakerLabel: "new")],
+            chunkIndex: 2, wallStartMs: 19_000, existingSegments: existing
+        )
+        #expect(result["new"] == SpeakerMapper.scopedRemoteLabel("new", chunkIndex: 2))
+    }
+
+    @Test("两个新组争用同一旧组时都保留独立身份")
+    func competingGroupsAreNotAssignedByLabelOrder() {
+        let existing = TranscriptSegment(startMs: 19_000, endMs: 21_000, text: "这个方案可以",
+                                         remoteSpeakerLabel: "old", source: .cloud, state: .final)
+        let result = SpeakerMapper.stitchedRemoteLabels(
+            for: ["new-a", "new-b"].map {
+                .init(startMs: 0, endMs: 2_000, text: "这个方案可以", speakerLabel: $0)
+            },
+            chunkIndex: 2, wallStartMs: 19_000, existingSegments: [existing]
+        )
+        #expect(result["new-a"] == SpeakerMapper.scopedRemoteLabel("new-a", chunkIndex: 2))
+        #expect(result["new-b"] == SpeakerMapper.scopedRemoteLabel("new-b", chunkIndex: 2))
     }
 }
 

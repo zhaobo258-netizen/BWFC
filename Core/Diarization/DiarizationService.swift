@@ -268,8 +268,39 @@ extension DiarizationAPIError: LocalizedError {
 /// 云端说话人识别服务协议（实施计划 7.3 / 10.1）。
 /// 协议隔离网络实现，集成测试用 URLProtocol Mock 替换 URLSession，
 /// 编排测试用 Mock 服务替换整个协议。
+struct DiarizationRecordingLimits: Sendable, Equatable {
+    var maximumBytes: Int64
+    var maximumDurationMs: Int64?
+
+    func validate(byteCount: Int64, durationMs: Int64) throws {
+        guard byteCount > 0, durationMs > 0 else {
+            throw DiarizationRecordingError.emptyAudio
+        }
+        guard byteCount <= maximumBytes,
+              maximumDurationMs.map({ durationMs <= $0 }) ?? true else {
+            throw DiarizationRecordingError.exceedsProviderLimit
+        }
+    }
+}
+
+enum DiarizationRecordingError: Error, LocalizedError, Equatable {
+    case unsupportedProvider
+    case emptyAudio
+    case exceedsProviderLimit
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupportedProvider: return "当前分人服务不支持整场识别，请选择讯飞或 OpenAI 兼容服务"
+        case .emptyAudio: return "录音没有可识别的音频"
+        case .exceedsProviderLimit: return "录音超过当前服务整场识别的大小或时长限制，原文与人物标注已保留"
+        }
+    }
+}
+
 protocol DiarizationServicing: Sendable {
     var knownSpeakerMatchingCapability: KnownSpeakerMatchingCapability { get }
+    var recordingLimits: DiarizationRecordingLimits? { get }
+    func transcribeRecording(at audioURL: URL, knownSpeakers: [KnownSpeakerReference]) async throws -> DiarizationChunkResult
     /// 上传一个音频分片并返回带说话人代号的确认片段（时间相对分片起点）
     func transcribeChunk(at chunkURL: URL,
                          knownSpeakers: [KnownSpeakerReference]) async throws -> DiarizationChunkResult
@@ -279,6 +310,11 @@ protocol DiarizationServicing: Sendable {
 
 extension DiarizationServicing {
     var knownSpeakerMatchingCapability: KnownSpeakerMatchingCapability { .unsupported }
+    var recordingLimits: DiarizationRecordingLimits? { nil }
+    func transcribeRecording(at audioURL: URL, knownSpeakers: [KnownSpeakerReference]) async throws -> DiarizationChunkResult {
+        guard recordingLimits != nil else { throw DiarizationRecordingError.unsupportedProvider }
+        return try await transcribeChunk(at: audioURL, knownSpeakers: knownSpeakers)
+    }
 }
 
 /// 基于 URLSession 的 OpenAI Audio Transcriptions 实现（阶段 3）。
@@ -290,6 +326,10 @@ struct OpenAIDiarizationService: DiarizationServicing {
     private let apiKeyStore: CloudAPIKeyStore
     private let baseURL: URL
     private let modelID: String
+
+    var recordingLimits: DiarizationRecordingLimits? {
+        DiarizationRecordingLimits(maximumBytes: 25_000_000, maximumDurationMs: nil)
+    }
 
     var knownSpeakerMatchingCapability: KnownSpeakerMatchingCapability {
         .supported(maximumSpeakers: KnownSpeakerReference.maximumCount)
@@ -328,6 +368,7 @@ struct OpenAIDiarizationService: DiarizationServicing {
         builder.addField(name: "model", value: modelID)
         builder.addField(name: "language", value: "zh")
         builder.addField(name: "response_format", value: "diarized_json")
+        builder.addField(name: "chunking_strategy", value: "auto")
         let chunkData = try Data(contentsOf: chunkURL)
         builder.addFile(name: "file",
                         fileName: "chunk.wav",
@@ -357,7 +398,7 @@ struct OpenAIDiarizationService: DiarizationServicing {
         request.setValue(builder.contentType, forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.httpBody = builder.finish()
-        request.timeoutInterval = 60
+        request.timeoutInterval = 300
 
         let (data, response) = try await perform(request)
         return try parse(data: data, response: response)

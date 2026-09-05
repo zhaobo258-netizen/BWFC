@@ -351,6 +351,10 @@ final class AppEnvironment {
         )
         controller.lexiconProvider = { [weak self] in self?.lexiconTerms ?? [] }
         controller.correctionRulesProvider = { [weak self] in self?.correctionRules ?? [] }
+        controller.prepareSpeakerReferences = { [weak self] project in
+            guard let self else { throw CancellationError() }
+            project.speakers = try self.refreshAutomaticSpeakerReferences(for: project.id)
+        }
         _importProcessing = controller
         return controller
     }
@@ -998,6 +1002,70 @@ final class AppEnvironment {
             speaker.role = person.role
             speaker.backgroundContext = person.backgroundContext
             speaker.isCurrentUser = person.isCurrentUser
+        }
+        return speakers
+    }
+
+    func refreshAutomaticSpeakerReferences(for projectID: UUID) throws -> [Speaker] {
+        guard !isPersistentStorageUnavailable else { throw ProjectWriteError.storageUnavailable }
+        guard let current = try allProjects().first(where: { $0.id == projectID }) else {
+            throw ProjectWriteError.projectDeleted
+        }
+        let profiles = try speakerVoiceProfileStore.loadForManagement()
+        let persons = try personLibraryStore.load()
+        let automatic = try automaticSpeakersWithPeople()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let original = try encoder.encode(current.speakers)
+        var speakers = try JSONDecoder().decode([Speaker].self, from: original)
+        for speaker in speakers {
+            guard let profileID = speaker.voiceProfileId,
+                  SpeakerPanelLogic.voiceReferencePath(for: speaker) != nil,
+                  let profile = profiles.first(where: { $0.id == profileID }) else { continue }
+            if let person = persons.first(where: { $0.voiceProfileIDs.contains(profileID) }) {
+                guard speaker.personId == nil || speaker.personId == person.id else {
+                    throw PersonLibraryStoreError.conflictingVoiceProfile
+                }
+                speaker.personId = person.id
+                speaker.displayName = person.displayName
+                speaker.role = person.role
+                speaker.backgroundContext = person.backgroundContext
+                speaker.isCurrentUser = person.isCurrentUser
+            }
+            speaker.voiceSamplePath = profile.sampleRelativePath
+            speaker.voiceSampleDurationMs = profile.sampleDurationMs
+            speaker.iflytekFeatureID = profile.iflytekFeatureID
+            speaker.communicationProfile = profile.communicationProfile
+        }
+        for candidate in automatic {
+            guard let profileID = candidate.voiceProfileId, let personID = candidate.personId,
+                  !speakers.contains(where: { $0.voiceProfileId == profileID }),
+                  SpeakerPanelLogic.activeVoiceReferenceCount(in: speakers) < KnownSpeakerReference.maximumCount else {
+                continue
+            }
+            if let existing = speakers.first(where: { $0.personId == personID }) {
+                // 有 profile ID 但无样本表示用户在本场停用，不自动重新启用。
+                guard existing.voiceProfileId == nil,
+                      SpeakerPanelLogic.voiceReferencePath(for: existing) == nil else { continue }
+                existing.voiceProfileId = profileID
+                existing.voiceSamplePath = candidate.voiceSamplePath
+                existing.voiceSampleDurationMs = candidate.voiceSampleDurationMs
+                existing.iflytekFeatureID = candidate.iflytekFeatureID
+                existing.communicationProfile = candidate.communicationProfile
+            } else {
+                candidate.cloudAlias = SpeakerPanelLogic.nextCloudAlias(existing: speakers)
+                speakers.append(candidate)
+            }
+        }
+        guard try encoder.encode(speakers) != original else { return current.speakers }
+        try personLibraryStore.changeIdentity(
+            projectStore: projectStore, businessProjectStore: businessProjectStore,
+            profileStore: speakerVoiceProfileStore
+        ) { _, projects, _ in
+            guard let stored = projects.first(where: { $0.id == projectID }) else {
+                throw ProjectWriteError.projectDeleted
+            }
+            stored.speakers = speakers
         }
         return speakers
     }

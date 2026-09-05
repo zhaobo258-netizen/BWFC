@@ -18,21 +18,21 @@ struct KnowledgeGardenView: View {
                         ContentUnavailableView(
                             "AI 未连接，开花不可用",
                             systemImage: "leaf",
-                            description: Text("前往设置连接分析模型（登录 Kimi 或保存 API Key）后，对话内容会自动长出知识种子并开花。")
+                            description: Text("前往设置连接分析模型（登录 Kimi 或保存 API Key）后，即可展开当前原话的概念解释与延伸知识。")
                         )
                         .padding(.vertical, 32)
                     } else if !hasConversationContent {
                         ContentUnavailableView(
                             "还没有对话内容",
                             systemImage: "leaf",
-                            description: Text("开始录音或导入音视频后，「开花」会把对话里值得展开的内容自动生成知识种子，并展开成概念解释与延伸知识。")
+                            description: Text("开始录音或导入音视频后，进入「开花」可选择原话，生成概念解释与延伸知识。")
                         )
                         .padding(.vertical, 32)
                     } else {
                         ContentUnavailableView(
-                            "知识种子生成中",
+                            "暂无可展开的原话",
                             systemImage: "leaf",
-                            description: Text("AI 已连接。随对话推进，实时分析会持续产生知识种子并自动开花；也可以在总结页签标记一段原话作为种子。")
+                            description: Text("需要至少一条四个字以上的最终原话。继续录音，或等待当前转写定稿后再打开本页。")
                         )
                         .padding(.vertical, 32)
                     }
@@ -49,8 +49,10 @@ struct KnowledgeGardenView: View {
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .task(id: controller.selectedSeedID) {
+            guard isAIConfigured else { return }
             await controller.bloomIfNeeded()
         }
+        .onDisappear { controller.cancelBloom() }
     }
 
     private var seedHeader: some View {
@@ -99,7 +101,11 @@ struct KnowledgeGardenView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
-                    .disabled(controller.state == .expanding)
+                    .disabled(controller.state == .expanding || !isAIConfigured)
+                    if controller.state == .expanding {
+                        Button("停止") { controller.cancelBloom() }
+                            .controlSize(.small)
+                    }
                     Spacer()
                 }
             }
@@ -136,6 +142,9 @@ struct KnowledgeGardenView: View {
     private func expansionSection(_ seed: KnowledgeSeed) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             sectionTitle("AI 联想", icon: "sparkles")
+            if !isAIConfigured {
+                sourceStatus("AI 未连接；请在设置中连接分析模型后重新开花。")
+            }
             if controller.state == .expanding && seed.branches.isEmpty {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
@@ -218,10 +227,11 @@ struct KnowledgeGardenView: View {
                 }
             }
 
-            if controller.state == .expanding && seed.connections.isEmpty {
+            if controller.state == .expanding && seed.connections.isEmpty
+                && controller.sourceSynthesisMessage == nil {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
-                    Text("正在检索 Obsidian、互联网和已连接的 MCP…")
+                    Text("正在准备短检索词并查询已连接来源…")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }

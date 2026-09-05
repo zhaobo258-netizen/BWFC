@@ -92,7 +92,7 @@ final class ConversationAnalysisControllerTests {
                 "未选场景时使用 auto 指令")
     }
 
-    @Test("增量：第二次分析只发送游标之后的新片段，并携带上一版压缩状态")
+    @Test("增量：新片段按游标发送，旧证据和上一版状态分别进入独立字段")
     func incrementalUsesCursor() async throws {
         addThreeSegments()
         let evidence = try #require(project.segments.first)
@@ -112,10 +112,24 @@ final class ConversationAnalysisControllerTests {
 
         #expect(mock.calls.count == 2)
         let secondInput = mock.calls[1].inputJSON
-        #expect(!secondInput.contains("第一句。"), "已分析片段不重复发送")
-        #expect(secondInput.contains("第四句。"))
-        #expect(secondInput.contains("第一版总览"), "上一版压缩状态随请求携带")
-        #expect(secondInput.contains("第一版条目"))
+        let payload = try #require(
+            try JSONSerialization.jsonObject(with: Data(secondInput.utf8)) as? [String: Any]
+        )
+        let transcript = try #require(payload["untrusted_transcript_data"] as? [String: Any])
+        let newSegments = try #require(transcript["new_segments"] as? [[String: Any]])
+        #expect(newSegments.count == 3)
+        #expect(newSegments.compactMap { $0["text"] as? String } == ["第四句。", "第五句。", "第六句。"])
+        #expect(newSegments.compactMap { $0["id"] as? String } == project.segments.suffix(3).map { $0.id.uuidString })
+        let previousEvidence = try #require(transcript["previous_evidence_segments"] as? [[String: Any]])
+        #expect(previousEvidence.count == 1)
+        #expect(previousEvidence.first?["id"] as? String == evidence.id.uuidString)
+        #expect(previousEvidence.first?["text"] as? String == "第一句。")
+        let previousState = try #require(payload["previous_state"] as? [String: Any])
+        #expect(previousState["headline"] as? String == "第一版总览")
+        let previousItems = try #require(previousState["items"] as? [[String: Any]])
+        #expect(previousItems.count == 1)
+        #expect(previousItems.first?["text"] as? String == "第一版条目")
+        #expect(previousItems.first?["evidence_segment_ids"] as? [String] == [evidence.id.uuidString])
         #expect(controller.currentSnapshot?.version == 2)
         #expect(project.analysisSnapshots.count == 2)
     }

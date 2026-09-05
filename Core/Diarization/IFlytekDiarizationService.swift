@@ -280,6 +280,10 @@ struct IFlytekDiarizationService: DiarizationServicing, Sendable {
     private let sleep: @Sendable (Int64) async -> Void
     private let maximumPollCount: Int
 
+    var recordingLimits: DiarizationRecordingLimits? {
+        DiarizationRecordingLimits(maximumBytes: 500_000_000, maximumDurationMs: 18_000_000)
+    }
+
     var knownSpeakerMatchingCapability: KnownSpeakerMatchingCapability {
         .supported(maximumSpeakers: 64)
     }
@@ -312,6 +316,22 @@ struct IFlytekDiarizationService: DiarizationServicing, Sendable {
         at chunkURL: URL,
         knownSpeakers: [KnownSpeakerReference]
     ) async throws -> DiarizationChunkResult {
+        try await transcribe(at: chunkURL, knownSpeakers: knownSpeakers, pollCount: maximumPollCount)
+    }
+
+    func transcribeRecording(
+        at audioURL: URL,
+        knownSpeakers: [KnownSpeakerReference]
+    ) async throws -> DiarizationChunkResult {
+        try await transcribe(at: audioURL, knownSpeakers: knownSpeakers, pollCount: max(maximumPollCount, 1_800))
+    }
+
+    private func transcribe(
+        at chunkURL: URL,
+        knownSpeakers: [KnownSpeakerReference],
+        pollCount: Int
+    ) async throws -> DiarizationChunkResult {
+        try Task.checkCancellation()
         let registeredSpeakers = knownSpeakers.compactMap {
             reference -> (reference: KnownSpeakerReference, featureID: String)? in
             guard let featureID = reference.iflytekFeatureID?
@@ -359,8 +379,10 @@ struct IFlytekDiarizationService: DiarizationServicing, Sendable {
                 ($0.featureID, $0.reference.alias)
             }
         )
-        for attempt in 0..<maximumPollCount {
+        for attempt in 0..<pollCount {
+            try Task.checkCancellation()
             if attempt > 0 { await sleep(2_000) }
+            try Task.checkCancellation()
             let envelope = try await query(
                 orderID: upload.orderID,
                 credentials: credentials,
@@ -439,7 +461,7 @@ struct IFlytekDiarizationService: DiarizationServicing, Sendable {
         )
         var request = URLRequest(url: signed.url)
         request.httpMethod = "POST"
-        request.timeoutInterval = 60
+        request.timeoutInterval = 300
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         request.setValue(signed.signature, forHTTPHeaderField: "signature")
         request.httpBody = audioData

@@ -11,6 +11,7 @@ struct SpeakerAssignSheet: View {
     let anchorText: String
     let isAnalysisItem: Bool
     let canAlsoAssignTranscript: Bool
+    var groupDescription: String? = nil
     let onPickExisting: (Speaker, Bool, Bool) -> Bool
     let onCreate: (String, String?, Bool, Bool) -> Bool
 
@@ -36,7 +37,7 @@ struct SpeakerAssignSheet: View {
             }
             Text(isAnalysisItem
                  ? "这里确认的是这条 AI 内容归谁，不会把多段证据静默当成同一个人的声音。"
-                 : "这里会批量修改同一声音组的原话，并从已确认的 2–10 秒单人发言学习永久声纹。")
+                 : (groupDescription ?? "这里会批量修改同一声音组的原话，并从已确认的 2–10 秒单人发言学习永久声纹。"))
                 .font(.caption)
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)

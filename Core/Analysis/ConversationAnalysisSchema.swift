@@ -140,8 +140,8 @@ enum ConversationAnalysisSnapshotBuilder {
                 category: category,
                 text: item.text,
                 subjectSpeakerId: item.subjectSpeakerId.flatMap { speakerIdByAlias[$0] },
-                epistemicStatus: epistemic,
-                confidence: confidence,
+                epistemicStatus: category == .possibleMotive ? .inference : epistemic,
+                confidence: category == .possibleMotive && confidence == .high ? .medium : confidence,
                 evidenceSegmentIds: evidence,
                 firstObservedAt: now,
                 lastUpdatedAt: now

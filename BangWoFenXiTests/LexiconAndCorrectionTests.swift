@@ -272,7 +272,14 @@ struct KnownTermsPromptTests {
     func motiveFrameworkAppended() {
         let text = ConversationAnalysisPrompt.text(scenario: nil)
         #expect(text.contains(ConversationAnalysisPrompt.motiveFramework))
-        #expect(text.contains("四层透视"))
+        #expect(text.contains(PromptRegistry.conversationMotiveFramework))
+        for label in ["原话依据：", "可能诉求：", "其他解释：", "待核实："] {
+            #expect(text.contains(label))
+        }
+        #expect(!text.contains("四层透视"))
+        #expect(!text.contains("下属往往"))
+        #expect(text.contains("同一问题只保留最合适的一个类别"))
+        #expect(text.contains("明确表达的顾虑和目的、事实与待核实问句无需套用四行"))
         #expect(text.contains("禁止声称某人"), "越界说明必须保留在框架内")
         #expect(text.contains(ConversationAnalysisPrompt.rules), "添加框架不得破坏红线原文")
     }

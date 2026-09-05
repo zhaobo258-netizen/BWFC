@@ -26,6 +26,7 @@ final class ImportProcessingController {
     /// 全局词库（导入转写的识别上下文；纠错规则由环境注入）
     var lexiconProvider: () -> [String] = { [] }
     var correctionRulesProvider: () -> [CorrectionRule] = { [] }
+    var prepareSpeakerReferences: ((Project) throws -> Void)?
 
     // MARK: - 可观察状态
 
@@ -402,6 +403,12 @@ final class ImportProcessingController {
                            message: "分人所需原录音缺失，文稿已保留")
         }
         do {
+            _ = try requireActiveProject(project.id)
+            try prepareSpeakerReferences?(project)
+            if service.recordingLimits != nil {
+                try await runRecordingDiarization(for: project, audioURL: audioURL, service: service)
+                return .completed
+            }
             let duration = try AudioChunkExtractor.durationMs(of: audioURL)
             let planner = ChunkPlanner()
             var windows = planner.pendingWindows(uptoAudioMs: duration, nextIndex: 0)
@@ -420,22 +427,9 @@ final class ImportProcessingController {
                 let latest = try requireActiveProject(project.id)
                 project.segments = latest.segments
                 project.speakers = latest.speakers
-                var references: [KnownSpeakerReference] = []
-                if case .supported(let maximum) = service.knownSpeakerMatchingCapability {
-                    for speaker in project.speakers {
-                        guard let samplePath = speaker.voiceSamplePath
-                            ?? speaker.legacyVoiceReferencePath else { continue }
-                        references.append(KnownSpeakerReference(
-                            alias: speaker.cloudAlias,
-                            sampleURL: try fileStore.absoluteURL(forRelativePath: samplePath),
-                            iflytekFeatureID: speaker.iflytekFeatureID
-                        ))
-                    }
-                    guard references.count <= maximum else {
-                        throw DiarizationAPIError.tooManyKnownSpeakers(
-                            maximum: maximum, actual: references.count
-                        )
-                    }
+                let references = try diarizationReferences(for: project, service: service).map {
+                    KnownSpeakerReference(alias: $0.alias, sampleURL: $0.sampleURL,
+                                          iflytekFeatureID: $0.iflytekFeatureID)
                 }
                 let aliases = Set(references.map(\.alias))
                 let known = Dictionary(
@@ -513,6 +507,93 @@ final class ImportProcessingController {
             return .failed(category: "diarization_failed", retryable: true,
                            message: "分人未完成，文稿已保留：\(error.localizedDescription)")
         }
+    }
+
+    private func diarizationReferences(
+        for project: Project, service: any DiarizationServicing
+    ) throws -> [HistoricalSpeakerRelabeler.SpeakerReference] {
+        guard case .supported(let maximum) = service.knownSpeakerMatchingCapability else { return [] }
+        var references: [HistoricalSpeakerRelabeler.SpeakerReference] = []
+        for speaker in project.speakers {
+            if service is IFlytekDiarizationService,
+               speaker.iflytekFeatureID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+                continue
+            }
+            guard let path = SpeakerPanelLogic.voiceReferencePath(for: speaker) else { continue }
+            references.append(.init(speakerID: speaker.id, alias: speaker.cloudAlias,
+                                    sampleURL: try fileStore.absoluteURL(forRelativePath: path),
+                                    iflytekFeatureID: speaker.iflytekFeatureID))
+        }
+        guard references.count <= maximum else {
+            throw DiarizationAPIError.tooManyKnownSpeakers(maximum: maximum, actual: references.count)
+        }
+        return references
+    }
+
+    private func runRecordingDiarization(
+        for project: Project, audioURL: URL, service: any DiarizationServicing
+    ) async throws {
+        let baseline = try requireActiveProject(project.id)
+        let snapshots = baseline.segments.map {
+            HistoricalSpeakerRelabeler.SegmentSnapshot(
+                id: $0.id, startMs: $0.startMs, endMs: $0.endMs, text: $0.text,
+                participantId: $0.participantId, speakerWasUserConfirmed: $0.speakerWasUserConfirmed == true
+            )
+        }
+        let result = try await HistoricalSpeakerRelabeler(diarization: service).diarizeRecording(
+            audioURL: audioURL, pauseIntervals: baseline.pauseIntervals, existingSegments: snapshots,
+            speakerReferences: try diarizationReferences(for: baseline, service: service)
+        )
+        let current = try requireActiveProject(project.id)
+        let originals = Dictionary(snapshots.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let unchanged = Set(current.segments.compactMap { segment -> UUID? in
+            guard let original = originals[segment.id], original.text == segment.text,
+                  original.startMs == segment.startMs, original.endMs == segment.endMs,
+                  original.participantId == segment.participantId,
+                  original.speakerWasUserConfirmed == (segment.speakerWasUserConfirmed == true) else { return nil }
+            return segment.id
+        })
+        let protected = current.segments.filter {
+            !unchanged.contains($0.id) || $0.speakerWasUserConfirmed == true
+                || $0.textWasUserEdited == true || ($0.state == .edited && $0.textWasUserEdited != false)
+        }
+        let invalidAnchorLabels = Set(snapshots.filter {
+            $0.speakerWasUserConfirmed && !unchanged.contains($0.id)
+        }.compactMap { result.remoteLabels[$0.id] })
+        let speakerIDs = Set(current.speakers.map(\.id))
+        let people = result.speakerIDsByRemoteLabel.filter {
+            speakerIDs.contains($0.value) && !invalidAnchorLabels.contains($0.key)
+        }
+        for segment in current.segments where unchanged.contains(segment.id) {
+            if let label = result.remoteLabels[segment.id] {
+                segment.remoteSpeakerLabel = label
+                if segment.speakerWasUserConfirmed != true, let personID = people[label],
+                   result.assignments[segment.id] == personID {
+                    segment.participantId = personID
+                    segment.speakerConfidence = .high
+                }
+            }
+        }
+        var reconciler = TranscriptReconciler()
+        reconciler.reset(finalized: current.segments)
+        let rules = correctionRulesProvider()
+        for remote in result.recordingSegments {
+            guard !protected.contains(where: {
+                TranscriptReconciler.overlapMs(startA: remote.startMs, endA: remote.endMs,
+                                              startB: $0.startMs, endB: $0.endMs) > 0
+            }) else { continue }
+            reconciler.applyCloudFinal(
+                startMs: remote.startMs, endMs: remote.endMs,
+                text: TranscriptCorrector.autoCorrect(remote.text, rules: rules),
+                participantId: remote.speakerLabel.flatMap { people[$0] }, remoteSpeakerLabel: remote.speakerLabel
+            )
+        }
+        let unfinished = current.segments.filter { $0.state != .final && $0.state != .edited }
+        project.segments = (reconciler.finalized + unfinished).sorted { $0.startMs < $1.startMs }
+        project.speakers = current.speakers
+        _ = try requireActiveProject(project.id)
+        try persistProject(project, .importPipeline)
+        updateJobProgress(.diarization, progress: 1)
     }
 
     /// 分析（阶段 D：V2 通用分析，语义分析师）：整篇一次性生成，快照直接写在 Project 上

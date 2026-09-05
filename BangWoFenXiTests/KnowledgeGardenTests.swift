@@ -158,8 +158,174 @@ private struct FixedKnowledgeKimiCredentials: KimiCredentialProviding {
     }
 }
 
+private actor SuspendedKnowledgeExpansionService: KnowledgeExpansionServicing {
+    private var continuation: CheckedContinuation<KnowledgeExpansionResult, Never>?
+    private var waiter: CheckedContinuation<Void, Never>?
+    private var didStart = false
+
+    func expand(seedText: String, whyItMatters: String, evidence: [KnowledgeEvidenceInput],
+                scenario: ProjectScenario?, userContext: [String], noteMarkdown: String?) async throws -> KnowledgeExpansionResult {
+        if didStart { return Self.result }
+        didStart = true
+        return await withCheckedContinuation { continuation in
+            self.continuation = continuation
+            waiter?.resume()
+            waiter = nil
+        }
+    }
+
+    func waitStarted() async {
+        if didStart { return }
+        await withCheckedContinuation { waiter = $0 }
+    }
+
+    func complete() {
+        continuation?.resume(returning: Self.result)
+        continuation = nil
+    }
+
+    private static var result: KnowledgeExpansionResult {
+        .init(branches: [.init(type: .conceptExplanation, title: "库存周转", body: "库存周转的解释。")], searchQueries: [])
+    }
+}
+
+private actor SuspendedKnowledgeProvider: KnowledgeProvider {
+    nonisolated let kind: KnowledgeProviderKind = .obsidian
+    nonisolated let providerID = "obsidian:suspended"
+    nonisolated let displayName = "延迟来源"
+    private var continuation: CheckedContinuation<[KnowledgeConnection], Never>?
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func healthCheck() async -> KnowledgeProviderHealth { .init(isAvailable: true, message: "Mock") }
+    func search(_ query: String, limit: Int) async throws -> [KnowledgeConnection] {
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+            waiter?.resume()
+            waiter = nil
+        }
+    }
+    func waitStarted() async {
+        if continuation != nil { return }
+        await withCheckedContinuation { waiter = $0 }
+    }
+    func complete() {
+        continuation?.resume(returning: [])
+        continuation = nil
+    }
+}
+
+private struct EmptyKnowledgeGenerationService: AITextGenerationServing {
+    var responseText: String
+    func generate(_ request: AITextGenerationRequest) async throws -> AITextGenerationResponse {
+        .init(text: responseText, provider: .init(id: "knowledge-test", displayName: "Mock", modelID: "fixture"))
+    }
+    func testActiveConnection() async throws -> AIProviderDescriptor {
+        .init(id: "knowledge-test", displayName: "Mock", modelID: "fixture")
+    }
+}
+
 @Suite("知识开花", .serialized)
 struct KnowledgeGardenTests {
+    @Test("取消开花后复位并可重试；晚到回复不覆盖项目")
+    @MainActor
+    func cancelledBloomCanRetry() async throws {
+        let segment = TranscriptSegment(startMs: 0, endMs: 1_000, text: "渠道库存需要统一业务口径。", source: .local, state: .final)
+        let project = Project(title: "取消开花", sourceType: .importedAudio, segments: [segment])
+        let service = SuspendedKnowledgeExpansionService()
+        let controller = KnowledgeGardenController(expansionService: service, providerFactory: { [] })
+        controller.attach(to: project)
+        let task = Task { await controller.bloomSelected() }
+        await service.waitStarted()
+        task.cancel()
+        await service.complete()
+        await task.value
+        #expect(controller.state == .idle)
+        #expect(controller.selectedSeed?.branches.isEmpty == true)
+        await controller.bloomSelected()
+        #expect(controller.state == .finished)
+        #expect(controller.selectedSeed?.branches.count == 1)
+    }
+
+    @Test("切换种子立即停止旧请求，新种子可继续开花")
+    @MainActor
+    func changingSeedCancelsOldRequest() async throws {
+        let segments = ["渠道库存需要统一业务口径。", "回款周期需要区分到期与逾期。"].enumerated().map {
+            TranscriptSegment(startMs: Int64($0.offset * 1_000), endMs: Int64(($0.offset + 1) * 1_000),
+                text: $0.element, source: .local, state: .final)
+        }
+        let project = Project(title: "切换开花", sourceType: .importedAudio, segments: segments)
+        let service = SuspendedKnowledgeExpansionService()
+        let controller = KnowledgeGardenController(expansionService: service, providerFactory: { [] })
+        controller.attach(to: project)
+        let originalID = try #require(controller.selectedSeedID)
+        let otherID = try #require(controller.seeds.first { $0.id != originalID }?.id)
+        let task = Task { await controller.bloomSelected() }
+        await service.waitStarted()
+        controller.selectSeed(otherID)
+        #expect(controller.state == .idle)
+        await controller.bloomSelected()
+        await service.complete()
+        await task.value
+        #expect(controller.selectedSeedID == otherID)
+        #expect(controller.state == .finished)
+        #expect(controller.seeds.first { $0.id == originalID }?.branches.isEmpty == true)
+        #expect(controller.selectedSeed?.branches.count == 1)
+    }
+
+    @Test("来源仍在检索时先显示AI联想")
+    @MainActor
+    func expansionAppearsBeforeSlowSourcesFinish() async {
+        let project = Project(title: "分步开花", sourceType: .importedAudio, segments: [
+            TranscriptSegment(startMs: 0, endMs: 1_000, text: "渠道库存需要统一业务口径。", source: .local, state: .final)
+        ])
+        let provider = SuspendedKnowledgeProvider()
+        let controller = KnowledgeGardenController(expansionService: MockKnowledgeExpansionService(
+            result: .init(branches: [.init(type: .conceptExplanation, title: "库存", body: "库存口径解释。")], searchQueries: [])
+        ), providerFactory: { [provider] })
+        controller.attach(to: project)
+        let task = Task { await controller.bloomSelected() }
+        await provider.waitStarted()
+        let deadline = Date().addingTimeInterval(5)
+        while controller.selectedSeed?.branches.isEmpty == true && Date() < deadline { await Task.yield() }
+        #expect(controller.selectedSeed?.branches.count == 1)
+        #expect(controller.state == .expanding)
+        await provider.complete()
+        await task.value
+        #expect(controller.state == .finished)
+    }
+
+    @Test("短原话也能生成种子，无外部来源仍能生成联想")
+    @MainActor
+    func shortTranscriptAndNoProvidersCanBloom() async {
+        let project = Project(title: "短原话", sourceType: .importedAudio, segments: [
+            TranscriptSegment(startMs: 0, endMs: 1_000, text: "库存周转", source: .local, state: .final)
+        ])
+        let controller = KnowledgeGardenController(expansionService: MockKnowledgeExpansionService(
+            result: .init(branches: [.init(type: .conceptExplanation, title: "周转", body: "周转说明。")], searchQueries: [])
+        ), providerFactory: { [] })
+        controller.attach(to: project)
+        #expect(controller.seeds.count == 1)
+        await controller.bloomSelected()
+        #expect(controller.selectedSeed?.branches.count == 1)
+        #expect(controller.sourceSynthesisMessage?.contains("未连接知识来源") == true)
+    }
+
+    @Test("有效联想不因缺少检索词丢失；空分支作为失败")
+    func incompleteExpansionResponseHandling() async throws {
+        let valid = KimiKnowledgeExpansionService(generationService: EmptyKnowledgeGenerationService(
+            responseText: #"{"branches":[{"type":"concept_explanation","title":"库存","body":"库存的说明"}]}"#))
+        let result = try await valid.expand(seedText: "库存", whyItMatters: "原话", evidence: [], scenario: nil,
+            userContext: [], noteMarkdown: nil)
+        #expect(result.branches.count == 1)
+        #expect(result.searchQueries.isEmpty)
+        let empty = KimiKnowledgeExpansionService(generationService: EmptyKnowledgeGenerationService(
+            responseText: #"{"branches":[],"search_queries":[]}"#))
+        await #expect(throws: AnalysisAPIError.invalidResponse) {
+            try await empty.expand(seedText: "库存", whyItMatters: "原话", evidence: [], scenario: nil,
+                userContext: [], noteMarkdown: nil)
+        }
+    }
+
     @Test("历史 attach 不触发开花请求，显式开花才调用模型")
     @MainActor
     func historyAttachDoesNotBloom() async {

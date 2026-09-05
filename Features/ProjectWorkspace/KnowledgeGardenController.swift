@@ -78,6 +78,9 @@ final class KnowledgeGardenController {
     private(set) var sourceSynthesisMessage: String?
     var onUpdated: (() -> Void)?
     var noteContextProvider: () -> String? = { nil }
+    private var bloomTask: Task<Void, Never>?
+    private var activeRequestID: UUID?
+    private var hasReplacedSources = false
     private var automaticBloomTask: Task<Void, Never>?
     private var pendingAutomaticBloomIDs: [UUID] = []
     private var automaticallyAttemptedSeedIDs = Set<UUID>()
@@ -98,6 +101,11 @@ final class KnowledgeGardenController {
     }
 
     func attach(to project: Project) {
+        cancelBloom()
+        providerMessages = [:]
+        providerDisplayNames = [:]
+        expansionMessage = nil
+        sourceSynthesisMessage = nil
         automaticBloomTask?.cancel()
         automaticBloomTask = nil
         pendingAutomaticBloomIDs = []
@@ -162,6 +170,7 @@ final class KnowledgeGardenController {
     func selectSeed(_ id: UUID) {
         guard seeds.contains(where: { $0.id == id }) else { return }
         guard id != selectedSeedID else { return }
+        cancelBloom()
         selectedSeedID = id
         // 状态消息属于上一个种子的开花过程，切换后清空，避免张冠李戴
         providerMessages = [:]
@@ -185,76 +194,102 @@ final class KnowledgeGardenController {
         await bloom(seedID: selectedSeedID)
     }
 
+    func cancelBloom() {
+        activeRequestID = nil
+        bloomTask?.cancel()
+        bloomTask = nil
+        if state == .expanding {
+            state = .idle
+            expansionMessage = "已停止开花；已生成内容已保留，可重新开花。"
+        }
+    }
+
     private func bloom(seedID: UUID) async {
         guard state != .expanding,
               let project,
-              let seed = seeds.first(where: { $0.id == seedID }) else {
-            return
-        }
+              let seed = seeds.first(where: { $0.id == seedID }) else { return }
+        let requestID = UUID()
+        activeRequestID = requestID
+        hasReplacedSources = false
         state = .expanding
-        if seedID == selectedSeedID {
-            providerMessages = [:]
-            providerDisplayNames = [:]
-            expansionMessage = nil
-            sourceSynthesisMessage = nil
+        providerMessages = [:]
+        providerDisplayNames = [:]
+        expansionMessage = nil
+        sourceSynthesisMessage = nil
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.performBloom(seed: seed, project: project, requestID: requestID)
         }
+        bloomTask = task
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
 
+    private func performBloom(seed: KnowledgeSeed, project: Project, requestID: UUID) async {
+        defer {
+            if activeRequestID == requestID {
+                activeRequestID = nil
+                bloomTask = nil
+                state = Task.isCancelled ? .idle : .finished
+            }
+        }
         let providers = providerFactory()
-        let output = await KnowledgeBloomAgent(
-            expansionService: expansionService
-        ).bloom(
+        if providers.isEmpty {
+            sourceSynthesisMessage = "未连接知识来源；AI 联想仍可生成。"
+        }
+        let output = await KnowledgeBloomAgent(expansionService: expansionService).bloom(
             seedText: seed.seedText,
             whyItMatters: seed.whyItMatters,
             evidence: Self.evidence(for: seed, in: project),
             scenario: project.scenario,
-            userContext: ProjectAIUserContext.statements(
-                from: project.aiChatMessages
-            ),
-            noteMarkdown: project.noteAIContextEnabled
-                ? noteContextProvider()
-                : nil,
-            providers: providers
+            userContext: ProjectAIUserContext.statements(from: project.aiChatMessages),
+            noteMarkdown: project.noteAIContextEnabled ? noteContextProvider() : nil,
+            providers: providers,
+            onProgress: { [weak self] progress in
+                await self?.apply(progress: progress, seedID: seed.id, requestID: requestID)
+            }
         )
-        guard self.project === project, !Task.isCancelled else { return }
-        apply(
-            outcomes: output.initialOutcomes,
-            to: seedID,
-            replacing: true
-        )
-
-        switch output.expansion {
-        case .success(let result):
-            updateSeed(id: seedID) { stored in
-                stored.branches = result.branches
-                stored.searchQueries = result.searchQueries
-                stored.updatedAt = Date()
-            }
-            if self.selectedSeedID == seedID {
-                expansionMessage = result.branches.isEmpty ? "AI 暂未生成有效联想" : nil
-            }
-        case .failure(let failure):
-            if self.selectedSeedID == seedID {
-                expansionMessage = Self.expansionFailureMessage(failure)
-            }
-        }
-
-        if !output.refinedOutcomes.isEmpty {
-            apply(
-                outcomes: output.refinedOutcomes,
-                to: seedID,
-                replacing: false
-            )
-        }
+        guard self.project === project, activeRequestID == requestID, !Task.isCancelled else { return }
         if let synthesis = output.sourceSynthesis {
-            updateSeed(id: seedID) {
+            updateSeed(id: seed.id) {
                 $0.sourceSynthesis = synthesis
                 $0.updatedAt = Date()
             }
-        } else if output.sourceSynthesisFailure != nil,
-                  selectedSeedID == seedID {
+        } else if output.sourceSynthesisFailure != nil, selectedSeedID == seed.id {
             sourceSynthesisMessage = "已找到来源，但 AI 速览暂时生成失败；原始资料仍可查看"
+        } else if !providers.isEmpty,
+                  output.initialOutcomes.isEmpty && output.refinedOutcomes.isEmpty {
+            sourceSynthesisMessage = "本次未生成可用的短检索词，未发起来源检索；可重新开花。"
+        } else if !hasReplacedSources,
+                  seeds.first(where: { $0.id == seed.id })?.connections.isEmpty == false {
+            sourceSynthesisMessage = "本次没有获得新来源，保留上次结果供参考。"
         }
-        state = .finished
+    }
+
+    private func apply(progress: KnowledgeBloomProgress, seedID: UUID, requestID: UUID) {
+        guard activeRequestID == requestID, !Task.isCancelled else { return }
+        switch progress {
+        case .expansion(.success(let result)):
+            guard !result.branches.isEmpty else {
+                expansionMessage = "AI 未返回有效联想，请重新开花；已保存结果保持不变。"
+                return
+            }
+            updateSeed(id: seedID) {
+                $0.branches = result.branches
+                $0.searchQueries = result.searchQueries
+                $0.updatedAt = Date()
+            }
+        case .expansion(.failure(let failure)):
+            expansionMessage = Self.expansionFailureMessage(failure)
+        case .sources(let outcomes):
+            guard !outcomes.isEmpty else { return }
+            let hasIncoming = outcomes.contains { !$0.connections.isEmpty }
+            apply(outcomes: outcomes, to: seedID, replacing: hasIncoming && !hasReplacedSources)
+            if hasIncoming { hasReplacedSources = true }
+        }
     }
 
     private func scheduleAutomaticBloom(preferredIDs: [UUID]) {
@@ -400,7 +435,8 @@ final class KnowledgeGardenController {
             }
         }
         let fallbackSegments = project.segments
-            .filter { ($0.state == .final || $0.state == .edited) && $0.text.count >= 12 }
+            .filter { ($0.state == .final || $0.state == .edited)
+                && $0.text.trimmingCharacters(in: .whitespacesAndNewlines).count >= 4 }
             .sorted {
                 if $0.isStarred != $1.isStarred { return $0.isStarred && !$1.isStarred }
                 return $0.startMs > $1.startMs
@@ -460,9 +496,10 @@ final class KnowledgeGardenController {
             case .missingAPIKey: return "AI 联想未启用；连接分析模型后可生成概念与跨领域连接"
             case .credentialAccessRequired:
                 return "App 更新后需要重新连接 AI；知识来源检索仍可使用"
-            case .unauthorized: return "AI 凭证已失效；知识来源检索仍可使用"
-            case .timeout: return "AI 联想超时；知识来源检索仍可使用"
-            default: return "AI 联想暂不可用；知识来源检索仍可使用"
+            case .unauthorized: return "AI 认证或模型权限不可用，请检查设置；本地知识库结果仍可查看"
+            case .timeout: return "AI 联想超时，请重新开花；已保存结果保持不变"
+            case .invalidResponse: return "AI 返回的联想格式不完整，请重新开花；已保存结果保持不变"
+            default: return "AI 联想暂不可用，请重新开花；本地知识库结果仍可查看"
             }
         }
         return "AI 联想暂不可用；知识来源检索仍可使用"

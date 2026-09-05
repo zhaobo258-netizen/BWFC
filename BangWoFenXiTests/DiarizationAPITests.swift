@@ -81,6 +81,8 @@ final class DiarizationAPITests {
         #expect(bodyText.contains(#"name="language""#))
         #expect(bodyText.contains("zh"))
         #expect(bodyText.contains("diarized_json"))
+        #expect(bodyText.contains(#"name="chunking_strategy""#))
+        #expect(bodyText.contains("auto"))
         #expect(bodyText.contains(#"name="known_speaker_names[]""#))
         #expect(bodyText.contains("p_01"), "云端只传本地代号")
         #expect(bodyText.contains("data:audio/wav;base64,"), "样本以数据 URL 传输")

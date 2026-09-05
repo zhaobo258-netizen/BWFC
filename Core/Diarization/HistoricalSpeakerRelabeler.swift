@@ -20,6 +20,9 @@ struct HistoricalSpeakerRelabeler: @unchecked Sendable {
     struct Result: Sendable, Equatable {
         var assignments: [UUID: UUID]
         var processedChunkCount: Int
+        var remoteLabels: [UUID: String] = [:]
+        var recordingSegments: [DiarizationChunkResult.Segment] = []
+        var speakerIDsByRemoteLabel: [String: UUID] = [:]
     }
 
     private let diarization: any DiarizationServicing
@@ -34,6 +37,73 @@ struct HistoricalSpeakerRelabeler: @unchecked Sendable {
         self.diarization = diarization
         self.planner = planner
         self.fileManager = fileManager
+    }
+
+    func diarizeRecording(
+        audioURL: URL,
+        pauseIntervals: [PauseInterval],
+        existingSegments: [SegmentSnapshot],
+        speakerReferences: [SpeakerReference]
+    ) async throws -> Result {
+        guard let limits = diarization.recordingLimits else {
+            throw DiarizationRecordingError.unsupportedProvider
+        }
+        guard speakerReferences.count <= KnownSpeakerReference.maximumCount else {
+            throw DiarizationAPIError.tooManyKnownSpeakers(
+                maximum: KnownSpeakerReference.maximumCount, actual: speakerReferences.count
+            )
+        }
+        try Task.checkCancellation()
+        let duration = try AudioChunkExtractor.durationMs(of: audioURL)
+        // 16 kHz mono Int16 WAV is 32 bytes/ms, plus its container header.
+        guard duration <= (limits.maximumBytes - 4_096) / 32 else {
+            throw DiarizationRecordingError.exceedsProviderLimit
+        }
+        try limits.validate(byteCount: duration * 32 + 4_096, durationMs: duration)
+        let directory = fileManager.temporaryDirectory.appending(
+            path: "帮我分析 整场分人 % \(UUID().uuidString)", directoryHint: .isDirectory
+        )
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: directory) }
+        let converted = directory.appending(path: "recording.wav")
+        try AudioChunkExtractor.exportRecordingWAV(from: audioURL, to: converted)
+        let bytes = try converted.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        try limits.validate(byteCount: Int64(bytes), durationMs: duration)
+        try Task.checkCancellation()
+        let references = speakerReferences.map {
+            KnownSpeakerReference(alias: $0.alias, sampleURL: $0.sampleURL,
+                                  iflytekFeatureID: $0.iflytekFeatureID)
+        }
+        let result = try await diarization.transcribeRecording(at: converted, knownSpeakers: references)
+        try Task.checkCancellation()
+        let mapped = DiarizationChunkResult(durationMs: result.durationMs, segments: result.segments.map {
+            var segment = $0
+            segment.startMs = Self.wallMs(forAudioMs: $0.startMs, pauseIntervals: pauseIntervals)
+            segment.endMs = Self.wallMs(forAudioMs: $0.endMs, pauseIntervals: pauseIntervals)
+            return segment
+        })
+        let labels = HistoricalSpeakerRelabelMatcher.labels(
+            result: mapped, chunkWallStartMs: 0, existingSegments: existingSegments
+        )
+        let knownIDs = Dictionary(speakerReferences.map { ($0.alias, $0.speakerID) },
+                                  uniquingKeysWith: { first, _ in first })
+        let assignments = HistoricalSpeakerRelabelMatcher.resolvedAssignments(
+            labels: labels, knownSpeakerIDs: knownIDs, existingSegments: existingSegments
+        )
+        let scope = "recording:\(UUID().uuidString):"
+        let peopleByLabel = HistoricalSpeakerRelabelMatcher.resolvedSpeakerIDs(
+            labels: labels, knownSpeakerIDs: knownIDs, existingSegments: existingSegments
+        )
+        return Result(
+            assignments: assignments, processedChunkCount: 1,
+            remoteLabels: labels.mapValues { scope + $0 },
+            recordingSegments: mapped.segments.map {
+                var segment = $0
+                segment.speakerLabel = $0.speakerLabel.map { scope + $0 }
+                return segment
+            },
+            speakerIDsByRemoteLabel: Dictionary(uniqueKeysWithValues: peopleByLabel.map { (scope + $0.key, $0.value) })
+        )
     }
 
     func relabel(
@@ -162,14 +232,68 @@ struct HistoricalSpeakerRelabeler: @unchecked Sendable {
 }
 
 enum HistoricalSpeakerRelabelMatcher {
+    static func resolvedAssignments(
+        labels: [UUID: String],
+        knownSpeakerIDs: [String: UUID],
+        existingSegments: [HistoricalSpeakerRelabeler.SegmentSnapshot]
+    ) -> [UUID: UUID] {
+        let people = resolvedSpeakerIDs(labels: labels, knownSpeakerIDs: knownSpeakerIDs,
+                                        existingSegments: existingSegments)
+        var assignments: [UUID: UUID] = [:]
+        for segment in existingSegments where !segment.speakerWasUserConfirmed {
+            if let label = labels[segment.id], let person = people[label] {
+                assignments[segment.id] = person
+            }
+        }
+        return assignments
+    }
+
+    static func resolvedSpeakerIDs(
+        labels: [UUID: String],
+        knownSpeakerIDs: [String: UUID],
+        existingSegments: [HistoricalSpeakerRelabeler.SegmentSnapshot]
+    ) -> [String: UUID] {
+        var confirmed: [String: Set<UUID>] = [:]
+        for segment in existingSegments where segment.speakerWasUserConfirmed {
+            if let label = labels[segment.id], let person = segment.participantId {
+                confirmed[label, default: []].insert(person)
+            }
+        }
+        var people: [String: UUID] = [:]
+        for label in Set(labels.values).union(knownSpeakerIDs.keys) {
+            let anchors = confirmed[label] ?? []
+            guard anchors.count <= 1 else { continue }
+            let known = knownSpeakerIDs[label]
+            if let anchor = anchors.first {
+                guard known == nil || known == anchor else { continue }
+                people[label] = anchor
+            } else if let known {
+                people[label] = known
+            }
+        }
+        return people
+    }
+
     static func assignments(
         result: DiarizationChunkResult,
         chunkWallStartMs: Int64,
         knownSpeakerIDs: [String: UUID],
         existingSegments: [HistoricalSpeakerRelabeler.SegmentSnapshot]
     ) -> [UUID: UUID] {
-        var assignments: [UUID: UUID] = [:]
-        for segment in existingSegments where !segment.speakerWasUserConfirmed {
+        let matchedLabels = labels(result: result, chunkWallStartMs: chunkWallStartMs,
+                                   existingSegments: existingSegments.filter { !$0.speakerWasUserConfirmed })
+        return matchedLabels.reduce(into: [:]) { assignments, item in
+            if let speakerID = knownSpeakerIDs[item.value] { assignments[item.key] = speakerID }
+        }
+    }
+
+    static func labels(
+        result: DiarizationChunkResult,
+        chunkWallStartMs: Int64,
+        existingSegments: [HistoricalSpeakerRelabeler.SegmentSnapshot]
+    ) -> [UUID: String] {
+        var matches: [UUID: String] = [:]
+        for segment in existingSegments {
             let duration = max(1, segment.endMs - segment.startMs)
             let overlapping = result.segments.filter { remote in
                 let overlap = TranscriptReconciler.overlapMs(
@@ -184,7 +308,7 @@ enum HistoricalSpeakerRelabelMatcher {
             let labels = Set(overlapping.map { $0.speakerLabel ?? "" })
             guard labels.count == 1,
                   let label = labels.first,
-                  let speakerID = knownSpeakerIDs[label] else { continue }
+                  !label.isEmpty else { continue }
 
             var covered: Int64 = 0
             var coveredUntil = segment.startMs
@@ -198,8 +322,8 @@ enum HistoricalSpeakerRelabelMatcher {
                   TranscriptText.similarity(
                     overlapping.map(\.text).joined(), segment.text
                   ) >= 0.45 else { continue }
-            assignments[segment.id] = speakerID
+            matches[segment.id] = label
         }
-        return assignments
+        return matches
     }
 }

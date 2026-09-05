@@ -53,6 +53,17 @@ struct KnowledgeExpansionOutputDTO: Decodable, Sendable, Equatable {
         case searchQueries = "search_queries"
     }
 
+    init(branches: [BranchDTO], searchQueries: [String]) {
+        self.branches = branches
+        self.searchQueries = searchQueries
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        branches = try container.decode([BranchDTO].self, forKey: .branches)
+        searchQueries = try container.decodeIfPresent([String].self, forKey: .searchQueries) ?? []
+    }
+
     struct BranchDTO: Decodable, Sendable, Equatable {
         var type: String
         var title: String
@@ -265,7 +276,9 @@ struct KimiKnowledgeExpansionService: KnowledgeExpansionServicing {
               let dto = try? JSONDecoder().decode(KnowledgeExpansionOutputDTO.self, from: data) else {
             throw AnalysisAPIError.invalidResponse
         }
-        return Self.buildResult(from: dto)
+        let result = Self.buildResult(from: dto)
+        guard !result.branches.isEmpty else { throw AnalysisAPIError.invalidResponse }
+        return result
     }
 
     func synthesizeSources(
