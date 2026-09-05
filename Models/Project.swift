@@ -82,17 +82,52 @@ enum ProjectStatus: String, Codable, Sendable, CaseIterable {
 
 /// 项目笔记文档（产品文档 03 号 §8.4）
 struct NoteDocument: Codable, Sendable, Hashable {
-    /// Markdown 正文
-    var markdown: String
-    /// 最近更新时间
-    var updatedAt: Date
-    /// 最近一次同步到归档的正文哈希（用于变更检测）
-    var lastSyncedHash: String?
+    struct ConversationSummary: Codable, Sendable, Hashable, Identifiable {
+        var id: UUID
+        var markdown: String
+        var createdAt: Date
+    }
 
-    init(markdown: String = "", updatedAt: Date = Date(), lastSyncedHash: String? = nil) {
+    var markdown: String
+    var updatedAt: Date
+    var lastSyncedHash: String?
+    var conversationSummaries: [ConversationSummary]
+
+    init(
+        markdown: String = "",
+        updatedAt: Date = Date(),
+        lastSyncedHash: String? = nil,
+        conversationSummaries: [ConversationSummary] = []
+    ) {
         self.markdown = markdown
         self.updatedAt = updatedAt
         self.lastSyncedHash = lastSyncedHash
+        self.conversationSummaries = conversationSummaries
+    }
+
+    func combinedMarkdown(manualMarkdown: String? = nil) -> String {
+        let manual = manualMarkdown ?? markdown
+        guard !conversationSummaries.isEmpty else { return manual }
+        let summaries = conversationSummaries.map {
+            $0.markdown
+        }.joined(separator: "\n\n---\n\n")
+        return [manual, "## AI 对话归结\n\n以下为对话整理，AI 建议与待确认判断不代表已作决定。\n\n" + summaries]
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .joined(separator: "\n\n")
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case markdown, updatedAt, lastSyncedHash, conversationSummaries
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        markdown = try container.decode(String.self, forKey: .markdown)
+        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+        lastSyncedHash = try container.decodeIfPresent(String.self, forKey: .lastSyncedHash)
+        conversationSummaries = try container.decodeIfPresent(
+            [ConversationSummary].self, forKey: .conversationSummaries
+        ) ?? []
     }
 }
 

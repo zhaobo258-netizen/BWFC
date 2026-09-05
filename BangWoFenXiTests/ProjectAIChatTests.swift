@@ -138,7 +138,8 @@ private actor SuspendedProjectAIChatService: ProjectAIChatServing {
     func resolve() {
         continuation?.resume(returning: ProjectAIChatResponse(
             reply: "这是清空前请求的晚到回复。",
-            provider: AIProviderDescriptor(id: "mock", displayName: "测试", modelID: "test")
+            provider: AIProviderDescriptor(id: "mock", displayName: "测试", modelID: "test"),
+            noteSummary: "- AI 建议：迟到内容不得写入。"
         ))
         continuation = nil
     }
@@ -193,6 +194,7 @@ struct ProjectAIChatTests {
         #expect(project.aiChatMessages.isEmpty)
         #expect(controller.messages.isEmpty)
         #expect(saves == 2)
+        #expect(project.note.conversationSummaries.isEmpty)
     }
 
     @Test("长录音按问题找回开头原文并披露覆盖范围")
@@ -1049,6 +1051,146 @@ struct ProjectAIChatTests {
         #expect(projects[0].aiChatMessages.count == 1)
         #expect(projects[0].aiChatDraft == "尚未发送")
         #expect(projects[0].noteAIContextEnabled)
+    }
+
+    @Test("AI 回应同步归结笔记，保留手写内容并在清空聊天后可重新读取")
+    @MainActor
+    func conversationSummaryPersistsWithReply() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try JSONProjectStore(directory: root)
+        let project = Project(title: "合成笔记测试", sourceType: .liveRecording,
+                              note: NoteDocument(markdown: "手写：等待人工确认。"))
+        let generation = ProjectAIChatGenerationService(responseText:
+            #"{"reply":"建议先核对数量，再决定是否扩大试点。","note_summary":"- 用户补充：试点数量待核对。\n- AI 建议：先核对，再决定是否扩大。"}"#)
+        let controller = ProjectAIChatController(service: ProjectAIChatAgent(generationService: generation)) { incoming in
+            var projects = try store.loadProjects()
+            ProjectPersistence.upsert(incoming, into: &projects, fields: .aiContext)
+            try store.saveProjects(projects)
+        }
+        controller.attach(to: project)
+        controller.draft = "试点数量还没核对，下一步怎么处理？"
+        await controller.send()
+        #expect(controller.errorMessage == nil)
+        #expect(controller.noteSummaryStatus == "本轮已自动归结笔记")
+        #expect(project.note.markdown == "手写：等待人工确认。")
+        #expect(controller.conversationSummaries == project.note.conversationSummaries)
+        let note = try #require(project.note.conversationSummaries.first)
+        #expect(note.id == project.aiChatMessages.last?.id)
+        #expect(note.markdown.contains("AI 建议"))
+        #expect(await generation.capturedRequests().count == 1)
+        #expect(await generation.capturedRequest()?.system.contains("note_summary") == true)
+        controller.clearConversation()
+        let restored = try #require(store.loadProjects().first)
+        #expect(restored.aiChatMessages.isEmpty)
+        #expect(restored.note.conversationSummaries.count == 1)
+        #expect(controller.conversationSummaries.count == 1)
+        #expect(restored.note.combinedMarkdown().contains("手写：等待人工确认。"))
+        #expect(restored.note.combinedMarkdown().contains("AI 建议"))
+    }
+
+    @Test("无效笔记字段不丢失有效回复，也不把完整回复冒充笔记", arguments: ["null", "42", "[]"])
+    @MainActor
+    func invalidNoteDoesNotLoseReply(noteJSON: String) async {
+        let generation = ProjectAIChatGenerationService(responseText:
+            "{\"reply\":\"有效回复\",\"note_summary\":\(noteJSON)}")
+        let project = Project(title: "格式测试", sourceType: .liveRecording)
+        let controller = ProjectAIChatController(service: ProjectAIChatAgent(generationService: generation), persist: { _ in })
+        controller.attach(to: project)
+        controller.draft = "测试"
+        await controller.send()
+        #expect(controller.messages.last?.text == "有效回复")
+        #expect(project.note.conversationSummaries.isEmpty)
+        #expect(controller.noteSummaryStatus == "本轮未生成笔记，回应已保留")
+    }
+
+    @Test("对话和笔记保存失败时不报告已保存或触发后续总结")
+    @MainActor
+    func summarySaveFailureRemainsVisible() async throws {
+        let store = InMemoryProjectStore()
+        let project = Project(title: "保存失败", sourceType: .liveRecording)
+        let service = ProjectAIChatMockService(response: ProjectAIChatResponse(
+            reply: "测试回复", provider: .init(id: "mock", displayName: "测试", modelID: "test"),
+            noteSummary: "- AI 建议：合成内容。"))
+        var updated = false
+        let controller = ProjectAIChatController(service: service) { incoming in
+            if incoming.aiChatMessages.last?.role == .assistant {
+                throw ProjectAIChatTestError.persistenceFailed
+            }
+            let detached = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(incoming))
+            try store.saveProjects([detached])
+        }
+        controller.onConversationUpdated = { updated = true }
+        controller.attach(to: project)
+        controller.draft = "请整理"
+        await controller.send()
+        #expect(controller.errorMessage?.contains("保存失败") == true)
+        #expect(controller.noteSummaryStatus == nil)
+        #expect(!updated)
+        #expect(controller.messages.last?.text == "测试回复")
+        #expect(try store.loadProjects().first?.note.conversationSummaries.isEmpty == true)
+        #expect(try store.loadProjects().first?.aiChatMessages.last?.role == .user)
+    }
+
+    @Test("切换项目后迟到回复和笔记不写入任何项目")
+    @MainActor
+    func switchedProjectRejectsLateSummary() async {
+        let service = SuspendedProjectAIChatService()
+        let first = Project(title: "第一个", sourceType: .liveRecording)
+        let second = Project(title: "第二个", sourceType: .liveRecording)
+        let controller = ProjectAIChatController(service: service, persist: { _ in })
+        controller.attach(to: first)
+        controller.draft = "测试迟到回复"
+        let sending = Task { await controller.send() }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !(await service.isWaiting), ContinuousClock.now < deadline { await Task.yield() }
+        #expect(await service.isWaiting)
+        controller.attach(to: second)
+        await service.resolve()
+        await sending.value
+        #expect(first.aiChatMessages.map(\.role) == [.user])
+        #expect(first.note.conversationSummaries.isEmpty)
+        #expect(second.aiChatMessages.isEmpty)
+        #expect(second.note.conversationSummaries.isEmpty)
+    }
+
+    @Test("旧笔记 JSON 可读，聊天和手写各自保存不会覆盖对方内容")
+    func noteMigrationAndFieldMerge() throws {
+        let old = #"{"markdown":"旧笔记","updatedAt":0}"#
+        let decoded = try JSONDecoder().decode(NoteDocument.self, from: Data(old.utf8))
+        #expect(decoded.markdown == "旧笔记")
+        #expect(decoded.conversationSummaries.isEmpty)
+        let id = UUID()
+        let summary = NoteDocument.ConversationSummary(id: UUID(), markdown: "AI 建议：待核实。", createdAt: Date())
+        let stored = Project(id: id, title: "现值", sourceType: .liveRecording, note: NoteDocument(markdown: "最新手写"))
+        let incoming = Project(id: id, title: "旧副本", sourceType: .liveRecording,
+                               note: NoteDocument(markdown: "旧手写", conversationSummaries: [summary]))
+        var projects = [stored]
+        ProjectPersistence.upsert(incoming, into: &projects, fields: .aiContext)
+        ProjectPersistence.upsert(incoming, into: &projects, fields: .aiContext)
+        #expect(stored.note.markdown == "最新手写")
+        #expect(stored.note.conversationSummaries.count == 1)
+        incoming.note.conversationSummaries = []
+        incoming.note.markdown = "再补充手写"
+        ProjectPersistence.upsert(incoming, into: &projects, fields: .note)
+        #expect(stored.note.markdown == "再补充手写")
+        #expect(stored.note.conversationSummaries == [summary])
+    }
+
+    @Test("自动归结保持本地权限边界，授权后才影响完整总结输入指纹")
+    func generatedNotesRespectContextPermission() {
+        let project = Project(title: "权限", sourceType: .liveRecording)
+        let before = FinalReportFingerprint.make(for: project)
+        project.note.conversationSummaries = [.init(id: UUID(), markdown: "AI 建议：测试笔记", createdAt: Date())]
+        #expect(FinalReportFingerprint.make(for: project) == before)
+        let disabled = ProjectAIChatRequestBuilder.make(project: project, currentRequest: "继续", noteMarkdown: project.note.combinedMarkdown())
+        #expect(disabled.noteMarkdown == nil)
+        project.noteAIContextEnabled = true
+        let enabledBefore = FinalReportFingerprint.make(for: project)
+        let enabled = ProjectAIChatRequestBuilder.make(project: project, currentRequest: "继续", noteMarkdown: project.note.combinedMarkdown())
+        #expect(enabled.noteMarkdown?.contains("AI 建议：测试笔记") == true)
+        project.note.conversationSummaries[0].markdown = "AI 建议：新内容"
+        #expect(FinalReportFingerprint.make(for: project) != enabledBefore)
     }
 
     // MARK: - 拖放引用文档校验

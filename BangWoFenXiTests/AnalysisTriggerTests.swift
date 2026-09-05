@@ -98,4 +98,64 @@ struct AnalysisTriggerTests {
         #expect(trigger.msUntilReady(atMs: 12_000) == 8_000)
         #expect(trigger.msUntilReady(atMs: 25_000) == 0)
     }
+
+    @Test("实时连续发言达到最大等待后必须分析")
+    func continuousSpeechHonorsMaximumWait() {
+        var trigger = AnalysisTrigger.liveRecording
+        for now: Int64 in stride(from: 0, through: 28_000, by: 4_000) {
+            trigger.noteNewSegment(atMs: now)
+            #expect(!trigger.readyToFire(atMs: now))
+        }
+
+        #expect(trigger.msUntilReady(atMs: 28_000) == 2_000)
+        #expect(!trigger.readyToFire(atMs: 29_999))
+        #expect(!trigger.debounceSatisfied(atMs: 30_000))
+        #expect(trigger.readyToFire(atMs: 30_000))
+        #expect(trigger.msUntilReady(atMs: 30_000) == 0)
+    }
+
+    @Test("最大等待不能绕过失败退避")
+    func maximumWaitPreservesFailureBackoff() {
+        var trigger = AnalysisTrigger.liveRecording
+        trigger.noteNewSegment(atMs: 0)
+        trigger.noteNewSegment(atMs: 4_000)
+        trigger.noteFailure(atMs: 29_000)
+        trigger.noteNewSegment(atMs: 58_000)
+
+        #expect(trigger.msUntilReady(atMs: 58_000) == 1_000)
+        #expect(!trigger.readyToFire(atMs: 58_999))
+        #expect(trigger.readyToFire(atMs: 59_000))
+        #expect(trigger.msUntilReady(atMs: 59_000) == 0)
+    }
+
+    @Test("成功后保留在途新增片段的实际等待起点")
+    func partialSuccessKeepsPendingArrivalTime() {
+        var trigger = AnalysisTrigger.liveRecording
+        trigger.noteNewSegment(atMs: 0)
+        trigger.noteNewSegment(atMs: 4_000)
+        let observedCount = trigger.newSegmentCount
+        trigger.noteNewSegment(atMs: 25_000)
+        trigger.noteSuccess(atMs: 29_000, consumingNewSegmentCount: observedCount)
+
+        #expect(trigger.newSegmentCount == 1)
+        #expect(!trigger.readyToFire(atMs: 30_000))
+        trigger.noteNewSegment(atMs: 52_000)
+        #expect(!trigger.readyToFire(atMs: 52_000))
+        #expect(trigger.msUntilReady(atMs: 52_000) == 3_000)
+        #expect(trigger.readyToFire(atMs: 55_000))
+    }
+
+    @Test("长时间无内容后恢复发言仍保留正常防抖")
+    func newSpeechAfterIdleStillDebounces() {
+        var trigger = AnalysisTrigger.liveRecording
+        trigger.noteNewSegment(atMs: 0)
+        trigger.noteNewSegment(atMs: 4_000)
+        trigger.noteSuccess(atMs: 9_000)
+        trigger.noteNewSegment(atMs: 100_000)
+        trigger.noteNewSegment(atMs: 100_001)
+
+        #expect(!trigger.readyToFire(atMs: 100_002))
+        #expect(trigger.msUntilReady(atMs: 100_002) == 4_999)
+        #expect(trigger.readyToFire(atMs: 105_001))
+    }
 }

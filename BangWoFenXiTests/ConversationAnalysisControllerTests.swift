@@ -303,6 +303,101 @@ final class ConversationAnalysisControllerTests {
                 "只重发旧片段时不得使分析游标回退")
     }
 
+    @Test("云端更正与晚到旧时间戳片段经运行时同步后重新进入分析")
+    func cloudRevisionsFlowThroughRuntimeIntoAnalysis() async throws {
+        let correctedSpeaker = Speaker(
+            cloudAlias: "p_02", displayName: "李经理", role: "项目负责人"
+        )
+        project.speakers.append(correctedSpeaker)
+        let original = TranscriptSegment(
+            startMs: 0, endMs: 2_000,
+            text: "本次试点需要由采购负责人再次确人。",
+            participantId: project.speakers[0].id, source: .local, state: .final
+        )
+        let later = TranscriptSegment(
+            startMs: 8_000, endMs: 10_000, text: "流程确认以后再扩围。",
+            participantId: project.speakers[0].id, source: .local, state: .final
+        )
+        project.segments = [original, later]
+        project.analysisSnapshots = [ConversationAnalysisSnapshot(
+            version: 1, analyzedThroughMs: 10_000,
+            items: [AnalysisItem(
+                category: .possibleMotive, text: "等待采购确认。",
+                subjectSpeakerId: project.speakers[0].id,
+                epistemicStatus: .inference, confidence: .medium,
+                evidenceSegmentIds: [original.id]
+            )]
+        )]
+        let clock = nowBox
+        let analysis = ConversationAnalysisController(
+            service: mock, triggerConfig: .liveRecording,
+            nowMs: { clock.withLock { $0 } }
+        )
+        analysis.attach(to: project)
+        let meeting = try ProjectRuntimeSession.makeRuntimeMeeting(from: project)
+        let transcription = LocalTranscriptionController(service: MockLocalTranscriptionService())
+        transcription.attach(to: meeting)
+        var persistedCount = 0
+        let runtime = ProjectRuntimePersistenceController(
+            meeting: meeting, project: project,
+            persist: { _ in persistedCount += 1 }, debounce: .seconds(60)
+        )
+        transcription.onFinalSegment = { runtime.schedule() }
+        transcription.onNewFinalSegment = { segmentID in
+            analysis.noteNewFinalSegment(segmentID: segmentID)
+        }
+        mock.resultQueue = [ConversationAnalysisOutputDTO(
+            headline: "已按云端更正更新", detectedScenario: nil, scenarioConfidence: nil,
+            items: [ConversationAnalysisOutputDTO.ItemDTO(
+                category: "possible_motive", text: "项目负责人正在推进确认。",
+                subjectSpeakerId: "p_02", epistemicStatus: "inference", confidence: "medium",
+                evidenceSegmentIds: [original.id.uuidString]
+            )]
+        )]
+
+        transcription.applyCloudSegment(
+            wallStartMs: 0, wallEndMs: 2_000,
+            text: "本次试点需要由采购负责人再次确认。",
+            participantId: correctedSpeaker.id, remoteSpeakerLabel: "p_02"
+        )
+        transcription.applyCloudSegment(
+            wallStartMs: 4_000, wallEndMs: 6_000, text: "补充验收口径后再定目标。",
+            participantId: project.speakers[0].id, remoteSpeakerLabel: "p_01"
+        )
+        let lateID = try #require(meeting.segments.first { $0.startMs == 4_000 }?.id)
+        #expect(project.segments.count == 2)
+        #expect(project.segments.first?.text == "本次试点需要由采购负责人再次确人。")
+        #expect(!project.segments.contains { $0.id == lateID },
+                "变更通知发出时，新增片段尚未同步到 Project")
+        #expect(runtime.hasPendingChanges)
+        #expect(persistedCount == 0)
+
+        #expect(runtime.flush())
+        #expect(persistedCount == 1)
+        advance(5_100)
+        await analysis.tick()
+
+        #expect(mock.calls.count == 1)
+        let inputData = try #require(mock.calls.last?.inputJSON.data(using: .utf8))
+        let input = try #require(
+            try JSONSerialization.jsonObject(with: inputData) as? [String: Any]
+        )
+        let untrusted = try #require(input["untrusted_transcript_data"] as? [String: Any])
+        let segments = try #require(untrusted["new_segments"] as? [[String: Any]])
+        #expect(segments.compactMap { $0["id"] as? String } == [original.id.uuidString, lateID.uuidString])
+        #expect(segments.compactMap { $0["text"] as? String } == [
+            "本次试点需要由采购负责人再次确认。", "补充验收口径后再定目标。"
+        ])
+        #expect(segments.first?["speaker_id"] as? String == "p_02")
+        #expect(analysis.currentSnapshot?.analyzedThroughMs == 10_000)
+        #expect(analysis.currentSnapshot?.version == 2)
+        #expect(analysis.currentSnapshot?.items.first?.subjectSpeakerId == correctedSpeaker.id)
+
+        advance(60_000)
+        await analysis.tick()
+        #expect(mock.calls.count == 1, "已消费的云端修订不应重复分析")
+    }
+
     @Test("AI 推断卡片可独立确认说话人并持久化，不篡改多条证据原话")
     func confirmsAnalysisItemSpeakerWithoutChangingTranscript() async throws {
         let first = addFinalSegment(startMs: 0, text: "甲方提问。")

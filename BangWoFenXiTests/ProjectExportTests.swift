@@ -4,6 +4,25 @@ import Testing
 
 @Suite("项目资料包导出")
 struct ProjectExportTests {
+    @Test("仅有 AI 归结也可作为项目笔记导出")
+    func exportsConversationNotes() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = Project(title: "合成笔记", sourceType: .liveRecording,
+            note: NoteDocument(conversationSummaries: [
+                .init(id: UUID(), markdown: "- AI 建议：先核对数量。", createdAt: Date())
+            ]))
+        let service = ProjectExportService()
+        #expect(service.availableContents(project: project, recordingURL: nil).contains(.projectNote))
+        let result = try service.export(project: project, recordingURL: nil, contents: [.projectNote], to: root)
+        let files = try FileManager.default.contentsOfDirectory(at: result, includingPropertiesForKeys: nil)
+        #expect(files.count == 1)
+        let text = try String(contentsOf: #require(files.first), encoding: .utf8)
+        #expect(text.contains("AI 对话归结"))
+        #expect(text.contains("AI 建议：先核对数量。"))
+    }
+
     @Test("按勾选项分别导出录音、转写和分析")
     func selectedContentsOnly() throws {
         let root = FileManager.default.temporaryDirectory

@@ -83,7 +83,7 @@ struct ProjectExportService {
         if !project.aiChatMessages.isEmpty {
             result.insert(.aiCollaboration)
         }
-        if !project.note.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if !project.note.combinedMarkdown().trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             result.insert(.projectNote)
         }
         return result
@@ -146,7 +146,7 @@ struct ProjectExportService {
         case .aiCollaboration:
             return collaborationMarkdown(project)
         case .projectNote:
-            return "# 项目笔记：\(project.title)\n\n\(project.note.markdown)\n"
+            return "# 项目笔记：\(project.title)\n\n\(project.note.combinedMarkdown())\n"
         }
     }
 

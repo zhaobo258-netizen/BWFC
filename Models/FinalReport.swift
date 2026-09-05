@@ -194,7 +194,7 @@ enum FinalReportFingerprint {
                 : "legacy_note_disabled"
         )
         if project.noteAIContextEnabled {
-            lines.append("legacy_note\u{1F}\(project.note.markdown)")
+            lines.append("legacy_note\u{1F}\(project.note.combinedMarkdown())")
         }
         lines.append(contentsOf: project.aiChatMessages.map { message in
             [

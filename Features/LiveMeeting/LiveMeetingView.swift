@@ -507,7 +507,7 @@ struct LiveMeetingView: View {
             try? environment.persist(loaded)
         }
         // 新最终片段驱动分析调度（本地与云端确认都会触发）
-        controller.onNewFinalSegment = { [weak analysisController] in
+        controller.onNewFinalSegment = { [weak analysisController] _ in
             analysisController?.noteNewFinalSegment()
         }
         analysis = analysisController

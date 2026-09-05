@@ -37,7 +37,7 @@ final class LocalTranscriptionController {
     /// 最终片段入库回调（由视图层注入持久化）
     var onFinalSegment: (() -> Void)?
     /// 新最终片段到达回调（阶段 4：驱动分析调度器）
-    var onNewFinalSegment: (() -> Void)?
+    var onNewFinalSegment: ((UUID) -> Void)?
 
     /// 语言资源下载进度（nil = 未在下载；0…1）
     private(set) var assetDownloadProgress: Double?
@@ -291,14 +291,14 @@ final class LocalTranscriptionController {
             remoteSpeakerLabel: remoteSpeakerLabel
         )
         switch outcome {
-        case .inserted:
+        case .inserted(let segment):
             syncMeetingSegmentsWithReconciler()
             onFinalSegment?()
-            onNewFinalSegment?()
-        case .updated:
+            onNewFinalSegment?(segment.id)
+        case .updated(let segment):
             syncMeetingSegmentsWithReconciler()
             onFinalSegment?()
-            onNewFinalSegment?()
+            onNewFinalSegment?(segment.id)
         case .duplicate(let existing):
             if existing.speakerWasUserConfirmed != true,
                let participantId, existing.participantId != participantId {
@@ -307,7 +307,7 @@ final class LocalTranscriptionController {
                 existing.updatedAt = Date()
                 syncMeetingSegmentsWithReconciler()
                 onFinalSegment?()
-                onNewFinalSegment?()
+                onNewFinalSegment?(existing.id)
             }
         case .skippedManual, .discardedEmpty:
             break
@@ -334,10 +334,10 @@ final class LocalTranscriptionController {
                 endMs: endWallMs,
                 text: TranscriptCorrector.autoCorrect(result.text, rules: correctionRules)
             )
-            if case .inserted = outcome {
+            if case .inserted(let segment) = outcome {
                 syncMeetingSegmentsWithReconciler()
                 onFinalSegment?()
-                onNewFinalSegment?()
+                onNewFinalSegment?(segment.id)
             }
             // 最终结果：立即发布（并取消未执行的尾随刷新）
             pendingFlushTask?.cancel()

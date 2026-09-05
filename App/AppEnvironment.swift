@@ -91,7 +91,9 @@ enum ProjectPersistence {
         case .all:
             break
         case .note:
-            stored.note = incoming.note
+            stored.note.markdown = incoming.note.markdown
+            stored.note.updatedAt = max(stored.note.updatedAt, incoming.note.updatedAt)
+            stored.note.lastSyncedHash = incoming.note.lastSyncedHash
         case .title:
             stored.title = incoming.title
             stored.lastActivityAt = incoming.lastActivityAt
@@ -149,6 +151,14 @@ enum ProjectPersistence {
             stored.aiChatMessages = incoming.aiChatMessages
             stored.aiChatDraft = incoming.aiChatDraft
             stored.noteAIContextEnabled = incoming.noteAIContextEnabled
+            let existingSummaryIDs = Set(stored.note.conversationSummaries.map(\.id))
+            let newSummaries = incoming.note.conversationSummaries.filter {
+                !existingSummaryIDs.contains($0.id)
+            }
+            if !newSummaries.isEmpty {
+                stored.note.conversationSummaries.append(contentsOf: newSummaries)
+                stored.note.updatedAt = max(stored.note.updatedAt, incoming.note.updatedAt)
+            }
         case .importPipeline:
             stored.status = incoming.status
             stored.processingJobs = incoming.processingJobs

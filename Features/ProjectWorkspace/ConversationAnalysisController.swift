@@ -63,8 +63,13 @@ final class ConversationAnalysisController {
     }
 
     /// 新最终片段到达（转写控制器回调）
-    func noteNewFinalSegment() {
+    func noteNewFinalSegment(segmentID: UUID? = nil) {
         trigger.noteNewSegment(atMs: nowMs())
+        if let segmentID {
+            // 云端回填可能早于游标，且此时运行时片段尚未同步到 Project。
+            speakerContextRevision += 1
+            pendingSpeakerContextRevisions[segmentID] = speakerContextRevision
+        }
     }
 
     /// 旧片段的说话人/角色修正后，将它重新纳入下一次增量分析。

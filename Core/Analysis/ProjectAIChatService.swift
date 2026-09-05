@@ -429,6 +429,7 @@ struct ProjectAIChatResponse: Sendable, Equatable {
     var reply: String
     var provider: AIProviderDescriptor
     var transcriptCorrections: [ProjectAIChatTranscriptCorrection] = []
+    var noteSummary: String? = nil
     var sources: [ProjectAIChatSource] = []
 }
 
@@ -517,6 +518,7 @@ struct ProjectAIChatAgent: ProjectAIChatServing {
                 dto.transcriptCorrections,
                 request: groundedRequest
             ),
+            noteSummary: dto.noteSummary,
             sources: Self.validatedSources(
                 dto.sourceIDs,
                 available: groundedRequest.webSources
@@ -879,6 +881,7 @@ struct ProjectAIChatAgent: ProjectAIChatServing {
 
     private struct OutputDTO: Decodable {
         var reply: String
+        var noteSummary: String?
         var transcriptCorrections: [TranscriptCorrectionDTO]
         var sourceIDs: [String]
 
@@ -895,6 +898,7 @@ struct ProjectAIChatAgent: ProjectAIChatServing {
 
         enum CodingKeys: String, CodingKey {
             case reply
+            case noteSummary = "note_summary"
             case transcriptCorrections = "transcript_corrections"
             case sourceIDs = "source_ids"
         }
@@ -902,6 +906,11 @@ struct ProjectAIChatAgent: ProjectAIChatServing {
         init(from decoder: any Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             reply = try container.decode(String.self, forKey: .reply)
+            let summary = try? container.decode(String.self, forKey: .noteSummary)
+            noteSummary = summary.flatMap {
+                let trimmed = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.count <= 1_200 ? trimmed : nil
+            }
             transcriptCorrections = try container.decodeIfPresent(
                 [TranscriptCorrectionDTO].self,
                 forKey: .transcriptCorrections

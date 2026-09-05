@@ -89,7 +89,7 @@ struct ProjectAIChatView: View {
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("此前笔记和逐字稿不会删除；已有完整总结会标记为需要更新。")
+            Text("手写笔记、已归结笔记和逐字稿不会删除；已有完整总结会标记为需要更新。")
         }
         .onDisappear { speechController?.handleDisappear() }
     }
@@ -129,7 +129,7 @@ struct ProjectAIChatView: View {
                 }
             }
             HStack(spacing: 6) {
-                Text("记录想法，发送后 AI 反馈")
+                Text(controller.noteSummaryStatus ?? "每次回应后自动归结笔记")
                 Spacer()
                 Label("纳入完整总结", systemImage: "doc.text")
                     .foregroundStyle(BWTheme.accent)
@@ -354,7 +354,7 @@ struct ProjectAIChatView: View {
     private func legacyNoteCard(_ note: String) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 6) {
-                Label("此前笔记", systemImage: "note.text")
+                Label("项目笔记", systemImage: "note.text")
                     .font(.caption)
                     .fontWeight(.semibold)
                 Spacer()
@@ -369,7 +369,7 @@ struct ProjectAIChatView: View {
                 )
                 .toggleStyle(.switch)
                 .controlSize(.mini)
-                .help("开启后，此前笔记会用于 AI 回应、开花和完整总结的共创章节")
+                .help("开启后，项目笔记会用于 AI 回应、开花和完整总结的共创章节")
             }
 
             Text(note)
@@ -382,7 +382,7 @@ struct ProjectAIChatView: View {
             HStack {
                 Text(
                     legacyNoteContextEnabled
-                        ? "作为用户观点使用，不会混成录音事实"
+                        ? "区分用户观点与 AI 建议，不会混成录音事实"
                         : "原文保留在本机，暂不发送给 AI"
                 )
                 .font(.caption2)
@@ -684,9 +684,10 @@ struct ProjectAIChatView: View {
     }
 
     private var normalizedLegacyNote: String? {
-        let trimmed = legacyNoteMarkdown.trimmingCharacters(
-            in: .whitespacesAndNewlines
-        )
+        let trimmed = NoteDocument(
+            markdown: legacyNoteMarkdown,
+            conversationSummaries: controller.conversationSummaries
+        ).combinedMarkdown().trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
 }

@@ -157,7 +157,11 @@ struct ProjectWorkspaceView: View {
         }
         .onReceive(chunkPollTimer) { _ in
             diarization?.pollProgress()
-            Task { await analysis?.tick() }
+            Task {
+                guard runtimePersistence?.saveError == nil,
+                      runtimePersistence?.flush() ?? true else { return }
+                await analysis?.tick()
+            }
         }
         .onChange(of: importJobsStatusKey) { _, _ in
             reloadImportedProjectFromStore()
@@ -1899,8 +1903,8 @@ struct ProjectWorkspaceView: View {
             },
             automaticallyBloomNewSeeds: false
         )
-        knowledgeController.noteContextProvider = { [weak noteController] in
-            noteController?.markdown
+        knowledgeController.noteContextProvider = { [weak noteController, weak project] in
+            project?.note.combinedMarkdown(manualMarkdown: noteController?.markdown)
         }
         knowledgeController.onUpdated = { [environment] in
             do {
@@ -1918,8 +1922,8 @@ struct ProjectWorkspaceView: View {
                 try environment.persist(project, fields: .aiContext)
             }
         )
-        chatController.noteContextProvider = { [weak noteController] in
-            noteController?.markdown
+        chatController.noteContextProvider = { [weak noteController, weak project] in
+            project?.note.combinedMarkdown(manualMarkdown: noteController?.markdown)
         }
         chatController.relatedProjectsProvider = { [environment, weak project] in
             guard let project else { return [] }
@@ -2003,8 +2007,8 @@ struct ProjectWorkspaceView: View {
             knowledgeController.refreshCandidates()
         }
         // 新最终片段驱动分析调度
-        controller.onNewFinalSegment = { [weak analysisController] in
-            analysisController?.noteNewFinalSegment()
+        controller.onNewFinalSegment = { [weak analysisController] segmentID in
+            analysisController?.noteNewFinalSegment(segmentID: segmentID)
         }
         analysis = analysisController
     }

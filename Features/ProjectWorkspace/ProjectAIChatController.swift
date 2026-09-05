@@ -22,6 +22,8 @@ final class ProjectAIChatController {
             scheduleDraftAutosave()
         }
     }
+    private(set) var conversationSummaries: [NoteDocument.ConversationSummary] = []
+    private(set) var noteSummaryStatus: String?
     private(set) var isSending = false
     private(set) var isLoadingAttachments = false
     private(set) var pendingAttachments: [ProjectAIChatAttachment] = []
@@ -65,6 +67,8 @@ final class ProjectAIChatController {
     func attach(to project: Project) {
         invalidateResponse()
         draftAutosaveTask?.cancel()
+        noteSummaryStatus = nil
+        conversationSummaries = project.note.conversationSummaries
         self.project = project
         messages = project.aiChatMessages
         setDraftWithoutAutosave(project.aiChatDraft)
@@ -206,6 +210,7 @@ final class ProjectAIChatController {
     ) async {
         let requestID = UUID()
         activeRequestID = requestID
+        noteSummaryStatus = nil
         contextCoverageMessage = request.transcriptCoverage.flatMap {
             $0.isPartial ? $0.notice : nil
         }
@@ -229,22 +234,41 @@ final class ProjectAIChatController {
                   self.project?.id == project.id else { return }
             let reply = replyWithCorrectionStatus(response, request: request)
                 + (contextCoverageMessage.map { "\n\n" + $0 } ?? "")
-            project.aiChatMessages.append(ProjectAIChatMessage(
+            let assistantMessage = ProjectAIChatMessage(
                 role: .assistant,
                 text: reply,
                 providerName: response.provider.displayName,
                 modelID: response.provider.modelID,
                 sources: response.sources
-            ))
+            )
+            project.aiChatMessages.append(assistantMessage)
+            if let summary = response.noteSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !summary.isEmpty, summary.count <= 1_200 {
+                project.note.conversationSummaries.append(.init(
+                    id: assistantMessage.id,
+                    markdown: summary,
+                    createdAt: assistantMessage.createdAt
+                ))
+                project.note.updatedAt = assistantMessage.createdAt
+            }
             project.aiChatMessages = ProjectAIChatRetention.keepingMostRecent(
                 project.aiChatMessages
             )
             messages = project.aiChatMessages
+            conversationSummaries = project.note.conversationSummaries
             do {
                 try persist(project)
+                if project.note.conversationSummaries.contains(where: { $0.id == assistantMessage.id }) {
+                    noteSummaryStatus = "本轮已自动归结笔记"
+                } else if response.noteSummary == "" {
+                    noteSummaryStatus = "本轮没有需要归结的新内容"
+                } else {
+                    noteSummaryStatus = "本轮未生成笔记，回应已保留"
+                }
                 onConversationUpdated()
             } catch {
-                errorMessage = "AI 已回应，但本地保存失败，请先复制回应内容。"
+                noteSummaryStatus = nil
+                errorMessage = "AI 已回应，但对话与笔记本地保存失败，请先复制内容。"
             }
         } catch let error as AnalysisAPIError {
             guard activeRequestID == requestID else { return }

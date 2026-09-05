@@ -50,6 +50,8 @@ final class LocalTranscriptionControllerTests {
                                           speakerWasUserConfirmed: true)
         meeting.segments = [first, confirmed]
         controller.attach(to: meeting)
+        var changedIDs: [UUID] = []
+        controller.onNewFinalSegment = { changedIDs.append($0) }
         let known = UUID()
         for segment in [first, confirmed] {
             controller.applyCloudSegment(wallStartMs: segment.startMs, wallEndMs: segment.endMs,
@@ -62,8 +64,59 @@ final class LocalTranscriptionControllerTests {
         #expect(first.text == "库存需要盘点")
         #expect(first.isStarred)
         #expect(confirmed.participantId == confirmedID)
+        #expect(changedIDs == [first.id], "人工确认人物不可被云端覆盖或触发重新分析")
+        controller.applyCloudSegment(wallStartMs: first.startMs, wallEndMs: first.endMs,
+                                     text: first.text, participantId: known,
+                                     remoteSpeakerLabel: "p_01")
+        #expect(changedIDs == [first.id], "内容与人物均未变化时不得重复触发")
         #expect(mock.startSessionCalls.isEmpty)
         #expect(controller.runState == .idle)
+    }
+
+    @Test("云端更正文稿和人物传递稳定片段 ID，空结果和人工文字不触发")
+    func cloudCorrectionNotifiesOnlyChangedSegments() throws {
+        let meeting = try makeMeeting()
+        let original = TranscriptSegment(
+            startMs: 0, endMs: 3_000,
+            text: "本次试点需要由采购负责人再次确人。",
+            participantId: UUID(), source: .local, state: .final
+        )
+        let manual = TranscriptSegment(
+            startMs: 4_000, endMs: 7_000, text: "这句话已经人工修订。",
+            participantId: UUID(), source: .manual, state: .edited
+        )
+        let manualSpeakerID = manual.participantId
+        meeting.segments = [original, manual]
+        controller.attach(to: meeting)
+        var changedIDs: [UUID] = []
+        var persistedCount = 0
+        controller.onNewFinalSegment = { changedIDs.append($0) }
+        controller.onFinalSegment = { persistedCount += 1 }
+        let correctedSpeakerID = UUID()
+
+        controller.applyCloudSegment(
+            wallStartMs: 0, wallEndMs: 3_000,
+            text: "本次试点需要由采购负责人再次确认。",
+            participantId: correctedSpeakerID, remoteSpeakerLabel: "p_02"
+        )
+        controller.applyCloudSegment(
+            wallStartMs: 4_000, wallEndMs: 7_000,
+            text: "云端结果不得覆盖人工修订。",
+            participantId: correctedSpeakerID, remoteSpeakerLabel: "p_02"
+        )
+        controller.applyCloudSegment(
+            wallStartMs: 8_000, wallEndMs: 9_000, text: "  \n  ",
+            participantId: correctedSpeakerID, remoteSpeakerLabel: "p_02"
+        )
+
+        #expect(meeting.segments.map(\.id) == [original.id, manual.id])
+        #expect(original.text == "本次试点需要由采购负责人再次确认。")
+        #expect(original.participantId == correctedSpeakerID)
+        #expect(original.source == .cloud)
+        #expect(manual.text == "这句话已经人工修订。")
+        #expect(manual.participantId == manualSpeakerID)
+        #expect(changedIDs == [original.id])
+        #expect(persistedCount == 1)
     }
 
     @Test("不可用则拒绝启动并给出真实原因")

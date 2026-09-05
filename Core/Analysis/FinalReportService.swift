@@ -165,7 +165,7 @@ enum ProjectAIContextBuilder {
                 project.aiChatMessages
             ),
             legacyNoteMarkdown: project.noteAIContextEnabled
-                ? normalizedLegacyNote(project.note.markdown)
+                ? normalizedLegacyNote(project.note.combinedMarkdown())
                 : nil,
             projectBackgroundContext: RelatedProjectContextBuilder
                 .normalizedCurrentBackground(
