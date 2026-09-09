@@ -93,6 +93,8 @@ struct TranscriptPanelView: View {
     var onGlobalCorrect: ((String, String) -> Int)?
     /// 打开完整指认弹层：可选已有/新建人物，并显式批量标注未确认发言。
     var onRequestSpeakerAssignment: ((TranscriptSegment) -> Void)?
+    /// 「就这句问 AI」：把该片段设为当前提问范围（M2 原话页）
+    var onAskAI: ((TranscriptSegment) -> Void)?
     /// 合并分析项目用：展示该片段来自哪段原始录音及其原始时间戳。
     var sourceRecordingTitle: ((TranscriptSegment) -> String?)? = nil
     var sourceRecordingStartMs: ((TranscriptSegment) -> Int64)? = nil
@@ -313,6 +315,11 @@ struct TranscriptPanelView: View {
                 }
             }
         }
+        Button("就这句问 AI…") {
+            guard let segment = segment(for: row) else { return }
+            onAskAI?(segment)
+        }
+        .disabled(onAskAI == nil)
         Button("修改文字…") {
             guard let segment = segment(for: row) else { return }
             editingText = segment.text

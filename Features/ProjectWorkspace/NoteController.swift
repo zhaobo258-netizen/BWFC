@@ -15,6 +15,8 @@ final class NoteController {
     private(set) var lastSavedAt: Date?
     /// 最近一次保存失败的真实描述（保存失败 edge case：如实显示，不掩盖）
     private(set) var saveError: String?
+    /// 可观察的摘入记录，让收起笔记时的归结卡也能即时刷新。
+    private(set) var insertedSummaryIDs: [UUID]
 
     private let project: Project
     private let persist: (Project) throws -> Void
@@ -36,6 +38,7 @@ final class NoteController {
         self.persist = persist
         self.debounce = debounce
         self.markdown = project.note.markdown
+        self.insertedSummaryIDs = project.note.insertedSummaryIDs
         self.lastSavedAt = nil
     }
 
@@ -50,7 +53,20 @@ final class NoteController {
     func loadFromProject() {
         isLoading = true
         markdown = project.note.markdown
+        insertedSummaryIDs = project.note.insertedSummaryIDs
         isLoading = false
+    }
+
+    @discardableResult
+    func insertSummary(_ summary: NoteDocument.ConversationSummary) -> NoteExcerptInsertion.Result {
+        var nextMarkdown = markdown
+        var nextIDs = insertedSummaryIDs
+        let result = NoteExcerptInsertion.insert(summary: summary, into: &nextMarkdown, insertedIDs: &nextIDs)
+        guard case .inserted = result else { return result }
+        insertedSummaryIDs = nextIDs
+        update(markdown: nextMarkdown)
+        saveNow()
+        return result
     }
 
     /// 立即保存（视图消失、结束录音、返回首页前等时机调用）。
@@ -74,6 +90,7 @@ final class NoteController {
 
     private func writeThrough() {
         project.note.markdown = markdown
+        project.note.insertedSummaryIDs = insertedSummaryIDs
         project.note.updatedAt = Date()
         do {
             try persist(project)
@@ -84,5 +101,37 @@ final class NoteController {
             saveError = String(describing: type(of: error))
             AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent("note_save_failed", error: String(describing: type(of: error))))
         }
+    }
+}
+
+/// 「摘入笔记」的纯逻辑（M2）：按稳定 ID 去重，只追加本次摘入的内容，
+/// 不覆盖后续手写输入，也不创建假撤销入口。
+enum NoteExcerptInsertion {
+    enum Result: Equatable {
+        case inserted(UUID)
+        case duplicate
+        case emptySummary
+    }
+
+    static func insert(
+        summary: NoteDocument.ConversationSummary,
+        into markdown: inout String,
+        insertedIDs: inout [UUID],
+        now: Date = Date()
+    ) -> Result {
+        let trimmed = summary.markdown.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard !trimmed.isEmpty else { return .emptySummary }
+        guard !insertedIDs.contains(summary.id) else { return .duplicate }
+        let dateText = now.formatted(date: .abbreviated, time: .shortened)
+        let content = "> **AI 归结摘入**（\(dateText)，轮次 \(summary.id.uuidString.prefix(8))）\n\n\(trimmed)\n"
+        // 只追加：不删除、不 trim 既有正文的任何字符
+        let isEmptyNote = markdown.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).isEmpty
+        markdown += (isEmptyNote ? "" : "\n\n---\n\n") + content
+        insertedIDs.append(summary.id)
+        return .inserted(summary.id)
     }
 }

@@ -16,6 +16,10 @@ final class ProjectAIChatController {
     private var isRestoringDraft = false
 
     private(set) var messages: [ProjectAIChatMessage] = []
+    /// 当前项目的共创提问范围（A 版 M1，供未来 UI 绑定）。
+    private(set) var queryScope: ProjectAIChatQueryScope = .wholeConversation
+    /// 模型已回应但本地保存失败时，内存中保留的待重存回复标记。
+    private(set) var hasUnsavedReply = false
     var draft = "" {
         didSet {
             guard !isRestoringDraft else { return }
@@ -71,12 +75,39 @@ final class ProjectAIChatController {
         conversationSummaries = project.note.conversationSummaries
         self.project = project
         messages = project.aiChatMessages
+        queryScope = project.aiChatQueryScope ?? .wholeConversation
+        if queryScope.isStrictSegments { isWebSearchEnabled = false }
+        hasUnsavedReply = false
         setDraftWithoutAutosave(project.aiChatDraft)
         pendingAttachments = []
         errorMessage = messages.last?.role == .user
             ? "上次消息尚未获得回答，可直接重试。" : nil
         draftSaveError = nil
         contextCoverageMessage = nil
+    }
+
+    /// 设置当前范围并按项目保存（保存失败时回滚并如实报告，不静默丢失）。
+    /// 不会清掉「上一轮失败、可重试」的错误提示：切换草稿范围不能让重试入口消失。
+    @discardableResult
+    func setQueryScope(_ scope: ProjectAIChatQueryScope) -> Bool {
+        guard let project else { return false }
+        let previous = project.aiChatQueryScope
+        let hadUnansweredLastMessage = messages.last?.role == .user
+        project.aiChatQueryScope = scope == .wholeConversation ? nil : scope
+        queryScope = project.aiChatQueryScope ?? .wholeConversation
+        do {
+            try persist(project)
+            if queryScope.isStrictSegments { isWebSearchEnabled = false }
+            if !hadUnansweredLastMessage {
+                errorMessage = nil
+            }
+            return true
+        } catch {
+            project.aiChatQueryScope = previous
+            queryScope = previous ?? .wholeConversation
+            errorMessage = "提问范围保存失败，范围未改变。"
+            return false
+        }
     }
 
     func addReferenceDocuments(from urls: [URL]) async {
@@ -146,21 +177,52 @@ final class ProjectAIChatController {
         draftAutosaveTask?.cancel()
         draftAutosaveTask = nil
 
-        let request = ProjectAIChatRequestBuilder.make(
-            project: project,
-            currentRequest: text,
-            noteMarkdown: noteContextProvider(),
-            currentAttachments: attachments,
-            relatedProjects: relatedProjectsProvider(),
-            confirmedMemories: confirmedMemoriesProvider(),
-            webSearchEnabled: isWebSearchEnabled
-        )
+        let scope = project.aiChatQueryScope ?? .wholeConversation
+        let request: ProjectAIChatRequest
+        do {
+            request = try ProjectAIChatRequestBuilder.makeForScope(
+                project: project,
+                scope: scope,
+                currentRequest: text,
+                noteMarkdown: noteContextProvider(),
+                currentAttachments: attachments,
+                relatedProjects: relatedProjectsProvider(),
+                confirmedMemories: confirmedMemoriesProvider(),
+                webSearchEnabled: isWebSearchEnabled
+            )
+        } catch let error as ProjectAIChatBuildError {
+            errorMessage = Self.scopeErrorMessage(for: error)
+            return
+        } catch {
+            errorMessage = "本次问题资料整理失败，尚未发送给 AI。"
+            return
+        }
         let previousMessages = project.aiChatMessages
         let previousDraft = project.aiChatDraft
+        let requestID = UUID()
+        // 实际纳入请求对话历史的上一轮消息（与 make 的 maxHistoryCount 口径一致）。
+        let historyMessages = Array(
+            project.aiChatMessages.suffix(
+                ProjectAIChatRequestBuilder.maximumHistoryCount
+            )
+        )
+        let (evidence, context) = ProjectAIChatRequestBuilder.snapshots(
+            projectID: project.id,
+            requestID: requestID,
+            scope: scope,
+            request: request,
+            project: project,
+            historyMessages: historyMessages
+        )
         project.aiChatMessages.append(ProjectAIChatMessage(
             role: .user,
             text: String(text.prefix(4_000)),
-            attachments: attachments
+            attachments: attachments,
+            turnID: requestID,
+            requestID: requestID,
+            queryScope: scope,
+            evidenceSnapshot: evidence,
+            contextSnapshot: context
         ))
         project.aiChatDraft = ""
         project.aiChatMessages = ProjectAIChatRetention.keepingMostRecent(
@@ -168,6 +230,7 @@ final class ProjectAIChatController {
         )
         do {
             try persist(project)
+            hasUnsavedReply = false
         } catch {
             project.aiChatMessages = previousMessages
             project.aiChatDraft = previousDraft
@@ -179,7 +242,13 @@ final class ProjectAIChatController {
         messages = project.aiChatMessages
         setDraftWithoutAutosave("")
         pendingAttachments = []
-        await perform(request, project: project)
+        await perform(
+            request,
+            project: project,
+            requestID: requestID,
+            evidenceSnapshot: evidence,
+            contextSnapshot: context
+        )
     }
 
     func retryLastMessage() async {
@@ -191,28 +260,94 @@ final class ProjectAIChatController {
             errorMessage = "最新录音文稿保存失败，尚未重试。"
             return
         }
-        let request = ProjectAIChatRequestBuilder.make(
-            project: project,
+        if let restored = ProjectAIChatRequestBuilder.restoredRequest(
             currentRequest: message.text,
-            noteMarkdown: noteContextProvider(),
-            currentAttachments: message.attachments,
-            relatedProjects: relatedProjectsProvider(),
-            confirmedMemories: confirmedMemoriesProvider(),
-            webSearchEnabled: isWebSearchEnabled,
-            excludingMessageID: message.id
+            evidence: message.evidenceSnapshot,
+            context: message.contextSnapshot,
+            scope: message.queryScope
+        ) {
+            let requestID = message.requestID ?? message.turnID ?? UUID()
+            await perform(
+                restored,
+                project: project,
+                requestID: requestID,
+                evidenceSnapshot: message.evidenceSnapshot,
+                contextSnapshot: message.contextSnapshot
+            )
+            return
+        }
+        // 旧消息（无快照、无轮次）不臆测来源：按整场对话兼容重建。
+        let scope = message.queryScope ?? project.aiChatQueryScope ?? .wholeConversation
+        guard !scope.isStrictSegments else {
+            errorMessage = "旧消息缺少可复用的来源快照，不能按片段重试；请重新提问。"
+            return
+        }
+        let request: ProjectAIChatRequest
+        do {
+            request = try ProjectAIChatRequestBuilder.makeForScope(
+                project: project,
+                scope: scope,
+                currentRequest: message.text,
+                noteMarkdown: noteContextProvider(),
+                currentAttachments: message.attachments,
+                relatedProjects: relatedProjectsProvider(),
+                confirmedMemories: confirmedMemoriesProvider(),
+                webSearchEnabled: isWebSearchEnabled,
+                excludingMessageID: message.id
+            )
+        } catch let error as ProjectAIChatBuildError {
+            errorMessage = Self.scopeErrorMessage(for: error)
+            return
+        } catch {
+            errorMessage = "重试资料整理失败，尚未重试。"
+            return
+        }
+        await perform(
+            request,
+            project: project,
+            requestID: UUID(),
+            evidenceSnapshot: nil,
+            contextSnapshot: nil
         )
-        await perform(request, project: project)
+    }
+
+    /// 模型已回应但保存失败时保留在内存，供 UI 后续「重新保存」；不自动重发模型。
+    @discardableResult
+    func saveUnsavedReply() -> Bool {
+        guard hasUnsavedReply, let project else { return false }
+        if project.aiChatMessages.last?.role != .assistant {
+            hasUnsavedReply = false
+            return true
+        }
+        do {
+            try persist(project)
+            hasUnsavedReply = false
+            noteSummaryStatus = "本轮回应已保存。"
+            errorMessage = nil
+            onConversationUpdated()
+            return true
+        } catch {
+            errorMessage = "AI 已回应，但保存仍然失败，内容仍保留在本机内存，请先复制。"
+            return false
+        }
     }
 
     private func perform(
         _ request: ProjectAIChatRequest,
-        project: Project
+        project: Project,
+        requestID: UUID,
+        evidenceSnapshot: ProjectAIChatEvidenceSnapshot?,
+        contextSnapshot: ProjectAIChatContextSnapshot?
     ) async {
-        let requestID = UUID()
         activeRequestID = requestID
         noteSummaryStatus = nil
-        contextCoverageMessage = request.transcriptCoverage.flatMap {
-            $0.isPartial ? $0.notice : nil
+        let scope = evidenceSnapshot?.scope ?? contextSnapshot?.scope
+        if scope?.isStrictSegments == true {
+            contextCoverageMessage = "本回答只使用所选片段原话与当前问题；未混入整场历史、分析、笔记或联网内容。"
+        } else {
+            contextCoverageMessage = request.transcriptCoverage.flatMap {
+                $0.isPartial ? $0.notice : nil
+            }
         }
         errorMessage = nil
         draftSaveError = nil
@@ -239,7 +374,12 @@ final class ProjectAIChatController {
                 text: reply,
                 providerName: response.provider.displayName,
                 modelID: response.provider.modelID,
-                sources: response.sources
+                sources: response.sources,
+                turnID: requestID,
+                requestID: requestID,
+                queryScope: scope,
+                evidenceSnapshot: evidenceSnapshot,
+                contextSnapshot: contextSnapshot
             )
             project.aiChatMessages.append(assistantMessage)
             if let summary = response.noteSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -247,7 +387,11 @@ final class ProjectAIChatController {
                 project.note.conversationSummaries.append(.init(
                     id: assistantMessage.id,
                     markdown: summary,
-                    createdAt: assistantMessage.createdAt
+                    createdAt: assistantMessage.createdAt,
+                    sourceTurnID: requestID,
+                    citedWebSources: response.sources,
+                    evidenceSegmentIDs: evidenceSnapshot?.sentSegments.map(\.id) ?? [],
+                    evidenceCopies: evidenceSnapshot?.sentSegments ?? []
                 ))
                 project.note.updatedAt = assistantMessage.createdAt
             }
@@ -258,6 +402,7 @@ final class ProjectAIChatController {
             conversationSummaries = project.note.conversationSummaries
             do {
                 try persist(project)
+                hasUnsavedReply = false
                 if project.note.conversationSummaries.contains(where: { $0.id == assistantMessage.id }) {
                     noteSummaryStatus = "本轮已自动归结笔记"
                 } else if response.noteSummary == "" {
@@ -268,7 +413,8 @@ final class ProjectAIChatController {
                 onConversationUpdated()
             } catch {
                 noteSummaryStatus = nil
-                errorMessage = "AI 已回应，但对话与笔记本地保存失败，请先复制内容。"
+                hasUnsavedReply = true
+                errorMessage = "AI 已回应，但对话与笔记本地保存失败，请先复制内容；内容保留在本机内存，可稍后重新保存。"
             }
         } catch let error as AnalysisAPIError {
             guard activeRequestID == requestID else { return }
@@ -311,6 +457,7 @@ final class ProjectAIChatController {
             try persist(project)
             invalidateResponse()
             messages = []
+            hasUnsavedReply = false
             errorMessage = nil
             contextCoverageMessage = nil
             onConversationUpdated()
@@ -369,6 +516,21 @@ final class ProjectAIChatController {
         }
     }
 
+    private static func scopeErrorMessage(for error: ProjectAIChatBuildError) -> String {
+        switch error {
+        case .emptyStrictSelection:
+            return "还没有可用的所选片段；片段不存在或尚未定稿时不会自动改发整场录音，请重新选择后提问。"
+        case .strictSelectionContainsInvalid:
+            return "所选片段中包含已失效或尚无最终文稿的条目，本次未发送任何内容；请重新选择后再提问。"
+        case .strictAttachmentsUnsupported:
+            return "“仅所选片段”范围暂不支持引用文档；请先移除引用文档，或切换到整场对话再发送。"
+        case .strictWebSearchUnsupported:
+            return "“仅所选片段”范围不会使用联网搜索；请关闭“联网搜索”，或切换到整场对话。"
+        case .strictSelectionExceedsLimit(let characterCount):
+            return "所选片段共 \(characterCount) 字，超过单次 \(ProjectAIChatRequestBuilder.maximumTranscriptCharacters) 字上限；请缩小所选片段范围后再提问。"
+        }
+    }
+
     private static func message(for error: AnalysisAPIError) -> String {
         switch error {
         case .missingAPIKey:
@@ -382,6 +544,8 @@ final class ProjectAIChatController {
             return "所选模型不可用；Kimi K3 需要相应会员权限，可在设置中切换模型。"
         case .timeout:
             return "AI 回应超时，可稍后重试。"
+        case .network:
+            return "网络连接失败，可点击“重试”继续。"
         case .rateLimited:
             return "AI 请求已达到额度或频率限制，请稍后重试。"
         case .invalidResponse:

@@ -86,23 +86,83 @@ struct NoteDocument: Codable, Sendable, Hashable {
         var id: UUID
         var markdown: String
         var createdAt: Date
+        /// 本轮 AI 归结关联的轮次标识；清空共创后仍可据此复核来源。
+        var sourceTurnID: UUID?
+        /// 该轮实际采用的联网来源副本（消息被清空后不悬空）。
+        var citedWebSources: [ProjectAIChatSource]
+        /// 该轮实际引用/涉及的原话证据片段 ID（发送时快照的稳定 UUID；便于快速索引）。
+        var evidenceSegmentIDs: [UUID]
+        /// 该轮实际外发原话的值快照副本（text/时间/说话人身份冻结）。
+        /// 聊天被裁剪或原文后来被修订时，仍可回看本归结“当时依据”，不悬空。
+        var evidenceCopies: [ProjectAIChatEvidenceSnapshot.SegmentCopy]
+
+        init(
+            id: UUID,
+            markdown: String,
+            createdAt: Date,
+            sourceTurnID: UUID? = nil,
+            citedWebSources: [ProjectAIChatSource] = [],
+            evidenceSegmentIDs: [UUID] = [],
+            evidenceCopies: [ProjectAIChatEvidenceSnapshot.SegmentCopy] = []
+        ) {
+            self.id = id
+            self.markdown = markdown
+            self.createdAt = createdAt
+            self.sourceTurnID = sourceTurnID
+            self.citedWebSources = citedWebSources
+            self.evidenceSegmentIDs = evidenceSegmentIDs
+            self.evidenceCopies = evidenceCopies
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case id, markdown, createdAt, sourceTurnID, citedWebSources,
+                 evidenceSegmentIDs, evidenceCopies
+        }
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(UUID.self, forKey: .id)
+            markdown = try container.decode(String.self, forKey: .markdown)
+            createdAt = try container.decode(Date.self, forKey: .createdAt)
+            sourceTurnID = try container.decodeIfPresent(
+                UUID.self,
+                forKey: .sourceTurnID
+            )
+            citedWebSources = try container.decodeIfPresent(
+                [ProjectAIChatSource].self,
+                forKey: .citedWebSources
+            ) ?? []
+            evidenceSegmentIDs = try container.decodeIfPresent(
+                [UUID].self,
+                forKey: .evidenceSegmentIDs
+            ) ?? []
+            evidenceCopies = try container.decodeIfPresent(
+                [ProjectAIChatEvidenceSnapshot.SegmentCopy].self,
+                forKey: .evidenceCopies
+            ) ?? []
+        }
     }
 
     var markdown: String
     var updatedAt: Date
     var lastSyncedHash: String?
     var conversationSummaries: [ConversationSummary]
+    /// 已通过「摘入笔记」写入手写笔记的 AI 归结稳定 ID（M2）。
+    /// 摘入按 ID 去重，跨重启不重复插入；属于 Project.note 字段，笔记保存时一并落盘。
+    var insertedSummaryIDs: [UUID]
 
     init(
         markdown: String = "",
         updatedAt: Date = Date(),
         lastSyncedHash: String? = nil,
-        conversationSummaries: [ConversationSummary] = []
+        conversationSummaries: [ConversationSummary] = [],
+        insertedSummaryIDs: [UUID] = []
     ) {
         self.markdown = markdown
         self.updatedAt = updatedAt
         self.lastSyncedHash = lastSyncedHash
         self.conversationSummaries = conversationSummaries
+        self.insertedSummaryIDs = insertedSummaryIDs
     }
 
     func combinedMarkdown(manualMarkdown: String? = nil) -> String {
@@ -117,7 +177,7 @@ struct NoteDocument: Codable, Sendable, Hashable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case markdown, updatedAt, lastSyncedHash, conversationSummaries
+        case markdown, updatedAt, lastSyncedHash, conversationSummaries, insertedSummaryIDs
     }
 
     init(from decoder: any Decoder) throws {
@@ -127,6 +187,9 @@ struct NoteDocument: Codable, Sendable, Hashable {
         lastSyncedHash = try container.decodeIfPresent(String.self, forKey: .lastSyncedHash)
         conversationSummaries = try container.decodeIfPresent(
             [ConversationSummary].self, forKey: .conversationSummaries
+        ) ?? []
+        insertedSummaryIDs = try container.decodeIfPresent(
+            [UUID].self, forKey: .insertedSummaryIDs
         ) ?? []
     }
 }
@@ -240,6 +303,8 @@ final class Project: Identifiable, Codable {
     var aiChatMessages: [ProjectAIChatMessage] = []
     /// AI 共创笔记中尚未发送的本机草稿
     var aiChatDraft: String = ""
+    /// 当前项目的共创提问范围（A 版 M1）。nil 表示整场对话（与旧行为一致）。
+    var aiChatQueryScope: ProjectAIChatQueryScope?
     /// 用户是否明确允许 AI 共创、开花和完整总结读取此前笔记
     var noteAIContextEnabled: Bool = false
     /// 旧 Meeting 专属字段存档（谈判背景/目标/底线/词汇等）；迁移时必有值，新建 V2 项目为 nil
@@ -284,6 +349,7 @@ final class Project: Identifiable, Codable {
         knowledgeSeeds: [KnowledgeSeed] = [],
         aiChatMessages: [ProjectAIChatMessage] = [],
         aiChatDraft: String = "",
+        aiChatQueryScope: ProjectAIChatQueryScope? = nil,
         noteAIContextEnabled: Bool = false,
         legacyMetadata: LegacyMeetingMetadata? = nil,
         note: NoteDocument = NoteDocument(markdown: "", updatedAt: Date()),
@@ -322,6 +388,7 @@ final class Project: Identifiable, Codable {
         self.knowledgeSeeds = knowledgeSeeds
         self.aiChatMessages = aiChatMessages
         self.aiChatDraft = aiChatDraft
+        self.aiChatQueryScope = aiChatQueryScope
         self.noteAIContextEnabled = noteAIContextEnabled
         self.legacyMetadata = legacyMetadata
         self.note = note
@@ -395,6 +462,10 @@ final class Project: Identifiable, Codable {
             String.self,
             forKey: .aiChatDraft
         ) ?? ""
+        aiChatQueryScope = try container.decodeIfPresent(
+            ProjectAIChatQueryScope.self,
+            forKey: .aiChatQueryScope
+        )
         noteAIContextEnabled = try container.decodeIfPresent(
             Bool.self,
             forKey: .noteAIContextEnabled

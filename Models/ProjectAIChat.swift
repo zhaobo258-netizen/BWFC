@@ -28,7 +28,7 @@ struct ProjectAIChatAttachment: Identifiable, Codable, Sendable, Equatable {
     }
 }
 
-struct ProjectAIChatSource: Identifiable, Codable, Sendable, Equatable {
+struct ProjectAIChatSource: Identifiable, Codable, Sendable, Equatable, Hashable {
     var id: String
     var providerName: String
     var title: String
@@ -85,6 +85,17 @@ struct ProjectAIChatMessage: Identifiable, Codable, Sendable, Equatable {
     var modelID: String?
     var attachments: [ProjectAIChatAttachment]
     var sources: [ProjectAIChatSource]
+    /// 同一轮 user/assistant 共享的轮次标识（A 版 M1）。
+    /// 旧消息没有该字段时为 nil（legacy），不臆测来源。
+    var turnID: UUID?
+    /// 网络请求标识，与 turnID 在同一轮内相同；切换项目/取消仍以此守卫。
+    var requestID: UUID?
+    /// 本轮实际使用的范围（旧消息为 nil → 按整场兼容）。
+    var queryScope: ProjectAIChatQueryScope?
+    /// 本轮实际发送的原话证据值快照（旧消息缺省）。
+    var evidenceSnapshot: ProjectAIChatEvidenceSnapshot?
+    /// 本轮实际发送的上下文快照（旧消息缺省）。
+    var contextSnapshot: ProjectAIChatContextSnapshot?
 
     init(
         id: UUID = UUID(),
@@ -94,7 +105,12 @@ struct ProjectAIChatMessage: Identifiable, Codable, Sendable, Equatable {
         providerName: String? = nil,
         modelID: String? = nil,
         attachments: [ProjectAIChatAttachment] = [],
-        sources: [ProjectAIChatSource] = []
+        sources: [ProjectAIChatSource] = [],
+        turnID: UUID? = nil,
+        requestID: UUID? = nil,
+        queryScope: ProjectAIChatQueryScope? = nil,
+        evidenceSnapshot: ProjectAIChatEvidenceSnapshot? = nil,
+        contextSnapshot: ProjectAIChatContextSnapshot? = nil
     ) {
         self.id = id
         self.role = role
@@ -104,11 +120,17 @@ struct ProjectAIChatMessage: Identifiable, Codable, Sendable, Equatable {
         self.modelID = modelID
         self.attachments = attachments
         self.sources = sources
+        self.turnID = turnID
+        self.requestID = requestID
+        self.queryScope = queryScope
+        self.evidenceSnapshot = evidenceSnapshot
+        self.contextSnapshot = contextSnapshot
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, role, text, createdAt, providerName, modelID, attachments,
-             sources
+             sources, turnID, requestID, queryScope, evidenceSnapshot,
+             contextSnapshot
     }
 
     init(from decoder: any Decoder) throws {
@@ -130,6 +152,20 @@ struct ProjectAIChatMessage: Identifiable, Codable, Sendable, Equatable {
             [ProjectAIChatSource].self,
             forKey: .sources
         ) ?? []
+        turnID = try container.decodeIfPresent(UUID.self, forKey: .turnID)
+        requestID = try container.decodeIfPresent(UUID.self, forKey: .requestID)
+        queryScope = try container.decodeIfPresent(
+            ProjectAIChatQueryScope.self,
+            forKey: .queryScope
+        )
+        evidenceSnapshot = try container.decodeIfPresent(
+            ProjectAIChatEvidenceSnapshot.self,
+            forKey: .evidenceSnapshot
+        )
+        contextSnapshot = try container.decodeIfPresent(
+            ProjectAIChatContextSnapshot.self,
+            forKey: .contextSnapshot
+        )
     }
 }
 
@@ -165,10 +201,24 @@ enum ProjectAIChatCorrectionIntent {
 enum ProjectAIChatRetention {
     static let maximumCount = 60
 
+    /// 保留最近消息，上限 60 条，但绝不在 user/assistant 对中间切断：
+    /// 从开头按整轮丢弃，保证留下来的第一条是 user（补全新一轮不会把新回复截掉）。
     static func keepingMostRecent(
         _ messages: [ProjectAIChatMessage]
     ) -> [ProjectAIChatMessage] {
-        Array(messages.suffix(maximumCount))
+        var kept = messages
+        while kept.count > maximumCount {
+            if kept.first?.role == .assistant {
+                // 遗留孤儿 assistant（旧数据边界），单独移除以免悬挂在队首。
+                kept.removeFirst()
+                continue
+            }
+            kept.removeFirst() // 丢弃开头一条 user
+            if kept.first?.role == .assistant {
+                kept.removeFirst() // 其配套 assistant 一并丢弃，保持整轮
+            }
+        }
+        return kept
     }
 }
 
