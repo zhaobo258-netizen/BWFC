@@ -65,6 +65,7 @@ enum ProjectPersistence {
         "knowledgeSeeds": .workspace,
         "aiChatMessages": .workspace,
         "aiChatDraft": .workspace,
+        "aiChatQueryScope": .workspace,
         "noteAIContextEnabled": .workspace,
         "legacyMetadata": .runtime,
         "note": .workspace,
@@ -92,6 +93,7 @@ enum ProjectPersistence {
             break
         case .note:
             stored.note.markdown = incoming.note.markdown
+            stored.note.insertedSummaryIDs = incoming.note.insertedSummaryIDs
             stored.note.updatedAt = max(stored.note.updatedAt, incoming.note.updatedAt)
             stored.note.lastSyncedHash = incoming.note.lastSyncedHash
         case .title:
@@ -150,6 +152,7 @@ enum ProjectPersistence {
         case .aiContext:
             stored.aiChatMessages = incoming.aiChatMessages
             stored.aiChatDraft = incoming.aiChatDraft
+            stored.aiChatQueryScope = incoming.aiChatQueryScope
             stored.noteAIContextEnabled = incoming.noteAIContextEnabled
             let existingSummaryIDs = Set(stored.note.conversationSummaries.map(\.id))
             let newSummaries = incoming.note.conversationSummaries.filter {

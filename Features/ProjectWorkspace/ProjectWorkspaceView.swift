@@ -1,6 +1,19 @@
 import SwiftUI
 import AppKit
 
+/// 「就这段问 AI」资格纯逻辑（M3）：只对当前仍有效 final/edited 且非空原话启用；
+/// 失效/被修订后历史按钮仍可用「回到完整对话」，但提问必须基于「当前原话」。
+enum EvidenceSegmentAskEligibility {
+    static func canAsk(segment: TranscriptSegment?) -> Bool {
+        guard let segment else { return false }
+        let state = segment.state
+        let hasText = !segment.text.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).isEmpty
+        return (state == .final || state == .edited) && hasText
+    }
+}
+
 enum ProjectAssetBannerPolicy {
     static func shouldShow(project: Project) -> Bool {
         switch project.status {
@@ -36,7 +49,7 @@ enum ProjectRecordingContinuationPolicy {
 /// 技术状态（转写/分人/分析/Key/分片）收进「处理详情」弹层，不占据主工作区；
 /// 异常（麦克风断开、语言资源缺失、云端暂停）才出现非阻塞横幅。
 struct ProjectWorkspaceView: View {
-    static let projectSidebarWidth: CGFloat = 232
+    nonisolated static let projectSidebarWidth: CGFloat = 232
 
     @Environment(AppEnvironment.self) private var environment
     @Environment(AppRouter.self) private var router
@@ -92,6 +105,21 @@ struct ProjectWorkspaceView: View {
     @State private var isProjectSidebarOverlayPresented = false
     @State private var isNotesInspectorPresented = false
     @State private var centerTab: CenterTab = .summary
+    // MARK: A 版内容区状态
+    @State private var understandingPage: UnderstandingPage = .overview
+    @State private var singleZoneSelection: WorkspaceSingleZoneSelection = .understanding
+    /// 顶部/原话等发起的单区切换请求（每次设置新值只消费一次）
+    @State private var externalZoneSwitchRequest: WorkspaceSingleZoneSelection?
+    /// 原话页发起「就这句问 AI」时的输入框聚焦令牌
+    @State private var aiComposerFocusToken: UUID?
+    /// 统一证据 sheet 路由（同一时间只开一个）
+    @State private var evidenceRoute: EvidenceRouteTarget?
+    /// 「回到完整对话」：先关闭来源 sheet，待其 onDismiss 后再发出的待处理定位请求
+    @State private var pendingConversationNavigationRequest: AIChatNavigationRequest?
+    /// 已生效、透传给 AI 区的轮次定位请求（每次点击换新 id）
+    @State private var conversationNavigationRequest: AIChatNavigationRequest?
+    /// 原话页按人物筛选
+    @State private var transcriptSpeakerFilter: UUID?
     @State private var liveAudioLevel: Float = 0
     @State private var audioQuality = RecordingAudioQualityTracker()
     @State private var hasResolvedAbnormalExit = false
@@ -308,20 +336,15 @@ struct ProjectWorkspaceView: View {
         } message: {
             Text("返回首页前需要先结束录音。此前笔记或共创草稿未保存成功时不会离开工作台。")
         }
+        .sheet(item: $evidenceRoute, onDismiss: flushPendingConversationNavigation) { route in
+            evidenceDetailSheet(route: route)
+        }
     }
 
     @ViewBuilder
     private func workspaceBody(mode: WorkspaceLayoutMode) -> some View {
-        if mode == .narrow {
-            workspaceBase(mode: mode)
-                .inspector(isPresented: $isNotesInspectorPresented) {
-                    noteColumn
-                        .background(BWTheme.columnBackground)
-                        .inspectorColumnWidth(min: 280, ideal: 320, max: 400)
-                }
-        } else {
-            workspaceBase(mode: mode)
-        }
+        // A 版：单区切换由内容区自己提供，不再使用独立笔记 inspector，避免重复面板。
+        workspaceBase(mode: mode)
     }
 
     private func workspaceBase(mode: WorkspaceLayoutMode) -> some View {
@@ -426,30 +449,460 @@ struct ProjectWorkspaceView: View {
         }
     }
 
+    // MARK: - A 版内容区（理解与回看 / 笔记与 AI）
+
+    private enum UnderstandingPage: String, CaseIterable {
+        case overview = "整体理解"
+        case people = "人物"
+        case transcript = "原话"
+        case starred = "标记"
+    }
+
     @ViewBuilder
     private func workspaceColumns(mode: WorkspaceLayoutMode, meeting: Meeting) -> some View {
-        if mode == .narrow {
-            TwoColumnLayout {
-                transcriptColumn(meeting: meeting)
-                    .background(BWTheme.columnBackground)
-            } center: {
-                analysisColumn(meeting: meeting)
-                    .background(BWTheme.paper)
-            }
-        } else {
-            ThreeColumnLayout(
-                minimums: mode == .wide ? .wide : .compact
-            ) {
-                transcriptColumn(meeting: meeting)
-                    .background(BWTheme.columnBackground)
-            } center: {
-                analysisColumn(meeting: meeting)
-                    .background(BWTheme.paper)
-            } right: {
-                noteColumn
-                    .background(BWTheme.columnBackground)
+        // 实际可用宽度由正文区自身 GeometryReader 判定（已扣除常驻项目侧栏）
+        aContent(meeting: meeting)
+    }
+
+    private func aContent(meeting: Meeting) -> some View {
+        GeometryReader { geo in
+            let widths = WorkspaceDualZonePolicy.solve(usableWidth: geo.size.width)
+            Group {
+                if WorkspaceDualZonePolicy.mode(for: geo.size.width) == .dual {
+                    HStack(spacing: WorkspaceDualZonePolicy.gap) {
+                        understandingZone(meeting: meeting)
+                            .frame(width: widths.left)
+                        thoughtZone(meeting: meeting)
+                            .frame(width: widths.right)
+                    }
+                } else {
+                    singleZoneContent(meeting: meeting)
+                }
             }
         }
+    }
+
+    private func singleZoneContent(meeting: Meeting) -> some View {
+        VStack(spacing: 0) {
+            Picker("", selection: $singleZoneSelection) {
+                Text("理解与回看").tag(WorkspaceSingleZoneSelection.understanding)
+                Text("笔记与 AI").tag(WorkspaceSingleZoneSelection.notesAndAI)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 360)
+            .padding(.vertical, 8)
+            .tint(BWTheme.accent)
+            .onChange(of: externalZoneSwitchRequest) { _, request in
+                if let request { singleZoneSelection = request }
+            }
+
+            Divider()
+            Group {
+                if singleZoneSelection == .understanding {
+                    understandingZone(meeting: meeting)
+                } else {
+                    thoughtZone(meeting: meeting)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    // MARK: 左区：理解与回看
+
+    private func understandingZone(meeting: Meeting) -> some View {
+        VStack(spacing: 0) {
+            Picker("", selection: $understandingPage) {
+                ForEach(UnderstandingPage.allCases, id: \.self) { page in
+                    Text(page.rawValue).tag(page)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 460)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .tint(BWTheme.accent)
+
+            Divider()
+
+            switch understandingPage {
+            case .overview:
+                analysisColumn(meeting: meeting)
+            case .people:
+                peoplePage(meeting: meeting)
+            case .transcript:
+                quotePage(meeting: meeting, starredOnly: false)
+            case .starred:
+                quotePage(meeting: meeting, starredOnly: true)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(BWTheme.columnBackground)
+    }
+
+    private func peoplePage(meeting: Meeting) -> some View {
+        let snapshot = analysis?.currentSnapshot
+            ?? project?.analysisSnapshots.last
+        let segments = currentSegments(of: meeting)
+        let projection = AnalysisPresentationMapper.project(
+            snapshot: snapshot,
+            speakers: project?.speakers ?? [],
+            segments: segments
+        )
+        let byID = Dictionary(uniqueKeysWithValues: segments.map { ($0.id, $0) })
+        return PersonUnderstandingView(
+            projection: projection,
+            evidenceTimeLabel: { id in
+                byID[id].map { TranscriptRowView.formatMs($0.startMs) }
+            },
+            onEvidenceTap: { id in
+                openEvidenceRoute(.live(sourceLabel: "人物理解", segmentID: id))
+            },
+            onRequestSpeakerAssignment: { entry in
+                requestSpeakerAssign(for: entry)
+            }
+        )
+    }
+
+    private func quotePage(meeting: Meeting, starredOnly: Bool) -> some View {
+        let allSegments = currentSegments(of: meeting)
+        let segments = allSegments.filter { segment in
+            if starredOnly, !segment.isStarred { return false }
+            if let filter = transcriptSpeakerFilter,
+               segment.participantId != filter { return false }
+            return true
+        }
+        return VStack(alignment: .leading, spacing: 0) {
+            quotePageHeader(meeting: meeting,
+                            starredOnly: starredOnly,
+                            allSegments: segments)
+            Divider()
+            if !starredOnly, meeting.status != .recording,
+               meeting.status != .paused, !isFinishing {
+                playbackBar
+            }
+            TranscriptPanelView(
+                segments: segments,
+                participants: meeting.participants,
+                unknownSpeakerDisplay: { segment in
+                    guard segment.participantId == nil else { return nil }
+                    return diarization?.displayName(forRemoteLabel: segment.remoteSpeakerLabel)
+                },
+                highlightedSegmentID: highlightedSegmentID,
+                liveAudioLevel: meeting.status == .recording ? liveAudioLevel : nil,
+                emptyTitle: starredOnly
+                    ? "还没有标记的原话"
+                    : (meeting.status == .recording ? "等待第一段发言" : "还没有可用文稿"),
+                emptyDetail: starredOnly
+                    ? "在原话上右键「加星标」，或点击行内星标即可归档到「标记」页。"
+                    : (meeting.status == .recording
+                       ? "开始说话后，实时转写会显示在这里"
+                       : "先回听原音频检查收音，再尝试重新转写。"),
+                onPlaySegment: { segment in
+                    // 原话行「从此处回听」保持既有行为：定位并播放当前句
+                    playFromTranscript(segmentID: segment.id)
+                },
+                onAssignSpeaker: { segment, participant in
+                    assignSpeakerFromTranscript(segment: segment, participant: participant)
+                },
+                onEditText: { segment, newText in
+                    MeetingTranscriptEditor.editText(segment, to: newText)
+                    persistAndRefresh(meeting)
+                    analysis?.noteSpeakerContextChanged(segmentIDs: [segment.id])
+                },
+                onToggleStar: { segment in
+                    MeetingTranscriptEditor.toggleStar(segment)
+                    persistAndRefresh(meeting)
+                },
+                onGlobalCorrect: { wrong, right in
+                    globalCorrect(wrong: wrong, right: right, meeting: meeting)
+                },
+                onRequestSpeakerAssignment: { segment in
+                    speakerAssignRequest = SpeakerAssignRequest(
+                        source: .transcript(segmentId: segment.id),
+                        anchorText: String(segment.text.prefix(80))
+                    )
+                },
+                onAskAI: { segment in
+                    askAIAbout(segments: [segment])
+                },
+                sourceRecordingTitle: { segment in
+                    guard let project else { return nil }
+                    return ProjectHomeSupport.sourceRecording(for: segment, in: project)?.title
+                },
+                sourceRecordingStartMs: { segment in
+                    guard let project else { return segment.startMs }
+                    return ProjectHomeSupport.sourceRelativeStartMs(for: segment, in: project)
+                }
+            )
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func quotePageHeader(meeting: Meeting,
+                                 starredOnly: Bool,
+                                 allSegments: [TranscriptSegment]) -> some View {
+        HStack(spacing: 8) {
+            if starredOnly {
+                Label("标记的原话", systemImage: "star.fill")
+                    .foregroundStyle(BWTheme.accent)
+            } else {
+                Label("录音文稿", systemImage: "doc.text.magnifyingglass")
+            }
+            Spacer(minLength: 0)
+            Menu {
+                Button {
+                    transcriptSpeakerFilter = nil
+                } label: {
+                    if transcriptSpeakerFilter == nil {
+                        Label("全部说话人", systemImage: "checkmark")
+                    } else {
+                        Text("全部说话人")
+                    }
+                }
+                Divider()
+                ForEach(project?.speakers ?? []) { speaker in
+                    Button {
+                        transcriptSpeakerFilter = speaker.id
+                    } label: {
+                        if transcriptSpeakerFilter == speaker.id {
+                            Label(speaker.displayName, systemImage: "checkmark")
+                        } else {
+                            Text(speaker.displayName)
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "person.2")
+                    if let id = transcriptSpeakerFilter,
+                       let speaker = project?.speakers.first(where: { $0.id == id }) {
+                        Text(speaker.displayName)
+                    } else {
+                        Text("全部")
+                    }
+                }
+                .font(.system(size: BWTheme.fontSizeDetail))
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .frame(minHeight: BWTheme.minimumHitHeight)
+            .accessibilityLabel("按人物筛选原话")
+
+            Text("\(allSegments.count) 段")
+                .font(.system(size: BWTheme.fontSizeDetail))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 12)
+        .frame(minHeight: 40)
+    }
+
+    private func assignSpeakerFromTranscript(segment: TranscriptSegment,
+                                             participant: Participant?) {
+        guard let project else { return }
+        guard let participant else {
+            MeetingTranscriptEditor.clearSpeaker(segment)
+            if let meeting {
+                persistAndRefresh(meeting)
+                analysis?.noteSpeakerContextChanged(segmentIDs: [segment.id])
+            }
+            return
+        }
+        if let speaker = project.speakers.first(where: { $0.id == participant.id }) {
+            _ = performTranscriptSpeakerAssign(anchorSegmentId: segment.id, speaker: speaker)
+        } else {
+            MeetingTranscriptEditor.assignSpeaker(segment, to: participant)
+            if let meeting {
+                persistAndRefresh(meeting)
+                analysis?.noteSpeakerContextChanged(segmentIDs: [segment.id])
+            }
+        }
+    }
+
+    // MARK: 右区：笔记与 AI
+
+    private func thoughtZone(meeting: Meeting) -> some View {
+        Group {
+            if let projectAIChat, let project, let noteController {
+                ThoughtWorkspaceView(
+                    noteController: noteController,
+                    project: project,
+                    chatController: projectAIChat,
+                    noteContextEnabled: project.noteAIContextEnabled,
+                    onNoteContextChanged: setNoteAIContextEnabled,
+                    onOpenSettings: router.showSettings,
+                    speechController: environment.answerSpeechController,
+                    canReanalyze: project.segments.contains {
+                        ($0.state == .final || $0.state == .edited)
+                            && !$0.text.trimmingCharacters(
+                                in: .whitespacesAndNewlines
+                            ).isEmpty
+                    },
+                    onOpenEvidence: { target in
+                        openEvidenceRoute(target)
+                    },
+                    onReanalyze: {
+                        Task { await analysis?.generateFinalAnalysis() }
+                    },
+                    segmentsProvider: {
+                        guard let meeting = self.meeting else { return [] }
+                        return self.currentSegments(of: meeting)
+                    },
+                    externalComposerFocusToken: aiComposerFocusToken,
+                    conversationTurnNavigationRequest: conversationNavigationRequest,
+                    onConversationNavigationConsumed: { id in
+                        if conversationNavigationRequest?.id == id { conversationNavigationRequest = nil }
+                    }
+                )
+            } else {
+                ContentUnavailableView(
+                    "AI 共创笔记正在准备",
+                    systemImage: "bubble.left.and.text.bubble.right"
+                )
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    // MARK: A 版统一证据路由与操作
+
+    private func openEvidenceRoute(_ target: EvidenceRouteTarget) {
+        highlightedSegmentID = nil
+        evidenceRoute = target
+    }
+
+    /// 原话页「就这段/就这句问 AI」：设置 M1 真范围、保留草稿、切单区到 AI 并聚焦输入；绝不自动发送。
+    /// - Returns: 范围已成功保存并切页为 true；失败如实报告，不伪装成功。
+    @discardableResult
+    private func askAIAbout(segments: [TranscriptSegment]) -> Bool {
+        guard let projectAIChat else {
+            operationError = "AI 共创对话尚未就绪，暂时不能提问。"
+            return false
+        }
+        guard !segments.isEmpty else { return false }
+        guard projectAIChat.setQueryScope(.selectedSegments(
+            selectedSegmentIDs: segments.map(\.id)
+        )) else {
+            operationError = projectAIChat.errorMessage ?? "提问范围保存失败，范围未改变。"
+            return false
+        }
+        singleZoneSelection = .notesAndAI
+        externalZoneSwitchRequest = .notesAndAI
+        aiComposerFocusToken = UUID()
+        return true
+    }
+
+    /// 统一证据面板「就这段问 AI」：关闭来源面板 → 切到 AI → 聚焦，不自动发送。
+    /// 范围保存失败时保持来源面板打开并如实报错（不能伪装成功）。
+    private func askAboutCurrentText(from route: EvidenceRouteTarget) {
+        let segments = meeting.map { currentSegments(of: $0) }
+            ?? project?.segments ?? []
+        guard let segment = segments.first(where: { $0.id == route.segmentID }),
+              EvidenceSegmentAskEligibility.canAsk(segment: segment) else { return }
+        guard askAIAbout(segments: [segment]) else { return }
+        evidenceRoute = nil
+    }
+
+    /// 归属待确认条目 → 原 speakerAssign 弹层
+    private func requestSpeakerAssign(for entry: AnalysisPresentationMapper.Entry) {
+        guard let meeting else { return }
+        let item = AnalysisItem(
+            id: entry.itemID,
+            category: entry.category,
+            text: entry.text,
+            subjectSpeakerId: nil,
+            epistemicStatus: entry.epistemicStatus,
+            confidence: entry.confidence,
+            evidenceSegmentIds: entry.evidenceSegmentIDs
+        )
+        requestSpeakerAssign(for: item, meeting: meeting)
+    }
+
+    private func currentSpeakerInfo(for id: UUID?) -> EvidenceSpeakerInfo? {
+        guard let id,
+              let speaker = project?.speakers.first(where: { $0.id == id }) else {
+            return nil
+        }
+        return EvidenceSpeakerInfo(displayName: speaker.displayName,
+                                   isUserConfirmed: speaker.isUserConfirmed)
+    }
+
+    private func evidenceDetailSheet(route: EvidenceRouteTarget) -> some View {
+        let segments = meeting.map { currentSegments(of: $0) }
+            ?? project?.segments ?? []
+        let status = EvidenceRouteResolver.currentStatus(
+            of: route,
+            currentSegments: segments,
+            currentSpeakerInfo: { id in self.currentSpeakerInfo(for: id) }
+        )
+        let currentSegment = segments.first { $0.id == route.segmentID }
+        let canAsk = EvidenceSegmentAskEligibility.canAsk(segment: currentSegment)
+        return EvidenceDetailSheet(
+            route: route,
+            status: status,
+            canAskAboutCurrentText: canAsk,
+            canPlayCurrentText: canPlayEvidence,
+            onPlay: { self.playEvidence(route: route) },
+            onLocate: { self.locateEvidenceFromSheet(route: route) },
+            onReturnToConversation: { self.returnToConversation(from: route) },
+            onAskAboutCurrentText: { self.askAboutCurrentText(from: route) },
+            onClose: { self.evidenceRoute = nil }
+        )
+    }
+
+    /// 用户主动点「回听当前原话」才启动播放（默认查看不自动播放）
+    private var canPlayEvidence: Bool {
+        !isFinishing && meeting?.status != .recording && meeting?.status != .paused
+    }
+
+    private func playEvidence(route: EvidenceRouteTarget) {
+        guard canPlayEvidence else { return }
+        guard let project,
+              let meeting,
+              let segment = currentSegments(of: meeting)
+                .first(where: { $0.id == route.segmentID }) else {
+            operationError = "当前已没有可回听的原话；快照仍可查看。"
+            return
+        }
+        preparePlayback(project: project, segment: segment)
+    }
+
+    /// 关闭抽屉并回到原话页定位（只定位不自动播放）
+    private func locateEvidenceFromSheet(route: EvidenceRouteTarget) {
+        evidenceRoute = nil
+        highlightedSegmentID = route.segmentID
+        understandingPage = .transcript
+        transcriptSpeakerFilter = nil
+        singleZoneSelection = .understanding
+        externalZoneSwitchRequest = .understanding
+    }
+
+    /// 从历史来源回到完整对话：先关闭来源面板，经其 onDismiss 发出定位请求，
+    /// 由 ProjectAIChatView 打开展开对话并定位对应 assistant 消息。
+    /// 不抢草稿焦点（只定位轮次正文）。
+    private func returnToConversation(from route: EvidenceRouteTarget) {
+        evidenceRoute = nil
+        guard case .aiHistory(let turnID, _, _) = route.origin else {
+            // live 来源没有可定位的轮次：只切到笔记与 AI 页
+            switchToNotesAndAIWithoutFocus()
+            return
+        }
+        pendingConversationNavigationRequest = AIChatNavigationRequest(turnID: turnID)
+        switchToNotesAndAIWithoutFocus()
+    }
+
+    private func switchToNotesAndAIWithoutFocus() {
+        singleZoneSelection = .notesAndAI
+        externalZoneSwitchRequest = .notesAndAI
+    }
+
+    /// 来源 sheet 关闭后发出待处理定位请求（避免与来源面板叠层展示）。
+    private func flushPendingConversationNavigation() {
+        guard let pending = pendingConversationNavigationRequest else { return }
+        pendingConversationNavigationRequest = nil
+        conversationNavigationRequest = pending
     }
 
     // MARK: - 项目侧栏
@@ -887,21 +1340,14 @@ struct ProjectWorkspaceView: View {
 
             if mode == .narrow {
                 Button {
-                    isNotesInspectorPresented.toggle()
+                    // A 版：导航到右区/单区的「笔记与 AI」状态，不再开第二个重复 inspector
+                    singleZoneSelection = .notesAndAI
+                    externalZoneSwitchRequest = .notesAndAI
                 } label: {
                     Image(systemName: "bubble.left.and.text.bubble.right")
                 }
-                .help(
-                    isNotesInspectorPresented
-                        ? "关闭 AI 共创笔记"
-                        : "打开 AI 共创笔记"
-                )
-                .accessibilityLabel(
-                    isNotesInspectorPresented
-                        ? "关闭 AI 共创笔记"
-                        : "打开 AI 共创笔记"
-                )
-                .accessibilityValue(isNotesInspectorPresented ? "已打开" : "已关闭")
+                .help("查看笔记与 AI（切到右区）")
+                .accessibilityLabel("查看笔记与 AI")
             }
 
             // 说话人与声纹面板
@@ -1812,6 +2258,7 @@ struct ProjectWorkspaceView: View {
         project.businessCategory = fresh.businessCategory
         project.projectBackgroundContext = fresh.projectBackgroundContext
         project.relatedProjectIDs = fresh.relatedProjectIDs
+        project.aiChatQueryScope = fresh.aiChatQueryScope
     }
 
     // MARK: - 装配与持久化桥接
@@ -2125,8 +2572,13 @@ struct ProjectWorkspaceView: View {
         return didPersist
     }
 
-    /// 点击中栏证据：左栏滚动并高亮对应片段
+    /// 统一证据路由：整体理解/人物/主题/开花等「查看依据」默认只打开抽屉，不自动播放。
     private func locateEvidence(segmentID: UUID) {
+        openEvidenceRoute(.live(sourceLabel: "分析依据", segmentID: segmentID))
+    }
+
+    /// 原话行「从此处回听」等明确的播放意图：定位并调用现有播放链路（可多资产映射）。
+    private func playFromTranscript(segmentID: UUID) {
         highlightedSegmentID = segmentID
         guard let project,
               let segment = project.segments.first(where: { $0.id == segmentID }),
@@ -3344,6 +3796,163 @@ struct ProjectWorkspaceView: View {
         }
     }
 
+}
+
+/// 统一「按需证据」抽屉（A 版 M2）：默认不自动播放；用户点播放才走现有播放链路。
+/// 历史冻结来源与当前逐字稿对照，片段失效禁止假定位；可回到完整对话。
+private struct EvidenceDetailSheet: View {
+    let route: EvidenceRouteTarget
+    let status: EvidenceCurrentStatus
+    let canAskAboutCurrentText: Bool
+    let canPlayCurrentText: Bool
+    let onPlay: () -> Void
+    let onLocate: () -> Void
+    let onReturnToConversation: () -> Void
+    let onAskAboutCurrentText: () -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Label(sourceTitle, systemImage: route.isHistorical ? "clock.arrow.circlepath" : "text.quote")
+                    .font(.system(size: BWTheme.fontSizeBody, weight: .semibold))
+                Spacer()
+                Button("关闭", action: onClose)
+                    .buttonStyle(.bordered)
+                    .frame(minHeight: BWTheme.minimumHitHeight)
+            }
+
+            statusHeader
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    statusBody
+                }
+                .padding(.vertical, 4)
+            }
+            .frame(maxHeight: 220)
+
+            HStack(spacing: 8) {
+                if route.isHistorical {
+                    Button("回到完整对话", action: onReturnToConversation)
+                        .frame(minHeight: BWTheme.minimumHitHeight)
+                        .help("从历史来源回到该轮完整对话")
+                        .accessibilityLabel("回到完整对话")
+                }
+                Spacer()
+                Button(route.isHistorical ? "就当前原话问 AI" : "就这段问 AI", action: onAskAboutCurrentText)
+                    .disabled(!canAskAboutCurrentText)
+                    .frame(minHeight: BWTheme.primaryActionHeight)
+                    .help(canAskAboutCurrentText ? "以当前原话设置下一轮范围，不自动发送" : "当前原话不存在、未定稿或为空")
+                if status.canLocate {
+                    Button("回听当前原话", action: onPlay)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!canPlayCurrentText)
+                        .frame(minHeight: BWTheme.primaryActionHeight)
+                        .help(canPlayCurrentText ? "点击才回听；定位到当前句对应音频" : "录音或收尾期间暂不可回听")
+                        .accessibilityLabel("回听当前原话")
+                    Button("在原话中定位", action: onLocate)
+                        .frame(minHeight: BWTheme.minimumHitHeight)
+                        .accessibilityLabel("在原话页定位这句话")
+                }
+            }
+        }
+        .padding(16)
+        .frame(minWidth: 540, idealWidth: 600, maxWidth: 620)
+        .background(BWTheme.paper)
+    }
+
+    private var sourceTitle: String {
+        switch route.origin {
+        case .live(let label): return "证据 · \(label)"
+        case .aiHistory(_, let scopeLabel, _): return "当时依据 · \(scopeLabel)"
+        }
+    }
+
+    private var statusHeader: some View {
+        switch status {
+        case .missing:
+            return AnyView(
+                Label("当前逐字稿已不存在该句，仅保留当时快照；不提供假定位。",
+                      systemImage: "exclamationmark.triangle")
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(.orange)
+            )
+        case .revised:
+            return AnyView(
+                Label("当时原话已被修订（文本/归属/时间可能与当时不同），两条都保留可查。",
+                      systemImage: "arrow.triangle.branch")
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(BWTheme.accent)
+            )
+        case .intact:
+            return AnyView(
+                Label(route.isHistorical ? "这段原话至今与当时一致。" : "当前原话 · 查看不会自动播放",
+                      systemImage: "checkmark.circle")
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(.green)
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var statusBody: some View {
+        switch status {
+        case .intact(let historical, let current):
+            evidenceBlock(title: route.isHistorical ? "当时依据" : "当前原话", context: historical ?? current, highlighted: true)
+        case .revised(let historical, let current):
+            VStack(alignment: .leading, spacing: 8) {
+                evidenceBlock(title: "当时依据", context: historical,
+                              highlighted: false, note: "冻结值副本")
+                Divider()
+                evidenceBlock(title: "当前原话", context: current, highlighted: true)
+            }
+        case .missing(let historical):
+            evidenceBlock(title: "当时依据（快照）", context: historical,
+                          highlighted: false, note: "此句当前已不存在")
+        }
+    }
+
+    private func evidenceBlock(title: String,
+                               context: EvidenceContext,
+                               highlighted: Bool,
+                               note: String? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text(title)
+                    .font(.system(size: BWTheme.fontSizeLabel, weight: .semibold))
+                    .foregroundStyle(highlighted ? BWTheme.accent : .secondary)
+                Text("\(TranscriptRowView.formatMs(context.startMs))")
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                Spacer()
+                if let speaker = context.speaker {
+                    Text(speaker.displayName ?? "未识别说话人")
+                        .font(.system(size: BWTheme.fontSizeDetail))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                if let note {
+                    Text(note)
+                        .font(.system(size: BWTheme.fontSizeDetail))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            Text(context.text)
+                .font(.system(size: BWTheme.fontSizeBody))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            (highlighted ? BWTheme.accent : Color.secondary).opacity(0.06),
+            in: RoundedRectangle(cornerRadius: 8)
+        )
+    }
 }
 
 private struct TranscriptReviewPersistenceFailure: Error {}

@@ -30,6 +30,20 @@ enum BWTheme {
         LinearGradient(colors: [accent, accentDeep],
                        startPoint: .topLeading, endPoint: .bottomTrailing)
     }
+
+    // MARK: - 语义尺寸（A 版 M2：正文 14–16pt，辅助/来源 ≥12pt，命中区 ≥32pt）
+    /// 正文阅读字号
+    static let fontSizeBody: CGFloat = 15
+    /// 次级/来源字号（≥12pt 的可访问下限）
+    static let fontSizeDetail: CGFloat = 12
+    /// 卡片内小标题（来源/状态行）
+    static let fontSizeLabel: CGFloat = 13
+    /// 控件最小命中高度
+    static let minimumHitHeight: CGFloat = 32
+    /// 主行动（发送等）高度
+    static let primaryActionHeight: CGFloat = 36
+    /// 证据/来源按钮最小宽度
+    static let minimumHitWidth: CGFloat = 32
 }
 
 extension Color {

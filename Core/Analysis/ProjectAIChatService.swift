@@ -16,7 +16,7 @@ struct ProjectAIChatRequest: Sendable, Equatable {
                 : "本轮已包含全部最终原文。"
         }
     }
-    struct Speaker: Sendable, Equatable, Encodable {
+    struct Speaker: Sendable, Equatable, Codable {
         var id: String
         var role: String?
         var backgroundContext: String?
@@ -45,7 +45,7 @@ struct ProjectAIChatRequest: Sendable, Equatable {
         }
     }
 
-    struct AnalysisItem: Sendable, Equatable, Encodable {
+    struct AnalysisItem: Sendable, Equatable, Codable {
         var category: String
         var text: String
         var epistemicStatus: String
@@ -58,12 +58,12 @@ struct ProjectAIChatRequest: Sendable, Equatable {
         }
     }
 
-    struct HistoryMessage: Sendable, Equatable, Encodable {
+    struct HistoryMessage: Sendable, Equatable, Codable {
         var role: String
         var text: String
     }
 
-    struct ReferenceDocument: Sendable, Equatable, Encodable {
+    struct ReferenceDocument: Sendable, Equatable, Codable {
         var id: String
         var fileName: String
         var fileType: String
@@ -82,7 +82,7 @@ struct ProjectAIChatRequest: Sendable, Equatable {
         }
     }
 
-    struct ConfirmedMemory: Sendable, Equatable, Encodable {
+    struct ConfirmedMemory: Sendable, Equatable, Codable {
         var id: String
         var personID: String?
         var businessProjectID: String?
@@ -129,6 +129,15 @@ struct ProjectAIChatRequest: Sendable, Equatable {
     var finalReportOverview: String? = nil
 }
 
+/// 严格片段模式构建失败：必须显式失败，不能回退整场。
+enum ProjectAIChatBuildError: Error, Equatable {
+    case emptyStrictSelection
+    case strictSelectionContainsInvalid([UUID])
+    case strictAttachmentsUnsupported
+    case strictWebSearchUnsupported
+    case strictSelectionExceedsLimit(characterCount: Int)
+}
+
 enum ProjectAIChatRequestBuilder {
     static let maximumTranscriptCharacters = 30_000
     static let maximumNoteCharacters = 20_000
@@ -148,6 +157,247 @@ enum ProjectAIChatRequestBuilder {
         confirmedMemories: [MemoryEntry] = [],
         webSearchEnabled: Bool = true,
         excludingMessageID: UUID? = nil
+    ) -> ProjectAIChatRequest {
+        // 整场对话：沿用既有按问题召回/时间采样与全部授权上下文行为。
+        makeWholeConversation(
+            project: project,
+            currentRequest: currentRequest,
+            noteMarkdown: noteMarkdown,
+            currentAttachments: currentAttachments,
+            relatedProjects: relatedProjects,
+            confirmedMemories: confirmedMemories,
+            webSearchEnabled: webSearchEnabled,
+            excludingMessageID: excludingMessageID
+        )
+    }
+
+    /// 范围感知入口（A 版 M1）。whole 走既有行为；严格片段模式在片段无效/带附件/带联网时
+    /// 明确抛错，绝不静默回退整场，也绝不混入未选中内容。
+    static func makeForScope(
+        project: Project,
+        scope: ProjectAIChatQueryScope,
+        currentRequest: String,
+        noteMarkdown: String?,
+        currentAttachments: [ProjectAIChatAttachment] = [],
+        relatedProjects: [Project] = [],
+        confirmedMemories: [MemoryEntry] = [],
+        webSearchEnabled: Bool = true,
+        excludingMessageID: UUID? = nil
+    ) throws -> ProjectAIChatRequest {
+        switch scope {
+        case .wholeConversation:
+            return makeWholeConversation(
+                project: project,
+                currentRequest: currentRequest,
+                noteMarkdown: noteMarkdown,
+                currentAttachments: currentAttachments,
+                relatedProjects: relatedProjects,
+                confirmedMemories: confirmedMemories,
+                webSearchEnabled: webSearchEnabled,
+                excludingMessageID: excludingMessageID
+            )
+        case .selectedSegments(let selectedIDs):
+            guard currentAttachments.isEmpty else {
+                throw ProjectAIChatBuildError.strictAttachmentsUnsupported
+            }
+            guard webSearchEnabled == false else {
+                throw ProjectAIChatBuildError.strictWebSearchUnsupported
+            }
+            let unavailable = ProjectAIChatScopeValidator.unavailableSegmentIDs(
+                in: project,
+                selectedSegmentIDs: selectedIDs
+            )
+            guard unavailable.isEmpty else {
+                throw ProjectAIChatBuildError.strictSelectionContainsInvalid(
+                    unavailable
+                )
+            }
+            let selected = ProjectAIChatScopeValidator.eligibleSelectedSegments(
+                in: project,
+                selectedSegmentIDs: selectedIDs
+            )
+            guard !selected.isEmpty else {
+                throw ProjectAIChatBuildError.emptyStrictSelection
+            }
+            let strictRequest = makeStrictSelection(
+                project: project,
+                selected: selected,
+                currentRequest: currentRequest
+            )
+            let sentCharacters = strictRequest.transcript.reduce(0) {
+                $0 + $1.text.count
+            }
+            guard sentCharacters <= maximumTranscriptCharacters else {
+                throw ProjectAIChatBuildError.strictSelectionExceedsLimit(
+                    characterCount: sentCharacters
+                )
+            }
+            return strictRequest
+        }
+    }
+
+    /// 从某轮已保存的 evidence/context 快照恢复出与当时完全一致的请求资料。
+    /// 只使用冻结快照数据（历史文本与引用文档均保存值副本）；旧消息（无快照）
+    /// 返回 nil，由调用方走 legacy 路径，绝不臆测来源、绝不用当前库拼凑。
+    static func restoredRequest(
+        currentRequest: String,
+        evidence: ProjectAIChatEvidenceSnapshot?,
+        context: ProjectAIChatContextSnapshot?,
+        scope: ProjectAIChatQueryScope? = nil
+    ) -> ProjectAIChatRequest? {
+        guard let evidence else { return nil }
+        let resolvedScope = scope ?? evidence.scope
+        let transcript = evidence.sentSegments.map {
+            ProjectAIChatRequest.Segment(
+                id: $0.id.uuidString,
+                speakerId: $0.speakerAlias,
+                startMs: $0.startMs,
+                text: $0.text
+            )
+        }
+        let coverage = evidence.coverage.map {
+            ProjectAIChatRequest.TranscriptCoverage(
+                totalSegments: $0.totalSegments,
+                includedSegments: $0.includedSegments,
+                totalCharacters: $0.totalCharacters,
+                includedCharacters: $0.includedCharacters,
+                matchedSegments: $0.matchedSegments
+            )
+        }
+        switch resolvedScope {
+        case .wholeConversation:
+            guard let context else { return nil }
+            return ProjectAIChatRequest(
+                scenario: context.scenario,
+                speakers: context.speakers,
+                transcript: transcript,
+                analysisHeadline: context.analysisHeadline,
+                analysisItems: context.analysisItems,
+                conversationHistory: context.conversationHistory,
+                currentRequest: String(currentRequest.prefix(4_000)),
+                projectBackgroundContext: context.projectBackgroundContext,
+                relatedProjectContext: context.relatedProjectContext,
+                confirmedBusinessMemories: context.confirmedBusinessMemories,
+                noteMarkdown: context.noteMarkdown,
+                referenceDocuments: context.referenceDocuments,
+                webSearchEnabled: context.webSearchEnabled,
+                webSources: [],
+                transcriptCoverage: coverage,
+                finalReportOverview: context.finalReportOverview
+            )
+        case .selectedSegments:
+            // 严格片段模式当时就没有任何扩展上下文；只恢复原话 + 当前问题。
+            return ProjectAIChatRequest(
+                scenario: context?.scenario ?? "auto",
+                speakers: [],
+                transcript: transcript,
+                analysisHeadline: nil,
+                analysisItems: [],
+                conversationHistory: [],
+                currentRequest: String(currentRequest.prefix(4_000)),
+                projectBackgroundContext: nil,
+                relatedProjectContext: [],
+                confirmedBusinessMemories: [],
+                noteMarkdown: nil,
+                referenceDocuments: [],
+                webSearchEnabled: false,
+                webSources: [],
+                transcriptCoverage: coverage,
+                finalReportOverview: nil
+            )
+        }
+    }
+
+    /// 从范围到 evidence/context 快照的一站式辅助（控制器发送时使用）。
+    static func snapshots(
+        projectID: UUID,
+        requestID: UUID,
+        scope: ProjectAIChatQueryScope,
+        request: ProjectAIChatRequest,
+        project: Project,
+        historyMessages: [ProjectAIChatMessage]
+    ) -> (evidence: ProjectAIChatEvidenceSnapshot, context: ProjectAIChatContextSnapshot) {
+        let capturedAt = Date()
+        let speakerByID = Dictionary(
+            project.speakers.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let aliasByID = Dictionary(
+            project.speakers.map { ($0.id, $0.cloudAlias) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let projectSegmentByID = Dictionary(
+            project.segments.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let sentSegments: [ProjectAIChatEvidenceSnapshot.SegmentCopy] =
+            request.transcript.compactMap { sent in
+                guard let id = UUID(uuidString: sent.id) else { return nil }
+                let live = projectSegmentByID[id]
+                let speaker = live?.participantId.flatMap { speakerByID[$0] }
+                return ProjectAIChatEvidenceSnapshot.SegmentCopy(
+                    id: id,
+                    startMs: sent.startMs,
+                    endMs: live?.endMs ?? 0,
+                    text: sent.text,
+                    participantId: live?.participantId,
+                    speakerAlias: sent.speakerId ?? live?.participantId.flatMap { aliasByID[$0] },
+                    speakerDisplayName: speaker?.displayName,
+                    speakerWasUserConfirmed: speaker?.isUserConfirmed,
+                    sourceAssetId: live?.sourceAssetId,
+                    updatedAt: live?.updatedAt ?? capturedAt
+                )
+            }
+            .sorted { $0.startMs < $1.startMs }
+        let selectedIDs: [UUID] = {
+            switch scope {
+            case .wholeConversation:
+                return sentSegments.map(\.id)
+            case .selectedSegments(let ids):
+                return ids
+            }
+        }()
+        let evidence = ProjectAIChatEvidenceSnapshot(
+            projectID: projectID,
+            requestID: requestID,
+            capturedAt: capturedAt,
+            scope: scope,
+            selectedSegmentIDs: selectedIDs,
+            sentSegments: sentSegments,
+            coverage: request.transcriptCoverage.map {
+                ProjectAIChatEvidenceSnapshot.CoverageCopy(coverage: $0)
+            }
+        )
+        let context = ProjectAIChatContextSnapshot(
+            requestID: requestID,
+            capturedAt: capturedAt,
+            scope: scope,
+            scenario: request.scenario,
+            speakers: scope.isStrictSegments ? [] : request.speakers,
+            analysisHeadline: request.analysisHeadline,
+            analysisItems: scope.isStrictSegments ? [] : request.analysisItems,
+            projectBackgroundContext: scope.isStrictSegments ? nil : request.projectBackgroundContext,
+            relatedProjectContext: scope.isStrictSegments ? [] : request.relatedProjectContext,
+            confirmedBusinessMemories: scope.isStrictSegments ? [] : request.confirmedBusinessMemories,
+            noteMarkdown: scope.isStrictSegments ? nil : request.noteMarkdown,
+            webSearchEnabled: scope.isStrictSegments ? false : request.webSearchEnabled,
+            finalReportOverview: scope.isStrictSegments ? nil : request.finalReportOverview,
+            conversationHistory: request.conversationHistory,
+            referenceDocuments: request.referenceDocuments,
+            historyMessageIDs: scope.isStrictSegments ? [] : historyMessages.map(\.id)
+        )
+        return (evidence, context)
+    }
+
+    private static func makeWholeConversation(
+        project: Project,
+        currentRequest: String,
+        noteMarkdown: String?,
+        currentAttachments: [ProjectAIChatAttachment],
+        relatedProjects: [Project],
+        confirmedMemories: [MemoryEntry],
+        webSearchEnabled: Bool,
+        excludingMessageID: UUID?
     ) -> ProjectAIChatRequest {
         let aliasByID = Dictionary(
             project.speakers.map { ($0.id, $0.cloudAlias) },
@@ -228,6 +478,65 @@ enum ProjectAIChatRequestBuilder {
                     ) else { return nil }
                     return String((report.headline + "\n" + report.overview).prefix(6_000))
                 }
+        )
+    }
+
+    /// 严格片段模式：只发送选中有效原话 + 当前问题（不做时间采样/关键词召回，
+    /// 不引入分析/历史/笔记/联网/人物背景/关联项目/记忆/历史附件）。
+    private static func makeStrictSelection(
+        project: Project,
+        selected: [TranscriptSegment],
+        currentRequest: String
+    ) -> ProjectAIChatRequest {
+        let aliasByID = Dictionary(
+            project.speakers.map { ($0.id, $0.cloudAlias) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        var totalCharacters = 0
+        var segments: [ProjectAIChatRequest.Segment] = []
+        var includedCharacters = 0
+        for segment in selected {
+            let trimmed = segment.text.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            guard !trimmed.isEmpty else { continue }
+            totalCharacters += trimmed.count
+            includedCharacters += trimmed.count
+            segments.append(ProjectAIChatRequest.Segment(
+                id: segment.id.uuidString,
+                speakerId: segment.participantId.flatMap { aliasByID[$0] },
+                startMs: segment.startMs,
+                text: trimmed
+            ))
+        }
+        let eligibleTotal = project.segments.filter {
+            $0.state == .final || $0.state == .edited
+        }.count
+        let coverage = ProjectAIChatRequest.TranscriptCoverage(
+            totalSegments: eligibleTotal,
+            includedSegments: segments.count,
+            totalCharacters: totalCharacters,
+            includedCharacters: includedCharacters,
+            matchedSegments: segments.count
+        )
+        return ProjectAIChatRequest(
+            scenario: project.scenario.map {
+                ConversationAnalysisTaxonomy.wireName(for: $0)
+            } ?? "auto",
+            speakers: [],
+            transcript: segments,
+            analysisHeadline: nil,
+            analysisItems: [],
+            conversationHistory: [],
+            currentRequest: String(currentRequest.prefix(4_000)),
+            projectBackgroundContext: nil,
+            relatedProjectContext: [],
+            confirmedBusinessMemories: [],
+            noteMarkdown: nil,
+            referenceDocuments: [],
+            webSearchEnabled: false,
+            transcriptCoverage: coverage,
+            finalReportOverview: nil
         )
     }
 

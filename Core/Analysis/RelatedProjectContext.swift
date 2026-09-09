@@ -1,6 +1,6 @@
 import Foundation
 
-struct RelatedProjectAIContext: Sendable, Equatable, Encodable {
+struct RelatedProjectAIContext: Sendable, Equatable, Codable {
     var referenceID: String
     var title: String
     var businessCategory: String?

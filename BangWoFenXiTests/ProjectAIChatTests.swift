@@ -127,6 +127,42 @@ private actor ProjectAIChatRetryService: ProjectAIChatServing {
     }
 }
 
+private actor ProjectAIChatRecordingRetryService: ProjectAIChatServing {
+    private var requests: [ProjectAIChatRequest] = []
+    private var callCount = 0
+    private let failFirstCall: Bool
+    private let response: ProjectAIChatResponse
+
+    init(
+        response: ProjectAIChatResponse? = nil,
+        failFirstCall: Bool = true
+    ) {
+        self.failFirstCall = failFirstCall
+        self.response = response ?? ProjectAIChatResponse(
+            reply: "重试后已正常回应。",
+            provider: AIProviderDescriptor(
+                id: "mock",
+                displayName: "测试 AI",
+                modelID: "test-model"
+            )
+        )
+    }
+
+    func reply(to request: ProjectAIChatRequest) async throws
+        -> ProjectAIChatResponse {
+        requests.append(request)
+        callCount += 1
+        if failFirstCall && callCount == 1 {
+            throw AnalysisAPIError.timeout
+        }
+        return response
+    }
+
+    func capturedRequests() -> [ProjectAIChatRequest] {
+        requests
+    }
+}
+
 private actor SuspendedProjectAIChatService: ProjectAIChatServing {
     private var continuation: CheckedContinuation<ProjectAIChatResponse, Never>?
     var isWaiting: Bool { continuation != nil }
@@ -1252,5 +1288,559 @@ struct ProjectAIChatTests {
                 "扩展名 \(ext) 必须可拖入"
             )
         }
+    }
+
+    // MARK: - A 版 M1：显式范围、逐轮快照与请求隔离
+
+    @Test("严格片段范围只发送有效选中原话与当前问题，不混入未选中内容")
+    @MainActor
+    func strictSegmentScopeExcludesUnselectedContent() async throws {
+        let selected = TranscriptSegment(
+            startMs: 16 * 3_600_000 + 8 * 60_000,
+            endMs: 16 * 3_600_000 + 8 * 60_000 + 2_000,
+            text: "期初库存三千箱。",
+            source: .local,
+            state: .final
+        )
+        let other = TranscriptSegment(
+            startMs: 18 * 3_600_000 + 42 * 60_000,
+            endMs: 18 * 3_600_000 + 42 * 60_000 + 2_000,
+            text: "配送费率需要单独谈。",
+            source: .local,
+            state: .final
+        )
+        let project = Project(
+            title: "范围测试",
+            sourceType: .importedAudio,
+            segments: [selected, other],
+            noteAIContextEnabled: true,
+            note: NoteDocument(markdown: "授权但不得进入片段范围的笔记")
+        )
+        project.aiChatMessages = [
+            ProjectAIChatMessage(role: .user, text: "上一轮历史"),
+            ProjectAIChatMessage(role: .assistant, text: "上一轮回答")
+        ]
+        let service = ProjectAIChatMockService()
+        let controller = ProjectAIChatController(service: service, persist: { _ in })
+        controller.attach(to: project)
+        project.aiChatQueryScope = .selectedSegments(
+            selectedSegmentIDs: [selected.id]
+        )
+        controller.noteContextProvider = {
+            "最新的授权笔记正文"
+        }
+        controller.isWebSearchEnabled = false
+        controller.draft = "期初库存是多少？"
+        await controller.send()
+
+        let captured = try #require(
+            await service.capturedRequests().last
+        )
+        #expect(captured.transcript.count == 1)
+        #expect(captured.transcript.first?.id == selected.id.uuidString)
+        #expect(captured.transcript.first?.text == "期初库存三千箱。")
+        #expect(!String(describing: captured).contains("配送费率需要单独谈。"))
+        #expect(captured.conversationHistory.isEmpty)
+        #expect(captured.analysisItems.isEmpty)
+        #expect(captured.noteMarkdown == nil)
+        #expect(captured.referenceDocuments.isEmpty)
+        #expect(captured.relatedProjectContext.isEmpty)
+        #expect(captured.confirmedBusinessMemories.isEmpty)
+        #expect(captured.webSearchEnabled == false)
+        #expect(captured.finalReportOverview == nil)
+
+        let user = try #require(
+            project.aiChatMessages.last { $0.role == .user }
+        )
+        #expect(user.queryScope == .selectedSegments(
+            selectedSegmentIDs: [selected.id]
+        ))
+        #expect(user.turnID == user.requestID)
+        #expect(user.evidenceSnapshot?.sentSegments.first?.text
+            == "期初库存三千箱。")
+        #expect(user.evidenceSnapshot?.sentSegments.first?.sourceAssetId == nil)
+        #expect(user.contextSnapshot?.noteMarkdown == nil)
+        #expect(user.contextSnapshot?.speakers.isEmpty == true)
+    }
+
+    @Test("16:08 提问后切 18:42、修改源文均不改旧轮依据")
+    @MainActor
+    func laterTurnAndSourceEditDoNotRewriteEarlierEvidence() async throws {
+        let early = TranscriptSegment(
+            startMs: 16 * 3_600_000 + 8 * 60_000,
+            endMs: 16 * 3_600_000 + 8 * 60_000 + 2_000,
+            text: "方案 A 报价五百万。",
+            source: .local,
+            state: .final
+        )
+        let late = TranscriptSegment(
+            startMs: 18 * 3_600_000 + 42 * 60_000,
+            endMs: 18 * 3_600_000 + 42 * 60_000 + 2_000,
+            text: "方案 B 延期两周。",
+            source: .local,
+            state: .final
+        )
+        let project = Project(
+            title: "时间与修订",
+            sourceType: .importedAudio,
+            segments: [early, late]
+        )
+        let service = ProjectAIChatMockService()
+        let controller = ProjectAIChatController(service: service, persist: { _ in })
+        controller.attach(to: project)
+        project.aiChatQueryScope = .selectedSegments(
+            selectedSegmentIDs: [early.id]
+        )
+        controller.isWebSearchEnabled = false
+        controller.draft = "方案 A 报价多少？"
+        await controller.send()
+
+        // 修改源文后旧轮快照仍保留发送时的原文
+        early.text = "人工修订：方案 A 报价六百万。"
+        let firstUser = try #require(
+            project.aiChatMessages.first { $0.role == .user }
+        )
+        #expect(
+            firstUser.evidenceSnapshot?.sentSegments.first?.text
+                == "方案 A 报价五百万。"
+        )
+
+        // 切到 18:42 再问，只看到新段，且旧轮消息内容未变化
+        project.aiChatQueryScope = .selectedSegments(
+            selectedSegmentIDs: [late.id]
+        )
+        controller.draft = "这一段的结论是什么？"
+        await controller.send()
+        let requests = await service.capturedRequests()
+        let second = try #require(requests.last)
+        #expect(second.transcript.count == 1)
+        #expect(second.transcript.first?.id == late.id.uuidString)
+        #expect(second.transcript.first?.text == "方案 B 延期两周。")
+        let restoredFirst = try #require(
+            project.aiChatMessages.first { $0.role == .user }
+        )
+        #expect(
+            restoredFirst.evidenceSnapshot?.sentSegments.first?.text
+                == "方案 A 报价五百万。"
+        )
+        #expect(restoredFirst.text == "方案 A 报价多少？")
+    }
+
+    @Test("严格范围无效/空白/空 ID 明确失败，不发网络、不留消息")
+    @MainActor
+    func strictInvalidSelectionFailsExplicitly() async throws {
+        let valid = TranscriptSegment(
+            startMs: 1_000, endMs: 2_000, text: "有效片段", source: .local, state: .final
+        )
+        let missing = UUID()
+        let service = ProjectAIChatMockService()
+        let project = Project(
+            title: "无效 ID",
+            sourceType: .importedAudio,
+            segments: [valid]
+        )
+        let controller = ProjectAIChatController(service: service, persist: { _ in })
+        controller.attach(to: project)
+        controller.isWebSearchEnabled = false
+        project.aiChatQueryScope = .selectedSegments(
+            selectedSegmentIDs: [missing]
+        )
+        controller.draft = "这段说了什么？"
+        await controller.send()
+        #expect(project.aiChatMessages.isEmpty)
+        #expect(await service.capturedRequests().isEmpty)
+        #expect(controller.errorMessage?.contains("失效") == true)
+
+        // 空白文字片段（final 但 trim 后为空）同样不能作为有效来源
+        let blank = TranscriptSegment(
+            startMs: 3_000, endMs: 4_000, text: "   \n  ",
+            source: .local, state: .final
+        )
+        let blankService = ProjectAIChatMockService()
+        let blankProject = Project(
+            title: "空白 ID",
+            sourceType: .importedAudio,
+            segments: [blank]
+        )
+        let blankController = ProjectAIChatController(
+            service: blankService, persist: { _ in }
+        )
+        blankController.attach(to: blankProject)
+        blankController.isWebSearchEnabled = false
+        blankProject.aiChatQueryScope = .selectedSegments(
+            selectedSegmentIDs: [blank.id]
+        )
+        blankController.draft = "空白也算来源？"
+        await blankController.send()
+        #expect(blankProject.aiChatMessages.isEmpty)
+        #expect(await blankService.capturedRequests().isEmpty)
+        #expect(blankController.errorMessage?.contains("失效") == true)
+
+        // 空选中列表不会静默回退整场
+        let emptyService = ProjectAIChatMockService()
+        let emptyProject = Project(
+            title: "空 ID",
+            sourceType: .importedAudio,
+            segments: [valid]
+        )
+        let emptyController = ProjectAIChatController(
+            service: emptyService, persist: { _ in }
+        )
+        emptyController.attach(to: emptyProject)
+        emptyController.isWebSearchEnabled = false
+        emptyProject.aiChatQueryScope = .selectedSegments(
+            selectedSegmentIDs: []
+        )
+        emptyController.draft = "没选片段也要问"
+        await emptyController.send()
+        #expect(emptyProject.aiChatMessages.isEmpty)
+        #expect(await emptyService.capturedRequests().isEmpty)
+        #expect(emptyController.errorMessage?.contains("片段") == true)
+    }
+
+    @Test("严格范围带引用文档：报可理解错误，不静默丢弃或发送")
+    @MainActor
+    func strictScopeRejectsReferenceDocuments() async throws {
+        let valid = TranscriptSegment(
+            startMs: 1_000, endMs: 2_000, text: "有效片段", source: .local, state: .final
+        )
+        let documentURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("md")
+        defer { try? FileManager.default.removeItem(at: documentURL) }
+        try "行业背景正文".write(to: documentURL, atomically: true, encoding: .utf8)
+
+        let service = ProjectAIChatMockService()
+        let project = Project(
+            title: "附件冲突",
+            sourceType: .importedAudio,
+            segments: [valid]
+        )
+        let controller = ProjectAIChatController(service: service, persist: { _ in })
+        controller.attach(to: project)
+        await controller.addReferenceDocuments(from: [documentURL])
+        #expect(!controller.pendingAttachments.isEmpty)
+        project.aiChatQueryScope = .selectedSegments(
+            selectedSegmentIDs: [valid.id]
+        )
+        controller.draft = "这段怎么说？"
+        await controller.send()
+        #expect(project.aiChatMessages.isEmpty)
+        #expect(await service.capturedRequests().isEmpty)
+        #expect(controller.errorMessage?.contains("引用文档") == true)
+        #expect(!controller.pendingAttachments.isEmpty)
+    }
+
+    @Test("严格范围开启联网：报错而不是把未选内容外发")
+    @MainActor
+    func strictScopeRejectsWebSearch() async {
+        let valid = TranscriptSegment(
+            startMs: 1_000, endMs: 2_000, text: "有效片段", source: .local, state: .final
+        )
+        let service = ProjectAIChatMockService()
+        let project = Project(
+            title: "联网冲突",
+            sourceType: .importedAudio,
+            segments: [valid]
+        )
+        let controller = ProjectAIChatController(service: service, persist: { _ in })
+        controller.attach(to: project)
+        project.aiChatQueryScope = .selectedSegments(
+            selectedSegmentIDs: [valid.id]
+        )
+        controller.isWebSearchEnabled = true
+        controller.draft = "这段说了什么？"
+        await controller.send()
+        #expect(project.aiChatMessages.isEmpty)
+        #expect(await service.capturedRequests().isEmpty)
+        #expect(controller.errorMessage?.contains("联网") == true)
+    }
+
+    @Test("旧消息缺轮次与快照时可读且来源为 legacy，不臆测")
+    func legacyMessageMetadataDecodesNil() throws {
+        let message = ProjectAIChatMessage(
+            role: .user,
+            text: "旧消息",
+            turnID: nil,
+            requestID: nil,
+            queryScope: nil,
+            evidenceSnapshot: nil,
+            contextSnapshot: nil
+        )
+        let data = try JSONEncoder().encode(message)
+        var object = try #require(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        // 更老的版本连这些键都不会有
+        object.removeValue(forKey: "turnID")
+        object.removeValue(forKey: "requestID")
+        object.removeValue(forKey: "queryScope")
+        object.removeValue(forKey: "evidenceSnapshot")
+        object.removeValue(forKey: "contextSnapshot")
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+        let restored = try JSONDecoder().decode(
+            ProjectAIChatMessage.self,
+            from: legacyData
+        )
+        #expect(restored.turnID == nil)
+        #expect(restored.requestID == nil)
+        #expect(restored.queryScope == nil)
+        #expect(restored.evidenceSnapshot == nil)
+        #expect(restored.contextSnapshot == nil)
+        #expect(restored.attachments.isEmpty)
+        #expect(restored.sources.isEmpty)
+    }
+
+    @Test("重试复用当轮快照：切范围、改源文与开联网都不改变请求资料")
+    @MainActor
+    func retryReusesStoredSnapshot() async throws {
+        let alpha = TranscriptSegment(
+            startMs: 1_000, endMs: 2_000, text: "方案 A 报价五百万。",
+            source: .local, state: .final
+        )
+        let beta = TranscriptSegment(
+            startMs: 9_000, endMs: 10_000, text: "别的原话不参与。",
+            source: .local, state: .final
+        )
+        let project = Project(
+            title: "快照重试",
+            sourceType: .importedAudio,
+            segments: [alpha, beta],
+            noteAIContextEnabled: true,
+            note: NoteDocument(markdown: "授权笔记不得混入片段重试")
+        )
+        let service = ProjectAIChatRecordingRetryService()
+        let controller = ProjectAIChatController(service: service, persist: { _ in })
+        controller.attach(to: project)
+        controller.isWebSearchEnabled = false
+        project.aiChatQueryScope = .selectedSegments(
+            selectedSegmentIDs: [alpha.id]
+        )
+        controller.draft = "报价怎么说？"
+        await controller.send()
+        #expect(controller.errorMessage?.contains("超时") == true)
+
+        alpha.text = "人工改写后的报价。"
+        project.aiChatQueryScope = .wholeConversation
+        controller.isWebSearchEnabled = true
+        controller.noteContextProvider = { "切换后最新的授权笔记" }
+        #expect(controller.canRetryLastMessage)
+        await controller.retryLastMessage()
+
+        let requests = await service.capturedRequests()
+        #expect(requests.count == 2)
+        let retried = try #require(requests.last)
+        #expect(retried.transcript.count == 1)
+        #expect(retried.transcript.first?.text == "方案 A 报价五百万。")
+        #expect(retried.noteMarkdown == nil)
+        #expect(retried.webSearchEnabled == false)
+        #expect(!String(describing: retried).contains("授权笔记不得混入片段重试"))
+        #expect(!String(describing: retried).contains("人工改写后的报价。"))
+        #expect(project.aiChatMessages.last?.role == .assistant)
+        #expect(
+            project.aiChatMessages.last?.turnID
+                == project.aiChatMessages.dropLast().last?.turnID
+        )
+    }
+
+    @Test("保留策略不切断新增完整轮次")
+    func retentionKeepsCompleteTurns() {
+        var messages: [ProjectAIChatMessage] = []
+        for index in 0..<34 {
+            messages.append(ProjectAIChatMessage(role: .user, text: "\(index)q"))
+            messages.append(ProjectAIChatMessage(role: .assistant, text: "\(index)a"))
+        }
+        let kept = ProjectAIChatRetention.keepingMostRecent(messages)
+        #expect(kept.count <= ProjectAIChatRetention.maximumCount)
+        #expect(kept.count % 2 == 0)
+        #expect(kept.first?.role == .user)
+        #expect(kept.last?.role == .assistant)
+        #expect(kept.last?.text == "33a")
+        #expect(kept.dropLast().last?.text == "33q")
+
+        // 消息带一条尚未回答的末尾 user 时，也不能把它与新回答拆开
+        var pending = Array(kept)
+        pending.append(ProjectAIChatMessage(role: .user, text: "34q"))
+        let keptPending = ProjectAIChatRetention.keepingMostRecent(pending)
+        #expect(keptPending.first?.role == .user)
+        #expect(keptPending.last?.text == "34q")
+        #expect(keptPending.count <= ProjectAIChatRetention.maximumCount)
+    }
+
+    @Test("范围字段随 aiContext 字段合并，保存失败回滚")
+    @MainActor
+    func scopeFieldMergeAndRollback() throws {
+        let id = UUID()
+        let scope = ProjectAIChatQueryScope.selectedSegments(
+            selectedSegmentIDs: [UUID(), UUID()]
+        )
+        let stored = Project(id: id, title: "现值", sourceType: .importedAudio)
+        var projects = [stored]
+        let incoming = Project(
+            id: id,
+            title: "旧标题",
+            sourceType: .importedAudio,
+            aiChatQueryScope: scope
+        )
+        ProjectPersistence.upsert(incoming, into: &projects, fields: .aiContext)
+        #expect(stored.aiChatQueryScope == scope)
+        #expect(stored.title == "现值")
+
+        // JSON 往返保留范围；旧 JSON 缺范围字段解码为 nil
+        let roundTrip = try JSONDecoder().decode(
+            Project.self,
+            from: JSONEncoder().encode(stored)
+        )
+        #expect(roundTrip.aiChatQueryScope == scope)
+        var object = try #require(
+            try JSONSerialization.jsonObject(with: JSONEncoder().encode(incoming))
+                as? [String: Any]
+        )
+        object.removeValue(forKey: "aiChatQueryScope")
+        let legacyProject = try JSONDecoder().decode(
+            Project.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+        #expect(legacyProject.aiChatQueryScope == nil)
+
+        // 控制器保存失败回滚，不静默丢范围
+        let project = Project(title: "回滚", sourceType: .importedAudio)
+        let controller = ProjectAIChatController(
+            service: ProjectAIChatMockService(),
+            persist: { _ in throw ProjectAIChatTestError.persistenceFailed }
+        )
+        controller.attach(to: project)
+        let applied = controller.setQueryScope(scope)
+        #expect(applied == false)
+        #expect(project.aiChatQueryScope == nil)
+        #expect(controller.queryScope == .wholeConversation)
+        #expect(controller.errorMessage?.contains("范围") == true)
+    }
+
+    @Test("切换范围不隐藏上一轮失败问题的重试入口")
+    @MainActor
+    func scopeChangeKeepsUnansweredRetry() async {
+        let service = ProjectAIChatRecordingRetryService()
+        let project = Project(title: "失败重试", sourceType: .importedAudio)
+        let controller = ProjectAIChatController(service: service, persist: { _ in })
+        controller.attach(to: project)
+        controller.draft = "请求会失败"
+        await controller.send()
+        #expect(controller.canRetryLastMessage)
+
+        // 把整场切到严格片段：仍然能重试上一轮失败问题
+        let applied = controller.setQueryScope(
+            .selectedSegments(selectedSegmentIDs: [UUID()])
+        )
+        #expect(applied)
+        #expect(controller.canRetryLastMessage)
+        #expect(controller.errorMessage != nil)
+    }
+
+    @Test("严格片段超字数上限明确拒绝，不静默塞入或改发整场")
+    @MainActor
+    func strictScopeRejectsOversizedSelection() async {
+        let oversizedText = String(
+            repeating: "长",
+            count: ProjectAIChatRequestBuilder.maximumTranscriptCharacters + 200
+        )
+        let segment = TranscriptSegment(
+            startMs: 1_000,
+            endMs: 2_000,
+            text: oversizedText,
+            source: .local,
+            state: .final
+        )
+        let service = ProjectAIChatMockService()
+        let project = Project(
+            title: "超限片段",
+            sourceType: .importedAudio,
+            segments: [segment]
+        )
+        let controller = ProjectAIChatController(service: service, persist: { _ in })
+        controller.attach(to: project)
+        // 严格片段模式不支持联网，先关闭默认开启的联网，才能命中「超字数上限」分支；
+        // 断言不弱化：仍然要求零请求与明确提示缩小范围。
+        controller.isWebSearchEnabled = false
+        project.aiChatQueryScope = .selectedSegments(
+            selectedSegmentIDs: [segment.id]
+        )
+        controller.draft = "这段话太多，也请阅读"
+        await controller.send()
+        #expect(project.aiChatMessages.isEmpty)
+        #expect(await service.capturedRequests().isEmpty)
+        #expect(controller.errorMessage?.contains("上限") == true)
+        #expect(controller.errorMessage?.contains("缩小") == true)
+    }
+
+    @Test("归结保留当时原话值快照：清空聊天并修订原文后仍可回看依据")
+    @MainActor
+    func conversationSummaryRetainsFrozenEvidenceCopies() async throws {
+        let segment = TranscriptSegment(
+            startMs: 1_000,
+            endMs: 2_000,
+            text: "报价五百万，含安装。",
+            source: .local,
+            state: .final
+        )
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try JSONProjectStore(directory: root)
+        let project = Project(
+            title: "归结快照",
+            sourceType: .liveRecording,
+            segments: [segment],
+            note: NoteDocument(markdown: "手写内容保留")
+        )
+        let generation = ProjectAIChatGenerationService(responseText:
+            #"{"reply":"报价已记录。","note_summary":"- AI 归结：报价五百万，含安装。"}"#)
+        let controller = ProjectAIChatController(
+            service: ProjectAIChatAgent(generationService: generation)
+        ) { incoming in
+            var projects = try store.loadProjects()
+            ProjectPersistence.upsert(incoming, into: &projects, fields: .aiContext)
+            try store.saveProjects(projects)
+        }
+        controller.attach(to: project)
+        controller.draft = "报价金额？"
+        await controller.send()
+        #expect(controller.errorMessage == nil)
+
+        // 源文被修订 + 聊天被清空后，归结仍保留当时依据
+        segment.text = "人工修订：报价六百万。"
+        controller.clearConversation()
+        let restored = try #require(try store.loadProjects().first)
+        let summary = try #require(restored.note.conversationSummaries.first)
+        #expect(summary.evidenceCopies.first?.id == segment.id)
+        #expect(summary.evidenceCopies.first?.text == "报价五百万，含安装。")
+        #expect(summary.evidenceSegmentIDs == [segment.id])
+        #expect(restored.aiChatMessages.isEmpty)
+    }
+
+    @Test("旧归结缺少来源字段时仍可解码，不悬空不臆测")
+    func legacyConversationSummaryDecodesEmptyCopies() throws {
+        let summary = NoteDocument.ConversationSummary(
+            id: UUID(),
+            markdown: "旧归结",
+            createdAt: Date(timeIntervalSince1970: 1_753_000_000)
+        )
+        let data = try JSONEncoder().encode(summary)
+        var object = try #require(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        object.removeValue(forKey: "sourceTurnID")
+        object.removeValue(forKey: "citedWebSources")
+        object.removeValue(forKey: "evidenceSegmentIDs")
+        object.removeValue(forKey: "evidenceCopies")
+        let legacy = try JSONDecoder().decode(
+            NoteDocument.ConversationSummary.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+        #expect(legacy.sourceTurnID == nil)
+        #expect(legacy.citedWebSources.isEmpty)
+        #expect(legacy.evidenceSegmentIDs.isEmpty)
+        #expect(legacy.evidenceCopies.isEmpty)
+        #expect(legacy.markdown == "旧归结")
     }
 }
