@@ -1,7 +1,18 @@
 import Foundation
+import Security
 
-/// 本机明文凭证存储。值写入当前 App 的 UserDefaults 域，不访问系统钥匙串。
+/// 本机凭证存储错误。code 为钥匙串 OSStatus，operation 标记出错动作。
+enum CredentialStoreError: Error {
+    case keychainFailure(code: OSStatus, operation: String)
+    case readbackMismatch(account: String)
+}
+
+/// 本机凭证存储。值写入系统钥匙串（kSecClassGenericPassword），不再落 UserDefaults 明文。
 /// service/account 共同隔离不同 provider 与测试条目。
+///
+/// 迁移规则（对历史 UserDefaults 条目，惰性触发于首次 read/contains）：
+/// 先写钥匙串并读回校验，确认钥匙串真实持有后才删除旧明文；任一步失败则保留旧值下次重试。
+/// 钥匙串已有条目时视为钥匙串是事实来源，仅清理旧明文，不回写覆盖。
 struct LocalCredentialStore: Sendable {
     let service: String
 
@@ -10,22 +21,118 @@ struct LocalCredentialStore: Sendable {
     }
 
     func save(_ value: String, account: String) throws {
-        UserDefaults.standard.set(value, forKey: storageKey(account: account))
+        try writeToKeychain(value, account: account)
+        removeLegacyEntry(account: account)
     }
 
     func read(account: String) throws -> String? {
-        UserDefaults.standard.string(forKey: storageKey(account: account))
+        if let migrated = migrateLegacyEntryIfNeeded(account: account) {
+            return migrated
+        }
+        return try readFromKeychain(account: account)
     }
 
     func contains(account: String) -> Bool {
-        UserDefaults.standard.object(forKey: storageKey(account: account)) != nil
+        if migrateLegacyEntryIfNeeded(account: account) != nil {
+            return true
+        }
+        return keychainItemStatus(account: account) == errSecSuccess
     }
 
     func delete(account: String) throws {
-        UserDefaults.standard.removeObject(forKey: storageKey(account: account))
+        let status = SecItemDelete(baseQuery(account: account) as CFDictionary)
+        switch status {
+        case errSecSuccess, errSecItemNotFound:
+            return
+        default:
+            throw CredentialStoreError.keychainFailure(code: status, operation: "删除")
+        }
     }
 
-    private func storageKey(account: String) -> String {
+    // MARK: - 钥匙串读写
+
+    private func writeToKeychain(_ value: String, account: String) throws {
+        let query = baseQuery(account: account)
+        SecItemDelete(query as CFDictionary)
+
+        var attributes = query
+        attributes[kSecValueData as String] = Data(value.utf8)
+        attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        let status = SecItemAdd(attributes as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw CredentialStoreError.keychainFailure(code: status, operation: "写入")
+        }
+
+        do {
+            guard try readFromKeychain(account: account) == value else {
+                throw CredentialStoreError.readbackMismatch(account: account)
+            }
+        } catch {
+            SecItemDelete(query as CFDictionary)
+            throw error
+        }
+    }
+
+    private func readFromKeychain(account: String) throws -> String? {
+        var query = baseQuery(account: account)
+        query[kSecReturnData as String] = kCFBooleanTrue
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        switch status {
+        case errSecSuccess:
+            guard let data = item as? Data else { return nil }
+            return String(data: data, encoding: .utf8)
+        case errSecItemNotFound:
+            return nil
+        default:
+            throw CredentialStoreError.keychainFailure(code: status, operation: "读取")
+        }
+    }
+
+    private func keychainItemStatus(account: String) -> OSStatus {
+        var query = baseQuery(account: account)
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        return SecItemCopyMatching(query as CFDictionary, &item)
+    }
+
+    private func baseQuery(account: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+    }
+
+    // MARK: - UserDefaults 历史明文迁移
+
+    private func migrateLegacyEntryIfNeeded(account: String) -> String? {
+        let key = legacyStorageKey(account: account)
+        guard UserDefaults.standard.object(forKey: key) != nil else { return nil }
+        let legacyValue = UserDefaults.standard.string(forKey: key) ?? ""
+        guard !legacyValue.isEmpty else {
+            UserDefaults.standard.removeObject(forKey: key)
+            return nil
+        }
+        if keychainItemStatus(account: account) == errSecSuccess {
+            UserDefaults.standard.removeObject(forKey: key)
+            return nil
+        }
+        do {
+            try writeToKeychain(legacyValue, account: account)
+        } catch {
+            return nil
+        }
+        UserDefaults.standard.removeObject(forKey: key)
+        return legacyValue
+    }
+
+    private func removeLegacyEntry(account: String) {
+        UserDefaults.standard.removeObject(forKey: legacyStorageKey(account: account))
+    }
+
+    private func legacyStorageKey(account: String) -> String {
         "bwfx.local-credential.\(encoded(service)).\(encoded(account))"
     }
 
@@ -58,7 +165,7 @@ enum CloudProvider: String, Sendable, CaseIterable {
     static let legacyAccount = "openai"
 }
 
-/// 云端 API Key 的本机明文存储封装；不同 provider 使用独立条目。
+/// 云端 API Key 的本机存储封装（系统钥匙串）；不同 provider 使用独立条目。
 struct CloudAPIKeyStore: Sendable {
     static let defaultService = "com.zhaobo.BangWoFenXi.credentials.local.v1"
     static let legacyAdHocService = "com.zhaobo.BangWoFenXi.credentials.local.legacy"
