@@ -226,7 +226,8 @@ final class DiarizationController {
         guard canProduceChunkFiles() else { return }
         guard let meeting, meeting.status == .recording,
               let timeline = timelineProvider?() else { return }
-        let uptoAudioMs = timeline.effectiveAudioMs(at: Date())
+        let timelineAudioMs = timeline.effectiveAudioMs(at: Date())
+        let uptoAudioMs = min(timelineAudioMs, recordedAudioMs)
         produceChunks(uptoAudioMs: uptoAudioMs)
     }
 
@@ -250,7 +251,8 @@ final class DiarizationController {
         // 未配置时连尾片也不切盘；start 仍然保留会议与时间线上下文。
         guard canProduceChunkFiles() else { return }
         if let meeting {
-            let audioMs = uptoAudioMs ?? timelineProvider?()?.effectiveAudioMs(at: Date()) ?? 0
+            let timelineAudioMs = timelineProvider?().map { $0.effectiveAudioMs(at: Date()) } ?? 0
+            let audioMs = min(uptoAudioMs ?? timelineAudioMs, recordedAudioMs)
             if audioMs > 0, let timeline = timelineProvider?(),
                let tail = planner.finalWindow(uptoAudioMs: audioMs, nextIndex: nextChunkIndex) {
                 enqueue(window: tail, meeting: meeting, timeline: timeline)
@@ -675,6 +677,15 @@ final class DiarizationController {
             return false
         }
         return true
+    }
+
+    /// 当前录音真实时长（毫秒）。若录音文件暂时不可读，返回上限值避免阻断分片处理。
+    private var recordedAudioMs: Int64 {
+        guard let meeting,
+              let audioURL = try? fileStore.audioFileURL(for: meeting) else {
+            return Int64.max
+        }
+        return (try? AudioChunkExtractor.durationMs(of: audioURL)) ?? Int64.max
     }
 
     private var isProviderConfigured: Bool {

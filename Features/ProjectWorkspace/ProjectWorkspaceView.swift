@@ -2656,6 +2656,15 @@ struct ProjectWorkspaceView: View {
             return false
         }
         project.speakers.append(speaker)
+        guard persistProject(fields: .speakers) else {
+            project.speakers.removeAll { $0.id == speaker.id }
+            if let meeting {
+                SpeakerPanelLogic.syncRuntimeParticipants(speakers: project.speakers, meeting: meeting)
+            }
+            try? environment.personLibraryStore.deletePerson(personID: personID)
+            diarization?.refreshKnownSpeakers()
+            return false
+        }
         let didAssign = performSpeakerAssign(request: request, speaker: speaker,
             alsoAssignTranscript: alsoAssignTranscript, assignAllUnconfirmed: assignAllUnconfirmed)
         if !didAssign {
