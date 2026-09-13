@@ -193,9 +193,15 @@ struct HistoricalPeopleLibraryView: View {
                 systemImage: "checkmark.circle.fill"
             )
             .foregroundStyle(.green)
+        case .localSherpaOnnx:
+            Label(
+                "本地引擎（实验）支持整场声纹候选；识别在本机完成，音频不出机。",
+                systemImage: "checkmark.circle.fill"
+            )
+            .foregroundStyle(.green)
         case .disabled:
             Label(
-                "云端分人已关闭，历史声纹不会自动匹配。",
+                "分人已关闭，历史声纹不会自动匹配。",
                 systemImage: "pause.circle"
             )
             .foregroundStyle(.secondary)

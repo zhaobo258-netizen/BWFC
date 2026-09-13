@@ -22,6 +22,8 @@ let package = Package(
                 "交付说明.md",
                 "Agent.md",
                 "开发日志.md",
+                // 本地分人引擎（独立 CLI，不经 SPM 编译；见 Helpers/LocalDiarization/README.md）
+                "Helpers",
                 // 打包与测试执行器的临时产物
                 "build",
                 "output"

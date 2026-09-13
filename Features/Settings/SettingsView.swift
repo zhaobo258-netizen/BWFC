@@ -37,6 +37,8 @@ struct SettingsView: View {
     @State private var iflytekAccessKeySecretInput = ""
     @State private var diarizationConfiguration = DiarizationProviderConfiguration()
     @State private var diarizationMessage: String?
+    @State private var localDiarizationStatusMessage: String?
+    @State private var isTestingLocalDiarization = false
     @State private var volcengineTestResult: (ok: Bool, text: String)?
     @State private var isTestingVolcengine = false
     @State private var iflytekTestResult: (ok: Bool, text: String)?
@@ -210,6 +212,8 @@ struct SettingsView: View {
                     diarizationVolcengineConfigurationSection
                 } else if diarizationConfiguration.selectedProvider == .iflytek {
                     diarizationIFlytekConfigurationSection
+                } else if diarizationConfiguration.selectedProvider == .localSherpaOnnx {
+                    diarizationLocalSection
                 }
                 Section("当前能力") {
                     LabeledContent("本地实时转写", value: "Apple Speech · 始终启用")
@@ -333,6 +337,76 @@ struct SettingsView: View {
             Text("支持新版单 API Key 鉴权；填写 Access Token 后自动使用服务接口双凭据鉴权。Secret Key 不用于此接口。Resource ID 固定为极速版。连接测试只发送约 0.1 秒合成静音，不发送项目、录音或逐字稿。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    /// 本地分人引擎（实验，13/14 号文档 20260913）：无 Key、不联网；
+    /// 模型由用户按指引一次性下载到默认目录，App 不内置、不自动联网下载。
+    private var diarizationLocalSection: some View {
+        let modelsDirectory = LocalSherpaSupport.defaultModelsDirectory()
+        let status = LocalSherpaSupport.modelsStatus(modelsDirectory: modelsDirectory)
+        return Section("本地分人（实验）") {
+            switch status {
+            case .ready:
+                LabeledContent("模型状态", value: "就绪")
+            case .notInstalled(let missing):
+                LabeledContent("模型状态", value: "未下载")
+                Text("缺少：\(missing.joined(separator: "；"))")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            case .invalid(let reason):
+                LabeledContent("模型状态", value: "异常")
+                Text(reason)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            LabeledContent("模型目录", value: modelsDirectory.path)
+                .textSelection(.enabled)
+            HStack {
+                Button("打开模型目录") {
+                    try? FileManager.default.createDirectory(
+                        at: modelsDirectory, withIntermediateDirectories: true
+                    )
+                    NSWorkspace.shared.open(modelsDirectory)
+                }
+                Button(isTestingLocalDiarization ? "检测中…" : "检测模型") {
+                    testLocalDiarizationEngine()
+                }
+                .disabled(isTestingLocalDiarization)
+            }
+            if let localDiarizationStatusMessage {
+                statusText(localDiarizationStatusMessage)
+            }
+            Text("""
+                首次使用请下载两个模型并放入上面的目录：
+                ① 分人模型：下载 sherpa-onnx-pyannote-segmentation-3-0.tar.bz2（github.com/k2-fsa/sherpa-onnx/releases → speaker-segmentation-models），解压后把其中 model.onnx 放到「模型目录/segmentation-3-0/model.onnx」
+                ② 声纹模型：下载 3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx（同一仓库 Releases → speaker-recongition-models），放到「模型目录/campplus-3dspeaker/model.onnx」
+                """)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+            Text("本地引擎只做整场识别（录音结束后用「识别说话人」），不参与会中分片；录音超过 2 小时不做整场识别。识别全程在本机完成，音频不出机。")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func testLocalDiarizationEngine() {
+        guard !isTestingLocalDiarization else { return }
+        isTestingLocalDiarization = true
+        localDiarizationStatusMessage = nil
+        let configuration = diarizationConfiguration
+        Task {
+            defer { isTestingLocalDiarization = false }
+            do {
+                let service = environment.makeDiarizationService(for: configuration)
+                let ok = try await service.testConnection()
+                localDiarizationStatusMessage = ok
+                    ? "检测通过：本地引擎与模型可用。"
+                    : "检测未通过：引擎返回异常结果。"
+            } catch {
+                localDiarizationStatusMessage = "检测未通过：\(error.localizedDescription)"
+            }
         }
     }
 

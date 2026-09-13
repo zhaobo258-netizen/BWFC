@@ -2,6 +2,9 @@
 .build/
 # 自制 .app 输出目录
 build/
+# 本地分人引擎编译产物与依赖库（build.sh 生成；库首次自动下载）
+Helpers/LocalDiarization/bangwo-local-diarization
+Helpers/LocalDiarization/*.dylib
 # 本机录音、转写与真实媒体探针输出
 output/
 # macOS 杂项

@@ -40,10 +40,23 @@ if [[ ! -x "$BIN_PATH" ]]; then
     exit 1
 fi
 
+echo "==> 构建本地分人引擎（sherpa-onnx 独立进程，13/14 号文档 20260913）"
+ENGINE_NAME="bangwo-local-diarization"
+ENGINE_SRC="$ROOT/Helpers/LocalDiarization"
+# 打包形态：引擎与主程序同目录（Contents/MacOS），dylib 在 Contents/Frameworks，
+# 引擎以 @executable_path/../Frameworks 解析依赖；沙箱下子进程继承 App 沙箱，不依赖环境变量。
+BWFX_ENGINE_RPATH="@executable_path/../Frameworks" \
+    BWFX_ENGINE_OUT="$ROOT/build/$ENGINE_NAME" \
+    bash "$ENGINE_SRC/build.sh"
+
 echo "==> 组装 ${APP_DIR}"
 rm -rf "$APP_DIR"
-mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources" "$APP_DIR/Contents/Frameworks"
 cp "$BIN_PATH" "$APP_DIR/Contents/MacOS/${BINARY_NAME}"
+cp "$ROOT/build/$ENGINE_NAME" "$APP_DIR/Contents/MacOS/$ENGINE_NAME"
+cp "$ROOT/build/engine-deps/lib/libsherpa-onnx-c-api.dylib" "$APP_DIR/Contents/Frameworks/" 2>/dev/null || \
+    { echo "错误：缺少引擎共享库（build/engine-deps/lib），请先跑一次引擎构建" >&2; exit 1; }
+cp "$ROOT/build/engine-deps/lib/libonnxruntime.dylib" "$APP_DIR/Contents/Frameworks/"
 cp "$INFO_PLIST" "$APP_DIR/Contents/Info.plist"
 cp "$ROOT/Resources/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 
@@ -58,6 +71,9 @@ if [[ "$SIGNING_IDENTITY" == "-" ]]; then
 else
     echo "==> 稳定身份签名：$SIGNING_IDENTITY"
 fi
+# 嵌套代码先签（稳定身份），外层再带 entitlements 签名
+codesign --force --sign "$SIGNING_IDENTITY" "$APP_DIR/Contents/Frameworks/libsherpa-onnx-c-api.dylib" "$APP_DIR/Contents/Frameworks/libonnxruntime.dylib"
+codesign --force --sign "$SIGNING_IDENTITY" "$APP_DIR/Contents/MacOS/$ENGINE_NAME"
 codesign --force --sign "$SIGNING_IDENTITY" --entitlements "$ROOT/Entitlements.plist" "$APP_DIR"
 
 echo "==> 签名校验"

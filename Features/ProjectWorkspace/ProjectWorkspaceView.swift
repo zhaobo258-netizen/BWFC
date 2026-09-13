@@ -2923,12 +2923,29 @@ struct ProjectWorkspaceView: View {
         let configuration = environment.diarizationConfigurationSnapshot()
         let service = environment.makeDiarizationService(for: configuration)
         guard service.recordingLimits != nil else {
-            reviewNotice = "整场声音分组与人物库匹配需要启用讯飞或 OpenAI 兼容分人服务。"
+            reviewNotice = "整场声音分组与人物库匹配需要启用分人服务（讯飞、OpenAI 兼容或本地实验引擎）。"
             return
         }
-        guard environment.diarizationKeyStore(for: configuration).hasConfiguredKey else {
-            reviewNotice = "分人服务尚未连接，请先在设置中配置；原文与人工标注已保留。"
-            return
+        if configuration.selectedProvider == .localSherpaOnnx {
+            // 本地引擎无 Key 门禁：改为模型就绪检查，未就绪给下载指引
+            let status = LocalSherpaSupport.modelsStatus(
+                modelsDirectory: LocalSherpaSupport.defaultModelsDirectory()
+            )
+            switch status {
+            case .ready:
+                break
+            case .notInstalled:
+                reviewNotice = "本地分人模型尚未下载：请到 设置 → 录音与说话人 → 本地（实验） 按指引放置模型；原文与人工标注已保留。"
+                return
+            case .invalid(let reason):
+                reviewNotice = "本地分人模型异常：\(reason) 原文与人工标注已保留。"
+                return
+            }
+        } else {
+            guard environment.diarizationKeyStore(for: configuration).hasConfiguredKey else {
+                reviewNotice = "分人服务尚未连接，请先在设置中配置；原文与人工标注已保留。"
+                return
+            }
         }
         guard !meeting.segments.isEmpty,
               let audioURL = try? environment.fileStore.audioFileURL(for: meeting) else {
