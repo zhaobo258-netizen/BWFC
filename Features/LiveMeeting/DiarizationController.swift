@@ -698,6 +698,9 @@ final class DiarizationController {
             return configurationSnapshot.isValid && keyStore.hasConfiguredKey
         case .iflytek:
             return configurationSnapshot.isValid && keyStore.hasConfiguredKey
+        case .localSherpaOnnx:
+            // 本地引擎 v1 只做整场识别（13 号文档 §3.3）；会中分片保持未配置零请求
+            return false
         }
     }
 

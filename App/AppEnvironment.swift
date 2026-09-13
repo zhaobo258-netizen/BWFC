@@ -596,7 +596,7 @@ final class AppEnvironment {
                 switch diarizationConfiguration.selectedProvider {
                 case .volcengine: return volcengineDiarizationKeyStore
                 case .iflytek: return iflytekCredentialStore
-                case .disabled, .openAICompatible: return diarizationStore
+                case .disabled, .openAICompatible, .localSherpaOnnx: return diarizationStore
                 }
             }()
         )
@@ -760,7 +760,8 @@ final class AppEnvironment {
             keyStore: keyStore(for: .diarization),
             volcengineKeyStore: volcengineDiarizationKeyStore,
             volcengineAccessTokenStore: volcengineDiarizationAccessTokenStore,
-            iflytekCredentialStore: iflytekCredentialStore
+            iflytekCredentialStore: iflytekCredentialStore,
+            localEngineConfiguration: LocalSherpaSupport.defaultConfiguration()
         )
     }
 
@@ -772,7 +773,8 @@ final class AppEnvironment {
             return volcengineDiarizationKeyStore
         case .iflytek:
             return iflytekCredentialStore
-        case .disabled, .openAICompatible:
+        case .disabled, .openAICompatible, .localSherpaOnnx:
+            // 本地引擎无 Key；返回统一存储仅为保持签名，门禁按 provider 分叉
             return keyStore(for: .diarization)
         }
     }
@@ -806,6 +808,9 @@ final class AppEnvironment {
             return configuration.isValid && keyStore.hasConfiguredKey
         case .iflytek:
             return configuration.isValid && keyStore.hasConfiguredKey
+        case .localSherpaOnnx:
+            // 状态灯按"选中即启用"呈现；模型缺失在识别入口与设置页给出指引
+            return true
         }
     }
 

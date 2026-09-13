@@ -5,6 +5,9 @@ enum DiarizationProvider: String, Codable, Sendable, CaseIterable {
     case openAICompatible
     case volcengine
     case iflytek
+    /// 本地 sherpa-onnx 引擎（13/14 号文档 20260913）：整场识别 + 声纹认人候选，
+    /// 不联网、无 API Key；会中分片保持未配置态。
+    case localSherpaOnnx
 
     var displayName: String {
         switch self {
@@ -12,6 +15,7 @@ enum DiarizationProvider: String, Codable, Sendable, CaseIterable {
         case .openAICompatible: return "OpenAI 兼容"
         case .volcengine: return "火山引擎"
         case .iflytek: return "讯飞"
+        case .localSherpaOnnx: return "本地（实验）"
         }
     }
 
@@ -94,6 +98,9 @@ struct DiarizationProviderConfiguration: Codable, Equatable, Sendable {
             return normalizedVolcengineResourceID == VolcengineDiarizationService.resourceID
         case .iflytek:
             return !normalizedIFlytekAppID.isEmpty
+        case .localSherpaOnnx:
+            // 选中即合法；模型缺失/引擎缺失由运行时错误给出下载或安装指引
+            return true
         }
     }
 
@@ -535,7 +542,8 @@ enum DiarizationServiceFactory {
             service: CloudAPIKeyStore.defaultService,
             account: IFlytekCredentials.credentialAccount
         ),
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        localEngineConfiguration: LocalSherpaSupport.EngineConfiguration? = nil
     ) -> any DiarizationServicing {
         switch configuration.selectedProvider {
         case .disabled:
@@ -569,6 +577,11 @@ enum DiarizationServiceFactory {
                 session: session,
                 appID: configuration.normalizedIFlytekAppID,
                 credentialStore: iflytekCredentialStore
+            )
+        case .localSherpaOnnx:
+            // 始终构造本地服务：模型/引擎缺失以明确的 providerError 呈现，不静默降级
+            return LocalSherpaDiarizationService(
+                configuration: localEngineConfiguration ?? LocalSherpaSupport.defaultConfiguration()
             )
         }
     }
