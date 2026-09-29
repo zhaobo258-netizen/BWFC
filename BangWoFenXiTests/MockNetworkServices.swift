@@ -67,12 +67,6 @@ final class IFlytekMockURLProtocol: MockURLProtocolBase, @unchecked Sendable {
     override class var sharedStorage: MockURLProtocolStorage { storage }
 }
 
-/// 阶段 4 谈判分析接口测试专用
-final class AnalysisMockURLProtocol: MockURLProtocolBase, @unchecked Sendable {
-    static let storage = MockURLProtocolStorage()
-    override class var sharedStorage: MockURLProtocolStorage { storage }
-}
-
 /// Kimi 网关分析接口测试专用
 final class KimiMockURLProtocol: MockURLProtocolBase, @unchecked Sendable {
     static let storage = MockURLProtocolStorage()

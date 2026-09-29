@@ -30,24 +30,6 @@ final class WorkspaceZoneLayoutTests {
         #expect(tiny.right >= 0)
         #expect(tiny.left + tiny.right + WorkspaceDualZonePolicy.gap == 637)
     }
-
-    @Test("扣除常驻侧栏后才是真正可用宽度")
-    func sidebarDeduction() {
-        let without = ProjectSidebarWidthAccounting.contentWidth(
-            totalWindowWidth: 1280, sidebarShown: false
-        )
-        #expect(without == 1280)
-        let with = ProjectSidebarWidthAccounting.contentWidth(
-            totalWindowWidth: 1280, sidebarShown: true
-        )
-        #expect(with == 1280 - ProjectWorkspaceView.projectSidebarWidth - 1)
-        #expect(ProjectSidebarWidthAccounting.zoneMode(
-            totalWindowWidth: 1280, sidebarShown: true
-        ) == .dual)
-        #expect(ProjectSidebarWidthAccounting.zoneMode(
-            totalWindowWidth: 637, sidebarShown: false
-        ) == .single)
-    }
 }
 
 /// 人物归属与证据投影（M2 纯逻辑）。

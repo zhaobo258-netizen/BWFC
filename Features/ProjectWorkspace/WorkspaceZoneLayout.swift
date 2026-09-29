@@ -1,7 +1,28 @@
 import SwiftUI
 
+/// 窗口宽度断点（窄/紧凑/宽）：决定常驻项目侧栏等窗口级行为。
+enum WorkspaceLayoutMode: Equatable {
+    case narrow
+    case compact
+    case wide
+
+    static func resolve(totalWidth: CGFloat) -> Self {
+        if totalWidth >= 1280 {
+            return .wide
+        }
+        if totalWidth >= 1080 {
+            return .compact
+        }
+        return .narrow
+    }
+
+    func showsPersistentSidebar(preference: Bool) -> Bool {
+        self == .wide && preference
+    }
+}
+
 /// A 版双区布局模式（M2）：在工作台正文内容宽度上判定，
-/// 与旧 WorkspaceLayoutMode（窄/紧凑/宽，三栏与 inspector 语义）解耦。
+/// 与 WorkspaceLayoutMode（窗口级断点）是两个独立维度。
 ///
 /// - `.dual`: 左「理解与回看」/ 右「笔记与 AI」两区并存。
 /// - `.single`: 一区独占，由用户在两个区之间切换。
@@ -70,25 +91,5 @@ enum WorkspaceSingleZoneSelection: Equatable {
 
     mutating func toggle() {
         self = self == .understanding ? .notesAndAI : .understanding
-    }
-}
-
-/// 项目侧栏常驻时对正文可用宽度的扣除（纯计算，供布局测试与工作台使用）。
-enum ProjectSidebarWidthAccounting {
-    /// 常驻项目侧栏宽度 + 与正文之间的分隔线
-    static func contentWidth(totalWindowWidth: CGFloat,
-                             sidebarShown: Bool) -> CGFloat {
-        guard sidebarShown else { return totalWindowWidth }
-        let sidebar = ProjectWorkspaceView.projectSidebarWidth + 1
-        return max(0, totalWindowWidth - sidebar)
-    }
-
-    /// 双区在当前窗口宽度与侧栏状态下是否可用。
-    static func zoneMode(totalWindowWidth: CGFloat,
-                         sidebarShown: Bool) -> WorkspaceZoneMode {
-        WorkspaceDualZonePolicy.mode(
-            for: contentWidth(totalWindowWidth: totalWindowWidth,
-                              sidebarShown: sidebarShown)
-        )
     }
 }
