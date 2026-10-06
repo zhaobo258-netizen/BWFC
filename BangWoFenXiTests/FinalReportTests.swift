@@ -1100,6 +1100,60 @@ struct FinalReportTests {
         #expect(generator.callCount == 1, "非瞬时错误不得重试")
     }
 
+    @Test("正文人物占位按当前人物真源投影，旧报告无占位不受影响（15 号计划 D.2/F09）")
+    func speakerPlaceholderProjection() throws {
+        let speakerA = Speaker(cloudAlias: "p_01", displayName: "客户甲")
+        let speakerB = Speaker(cloudAlias: "p_02", displayName: "老王")
+        let text = "@p_01 确认了 @p_01 的口径，@p_02 补充交付范围；未登记的 @p_09 保持原样。"
+        let projected = FinalReportSpeakerProjector.project(text, speakers: [speakerA, speakerB])
+        #expect(projected.contains("客户甲 确认了 客户甲 的口径"))
+        #expect(projected.contains("老王 补充交付范围"))
+        #expect(projected.contains("@p_09 保持原样"))
+        #expect(!projected.contains("@p_01"))
+
+        // 旧报告没有占位符：恒等
+        let legacy = "2024 年确认有效客户口径。"
+        #expect(FinalReportSpeakerProjector.project(legacy, speakers: [speakerA]) == legacy)
+
+        // Markdown 导出与卡片投影一致
+        let project = Project(
+            title: "投影测试",
+            sourceType: .liveRecording,
+            speakers: [speakerA],
+            segments: []
+        )
+        let report = FinalReportSnapshot(
+            version: 1,
+            providerID: "mock", providerName: "测试", modelID: "test",
+            promptVersion: "v",
+            inputFingerprint: "f",
+            headline: "@p_01 拍板",
+            overview: "由 @p_01 主导。",
+            items: [FinalReportItem(
+                category: .decision,
+                text: "@p_01 确认有效客户口径。",
+                epistemicStatus: .explicit,
+                confidence: .high,
+                evidenceSegmentIds: []
+            )]
+        )
+        let markdown = FinalReportMarkdownRenderer.makeMarkdown(report: report, project: project)
+        #expect(markdown.contains("- @p_01 拍板") == false)
+        #expect(markdown.contains("客户甲 拍板"))
+        #expect(markdown.contains("客户甲 确认有效客户口径。"))
+    }
+
+    @Test("总结提示词约束决定语义、数字口径与人物占位（15 号计划 D.3/D.4）")
+    func finalReportPromptSemantics() throws {
+        let system = PromptRegistry.finalReportSystem(scenario: .internalMeeting)
+        #expect(system.contains("@p_01"))
+        #expect(system.contains("@代号"))
+        #expect(system.contains("不得写成 decision"))
+        #expect(system.contains("口径待确认"))
+        #expect(system.contains("复合结论必须整体有证据支持"))
+        #expect(system.contains("责任人或期限没有明确证据时填 null"))
+    }
+
     private func waitUntil(
         timeout: Duration = .seconds(5),
         _ condition: () -> Bool

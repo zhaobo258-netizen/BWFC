@@ -563,6 +563,15 @@ enum FinalReportMarkdownRenderer {
             project.speakers.map { ($0.id, $0.displayName) },
             uniquingKeysWith: { first, _ in first }
         )
+        // 结构化人物引用投影（15 号计划 D.2）：正文全部位置统一按当前人物真源显示
+        let projectedHeadline = FinalReportSpeakerProjector.project(
+            report.headline,
+            speakers: project.speakers
+        )
+        let projectedOverview = FinalReportSpeakerProjector.project(
+            report.overview,
+            speakers: project.speakers
+        )
         let segments = Dictionary(
             project.segments.map { ($0.id, $0) },
             uniquingKeysWith: { first, _ in first }
@@ -577,11 +586,11 @@ enum FinalReportMarkdownRenderer {
             "",
             "## 一句话结论",
             "",
-            report.headline,
+            projectedHeadline,
             "",
             "## 完整概述",
             "",
-            report.overview
+            projectedOverview
         ]
         if let collaborationSummary = report.collaborationSummary {
             lines.append(contentsOf: [
@@ -597,14 +606,23 @@ enum FinalReportMarkdownRenderer {
             let items = report.items.filter { $0.category == category }
             guard !items.isEmpty else { continue }
             lines.append(contentsOf: ["", "## \(category.displayName)", ""])
+            if category == .decision || category == .actionItem {
+                lines.append("> 请回听原话核对后再作为结论使用；模型整理不能替代人工核验。")
+                lines.append("")
+            }
             for item in items {
                 var suffix: [String] = []
-                if let owner = item.ownerSpeakerId.flatMap({ speakerNames[$0] }) {
-                    suffix.append("责任人：\(owner)")
+                if let owner = item.ownerSpeakerId {
+                    suffix.append("责任人：\(speakerNames[owner] ?? "未知人物")")
                 }
                 if let deadline = item.deadlineText {
                     suffix.append("期限：\(deadline)")
                 }
+                // 结构化人物引用投影（15 号计划 D.2）：与界面卡片一致
+                let projectedText = FinalReportSpeakerProjector.project(
+                    item.text,
+                    speakers: project.speakers
+                )
                 let timePrefix: String
                 if category == .chapter,
                    let firstEvidence = item.evidenceSegmentIds.first,
@@ -618,7 +636,7 @@ enum FinalReportMarkdownRenderer {
                 } else {
                     timePrefix = ""
                 }
-                lines.append("- \(timePrefix)\(item.text)\(suffix.isEmpty ? "" : "（\(suffix.joined(separator: "；"))）")")
+                lines.append("- \(timePrefix)\(projectedText)\(suffix.isEmpty ? "" : "（\(suffix.joined(separator: "；"))）")")
                 for evidenceID in item.evidenceSegmentIds {
                     guard let segment = segments[evidenceID] else { continue }
                     let speaker = segment.participantId.flatMap { speakerNames[$0] } ?? "待识别"

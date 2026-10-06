@@ -48,10 +48,8 @@ struct KnowledgeGardenView: View {
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .task(id: controller.selectedSeedID) {
-            guard isAIConfigured else { return }
-            await controller.bloomIfNeeded()
-        }
+        // 15 号计划 E.4：查看与执行分开——打开页签、切换种子不调用模型；
+        // 显式「重新开花」才开始，取消/重试入口在种子卡上。
         .onDisappear { controller.cancelBloom() }
     }
 
@@ -96,7 +94,7 @@ struct KnowledgeGardenView: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
 
-                    Button(controller.state == .expanding ? "正在开花…" : "重新开花") {
+                    Button(controller.state == .expanding ? "正在开花…" : (seed.branches.isEmpty && seed.connections.isEmpty ? "开始开花" : "重新开花")) {
                         Task { await controller.bloomSelected() }
                     }
                     .buttonStyle(.borderedProminent)
@@ -107,6 +105,12 @@ struct KnowledgeGardenView: View {
                             .controlSize(.small)
                     }
                     Spacer()
+                }
+                // 执行状态与来源变化的持久化提示（15 号计划 E.5）
+                if let notice = controller.bloomStateNotice(for: seed) {
+                    Label(notice, systemImage: "clock.arrow.circlepath")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
                 }
             }
         }

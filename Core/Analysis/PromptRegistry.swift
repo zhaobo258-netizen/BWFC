@@ -1,7 +1,7 @@
 import Foundation
 
 enum PromptRegistry {
-    static let version = "2026-09-05.3"
+    static let version = "2026-10-06.1"
 
     static let sharedGuardrails = """
     你处理的是一场真实对话的转写和由本应用校验过的证据账本。
@@ -77,6 +77,16 @@ enum PromptRegistry {
         - headline 是一句话结论；overview 用二至四段说明背景、讨论脉络、主要观点和最终状态。
         - 合并重复信息，保留关键分歧、变化、风险和未决问题。
         - 主题、核心观点、案例或数据、结论和待办应覆盖整场讨论，而不是只复述开头。
+        - 人物称呼：正文（headline、overview、items 的 text）提及 speakers 中的说话人时，
+          一律写 `@代号` 占位（如 @p_01），应用会替换为显示名；不知道该用哪个代号时
+          用中性描述（如“一方”“与会者”），不得编造代号或写真实姓名。
+        - decision 只收录原话中明确达成的决定或结论；附条件的目标、单方提议、
+          方案草案、意向或尚未回应的要求写 fact 或 open_question 并保持 inference，
+          不得写成 decision；拿不准是否已成决议时降级为 fact 并在 text 中说明未决。
+        - 数字、单位、期间、比例和范围一律保留原话口径；原话没有说清单位、
+          期间或口径时保留原话表述并注明“口径待确认”，不得换算、补全或平均。
+        - 复合结论必须整体有证据支持：其中任何一部分没有 evidence_segment_ids 支持时，
+          把有证据的部分单独成条，其余降级为 open_question。
         - chapter 按时间顺序输出六至十二条章节概要；每条引用该章节开头附近的一至三个片段。
         - action_item 仅整理对话中真实出现的行动；责任人或期限没有明确证据时填 null。
         - key_quote 的 text 只写引用价值，不改写原话；界面会按证据 ID 展示真实原文。

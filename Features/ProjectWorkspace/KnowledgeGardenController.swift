@@ -179,14 +179,6 @@ final class KnowledgeGardenController {
         sourceSynthesisMessage = nil
     }
 
-    func bloomIfNeeded() async {
-        guard let seed = selectedSeed,
-              Self.needsBloom(seed) else {
-            return
-        }
-        await bloomSelected()
-    }
-
     func bloomSelected() async {
         guard let selectedSeedID else {
             return
@@ -234,7 +226,44 @@ final class KnowledgeGardenController {
                 activeRequestID = nil
                 bloomTask = nil
                 state = Task.isCancelled ? .idle : .finished
+                if Task.isCancelled {
+                    updateSeed(id: seed.id) {
+                        if $0.lastBloomStatus == "running" {
+                            $0.lastBloomStatus = "cancelled"
+                            $0.updatedAt = Date()
+                        }
+                    }
+                } else {
+                    // expansion(.failure) 已写入失败态；仍是 running 说明整链成功（含部分成功）
+                    updateSeed(id: seed.id) {
+                        if $0.lastBloomStatus == "running" {
+                            $0.lastBloomStatus = "succeeded"
+                            $0.lastBloomFailureKind = nil
+                            $0.updatedAt = Date()
+                        }
+                    }
+                }
             }
+        }
+        // 15 号计划 E.1/E.2：先校验证据有效性，再取数量上限；零有效原话不调用模型
+        let evidence = Self.validEvidence(for: seed, in: project)
+        guard !evidence.isEmpty else {
+            updateSeed(id: seed.id) {
+                $0.lastBloomStatus = "failed"
+                $0.lastBloomFailureKind = "no_valid_evidence"
+                $0.lastBloomAt = Date()
+            }
+            if selectedSeedID == seed.id {
+                expansionMessage = "这条种子引用的原话已不存在或尚未定稿，无法作为本次录音的事实依据；请换一个种子，或先更新原话。"
+            }
+            return
+        }
+        let fingerprint = Self.inputFingerprint(seedText: seed.seedText, evidence: evidence)
+        updateSeed(id: seed.id) {
+            $0.lastBloomStatus = "running"
+            $0.lastBloomFailureKind = nil
+            $0.lastBloomInputFingerprint = fingerprint
+            $0.lastBloomAt = Date()
         }
         let providers = providerFactory()
         if providers.isEmpty {
@@ -243,7 +272,7 @@ final class KnowledgeGardenController {
         let output = await KnowledgeBloomAgent(expansionService: expansionService).bloom(
             seedText: seed.seedText,
             whyItMatters: seed.whyItMatters,
-            evidence: Self.evidence(for: seed, in: project),
+            evidence: evidence,
             scenario: project.scenario,
             userContext: ProjectAIUserContext.statements(from: project.aiChatMessages),
             noteMarkdown: project.noteAIContextEnabled ? noteContextProvider() : nil,
@@ -284,6 +313,11 @@ final class KnowledgeGardenController {
             }
         case .expansion(.failure(let failure)):
             expansionMessage = Self.expansionFailureMessage(failure)
+            updateSeed(id: seedID) {
+                $0.lastBloomStatus = "failed"
+                $0.lastBloomFailureKind = "ai_expansion"
+                $0.updatedAt = Date()
+            }
         case .sources(let outcomes):
             guard !outcomes.isEmpty else { return }
             let hasIncoming = outcomes.contains { !$0.connections.isEmpty }
@@ -455,7 +489,13 @@ final class KnowledgeGardenController {
         return candidates
     }
 
-    private static func evidence(
+    private static func identityKey(_ seed: KnowledgeSeed) -> String {
+        normalized(seed.seedText) + "|" + seed.evidenceSegmentIds.map(\.uuidString).joined(separator: ",")
+    }
+
+    /// 有效证据（15 号计划 E.1）：先过滤失效/未定稿/空文本的引用，再取数量上限；
+    /// 文本取当前逐字稿的最新内容，不是种子创建时的快照。
+    private static func validEvidence(
         for seed: KnowledgeSeed,
         in project: Project
     ) -> [KnowledgeEvidenceInput] {
@@ -463,17 +503,66 @@ final class KnowledgeGardenController {
             project.segments.map { ($0.id, $0) },
             uniquingKeysWith: { first, _ in first }
         )
-        return seed.evidenceSegmentIds.prefix(3).compactMap { id in
-            guard let segment = byID[id] else { return nil }
+        return seed.evidenceSegmentIds.compactMap { id in
+            guard let segment = byID[id],
+                  segment.state == .final || segment.state == .edited,
+                  !segment.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return nil
+            }
             return KnowledgeEvidenceInput(
                 segmentId: id,
                 text: String(segment.text.prefix(1_000))
             )
-        }
+        }.prefix(3).map { $0 }
     }
 
-    private static func identityKey(_ seed: KnowledgeSeed) -> String {
-        normalized(seed.seedText) + "|" + seed.evidenceSegmentIds.map(\.uuidString).joined(separator: ",")
+    /// 开花输入指纹（15 号计划 E.5）：种子文本 + 有效证据文本；
+    /// 与上次执行不一致时标记"来源已变化"，旧结果不冒充仍然成立
+    static func inputFingerprint(
+        seedText: String,
+        evidence: [KnowledgeEvidenceInput]
+    ) -> String {
+        let value = (seedText + "\u{1E}") + evidence.map {
+            $0.segmentId.uuidString + "\u{1F}" + $0.text
+        }.joined(separator: "\u{1E}")
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in value.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1_099_511_628_211
+        }
+        return String(hash, radix: 16)
+    }
+
+    /// 当前种子是否已有过期风险的上次执行结果（来源变化 / 执行被中断）
+    func bloomStateNotice(for seed: KnowledgeSeed) -> String? {
+        if seed.lastBloomStatus == "running" {
+            return "上次开花在执行中被中断（可能退出 App）；可重新开始。"
+        }
+        if seed.lastBloomStatus == "failed", let kind = seed.lastBloomFailureKind {
+            switch kind {
+            case "no_valid_evidence":
+                return "上次开花失败：种子引用的原话已不存在或未定稿。"
+            case "ai_expansion":
+                return "上次开花的 AI 联想失败；可重试。"
+            default:
+                return "上次开花失败；可重试。"
+            }
+        }
+        if seed.lastBloomStatus == "succeeded", seed.lastBloomInputFingerprint != nil {
+            let currentFingerprint = Self.inputFingerprint(
+                seedText: seed.seedText,
+                evidence: validEvidenceForDisplay(for: seed)
+            )
+            if currentFingerprint != seed.lastBloomInputFingerprint {
+                return "种子原话已变化，上次开花结果可能过期；可重新开花。"
+            }
+        }
+        return nil
+    }
+
+    private func validEvidenceForDisplay(for seed: KnowledgeSeed) -> [KnowledgeEvidenceInput] {
+        guard let project else { return [] }
+        return Self.validEvidence(for: seed, in: project)
     }
 
     private static func needsBloom(_ seed: KnowledgeSeed) -> Bool {

@@ -81,11 +81,11 @@ struct FinalReportView: View {
                 }
             }
 
-            Text(report.headline)
+            Text(FinalReportSpeakerProjector.project(report.headline, speakers: project.speakers))
                 .font(.headline)
                 .fixedSize(horizontal: false, vertical: true)
 
-            Text(report.overview)
+            Text(FinalReportSpeakerProjector.project(report.overview, speakers: project.speakers))
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
@@ -317,6 +317,11 @@ struct FinalReportView: View {
                     .fontWeight(.semibold)
                     .foregroundStyle(.secondary)
             }
+            if category == .decision || category == .actionItem {
+                Text("请点开原话证据核对后再作为结论使用；模型整理不能替代人工核验。")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
             ForEach(items) { item in
                 reportItem(item)
             }
@@ -345,7 +350,8 @@ struct FinalReportView: View {
                     .fontWeight(.semibold)
                     .foregroundStyle(BWTheme.accent)
             }
-            Text(item.text)
+            // 结构化人物引用投影（15 号计划 D.2）：@代号 按当前人物真源显示
+            Text(FinalReportSpeakerProjector.project(item.text, speakers: project.speakers))
                 .font(.callout)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
@@ -357,8 +363,8 @@ struct FinalReportView: View {
                 Text(confidenceText(item.confidence))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                if let owner = item.ownerSpeakerId.flatMap(speakerName) {
-                    Text("责任人：\(owner)")
+                if let owner = item.ownerSpeakerId {
+                    Text("责任人：\(ownerDisplay(owner))")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -411,6 +417,11 @@ struct FinalReportView: View {
 
     private func speakerName(_ id: UUID) -> String? {
         project.speakers.first(where: { $0.id == id })?.displayName
+    }
+
+    /// 责任人显示：人物被删除或改名后仍如实呈现（15 号计划 D.2）
+    private func ownerDisplay(_ id: UUID) -> String {
+        speakerName(id) ?? "未知人物"
     }
 
     private func confidenceText(_ confidence: Confidence) -> String {

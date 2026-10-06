@@ -122,6 +122,15 @@ struct KnowledgeSeed: Identifiable, Codable, Sendable, Hashable {
     var isAddedToProject: Bool
     var createdAt: Date
     var updatedAt: Date
+    /// 最近一次开花执行的持久化状态（15 号计划 E.5）：
+    /// running / succeeded / failed / cancelled；重启后读到 running 视为上次执行被中断
+    var lastBloomStatus: String?
+    /// 最近一次失败的脱敏类别（如 ai_expansion、no_valid_evidence）
+    var lastBloomFailureKind: String?
+    /// 最近一次执行时的输入指纹（种子文本 + 有效证据文本）；变化后标记来源已变化
+    var lastBloomInputFingerprint: String?
+    /// 最近一次执行时间
+    var lastBloomAt: Date?
 
     init(
         id: UUID = UUID(),
@@ -134,7 +143,11 @@ struct KnowledgeSeed: Identifiable, Codable, Sendable, Hashable {
         searchQueries: [String] = [],
         isAddedToProject: Bool = false,
         createdAt: Date = Date(),
-        updatedAt: Date = Date()
+        updatedAt: Date = Date(),
+        lastBloomStatus: String? = nil,
+        lastBloomFailureKind: String? = nil,
+        lastBloomInputFingerprint: String? = nil,
+        lastBloomAt: Date? = nil
     ) {
         self.id = id
         self.seedText = seedText
@@ -147,5 +160,9 @@ struct KnowledgeSeed: Identifiable, Codable, Sendable, Hashable {
         self.isAddedToProject = isAddedToProject
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.lastBloomStatus = lastBloomStatus
+        self.lastBloomFailureKind = lastBloomFailureKind
+        self.lastBloomInputFingerprint = lastBloomInputFingerprint
+        self.lastBloomAt = lastBloomAt
     }
 }

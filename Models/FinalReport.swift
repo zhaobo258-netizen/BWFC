@@ -125,6 +125,31 @@ enum FinalReportSnapshotRetention {
     }
 }
 
+/// 完整总结的结构化人物引用投影（15 号计划 D.2/F09）：
+/// 模型在正文里用 `@代号`（如 @p_01）引用 speakers 中真实存在的人物，
+/// 显示与导出统一按当前 Person 真源投影为显示名；不做盲目字符串替换——
+/// 只有与 speakers 现存 alias 完全一致的占位才替换，其余原样保留。
+/// 旧报告没有占位符，投影为恒等变换，向后兼容。
+enum FinalReportSpeakerProjector {
+    /// 把正文中的 `@alias` 占位投影为当前显示名
+    static func project(_ text: String, speakers: [Speaker]) -> String {
+        let aliases = speakers
+            .filter { !$0.cloudAlias.isEmpty }
+            .sorted { $0.cloudAlias.count > $1.cloudAlias.count }
+        guard !aliases.isEmpty else { return text }
+        var result = text
+        for speaker in aliases {
+            let token = "@\(speaker.cloudAlias)"
+            guard result.contains(token) else { continue }
+            result = result.replacingOccurrences(
+                of: token,
+                with: speaker.displayName.isEmpty ? "未知人物" : speaker.displayName
+            )
+        }
+        return result
+    }
+}
+
 enum FinalReportFingerprint {
     static func make(for project: Project, relatedProjects: [Project] = []) -> String {
         let local = localFingerprint(for: project)

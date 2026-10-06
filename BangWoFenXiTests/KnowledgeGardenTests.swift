@@ -23,6 +23,7 @@ private actor CapturingKnowledgeExpansionService:
     private var capturedUserContext: [String] = []
     private var capturedNote: String?
     private(set) var requestCount = 0
+    private(set) var capturedEvidence: [KnowledgeEvidenceInput] = []
 
     func expand(
         seedText: String,
@@ -35,6 +36,7 @@ private actor CapturingKnowledgeExpansionService:
         requestCount += 1
         capturedUserContext = userContext
         capturedNote = noteMarkdown
+        capturedEvidence = evidence
         return KnowledgeExpansionResult(
             branches: [
                 KnowledgeBranch(
@@ -1330,5 +1332,101 @@ struct KnowledgeGardenTests {
         try firstToken.deleteKey()
         #expect(!firstToken.hasConfiguredKey)
         #expect(try secondToken.readKey() == "token-two")
+    }
+
+    @Test("开花证据先过滤失效引用再取上限；全部失效时零模型调用（15 号计划 E.1/E.2/F04）")
+    @MainActor
+    func bloomFiltersInvalidEvidenceBeforeLimit() async throws {
+        let validSegments = (0..<3).map { index in
+            TranscriptSegment(startMs: Int64(index * 1_000), endMs: Int64(index * 1_000 + 900),
+                text: "有效原话\(index)：渠道库存需要统一业务口径。", source: .local, state: .final)
+        }
+        let provisional = TranscriptSegment(startMs: 9_000, endMs: 9_900,
+            text: "还在识别中的片段", source: .local, state: .provisional)
+        let project = Project(title: "证据过滤", sourceType: .importedAudio,
+            segments: validSegments + [provisional])
+        let missingID = UUID()
+        let seed = KnowledgeSeed(
+            seedText: "渠道库存口径",
+            whyItMatters: "测试种子",
+            evidenceSegmentIds: [missingID, provisional.id]
+                + validSegments.map(\.id))
+        project.knowledgeSeeds = [seed]
+
+        let service = CapturingKnowledgeExpansionService()
+        let controller = KnowledgeGardenController(expansionService: service, providerFactory: { [] })
+        controller.attach(to: project)
+        #expect(controller.selectedSeed?.id == seed.id)
+
+        await controller.bloomSelected()
+
+        let capturedEvidence = await service.capturedEvidence
+        #expect(capturedEvidence.count == 3, "先过滤失效引用再取上限 3")
+        #expect(Set(capturedEvidence.map(\.segmentId)) == Set(validSegments.map(\.id)))
+        #expect(controller.selectedSeed?.lastBloomStatus == "succeeded")
+        #expect(controller.selectedSeed?.lastBloomInputFingerprint != nil)
+        #expect(controller.selectedSeed?.lastBloomAt != nil)
+    }
+
+    @Test("种子引用全部失效时不调用模型并提示更新种子（15 号计划 E.2）")
+    @MainActor
+    func bloomSkipsModelWhenNoValidEvidence() async throws {
+        let segment = TranscriptSegment(startMs: 0, endMs: 900,
+            text: "尚未定稿的片段", source: .local, state: .provisional)
+        let project = Project(title: "全失效种子", sourceType: .importedAudio, segments: [segment])
+        let seed = KnowledgeSeed(
+            seedText: "失效种子",
+            whyItMatters: "测试种子",
+            evidenceSegmentIds: [segment.id, UUID()])
+        project.knowledgeSeeds = [seed]
+
+        let service = CapturingKnowledgeExpansionService()
+        let controller = KnowledgeGardenController(expansionService: service, providerFactory: { [] })
+        controller.attach(to: project)
+
+        await controller.bloomSelected()
+
+        #expect(await service.requestCount == 0, "零有效原话不得调用模型")
+        #expect(controller.expansionMessage?.contains("已不存在或尚未定稿") == true)
+        #expect(controller.selectedSeed?.lastBloomStatus == "failed")
+        #expect(controller.selectedSeed?.lastBloomFailureKind == "no_valid_evidence")
+        // 已收藏种子不会被丢弃
+        #expect(controller.seeds.contains { $0.id == seed.id })
+    }
+
+    @Test("执行状态持久化：中断、取消与来源变化如实提示（15 号计划 E.5）")
+    @MainActor
+    func bloomStateNotices() throws {
+        let segment = TranscriptSegment(startMs: 0, endMs: 900,
+            text: "渠道库存需要统一业务口径。", source: .local, state: .final)
+        let project = Project(title: "状态提示", sourceType: .importedAudio, segments: [segment])
+        var seed = KnowledgeSeed(
+            seedText: "口径种子",
+            whyItMatters: "测试种子",
+            evidenceSegmentIds: [segment.id])
+        project.knowledgeSeeds = [seed]
+        let controller = KnowledgeGardenController(
+            expansionService: MockKnowledgeExpansionService(
+                result: KnowledgeExpansionResult(branches: [], searchQueries: [])),
+            providerFactory: { [] })
+        controller.attach(to: project)
+
+        // 重启后残留 running → 执行被中断
+        seed.lastBloomStatus = "running"
+        #expect(controller.bloomStateNotice(for: seed)?.contains("被中断") == true)
+
+        // 失败分类提示
+        seed.lastBloomStatus = "failed"
+        seed.lastBloomFailureKind = "ai_expansion"
+        #expect(controller.bloomStateNotice(for: seed)?.contains("失败") == true)
+
+        // 成功但来源变化 → 过期提示；一致 → 无提示
+        let evidence = KnowledgeEvidenceInput(segmentId: segment.id, text: segment.text)
+        seed.lastBloomStatus = "succeeded"
+        seed.lastBloomInputFingerprint = KnowledgeGardenController.inputFingerprint(
+            seedText: seed.seedText, evidence: [evidence])
+        #expect(controller.bloomStateNotice(for: seed) == nil)
+        segment.text = "渠道库存需要统一业务口径，含在途与破损。"
+        #expect(controller.bloomStateNotice(for: seed)?.contains("已变化") == true)
     }
 }
