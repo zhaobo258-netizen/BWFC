@@ -20,6 +20,12 @@ struct ChunkQueueEntry: Codable, Equatable, Sendable {
     var status: Status
     /// 已失败次数（退避与上限判断依据）
     var attemptCount: Int
+    /// 最近一次失败的脱敏类别（15 号计划 F07：可诊断；旧队列缺省为 nil）
+    var lastFailureKind: String?
+    /// 最近一次失败的 provider 订单关联（本机诊断用；非敏感令牌）
+    var lastOrderID: String?
+    /// 最近一次失败的 provider 原始状态（如讯飞 orderInfo.status）
+    var lastProviderStatus: Int?
 
     enum Status: String, Codable, Sendable {
         case pending           // 待上传
@@ -39,7 +45,10 @@ struct ChunkQueueEntry: Codable, Equatable, Sendable {
         provider: DiarizationProvider = .openAICompatible,
         providerConfigurationFingerprint: String = "",
         status: Status,
-        attemptCount: Int
+        attemptCount: Int,
+        lastFailureKind: String? = nil,
+        lastOrderID: String? = nil,
+        lastProviderStatus: Int? = nil
     ) {
         self.index = index
         self.audioStartMs = audioStartMs
@@ -51,6 +60,9 @@ struct ChunkQueueEntry: Codable, Equatable, Sendable {
         self.providerConfigurationFingerprint = providerConfigurationFingerprint
         self.status = status
         self.attemptCount = attemptCount
+        self.lastFailureKind = lastFailureKind
+        self.lastOrderID = lastOrderID
+        self.lastProviderStatus = lastProviderStatus
     }
 
     init(from decoder: any Decoder) throws {
@@ -71,6 +83,9 @@ struct ChunkQueueEntry: Codable, Equatable, Sendable {
         ) ?? ""
         status = try container.decode(Status.self, forKey: .status)
         attemptCount = try container.decode(Int.self, forKey: .attemptCount)
+        lastFailureKind = try container.decodeIfPresent(String.self, forKey: .lastFailureKind)
+        lastOrderID = try container.decodeIfPresent(String.self, forKey: .lastOrderID)
+        lastProviderStatus = try container.decodeIfPresent(Int.self, forKey: .lastProviderStatus)
     }
 
     /// 是否还需要处理（恢复队列时的过滤条件）

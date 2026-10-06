@@ -61,6 +61,9 @@ final class TranscriptSegment: Identifiable, Codable {
     var textWasUserEdited: Bool?
     /// 说话人由用户明确确认；云端可更新文字/边界，但不得覆盖此归属。
     var speakerWasUserConfirmed: Bool?
+    /// 整场回填的新证据与旧自动归属矛盾、待人工确认（15 号计划 F02）。
+    /// nil/false 表示无冲突；人工确认归属后清除。旧值保留以便核对，不自动改写。
+    var speakerAttributionConflict: Bool?
 
     init(
         id: UUID = UUID(),
@@ -78,7 +81,8 @@ final class TranscriptSegment: Identifiable, Codable {
         languageCode: String? = nil,
         sourceAssetId: UUID? = nil,
         textWasUserEdited: Bool? = nil,
-        speakerWasUserConfirmed: Bool? = nil
+        speakerWasUserConfirmed: Bool? = nil,
+        speakerAttributionConflict: Bool? = nil
     ) {
         self.id = id
         self.startMs = startMs
@@ -96,5 +100,6 @@ final class TranscriptSegment: Identifiable, Codable {
         self.sourceAssetId = sourceAssetId
         self.textWasUserEdited = textWasUserEdited
         self.speakerWasUserConfirmed = speakerWasUserConfirmed
+        self.speakerAttributionConflict = speakerAttributionConflict
     }
 }

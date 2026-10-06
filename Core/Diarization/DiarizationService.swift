@@ -234,6 +234,49 @@ enum DiarizationAPIError: Error, Equatable {
     case knownSpeakerMatchingUnsupported
     /// Provider 返回了可读的业务错误。
     case providerError(code: String, message: String)
+    /// 订单已受理但处理失败（讯飞 orderInfo.status=-1）。
+    /// 携带最小订单关联与官方 failType（15 号计划 F07）：供队列保存类别、订单 ID 与重试分类。
+    case orderFailed(orderID: String, status: Int, failType: Int?, message: String)
+}
+
+extension DiarizationAPIError {
+    /// 讯飞 orderInfo.failType 分类（官方文档核对 2026-10-06）：
+    /// 0 正常执行、1 音频上传失败、2 转码失败、3 识别失败、4 时长超限（>5 小时）、
+    /// 5 时长校验失败（duration 参数与真实音频不符）、6 静音文件、99 其他。
+    /// 官方文档未给 rl 与 featureIds 顺序的对应契约，相关映射另行验证（见开发日志）。
+    enum OrderFailureKind: String, Sendable {
+        case upload
+        case transcode
+        case recognition
+        case durationLimit
+        case durationMismatch
+        case silence
+        case unknown
+
+        var displayName: String {
+            switch self {
+            case .upload: return "音频上传失败"
+            case .transcode: return "音频转码失败"
+            case .recognition: return "音频识别失败"
+            case .durationLimit: return "音频时长超限"
+            case .durationMismatch: return "音频时长校验失败"
+            case .silence: return "静音音频"
+            case .unknown: return "原因未知"
+            }
+        }
+    }
+
+    static func orderFailureKind(_ failType: Int?) -> OrderFailureKind {
+        switch failType {
+        case 1: return .upload
+        case 2: return .transcode
+        case 3: return .recognition
+        case 4: return .durationLimit
+        case 5: return .durationMismatch
+        case 6: return .silence
+        default: return .unknown
+        }
+    }
 }
 
 extension DiarizationAPIError: LocalizedError {
@@ -268,6 +311,9 @@ extension DiarizationAPIError: LocalizedError {
             return "当前分人服务只支持匿名说话人，不支持历史声纹身份匹配"
         case .providerError(let code, let message):
             return "云端服务错误 \(code)：\(message)"
+        case .orderFailed(_, let status, let failType, let message):
+            let reason = DiarizationAPIError.orderFailureKind(failType).displayName
+            return "云端订单处理失败（状态 \(status)，\(reason)）：\(message)"
         }
     }
 }

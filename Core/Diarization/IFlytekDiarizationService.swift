@@ -348,11 +348,22 @@ struct IFlytekDiarizationService: DiarizationServicing, Sendable {
             )
         }
         let credentials = try IFlytekCredentials.load(from: credentialStore)
+        // 官方接口要求 16 kHz、16bit、单声道（文档核对 2026-10-06）。
+        // 分片与整场统一在发送前派生转换；原始音频文件只读，不改其内容或时间轴。
+        let convertedAudioURL = FileManager.default.temporaryDirectory
+            .appending(path: "bwfx-iflytek-chunk-\(UUID().uuidString).wav", directoryHint: .notDirectory)
+        defer { try? FileManager.default.removeItem(at: convertedAudioURL) }
+        do {
+            try AudioChunkExtractor.exportRecordingWAV(from: chunkURL, to: convertedAudioURL)
+        } catch {
+            throw DiarizationAPIError.invalidResponse
+        }
         let audioData: Data
         let durationMs: Int64
         do {
-            audioData = try Data(contentsOf: chunkURL)
-            durationMs = try AudioChunkExtractor.durationMs(of: chunkURL)
+            audioData = try Data(contentsOf: convertedAudioURL)
+            // 真实时长从转换产物读取，而不是源文件（15 号计划 B.3）
+            durationMs = try AudioChunkExtractor.durationMs(of: convertedAudioURL)
         } catch {
             throw DiarizationAPIError.network
         }
@@ -369,6 +380,10 @@ struct IFlytekDiarizationService: DiarizationServicing, Sendable {
             credentials: credentials,
             signatureRandom: signatureRandom
         )
+        // rl 与 featureIds 的对应契约：官方文档只说明 rl 是"分离的角色编号"，
+        // 未声明数字与 featureIds 注册顺序一一对应（15 号计划 F05，待受控实测）。
+        // 当前按注册顺序映射，结果只能作为 provider 声称的候选身份，
+        // 由整场回填的冲突语义与人工确认兜底，不等于已确认身份。
         let aliasesByRole = Dictionary(
             uniqueKeysWithValues: registeredSpeakers.enumerated().map {
                 (String($0.offset + 1), $0.element.reference.alias)
@@ -405,8 +420,17 @@ struct IFlytekDiarizationService: DiarizationServicing, Sendable {
                     aliasesByFeatureID: aliasesByFeatureID
                 )
             default:
-                throw DiarizationAPIError.providerError(
-                    code: String(orderInfo.status),
+                // 官方 failType=6：静音文件。真实内容就是无语音，按空结果收尾，不进入失败重试。
+                if orderInfo.failType == 6 {
+                    return DiarizationChunkResult(
+                        durationMs: orderInfo.originalDuration ?? durationMs,
+                        segments: []
+                    )
+                }
+                throw DiarizationAPIError.orderFailed(
+                    orderID: upload.orderID,
+                    status: orderInfo.status,
+                    failType: orderInfo.failType,
                     message: "转写订单失败"
                 )
             }
@@ -624,6 +648,8 @@ struct IFlytekDiarizationService: DiarizationServicing, Sendable {
         struct OrderInfoDTO: Decodable {
             var status: Int
             var originalDuration: Int64?
+            /// 官方订单异常分类（1 上传、2 转码、3 识别、4 时长超限、5 时长校验、6 静音、99 其他）
+            var failType: Int?
         }
     }
 

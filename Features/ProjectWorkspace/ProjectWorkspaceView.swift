@@ -98,7 +98,7 @@ struct ProjectWorkspaceView: View {
     /// 说话人指认弹层的锚点（09 号计划需求 2；总结条目或转写行进入）
     @State private var speakerAssignRequest: SpeakerAssignRequest?
     @State private var isRelabelingHistoricalSpeakers = false
-    @State private var historicalSpeakerTask: Task<Void, Never>?
+    @State private var historicalSpeakerTask: Task<ProjectWorkspaceView.SpeakerRecognitionOutcome, Never>?
     @State private var newDeviceID: String?
     @State private var sidebarProjects: [Project] = []
     @AppStorage("bwfx.workspace.projectSidebarVisible") private var prefersProjectSidebarVisible = true
@@ -2879,6 +2879,27 @@ struct ProjectWorkspaceView: View {
             speaker.communicationProfile = profile.communicationProfile
             speaker.isCurrentUser = profile.isCurrentUser
             speaker.iflytekFeatureID = profile.iflytekFeatureID
+            // 与说话人面板的永久保存入口共用同一套 Person／Profile 关联语义
+            // （15 号计划 F13：原话指认登记声纹不能缺人物关联）。
+            // 关联失败不回滚已保存的声纹与指认，如实提示可重试。
+            do {
+                let person = try environment.personLibraryStore.ensurePerson(
+                    for: profile,
+                    preferredPersonID: speaker.personId
+                )
+                try environment.linkPerson(
+                    personID: person.id, projectID: project.id,
+                    speakerID: speaker.id, currentProject: project
+                )
+                speaker.personId = person.id
+                speaker.isCurrentUser = person.isCurrentUser
+                speaker.backgroundContext = person.backgroundContext
+            } catch {
+                operationError = "声纹样本已保存，但人物关联未完成（\(error.localizedDescription)）；可在「说话人」面板重试永久保存。"
+                AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent(
+                    "voice_sample_person_link_failed", error: String(describing: type(of: error))
+                ))
+            }
             reviewNotice = profile.isAutoEnabled
                 ? "已标注并保存 \(speaker.displayName) 的本地声纹样本。"
                 : "已保存 \(speaker.displayName) 的永久声纹；自动识别名额已满。"
@@ -2916,15 +2937,38 @@ struct ProjectWorkspaceView: View {
         return "\(name) · 本组 \(count) 条原话，一次指认即可批量归属；已确认给其他人的原话会保留。"
     }
 
+    /// 整场人物识别的终态结果（15 号计划 A.3：收尾流程等待终态后再生成总结）
+    enum SpeakerRecognitionOutcome: Equatable, Sendable {
+        case completed(groups: Int, assignments: Int)
+        /// 识别失败（可重试）
+        case failed(message: String)
+        /// 未运行：未启用、用户停止或等待超时（不算故障，不写失败任务）
+        case skipped(reason: String)
+    }
+
+    /// 收尾流程等待整场识别的时限。识别自身有错误与取消路径；
+    /// 超过时限则取消识别并继续生成总结（15 号计划 A.4：不无限等待）。
+    static let speakerRecognitionFinishTimeoutSeconds: UInt64 = 1_200
+
     private func startHistoricalSpeakerRelabel(project: Project, meeting: Meeting) {
+        historicalSpeakerTask = Task {
+            await runHistoricalSpeakerRelabel(project: project, meeting: meeting)
+        }
+    }
+
+    /// 整场人物识别核心：完成、失败、取消、跳过都返回终态，不悬挂。
+    @discardableResult
+    private func runHistoricalSpeakerRelabel(project: Project, meeting: Meeting) async -> SpeakerRecognitionOutcome {
         guard !isRelabelingHistoricalSpeakers,
               meeting.status != .recording, meeting.status != .paused,
-              !environment.importProcessing.isRunning else { return }
+              !environment.importProcessing.isRunning else {
+            return .skipped(reason: "识别已在进行或录音未结束")
+        }
         let configuration = environment.diarizationConfigurationSnapshot()
         let service = environment.makeDiarizationService(for: configuration)
         guard service.recordingLimits != nil else {
             reviewNotice = "整场声音分组与人物库匹配需要启用分人服务（讯飞、OpenAI 兼容或本地实验引擎）。"
-            return
+            return .skipped(reason: "分人服务未启用")
         }
         if configuration.selectedProvider == .localSherpaOnnx {
             // 本地引擎无 Key 门禁：改为模型就绪检查，未就绪给下载指引
@@ -2936,27 +2980,27 @@ struct ProjectWorkspaceView: View {
                 break
             case .notInstalled:
                 reviewNotice = "本地分人模型尚未下载：请到 设置 → 录音与说话人 → 本地（实验） 按指引放置模型；原文与人工标注已保留。"
-                return
+                return .skipped(reason: "本地模型未安装")
             case .invalid(let reason):
                 reviewNotice = "本地分人模型异常：\(reason) 原文与人工标注已保留。"
-                return
+                return .skipped(reason: "本地模型异常")
             }
         } else {
             guard environment.diarizationKeyStore(for: configuration).hasConfiguredKey else {
                 reviewNotice = "分人服务尚未连接，请先在设置中配置；原文与人工标注已保留。"
-                return
+                return .skipped(reason: "分人服务未连接")
             }
         }
         guard !meeting.segments.isEmpty,
               let audioURL = try? environment.fileStore.audioFileURL(for: meeting) else {
             reviewNotice = "没有可识别的文稿或原音频，请先完成转写。"
-            return
+            return .skipped(reason: "没有可识别素材")
         }
         do {
             project.speakers = try environment.refreshAutomaticSpeakerReferences(for: project.id)
         } catch {
             reviewNotice = "人物库读取失败，尚未开始识别：\(error.localizedDescription)"
-            return
+            return .failed(message: "人物库读取失败")
         }
         SpeakerPanelLogic.syncRuntimeParticipants(speakers: project.speakers, meeting: meeting)
         diarization?.refreshKnownSpeakers()
@@ -2977,42 +3021,117 @@ struct ProjectWorkspaceView: View {
         }
         let relabeler = HistoricalSpeakerRelabeler(diarization: service)
         isRelabelingHistoricalSpeakers = true
+        defer {
+            isRelabelingHistoricalSpeakers = false
+            historicalSpeakerTask = nil
+        }
         reviewNotice = references.isEmpty
             ? "正在识别整场声音分组；当前没有可供此服务比对的已登记声纹。"
             : "正在识别整场声音，并比对人物库中的 \(references.count) 位人物…"
-        historicalSpeakerTask = Task {
-            defer {
-                isRelabelingHistoricalSpeakers = false
-                historicalSpeakerTask = nil
+        do {
+            let result = try await relabeler.diarizeRecording(audioURL: audioURL,
+                pauseIntervals: meeting.pauseIntervals, existingSegments: snapshots,
+                speakerReferences: Array(references.prefix(KnownSpeakerReference.maximumCount)))
+            try Task.checkCancellation()
+            guard (try environment.allProjects()).contains(where: { $0.id == project.id }) else {
+                return .skipped(reason: "项目已删除")
             }
-            do {
-                let result = try await relabeler.diarizeRecording(audioURL: audioURL,
-                    pauseIntervals: meeting.pauseIntervals, existingSegments: snapshots,
-                    speakerReferences: Array(references.prefix(KnownSpeakerReference.maximumCount)))
-                try Task.checkCancellation()
-                guard (try environment.allProjects()).contains(where: { $0.id == project.id }) else { return }
-                let changed = Self.applySpeakerRecognition(result, snapshots: snapshots, to: meeting.segments,
-                    validSpeakerIDs: Set(project.speakers.map(\.id)))
-                if !changed.isEmpty {
-                    guard persistAndRefresh(meeting) else {
-                        reviewNotice = "识别完成，但保存失败；请重试。"
-                        return
-                    }
-                    diarization?.attach(to: meeting)
-                    analysis?.noteSpeakerContextChanged(segmentIDs: changed)
+            let changed = Self.applySpeakerRecognition(result, snapshots: snapshots, to: meeting.segments,
+                validSpeakerIDs: Set(project.speakers.map(\.id)))
+            if !changed.isEmpty {
+                guard persistAndRefresh(meeting) else {
+                    reviewNotice = "识别完成，但保存失败；请重试。"
+                    return .failed(message: "结果保存失败")
                 }
-                let groups = Set(result.remoteLabels.values).count
-                reviewNotice = groups == 0
-                    ? "识别完成，未找到可可靠对齐的声音分组；原文与人工标注已保留。"
-                    : "已区分 \(groups) 个声音组，匹配人物 \(result.assignments.count) 条原话；未识别的组可一次性指认。"
-            } catch is CancellationError {
-                reviewNotice = "已停止识别，原文与人工标注已保留。"
-            } catch {
-                reviewNotice = "说话人识别未完成：\(error.localizedDescription)"
+                diarization?.attach(to: meeting)
+                analysis?.noteSpeakerContextChanged(segmentIDs: changed)
             }
+            let groups = Set(result.remoteLabels.values).count
+            reviewNotice = groups == 0
+                ? "识别完成，未找到可可靠对齐的声音分组；原文与人工标注已保留。"
+                : "已区分 \(groups) 个声音组，匹配人物 \(result.assignments.count) 条原话；未识别的组可一次性指认。"
+            return .completed(groups: groups, assignments: result.assignments.count)
+        } catch is CancellationError {
+            reviewNotice = "已停止识别，原文与人工标注已保留。"
+            return .skipped(reason: "已停止识别")
+        } catch {
+            reviewNotice = "说话人识别未完成：\(error.localizedDescription)"
+            return .failed(message: error.localizedDescription)
         }
     }
 
+    /// 收尾流程等待整场识别到终态；超过时限取消识别并继续总结（15 号计划 A.4）。
+    private func awaitSpeakerRelabelWithTimeout(
+        project: Project,
+        meeting: Meeting
+    ) async -> SpeakerRecognitionOutcome {
+        let task = Task {
+            await runHistoricalSpeakerRelabel(project: project, meeting: meeting)
+        }
+        historicalSpeakerTask = task
+        let outcome = await withTaskGroup(of: SpeakerRecognitionOutcome?.self) { group in
+            group.addTask { await task.value }
+            group.addTask {
+                try? await Task.sleep(
+                    for: .seconds(Self.speakerRecognitionFinishTimeoutSeconds)
+                )
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+        guard let outcome else {
+            task.cancel()
+            _ = await task.value
+            return .skipped(reason: "整场识别等待超时，已跳过")
+        }
+        return outcome
+    }
+
+    /// 整场人物识别终态写入持久任务（15 号计划 F06：首页与工作台状态一致）。
+    /// 未启用或用户跳过不写失败任务；失败与分片待重试都如实记录。
+    private func recordDiarizationOutcome(
+        _ outcome: SpeakerRecognitionOutcome,
+        project: Project
+    ) {
+        var jobStatus: ProcessingJobStatus?
+        var errorCategory: String?
+        switch outcome {
+        case .completed:
+            jobStatus = .completed
+        case .failed:
+            jobStatus = .failedRetryable
+            errorCategory = "speaker_recognition_failed"
+            reviewNotice = "整场人物识别未完成；总结将基于当前人物状态生成，可稍后用「识别说话人」重试。"
+        case .skipped:
+            break
+        }
+        if let diarization, diarization.awaitingUserRetryCount > 0 {
+            jobStatus = .failedRetryable
+            errorCategory = "chunks_awaiting_user_retry"
+        }
+        guard let jobStatus else { return }
+        project.processingJobs.removeAll { $0.kind == .diarization }
+        project.processingJobs.append(ProcessingJob(
+            kind: .diarization,
+            status: jobStatus,
+            progress: jobStatus == .completed ? 1 : nil,
+            lastErrorCategory: errorCategory
+        ))
+        do {
+            try environment.persist(project, fields: .importPipeline)
+        } catch {
+            AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent(
+                "diarization_job_persist_failed", error: String(describing: type(of: error))
+            ))
+        }
+    }
+
+    /// 整场回填规则（15 号计划 C.2/C.3/F02）：
+    /// 人工确认优先；相同自动结果幂等保持；新证据与旧自动归属矛盾时保留旧值并标
+    /// `speakerAttributionConflict` 待确认，不静默改写、不凭返回代号宣称高置信；
+    /// 未被本轮覆盖的片段保持原状（缺少覆盖不等于反证）。
     static func applySpeakerRecognition(
         _ result: HistoricalSpeakerRelabeler.Result,
         snapshots: [HistoricalSpeakerRelabeler.SegmentSnapshot],
@@ -3034,16 +3153,49 @@ struct ProjectWorkspaceView: View {
         for segment in segments {
             guard unchanged.contains(segment.id) else { continue }
             var didChange = false
-            if let label = result.remoteLabels[segment.id], label != segment.remoteSpeakerLabel {
+            let newLabel = result.remoteLabels[segment.id]
+            let originalLabel = segment.remoteSpeakerLabel
+            if let label = newLabel, label != originalLabel {
                 segment.remoteSpeakerLabel = label
                 didChange = true
             }
-            if segment.speakerWasUserConfirmed != true,
-               let id = result.assignments[segment.id], id != segment.participantId,
-               validSpeakerIDs?.contains(id) ?? true,
-               !invalidAnchorLabels.contains(result.remoteLabels[segment.id] ?? "") {
-                segment.participantId = id
-                segment.speakerConfidence = .high
+            if segment.speakerWasUserConfirmed == true {
+                // 人工确认优先：新声音组不改归属；历史冲突标记一并解除
+                if segment.speakerAttributionConflict == true {
+                    segment.speakerAttributionConflict = false
+                    didChange = true
+                }
+            } else if let label = newLabel,
+                      result.assignments[segment.id] != nil,
+                      invalidAnchorLabels.contains(label) {
+                // 新证据锚点已失效：归属与冲突状态保持原状，不采信也不否定
+            } else if let id = result.assignments[segment.id] {
+                if id == segment.participantId {
+                    // 幂等保持；清掉此前遗留的待确认冲突
+                    if segment.speakerAttributionConflict == true {
+                        segment.speakerAttributionConflict = false
+                        didChange = true
+                    }
+                } else if segment.participantId == nil,
+                          validSpeakerIDs?.contains(id) ?? true {
+                    segment.participantId = id
+                    segment.speakerConfidence = .high
+                    segment.speakerAttributionConflict = false
+                    didChange = true
+                } else {
+                    // 新结果与旧自动归属矛盾：保留旧值，标冲突待人工确认
+                    if validSpeakerIDs?.contains(id) ?? true {
+                        segment.speakerAttributionConflict = true
+                        segment.speakerConfidence = .low
+                        didChange = true
+                    }
+                }
+            } else if newLabel != nil, newLabel != originalLabel,
+                      segment.participantId != nil {
+                // 标签已更换但无法解析到人物：旧归属的证据源消失，
+                // 保留旧值但明确待确认，不表现为"新识别通过"
+                segment.speakerAttributionConflict = true
+                segment.speakerConfidence = .low
                 didChange = true
             }
             if didChange {
@@ -3641,7 +3793,6 @@ struct ProjectWorkspaceView: View {
         projectAIChat?.saveDraftNow()
         isFinishing = true
         Task {
-            var shouldRecognizeSpeakers = false
             do {
                 environment.audioCapture.onLevel = nil
                 try recorder?.beginFinish()
@@ -3659,7 +3810,7 @@ struct ProjectWorkspaceView: View {
                 let transcriptionFailed = transcription?.lastErrorDescription != nil
                     || project?.hasUsableTranscript != true
                 let configuration = environment.diarizationConfigurationSnapshot()
-                shouldRecognizeSpeakers = !transcriptionFailed
+                let shouldRecognizeSpeakers = !transcriptionFailed
                     && environment.diarizationKeyStore(for: configuration).hasConfiguredKey
                     && environment.makeDiarizationService(for: configuration).recordingLimits != nil
                 if let project {
@@ -3676,37 +3827,44 @@ struct ProjectWorkspaceView: View {
                 operationError = nil
                 if transcriptionFailed {
                     operationError = "录音已保存，但转写未完成。请先回听原音频，再使用“重新转写”；本次未自动生成总结。"
-                } else if environment.isAnalysisConfigured {
-                    // 先复查全文更正识别错误，再生成完整总结（报告用的是更正后文稿）。
-                    // 复查失败不阻断——转写保持原样，总结照常生成。
-                    await reviewTranscriptAfterRecording(meeting: meeting)
-                    environment.finalReportCoordinator.start(projectID: projectID)
-                    await proposeMemoryCandidatesIfNeeded()
-                    if let project {
-                        Task {
-                            do {
-                                if let count = try await environment
-                                    .refreshCurrentUserCommunicationProfile(
-                                        from: project
-                                    ) {
-                                    reviewNotice = "已从 \(count) 条人工确认原话更新“我”的表达画像，下次对话会继续使用。"
+                } else {
+                    // 15 号计划 A.3 收尾顺序：最终文稿整理 → 整场人物处理到达终态 →
+                    // 冻结输入版本生成完整总结及依赖身份的派生候选。
+                    if environment.isAnalysisConfigured {
+                        // 先复查全文更正识别错误（报告用的是更正后文稿）。
+                        // 复查失败不阻断——转写保持原样，总结照常生成。
+                        await reviewTranscriptAfterRecording(meeting: meeting)
+                    }
+                    if shouldRecognizeSpeakers, let project {
+                        let outcome = await awaitSpeakerRelabelWithTimeout(project: project, meeting: meeting)
+                        recordDiarizationOutcome(outcome, project: project)
+                    }
+                    if environment.isAnalysisConfigured {
+                        environment.finalReportCoordinator.start(projectID: projectID)
+                        await proposeMemoryCandidatesIfNeeded()
+                        if let project {
+                            Task {
+                                do {
+                                    if let count = try await environment
+                                        .refreshCurrentUserCommunicationProfile(
+                                            from: project
+                                        ) {
+                                        reviewNotice = "已从 \(count) 条人工确认原话更新“我”的表达画像，下次对话会继续使用。"
+                                    }
+                                } catch {
+                                    reviewNotice = "录音已安全结束；“我”的表达画像本次未更新，可在人物库重试。"
                                 }
-                            } catch {
-                                reviewNotice = "录音已安全结束；“我”的表达画像本次未更新，可在人物库重试。"
                             }
                         }
+                    } else {
+                        // 静默跳过会让人误以为「完整总结」功能缺失；必须说清原因和补救入口
+                        operationError = "AI 未连接，完整总结未生成；可前往设置连接后在「完整总结」页签手动生成。"
                     }
-                } else {
-                    // 静默跳过会让人误以为「完整总结」功能缺失；必须说清原因和补救入口
-                    operationError = "AI 未连接，完整总结未生成；可前往设置连接后在「完整总结」页签手动生成。"
                 }
             } catch {
                 operationError = error.localizedDescription
             }
             isFinishing = false
-            if shouldRecognizeSpeakers, let project {
-                startHistoricalSpeakerRelabel(project: project, meeting: meeting)
-            }
         }
     }
 
@@ -4038,7 +4196,13 @@ private struct ProcessingDetailsButton: View {
                         : "未配置（当前仅 Apple Speech）"
                 )
                 if let diarization, diarization.awaitingUserRetryCount > 0 {
-                    Button("重试 \(diarization.awaitingUserRetryCount) 个失败分片", action: onRetryChunks)
+                    let summary = diarization.awaitingUserRetrySummary
+                    Button(
+                        summary == nil
+                            ? "重试 \(diarization.awaitingUserRetryCount) 个失败分片"
+                            : "重试 \(diarization.awaitingUserRetryCount) 个失败分片（\(summary!)）",
+                        action: onRetryChunks
+                    )
                 }
             }
             .padding(16)
@@ -4083,10 +4247,30 @@ private struct ProcessingDetailsButton: View {
         if let stored = savedStatus(for: .diarization) { return stored }
         guard let diarization else { return "本场未运行" }
         switch diarization.cloudState {
-        case .idle: return "本场未运行"
-        case .working(let pending): return pending > 0 ? "识别中（待处理 \(pending)）" : "本场队列已处理"
-        case .suspended: return "已暂停"
-        case .unconfigured: return "未配置（仅本地转写）"
+        case .idle:
+            if diarization.awaitingUserRetryCount > 0 {
+                return "队列已处理 · \(diarization.awaitingUserRetryCount) 个分片失败待重试"
+            }
+            return diarization.pendingChunkCount > 0
+                ? "有 \(diarization.pendingChunkCount) 个分片待处理"
+                : (diarizationStatusQueueKnown ? "本场队列已处理" : "本场未运行")
+        case .working(let pending):
+            return pending > 0 ? "识别中（待处理 \(pending)）" : "本场队列已处理"
+        case .restored(let pending, let awaitingRetry):
+            if awaitingRetry > 0 {
+                return "已恢复队列 · \(awaitingRetry) 个分片失败待重试"
+            }
+            return pending > 0 ? "已恢复队列 · \(pending) 个分片待处理" : "本场队列已处理"
+        case .suspended:
+            return "已暂停"
+        case .unconfigured:
+            return "未配置（仅本地转写）"
         }
+    }
+
+    /// 队列里是否有任何条目（区分"从未运行"与"已处理完"）
+    private var diarizationStatusQueueKnown: Bool {
+        guard let diarization else { return false }
+        return !diarization.queue.isEmpty
     }
 }

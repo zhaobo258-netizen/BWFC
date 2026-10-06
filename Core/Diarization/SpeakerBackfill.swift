@@ -50,6 +50,12 @@ enum SpeakerBackfill {
             if segment.participantId != speakerId || segment.speakerWasUserConfirmed != true {
                 segment.participantId = speakerId
                 segment.speakerWasUserConfirmed = true
+                segment.speakerAttributionConflict = false
+                segment.updatedAt = now
+                changed.append(segment.id)
+            } else if segment.speakerAttributionConflict == true {
+                // 幂等指认也解除历史冲突标记：人工确认优先
+                segment.speakerAttributionConflict = false
                 segment.updatedAt = now
                 changed.append(segment.id)
             }

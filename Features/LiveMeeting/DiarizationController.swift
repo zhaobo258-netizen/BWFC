@@ -12,6 +12,8 @@ final class DiarizationController {
         case idle
         /// 处理中（含队列等待数）
         case working(pending: Int)
+        /// 队列已恢复但未在处理（重开录音的只读展示；含待处理与待重试数）
+        case restored(pending: Int, awaitingRetry: Int)
         /// 云端暂停：401（本地录音与转写继续，修复后可重试）
         case suspended(reason: String)
         /// 分人 Key 未配置（灰色显示；绝不借用分析 Key 发请求）
@@ -85,6 +87,7 @@ final class DiarizationController {
     // MARK: - 会话
 
     /// 回看已有录音也恢复分组；不读取凭据、不启动转写或上传队列。
+    /// 同时只读恢复持久化队列用于展示（15 号计划 F01：重开录音失败可见、可重试）。
     func attach(to meeting: Meeting) {
         if self.meeting?.id != meeting.id {
             mapper = SpeakerMapper(participants: [])
@@ -92,6 +95,34 @@ final class DiarizationController {
         self.meeting = meeting
         transcriptController.attach(to: meeting)
         rebuildSpeakerMapper()
+        restoreQueueForDisplay(for: meeting)
+    }
+
+    /// 回看项目时只读恢复持久化队列：不保存、不启动上传。
+    /// 计数与重试入口按这份数据工作；真正继续处理走 retryAwaitingUserChunks。
+    private func restoreQueueForDisplay(for meeting: Meeting) {
+        let store = ChunkQueueStore(fileURL: fileStore.chunkQueueFileURL(for: meeting.id))
+        guard let restored = try? store.load(), !restored.isEmpty else { return }
+        queueStore = store
+        // 崩溃时处于 uploading 的条目按失败展示（与 start 的恢复语义一致）
+        queue = restored.map { entry in
+            var entry = entry
+            if entry.status == .uploading { entry.status = .failed }
+            if entry.providerConfigurationFingerprint.isEmpty,
+               entry.provider == configurationSnapshot.selectedProvider {
+                entry.providerConfigurationFingerprint = configurationSnapshot.fingerprint
+            }
+            return entry
+        }
+        // 需要处理但分片文件已不存在的条目无法重试，不参与计数
+        queue = queue.filter { entry in
+            guard entry.needsProcessing else { return true }
+            return FileManager.default.fileExists(
+                atPath: fileStore.chunksDirectory(for: meeting.id)
+                    .appending(path: entry.fileName).path
+            )
+        }
+        updateCloudState()
     }
 
     private func rebuildSpeakerMapper() {
@@ -363,6 +394,10 @@ final class DiarizationController {
                     for: entry
                 )
                 queue[entryIndex].status = .succeeded
+                // 成功后清掉上一次失败的诊断残留，避免误读
+                queue[entryIndex].lastFailureKind = nil
+                queue[entryIndex].lastOrderID = nil
+                queue[entryIndex].lastProviderStatus = nil
                 // 上传成功且结果已持久化后删除临时分片文件（实施计划 7.4）
                 if let meeting {
                     try? FileManager.default.removeItem(
@@ -537,28 +572,33 @@ final class DiarizationController {
     }
 
     /// 上传失败分类处理（实施计划 11.2；401 语义收窄到分人 provider 自身）
+    /// 每个分支都记录脱敏失败类别（15 号计划 F07）；订单关联只由 provider 提供。
     private func handleUploadError(_ error: DiarizationAPIError, entryIndex: Int) {
         let attemptCount = queue[entryIndex].attemptCount
         switch error {
         case .unauthorized:
             // 分人 Key 无效：仅暂停分人 provider，本地录音与分析继续
             queue[entryIndex].status = .pending
+            queue[entryIndex].lastFailureKind = "auth"
             suspensionCause = .providerCredential
             cloudState = .suspended(reason: "分人 Key 无效（401）。请在设置中检查「分人 Key」，分析（Kimi）不受影响。")
             AppLog.logError(AppLog.diarization, LogSanitizer.formatEvent("cloud_suspended", statusCode: 401))
         case .missingAPIKey:
             // 运行中 Key 被删除：视为未配置，零请求
             queue[entryIndex].status = .pending
+            queue[entryIndex].lastFailureKind = "unconfigured"
             suspensionCause = nil
             cloudState = .unconfigured
         case .credentialAccessRequired:
             queue[entryIndex].status = .pending
+            queue[entryIndex].lastFailureKind = "credential"
             suspensionCause = .providerCredential
             cloudState = .suspended(
                 reason: "App 更新后需要重新保存分人 Key。本地录音与转写不受影响。"
             )
         case .tooManyKnownSpeakers(let maximum, let actual):
             queue[entryIndex].status = .pending
+            queue[entryIndex].lastFailureKind = "too_many_speakers"
             suspensionCause = .knownSpeakerConfiguration
             AppLog.logWarning(
                 AppLog.diarization,
@@ -572,17 +612,24 @@ final class DiarizationController {
             )
         case .invalidKnownSpeakerSample:
             queue[entryIndex].status = .pending
+            queue[entryIndex].lastFailureKind = "known_speaker_sample"
             suspensionCause = .knownSpeakerConfiguration
             cloudState = .suspended(
                 reason: "声纹配置暂停：\(error.localizedDescription)。请修正或移除该样本，保存后将自动继续。"
             )
         case .knownSpeakerMatchingUnsupported:
             queue[entryIndex].status = .pending
+            queue[entryIndex].lastFailureKind = "matching_unsupported"
             suspensionCause = .providerConfigurationMismatch
             cloudState = .suspended(
                 reason: "当前分人服务不支持历史人物声纹匹配。本地录音与匿名分人继续可用，请切换支持已知说话人的服务后重试。"
             )
         case .rateLimited, .serverError, .network:
+            queue[entryIndex].lastFailureKind = switch error {
+            case .rateLimited: "rate_limited"
+            case .serverError: "server"
+            default: "network"
+            }
             queue[entryIndex].attemptCount += 1
             if retryPolicy.shouldRetry(afterFailures: queue[entryIndex].attemptCount) {
                 queue[entryIndex].status = .failed
@@ -592,9 +639,10 @@ final class DiarizationController {
                 queue[entryIndex].status = .awaitingUserRetry
                 AppLog.logError(AppLog.diarization, LogSanitizer.formatEvent("chunk_awaiting_user_retry"))
             }
-        case .clientError, .invalidResponse, .providerError:
-            // 请求/响应问题：不重试，直接待用户处理
+        case .clientError(let statusCode):
             queue[entryIndex].status = .awaitingUserRetry
+            queue[entryIndex].lastFailureKind = "client"
+            queue[entryIndex].lastProviderStatus = statusCode
             AppLog.logWarning(
                 AppLog.diarization,
                 LogSanitizer.formatEvent(
@@ -602,6 +650,53 @@ final class DiarizationController {
                     error: "attempt=\(attemptCount),index=\(entryIndex),reason=\(error.localizedDescription)"
                 )
             )
+        case .invalidResponse:
+            queue[entryIndex].status = .awaitingUserRetry
+            queue[entryIndex].lastFailureKind = "invalid_response"
+            AppLog.logWarning(
+                AppLog.diarization,
+                LogSanitizer.formatEvent(
+                    "chunk_error_non_retriable",
+                    error: "attempt=\(attemptCount),index=\(entryIndex),reason=\(error.localizedDescription)"
+                )
+            )
+        case .providerError(let code, _):
+            queue[entryIndex].status = .awaitingUserRetry
+            queue[entryIndex].lastFailureKind = "provider_\(code)"
+            AppLog.logWarning(
+                AppLog.diarization,
+                LogSanitizer.formatEvent(
+                    "chunk_error_non_retriable",
+                    error: "attempt=\(attemptCount),index=\(entryIndex),reason=\(error.localizedDescription)"
+                )
+            )
+        case .orderFailed(let orderID, let status, let failType, _):
+            // 官方 failType 分类（15 号计划 B.1）：上传/识别失败可退避重试，
+            // 转码、时长、静音等输入或配置问题待用户处理，不盲目重试。
+            queue[entryIndex].lastOrderID = orderID
+            queue[entryIndex].lastProviderStatus = status
+            let kind = DiarizationAPIError.orderFailureKind(failType)
+            queue[entryIndex].lastFailureKind = kind.rawValue
+            switch kind {
+            case .upload, .recognition:
+                queue[entryIndex].attemptCount += 1
+                if retryPolicy.shouldRetry(afterFailures: queue[entryIndex].attemptCount) {
+                    queue[entryIndex].status = .failed
+                    AppLog.logWarning(AppLog.diarization, LogSanitizer.formatEvent(
+                        "chunk_retry_scheduled",
+                        error: "index=\(entryIndex),failType=\(failType.map(String.init) ?? "nil")"
+                    ))
+                } else {
+                    queue[entryIndex].status = .awaitingUserRetry
+                    AppLog.logError(AppLog.diarization, LogSanitizer.formatEvent("chunk_awaiting_user_retry"))
+                }
+            case .transcode, .durationLimit, .durationMismatch, .silence, .unknown:
+                queue[entryIndex].status = .awaitingUserRetry
+                AppLog.logWarning(AppLog.diarization, LogSanitizer.formatEvent(
+                    "chunk_order_failed",
+                    error: "index=\(entryIndex),status=\(status),failType=\(failType.map(String.init) ?? "nil")"
+                ))
+            }
         }
     }
 
@@ -646,6 +741,39 @@ final class DiarizationController {
     /// 待用户重试的分片数
     var awaitingUserRetryCount: Int {
         queue.filter { $0.status == .awaitingUserRetry }.count
+    }
+
+    /// 恢复队列中仍待处理（pending/failed）的分片数（重开录音展示用）
+    var pendingChunkCount: Int {
+        queue.filter { $0.status == .pending || $0.status == .failed }.count
+    }
+
+    /// 待重试分片的脱敏失败类别摘要（如"转码失败×3"），无待重试时为 nil
+    var awaitingUserRetrySummary: String? {
+        let entries = queue.filter { $0.status == .awaitingUserRetry }
+        guard !entries.isEmpty else { return nil }
+        let counts = Dictionary(grouping: entries, by: { entry -> String in
+            guard let kind = entry.lastFailureKind else { return DiarizationAPIError.orderFailureKind(nil).displayName }
+            return DiarizationAPIError.OrderFailureKind(rawValue: kind)?.displayName
+                ?? { switch kind {
+                case "auth": return "分人凭证无效"
+                case "unconfigured": return "分人未配置"
+                case "credential": return "凭证需要重新保存"
+                case "too_many_speakers": return "声纹数量超限"
+                case "known_speaker_sample": return "声纹样本无效"
+                case "matching_unsupported": return "服务不支持声纹匹配"
+                case "rate_limited": return "云端限流"
+                case "server": return "云端服务失败"
+                case "network": return "网络连接失败"
+                case "client": return "请求被拒绝"
+                case "invalid_response": return "响应无法解析"
+                default: return kind.hasPrefix("provider_") ? "服务拒绝（\(kind.dropFirst(9))）" : kind
+                } }()
+        }).mapValues(\.count)
+        return counts
+            .sorted { $0.value > $1.value }
+            .map { "\($0.key)×\($0.value)" }
+            .joined(separator: "、")
     }
 
     /// 待识别说话人标签（用于手动映射 UI）
@@ -707,8 +835,16 @@ final class DiarizationController {
     private func updateCloudState() {
         if case .suspended = cloudState { return }
         if case .unconfigured = cloudState { return }
-        let pending = queue.filter { $0.needsProcessing }.count
-        cloudState = pending > 0 ? .working(pending: pending) : .idle
+        let outstanding = queue.filter { $0.needsProcessing }.count
+        let awaiting = queue.filter { $0.status == .awaitingUserRetry }.count
+        if processingTask != nil, outstanding > 0 {
+            cloudState = .working(pending: outstanding)
+        } else if outstanding > 0 || awaiting > 0 {
+            // 有队列工作但没有活跃处理循环：恢复展示态，不谎称"识别中"
+            cloudState = .restored(pending: outstanding, awaitingRetry: awaiting)
+        } else {
+            cloudState = .idle
+        }
         onQueueChanged?()
     }
 

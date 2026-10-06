@@ -26,6 +26,8 @@ struct TranscriptRowData: Equatable, Identifiable {
         let participant = segment.participantId.flatMap { id in
             participants.first(where: { $0.id == id })
         }
+        // 整场回填冲突（15 号计划 F02）：旧归属待人工复核，在行内如实标注
+        let conflictSuffix = segment.speakerAttributionConflict == true ? "（归属待确认）" : ""
         return TranscriptRowData(
             id: segment.id,
             startMs: displayStartMs ?? segment.startMs,
@@ -33,7 +35,7 @@ struct TranscriptRowData: Equatable, Identifiable {
             state: segment.state,
             source: segment.source,
             isStarred: segment.isStarred,
-            speakerName: participant?.displayName ?? (unknownDisplay ?? "识别中"),
+            speakerName: (participant?.displayName ?? (unknownDisplay ?? "识别中")) + conflictSuffix,
             speakerColorToken: participant?.colorToken,
             sourceRecordingTitle: sourceRecordingTitle,
             isHighlighted: segment.id == highlightedID
@@ -295,7 +297,10 @@ struct TranscriptPanelView: View {
                     }
                     onAssignSpeaker?(segment, participant)
                 } label: {
-                    if row.speakerName == item.title.components(separatedBy: "（").first {
+                    // 冲突后缀不参与勾选匹配：按人物名比对
+                    if row.speakerName
+                        .replacingOccurrences(of: "（归属待确认）", with: "")
+                        == item.title.components(separatedBy: "（").first {
                         Label(item.title, systemImage: "checkmark")
                     } else {
                         Text(item.title)

@@ -689,6 +689,87 @@ final class DiarizationControllerTests {
         #expect(controller.queue.first?.status == .pending)
         #expect(mockDiarization.calls.count == 1)
     }
+
+    @Test("重开录音只读恢复失败队列：计数可见、零上传、重试可继续（15 号计划 F01）")
+    func attachRestoresPersistedQueueForDisplay() async throws {
+        // 预置上一场留下的队列：一个待用户重试（含失败诊断）、一个失败、一个已成功
+        let store = ChunkQueueStore(fileURL: fileStore.chunkQueueFileURL(for: meeting.id))
+        let chunksDir = try fileStore.ensureChunksDirectory(for: meeting.id)
+        try AudioChunkExtractor.extract(
+            from: fileStore.meetingDirectory(for: meeting.id)
+                .appending(path: MeetingFileStore.recordingFileName),
+            startMs: 0, endMs: 20_000,
+            to: chunksDir.appending(path: "chunk_0000.wav")
+        )
+        try store.save([
+            ChunkQueueEntry(index: 0, audioStartMs: 0, audioEndMs: 20_000,
+                            wallStartMs: 0, wallEndMs: 20_000,
+                            fileName: "chunk_0000.wav", status: .failed, attemptCount: 3),
+            ChunkQueueEntry(index: 1, audioStartMs: 20_000, audioEndMs: 36_000,
+                            wallStartMs: 20_000, wallEndMs: 36_000,
+                            fileName: "chunk_0001.wav", status: .awaitingUserRetry, attemptCount: 5,
+                            lastFailureKind: "transcode", lastOrderID: "order-x", lastProviderStatus: -1),
+            ChunkQueueEntry(index: 2, audioStartMs: 36_000, audioEndMs: 45_000,
+                            wallStartMs: 36_000, wallEndMs: 45_000,
+                            fileName: "chunk_0002.wav", status: .succeeded, attemptCount: 0)
+        ])
+        meeting.status = .finalizing
+
+        // 回看项目：只读恢复，不触发任何上传
+        controller.attach(to: meeting)
+        #expect(controller.awaitingUserRetryCount == 1)
+        #expect(controller.pendingChunkCount == 1)
+        #expect(controller.awaitingUserRetrySummary == "音频转码失败×1")
+        guard case .restored(let pending, let awaitingRetry) = controller.cloudState else {
+            Issue.record("恢复态必须可见而非谎称识别中")
+            return
+        }
+        #expect(pending == 1 && awaitingRetry == 1)
+        #expect(mockDiarization.calls.isEmpty, "回看不得启动上传")
+        #expect(mockTranscription.startSessionCalls.isEmpty)
+
+        // 用户重试：错误解除后真正继续处理
+        mockDiarization.resultQueue = [
+            DiarizationChunkResult(durationMs: 20_000, segments: [
+                .init(startMs: 0, endMs: 3_000, text: "重试后补传成功。", speakerLabel: "p_01")
+            ])
+        ]
+        controller.retryAwaitingUserChunks()
+        await waitUntil { self.controller.queue.filter { $0.status != .succeeded }.isEmpty }
+        #expect(controller.queue.allSatisfy { $0.status == .succeeded })
+        #expect(meeting.segments.first?.text == "重试后补传成功。")
+        #expect(controller.cloudState == .idle)
+        controller.cancel()
+    }
+
+    @Test("订单失败按官方 failType 分类：输入问题待用户处理，临时问题可重试（15 号计划 F07）")
+    func orderFailedClassificationByFailType() async throws {
+        try await startAll()
+        // 转码失败（failType=2）：输入问题 → 待用户处理，保留订单关联
+        mockDiarization.persistentError = DiarizationAPIError.orderFailed(
+            orderID: "order-transcode", status: -1, failType: 2, message: "转写订单失败"
+        )
+        controller.produceChunks(uptoAudioMs: 20_000)
+        await controller.finishAndDrain(uptoAudioMs: 18_500)
+        #expect(controller.queue.first?.status == .awaitingUserRetry)
+        #expect(controller.queue.first?.attemptCount == 0, "输入问题不消耗重试次数")
+        #expect(controller.queue.first?.lastFailureKind == "transcode")
+        #expect(controller.queue.first?.lastOrderID == "order-transcode")
+        #expect(controller.queue.first?.lastProviderStatus == -1)
+        #expect(controller.awaitingUserRetrySummary == "音频转码失败×1")
+
+        // 上传失败（failType=1）：临时问题 → 自动退避重试（sleep 注入为空操作，
+        // 循环瞬时跑满退避上限后进入待用户重试，与 persistentFailureBackoff 同为 5 次尝试）
+        mockDiarization.persistentError = DiarizationAPIError.orderFailed(
+            orderID: "order-upload", status: -1, failType: 1, message: "转写订单失败"
+        )
+        controller.retryAwaitingUserChunks()
+        await waitUntil { self.controller.queue.first?.status == .awaitingUserRetry }
+        #expect(controller.queue.first?.attemptCount == 5, "首次 + 4 次自动重试")
+        #expect(controller.queue.first?.lastFailureKind == "upload")
+        #expect(controller.queue.first?.lastOrderID == "order-upload")
+        controller.cancel()
+    }
 }
 
 /// 简单的线程安全盒子（测试用）

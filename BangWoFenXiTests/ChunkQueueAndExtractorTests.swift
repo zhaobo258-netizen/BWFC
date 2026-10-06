@@ -73,6 +73,32 @@ final class ChunkQueueAndExtractorTests {
         #expect(entry.providerConfigurationFingerprint.isEmpty)
     }
 
+    @Test("旧队列缺少失败诊断字段时安全解码；新字段可往返（15 号计划 F07）")
+    func legacyQueueDecodesWithoutDiagnostics() throws {
+        let legacy = Data("""
+        [{"index":0,"audioStartMs":0,"audioEndMs":20000,"wallStartMs":0,"wallEndMs":20000,"fileName":"chunk_0000.wav","status":"awaitingUserRetry","attemptCount":5}]
+        """.utf8)
+        let legacyURL = tempDirectory.appending(path: "legacy-no-diagnostics.json")
+        try legacy.write(to: legacyURL)
+        let entry = try #require(ChunkQueueStore(fileURL: legacyURL).load().first)
+        #expect(entry.lastFailureKind == nil)
+        #expect(entry.lastOrderID == nil)
+        #expect(entry.lastProviderStatus == nil)
+
+        let diagnosed = ChunkQueueEntry(
+            index: 1, audioStartMs: 0, audioEndMs: 20_000,
+            wallStartMs: 0, wallEndMs: 20_000,
+            fileName: "chunk_0001.wav", status: .awaitingUserRetry, attemptCount: 3,
+            lastFailureKind: "transcode", lastOrderID: "order-9", lastProviderStatus: -1
+        )
+        let store = ChunkQueueStore(fileURL: tempDirectory.appending(path: "diagnostics-queue.json"))
+        try store.save([diagnosed])
+        let loaded = try #require(store.load().first)
+        #expect(loaded.lastFailureKind == "transcode")
+        #expect(loaded.lastOrderID == "order-9")
+        #expect(loaded.lastProviderStatus == -1)
+    }
+
     @Test("分人配置使用独立 defaults 且指纹随非敏感配置变化")
     func providerConfigurationRoundTrip() throws {
         let suiteName = "com.zhaobo.BangWoFenXi.tests.diarization.\(UUID().uuidString)"

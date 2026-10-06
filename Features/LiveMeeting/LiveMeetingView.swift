@@ -251,6 +251,10 @@ struct LiveMeetingView: View {
             return "分人识别正常"
         case .working(let pending):
             return pending > 0 ? "分人识别中（待处理 \(pending)）" : "分人识别正常"
+        case .restored(let pending, let awaitingRetry):
+            return awaitingRetry > 0
+                ? "有 \(awaitingRetry) 个分片待重试"
+                : "有 \(pending) 个分片待处理"
         case .suspended:
             return "分人识别暂停"
         case .unconfigured:
@@ -262,6 +266,7 @@ struct LiveMeetingView: View {
         guard let diarization else { return .secondary }
         switch diarization.cloudState {
         case .idle, .working: return .green
+        case .restored: return .orange
         case .suspended: return .orange
         case .unconfigured: return .gray
         }

@@ -271,6 +271,132 @@ final class IFlytekDiarizationServiceTests {
         #expect(json["audio_type"] as? String == "raw")
     }
 
+    @Test("订单失败携带官方 failType 与订单关联，不再只显示 -1")
+    func orderFailedCarriesFailType() async throws {
+        try saveCredentials()
+        let chunk = try makeSilentWAV(durationMs: 1_000)
+        defer { try? FileManager.default.removeItem(at: chunk) }
+        storage.requestHandler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil
+            )!
+            if request.url?.path == "/v2/upload" {
+                return (response, Data(#"{"code":"000000","descInfo":"success","content":{"orderId":"order-f1"}}"#.utf8))
+            }
+            let body = try JSONSerialization.data(withJSONObject: [
+                "code": "000000",
+                "descInfo": "success",
+                "content": ["orderInfo": ["status": -1, "failType": 2]]
+            ])
+            return (response, body)
+        }
+
+        do {
+            _ = try await makeService().transcribeChunk(at: chunk, knownSpeakers: [])
+            Issue.record("failType=2 必须抛出订单失败")
+        } catch let error as DiarizationAPIError {
+            guard case .orderFailed(let orderID, let status, let failType, _) = error else {
+                Issue.record("必须是 orderFailed，实际：\(error)")
+                return
+            }
+            #expect(orderID == "order-f1")
+            #expect(status == -1)
+            #expect(failType == 2)
+        }
+        #expect(DiarizationAPIError.orderFailureKind(2) == .transcode)
+        #expect(DiarizationAPIError.orderFailureKind(5) == .durationMismatch)
+        #expect(DiarizationAPIError.orderFailureKind(nil) == .unknown)
+    }
+
+    @Test("静音订单（failType=6）按空结果收尾，不进入失败重试")
+    func silenceOrderReturnsEmptyResult() async throws {
+        try saveCredentials()
+        let chunk = try makeSilentWAV(durationMs: 1_000)
+        defer { try? FileManager.default.removeItem(at: chunk) }
+        storage.requestHandler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil
+            )!
+            if request.url?.path == "/v2/upload" {
+                return (response, Data(#"{"code":"000000","descInfo":"success","content":{"orderId":"order-silence"}}"#.utf8))
+            }
+            let body = try JSONSerialization.data(withJSONObject: [
+                "code": "000000",
+                "descInfo": "success",
+                "content": ["orderInfo": ["status": -1, "failType": 6, "originalDuration": 1_000]]
+            ])
+            return (response, body)
+        }
+
+        let result = try await makeService().transcribeChunk(at: chunk, knownSpeakers: [])
+        #expect(result.segments.isEmpty)
+        #expect(result.durationMs == 1_000)
+    }
+
+    @Test("分片上传前统一转换为 16kHz 16bit 单声道（官方格式要求）")
+    func uploadsConverted16kMonoAudio() async throws {
+        try saveCredentials()
+        // 44.1kHz 立体声 Float32 源分片（今日录音链路的真实属性）；
+        // 写入后用独立作用域释放 AVAudioFile，确保数据落盘再被服务读取
+        let sourceURL = FileManager.default.temporaryDirectory
+            .appending(path: "iflytek-src-\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: sourceURL) }
+        do {
+            let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)!
+            let file = try AVAudioFile(forWriting: sourceURL, settings: format.settings)
+            let frameCount = AVAudioFrameCount(format.sampleRate * 0.5)
+            let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount)!
+            buffer.frameLength = frameCount
+            for frame in 0..<Int(frameCount) {
+                let value = sin(2 * Float.pi * 440 * Float(frame) / 44_100) * 0.3
+                buffer.floatChannelData![0][frame] = value
+                buffer.floatChannelData![1][frame] = value
+            }
+            try file.write(from: buffer)
+        }
+
+        storage.requestHandler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil
+            )!
+            if request.url?.path == "/v2/upload" {
+                return (response, Data(#"{"code":"000000","descInfo":"success","content":{"orderId":"order-conv"}}"#.utf8))
+            }
+            let best = #"{"st":{"bg":"0","ed":"400","rl":"1","rt":[{"ws":[{"cw":[{"w":"转换检查","wp":"n"}]}]}]}}"#
+            let orderData = try JSONSerialization.data(withJSONObject: [
+                "lattice": [["json_1best": best]]
+            ])
+            let orderResult = try #require(String(data: orderData, encoding: .utf8))
+            let body = try JSONSerialization.data(withJSONObject: [
+                "code": "000000",
+                "descInfo": "success",
+                "content": [
+                    "orderInfo": ["status": 4, "originalDuration": 500],
+                    "orderResult": orderResult
+                ]
+            ])
+            return (response, body)
+        }
+
+        let result = try await makeService().transcribeChunk(at: sourceURL, knownSpeakers: [])
+        #expect(result.segments.first?.text == "转换检查")
+        let uploadRequest = try #require(storage.capturedRequests.first)
+        let body = try #require(mockRequestBodyData(of: uploadRequest))
+        #expect(body.count > 100)
+        // 读回上传产物核对官方格式要求：16 kHz、16bit、单声道
+        let uploadedURL = FileManager.default.temporaryDirectory
+            .appending(path: "iflytek-uploaded-\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: uploadedURL) }
+        try body.write(to: uploadedURL)
+        let uploaded = try AVAudioFile(forReading: uploadedURL)
+        #expect(uploaded.fileFormat.sampleRate == 16_000)
+        #expect(uploaded.fileFormat.channelCount == 1)
+        #expect(uploaded.fileFormat.commonFormat == .pcmFormatInt16)
+        // 真实时长从转换产物读取：0.5 秒 ± 采样舍入
+        let durationMs = Int64(Double(uploaded.length) / uploaded.fileFormat.sampleRate * 1_000)
+        #expect(abs(durationMs - 500) <= 20)
+    }
+
     private func makeService() -> IFlytekDiarizationService {
         IFlytekDiarizationService(
             session: session,

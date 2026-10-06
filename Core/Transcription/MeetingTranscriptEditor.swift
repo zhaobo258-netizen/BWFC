@@ -9,6 +9,7 @@ enum MeetingTranscriptEditor {
     static func assignSpeaker(_ segment: TranscriptSegment, to participant: Participant) {
         segment.participantId = participant.id
         segment.speakerWasUserConfirmed = true
+        segment.speakerAttributionConflict = false
         segment.updatedAt = Date()
     }
 
@@ -16,6 +17,7 @@ enum MeetingTranscriptEditor {
     static func clearSpeaker(_ segment: TranscriptSegment) {
         segment.participantId = nil
         segment.speakerWasUserConfirmed = true
+        segment.speakerAttributionConflict = false
         segment.updatedAt = Date()
     }
 

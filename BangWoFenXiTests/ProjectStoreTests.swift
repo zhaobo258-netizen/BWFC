@@ -1029,4 +1029,141 @@ final class ProjectStoreTests {
         }
     }
 
+    @Test("回填矛盾不静默改写旧自动归属：标冲突待确认（15 号计划 F02）")
+    @MainActor
+    func speakerRecognitionFlagsConflictOnContradictingAssignment() {
+        let oldSpeakerID = UUID()
+        let newSpeakerID = UUID()
+        let segment = TranscriptSegment(startMs: 0, endMs: 2_000, text: "自动归属片段",
+            participantId: oldSpeakerID, remoteSpeakerLabel: "chunk:0:speaker_1",
+            source: .cloud, state: .final, speakerConfidence: .high)
+        let snapshot = HistoricalSpeakerRelabeler.SegmentSnapshot(id: segment.id,
+            startMs: 0, endMs: 2_000, text: "自动归属片段",
+            participantId: oldSpeakerID, speakerWasUserConfirmed: false)
+        let result = HistoricalSpeakerRelabeler.Result(
+            assignments: [segment.id: newSpeakerID],
+            processedChunkCount: 1,
+            remoteLabels: [segment.id: "chunk:0:speaker_1"])
+
+        let changed = ProjectWorkspaceView.applySpeakerRecognition(result, snapshots: [snapshot], to: [segment])
+
+        #expect(changed == [segment.id])
+        #expect(segment.participantId == oldSpeakerID, "旧自动归属保留，不静默改写")
+        #expect(segment.speakerAttributionConflict == true, "矛盾必须显式标记")
+        #expect(segment.speakerConfidence == .low, "冲突态不宣称高置信")
+        #expect(segment.speakerWasUserConfirmed != true)
+
+        // 人工指认后解除冲突
+        MeetingTranscriptEditor.assignSpeaker(
+            segment, to: Participant(id: newSpeakerID, cloudAlias: "p_02",
+                                     displayName: "李总", side: .counterpart))
+        #expect(segment.speakerAttributionConflict == false)
+        #expect(segment.speakerWasUserConfirmed == true)
+        #expect(segment.participantId == newSpeakerID)
+    }
+
+    @Test("标签更换但解析不出人物：旧归属标待确认，不表现为新识别通过")
+    @MainActor
+    func speakerRecognitionFlagsConflictWhenLabelChangesWithoutAssignment() {
+        let oldSpeakerID = UUID()
+        let segment = TranscriptSegment(startMs: 0, endMs: 2_000, text: "标签更换片段",
+            participantId: oldSpeakerID, remoteSpeakerLabel: "chunk:0:speaker_1",
+            source: .cloud, state: .final, speakerConfidence: .high)
+        let snapshot = HistoricalSpeakerRelabeler.SegmentSnapshot(id: segment.id,
+            startMs: 0, endMs: 2_000, text: "标签更换片段",
+            participantId: oldSpeakerID, speakerWasUserConfirmed: false)
+        // 新一轮结果只有新标签，没有 assignment
+        let result = HistoricalSpeakerRelabeler.Result(
+            assignments: [:], processedChunkCount: 1,
+            remoteLabels: [segment.id: "chunk:0:speaker_2"])
+
+        let changed = ProjectWorkspaceView.applySpeakerRecognition(result, snapshots: [snapshot], to: [segment])
+
+        #expect(changed == [segment.id])
+        #expect(segment.remoteSpeakerLabel == "chunk:0:speaker_2")
+        #expect(segment.participantId == oldSpeakerID)
+        #expect(segment.speakerAttributionConflict == true)
+        #expect(segment.speakerConfidence == .low)
+    }
+
+    @Test("回填幂等与冲突解除：相同结果清除待确认标记且二次运行零改动")
+    @MainActor
+    func speakerRecognitionClearsStaleConflictIdempotently() {
+        let speakerID = UUID()
+        let segment = TranscriptSegment(startMs: 0, endMs: 2_000, text: "幂等片段",
+            participantId: speakerID, remoteSpeakerLabel: "chunk:0:speaker_1",
+            source: .cloud, state: .final, speakerConfidence: .low,
+            speakerAttributionConflict: true)
+        let snapshot = HistoricalSpeakerRelabeler.SegmentSnapshot(id: segment.id,
+            startMs: 0, endMs: 2_000, text: "幂等片段",
+            participantId: speakerID, speakerWasUserConfirmed: false)
+        let result = HistoricalSpeakerRelabeler.Result(
+            assignments: [segment.id: speakerID], processedChunkCount: 1,
+            remoteLabels: [segment.id: "chunk:0:speaker_1"])
+
+        let changed = ProjectWorkspaceView.applySpeakerRecognition(result, snapshots: [snapshot], to: [segment])
+        #expect(changed == [segment.id])
+        #expect(segment.speakerAttributionConflict == false)
+        #expect(segment.participantId == speakerID)
+
+        #expect(ProjectWorkspaceView.applySpeakerRecognition(result, snapshots: [snapshot], to: [segment]).isEmpty)
+    }
+
+    @Test("未被整场回填覆盖的片段保持原状（缺少覆盖不等于反证）")
+    @MainActor
+    func speakerRecognitionLeavesUncoveredSegmentsUntouched() {
+        let speakerID = UUID()
+        let segment = TranscriptSegment(startMs: 0, endMs: 2_000, text: "未覆盖片段",
+            participantId: speakerID, remoteSpeakerLabel: "chunk:0:speaker_1",
+            source: .cloud, state: .final, speakerConfidence: .high,
+            speakerAttributionConflict: true)
+        let snapshot = HistoricalSpeakerRelabeler.SegmentSnapshot(id: segment.id,
+            startMs: 0, endMs: 2_000, text: "未覆盖片段",
+            participantId: speakerID, speakerWasUserConfirmed: false)
+        let result = HistoricalSpeakerRelabeler.Result(assignments: [:], processedChunkCount: 1, remoteLabels: [:])
+
+        let changed = ProjectWorkspaceView.applySpeakerRecognition(result, snapshots: [snapshot], to: [segment])
+
+        #expect(changed.isEmpty)
+        #expect(segment.participantId == speakerID)
+        #expect(segment.speakerAttributionConflict == true, "未覆盖不清冲突也不清归属")
+        #expect(segment.speakerConfidence == .high)
+    }
+
+    @Test("批量指认幂等解除冲突标记；原话行冲突显示后缀")
+    @MainActor
+    func speakerBackfillAndRowDisplayHandleConflict() {
+        let speakerID = UUID()
+        let anchor = TranscriptSegment(startMs: 0, endMs: 1_000, text: "锚点",
+            remoteSpeakerLabel: "chunk:0:speaker_1", source: .cloud, state: .final)
+        let conflict = TranscriptSegment(startMs: 1_000, endMs: 2_000, text: "冲突片段",
+            participantId: UUID(), remoteSpeakerLabel: "chunk:0:speaker_1",
+            source: .cloud, state: .final, speakerAttributionConflict: true)
+        let outcome = SpeakerBackfill.assign(
+            anchorSegmentId: anchor.id, to: speakerID, segments: [anchor, conflict])
+        #expect(outcome.changedSegmentIds.count == 2)
+        #expect(conflict.speakerAttributionConflict == false)
+        #expect(conflict.speakerWasUserConfirmed == true)
+        #expect(conflict.participantId == speakerID)
+
+        // 已指认但冲突标记残留的场景：再次批量指认幂等解除
+        conflict.speakerAttributionConflict = true
+        let second = SpeakerBackfill.assign(
+            anchorSegmentId: anchor.id, to: speakerID, segments: [anchor, conflict])
+        #expect(second.changedSegmentIds == [conflict.id])
+        #expect(conflict.speakerAttributionConflict == false)
+
+        // 原话行显示冲突后缀，且不影响正常行的名字
+        let participant = Participant(cloudAlias: "p_01", displayName: "张总", side: .counterpart)
+        conflict.participantId = participant.id
+        conflict.speakerAttributionConflict = true
+        let conflictRow = TranscriptRowData.make(
+            from: conflict, participants: [participant], unknownDisplay: nil, highlightedID: nil)
+        #expect(conflictRow.speakerName == "张总（归属待确认）")
+        conflict.speakerAttributionConflict = false
+        let normalRow = TranscriptRowData.make(
+            from: conflict, participants: [participant], unknownDisplay: nil, highlightedID: nil)
+        #expect(normalRow.speakerName == "张总")
+    }
+
 }
