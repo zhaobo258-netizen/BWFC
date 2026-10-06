@@ -18,11 +18,20 @@ struct HistoricalSpeakerRelabeler: @unchecked Sendable {
     }
 
     struct Result: Sendable, Equatable {
+        struct MatchDetail: Sendable, Equatable {
+            /// 引擎给出的候选代号；相似度不足时身份标签已降级匿名
+            var alias: String?
+            var similarity: Double?
+            var clusterConfidence: Double?
+        }
+
         var assignments: [UUID: UUID]
         var processedChunkCount: Int
         var remoteLabels: [UUID: String] = [:]
         var recordingSegments: [DiarizationChunkResult.Segment] = []
         var speakerIDsByRemoteLabel: [String: UUID] = [:]
+        /// 每条原话匹配到的声纹详情（15 号计划 G.3）：供候选展示相似度与来源
+        var matchDetails: [UUID: MatchDetail] = [:]
     }
 
     private let diarization: any DiarizationServicing
@@ -94,6 +103,22 @@ struct HistoricalSpeakerRelabeler: @unchecked Sendable {
         let peopleByLabel = HistoricalSpeakerRelabelMatcher.resolvedSpeakerIDs(
             labels: labels, knownSpeakerIDs: knownIDs, existingSegments: existingSegments
         )
+        // 15 号计划 G.3：把每条原话匹配到的声纹相似度与来源随结果传出
+        let detailByLabel = Dictionary(
+            mapped.segments.compactMap { segment -> (String, Result.MatchDetail)? in
+                guard let label = segment.speakerLabel else { return nil }
+                return (
+                    label,
+                    Result.MatchDetail(
+                        alias: segment.matchAlias,
+                        similarity: segment.matchSimilarity,
+                        clusterConfidence: segment.clusterConfidence
+                    )
+                )
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let matchDetails = labels.compactMapValues { label in detailByLabel[label] }
         return Result(
             assignments: assignments, processedChunkCount: 1,
             remoteLabels: labels.mapValues { scope + $0 },
@@ -102,7 +127,8 @@ struct HistoricalSpeakerRelabeler: @unchecked Sendable {
                 segment.speakerLabel = $0.speakerLabel.map { scope + $0 }
                 return segment
             },
-            speakerIDsByRemoteLabel: Dictionary(uniqueKeysWithValues: peopleByLabel.map { (scope + $0.key, $0.value) })
+            speakerIDsByRemoteLabel: Dictionary(uniqueKeysWithValues: peopleByLabel.map { (scope + $0.key, $0.value) }),
+            matchDetails: matchDetails
         )
     }
 
@@ -318,10 +344,14 @@ enum HistoricalSpeakerRelabelMatcher {
                 covered += max(0, end - max(start, coveredUntil))
                 coveredUntil = max(coveredUntil, end)
             }
+            // 纯音频分组（15 号计划 G.2）：本地引擎等纯时间结果没有转写文本，
+            // 只按时间重叠与覆盖率对齐；有文本的结果仍保留文本相似度保护。
+            let remoteText = overlapping.map(\.text).joined()
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let textMatches = remoteText.isEmpty
+                || TranscriptText.similarity(remoteText, segment.text) >= 0.45
             guard Double(covered) / Double(duration) >= 0.8,
-                  TranscriptText.similarity(
-                    overlapping.map(\.text).joined(), segment.text
-                  ) >= 0.45 else { continue }
+                  textMatches else { continue }
             matches[segment.id] = label
         }
         return matches

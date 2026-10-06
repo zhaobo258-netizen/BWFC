@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import Testing
 @testable import BangWoFenXi
@@ -18,7 +19,13 @@ final class LocalSherpaDiarizationTests {
         if [ -n "$DUMP_ARGS" ]; then printf '%s\\n' "$@" > "$DUMP_ARGS"; fi
         prev=""
         for a in "$@"; do
-          if [ "$prev" = "--references" ] && [ -n "$STUB_REFS_OUT" ]; then cp "$a" "$STUB_REFS_OUT"; fi
+          if [ "$prev" = "--references" ] && [ -n "$STUB_REFS_OUT" ]; then
+            cp "$a" "$STUB_REFS_OUT"
+            if [ -n "$STUB_REFS_WAV_DIR" ]; then
+              mkdir -p "$STUB_REFS_WAV_DIR"
+              python3 -c "import json,shutil,sys,os; refs=json.load(open(sys.argv[1])); [shutil.copy(r['wav'], os.path.join(sys.argv[2], str(i)+'.wav')) for i,r in enumerate(refs)]" "$a" "$STUB_REFS_WAV_DIR"
+            fi
+          fi
           prev="$a"
         done
         case "$STUB_MODE" in
@@ -129,6 +136,25 @@ final class LocalSherpaDiarizationTests {
         #expect(result.segments[0].speakerLabel == "p_01")
         #expect(result.segments[0].startMs == 30)
         #expect(result.segments[1].text == "")
+        // 15 号计划 G.3：匹配详情随结果传递，供候选展示
+        #expect(result.segments[0].matchAlias == "p_01")
+        #expect(abs(result.segments[0].matchSimilarity! - 0.97) < 0.001)
+        #expect(abs(result.segments[0].clusterConfidence! - 0.88) < 0.001)
+    }
+
+    @Test("相似度低于阈值时保留匿名，候选只进 matchAlias（15 号计划 G.3）")
+    func lowSimilarityStaysAnonymous() throws {
+        let json = """
+        {"durationMs": 2000, "segments": [
+          {"startMs": 0, "endMs": 900, "speakerLabel": "p_01", "clusterConfidence": 0.7,
+           "matchAlias": "p_01", "matchSimilarity": 0.31}
+        ], "engine": {"clusters": 1, "elapsedMs": 5}}
+        """
+        let output = try LocalSherpaSupport.parseOutput(Data(json.utf8))
+        let result = LocalSherpaSupport.makeChunkResult(output)
+        #expect(result.segments[0].speakerLabel != "p_01", "低相似度不得当作已登记身份")
+        #expect(result.segments[0].matchAlias == "p_01")
+        #expect(abs(result.segments[0].matchSimilarity! - 0.31) < 0.001)
     }
 
     @Test("stdout 合同拒绝非法输出")
@@ -190,8 +216,20 @@ final class LocalSherpaDiarizationTests {
         """, to: work.appending(path: "out.json"))
         let engineURL = try writeStubEngine(in: work)
         let modelsDirectory = try makeReadyModelsDirectory()
+        // 48kHz 单声道 Float32 登记样本（今日录音链路的真实属性）
         let sample = work.appending(path: "sample.wav")
-        try Data("# wav".utf8).write(to: sample, options: .atomic)
+        do {
+            let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
+            let file = try AVAudioFile(forWriting: sample, settings: format.settings)
+            let frameCount = AVAudioFrameCount(format.sampleRate * 10)
+            let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount)!
+            buffer.frameLength = frameCount
+            for frame in 0..<Int(frameCount) {
+                buffer.floatChannelData![0][frame] =
+                    sin(2 * Float.pi * 220 * Float(frame) / 48_000) * 0.3
+            }
+            try file.write(from: buffer)
+        }
 
         let dumpURL = work.appending(path: "args.txt")
         let refsCaptureURL = work.appending(path: "captured-references.json")
@@ -201,11 +239,14 @@ final class LocalSherpaDiarizationTests {
         setenv("STUB_JSON", cannedOutput.path, 1)
         setenv("STUB_MODE", "ok", 1)
         setenv("STUB_REFS_OUT", refsCaptureURL.path, 1)
+        let refsWavDir = work.appending(path: "kept-reference-wavs")
+        setenv("STUB_REFS_WAV_DIR", refsWavDir.path, 1)
         defer {
             unsetenv("DUMP_ARGS")
             unsetenv("STUB_JSON")
             unsetenv("STUB_MODE")
             unsetenv("STUB_REFS_OUT")
+            unsetenv("STUB_REFS_WAV_DIR")
         }
 
         let service = makeService(engineURL: engineURL, modelsDirectory: modelsDirectory)
@@ -228,7 +269,20 @@ final class LocalSherpaDiarizationTests {
             [LocalSherpaDiarizationService.ReferenceDTO].self, from: Data(contentsOf: refsCaptureURL)
         )
         #expect(references.map { $0.alias } == ["p_02"])
-        #expect(references.map { $0.wav } == [sample.path])
+        // 15 号计划 G.1：引用必须指向派生的 16kHz 单声道转码产物，原样本只读不动
+        let referenceWav = try #require(references.first?.wav)
+        #expect(referenceWav != sample.path)
+        let enumerator = FileManager.default.enumerator(
+            at: refsWavDir, includingPropertiesForKeys: nil
+        )
+        let keptWavs = (enumerator?.allObjects ?? [])
+            .compactMap { $0 as? URL }
+            .filter { $0.pathExtension == "wav" }
+        let converted = try AVAudioFile(forReading: try #require(keptWavs.first))
+        #expect(converted.fileFormat.sampleRate == 16_000)
+        #expect(converted.fileFormat.channelCount == 1)
+        #expect(converted.fileFormat.commonFormat == .pcmFormatInt16)
+        #expect(Int64(Double(converted.length) / converted.fileFormat.sampleRate * 1_000) == 10_000)
     }
 
     @Test("引擎错误码透传为 providerError")

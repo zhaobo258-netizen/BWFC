@@ -135,7 +135,21 @@ struct RootView: View {
                 .padding(.top, 10)
                 .padding(.horizontal, 18)
                 .transition(.move(edge: .top).combined(with: .opacity))
+                // 15 号计划 F/A.6：成功提示自动收起，不永久遮挡工具栏；
+                // 「查看」入口之外，工作台「完整总结」页签与首页项目卡仍可进入
+                .task(id: completion) {
+                    try? await Task.sleep(for: .seconds(8))
+                    dismissNotification(matching: completion)
+                }
             }
+        }
+    }
+
+    /// 自动收起当前提示；期间若来了新提示（id 不同）则不打断新提示的展示
+    private func dismissNotification(matching completion: FinalReportCoordinator.Completion) {
+        guard finalReportNotification == completion else { return }
+        withAnimation {
+            finalReportNotification = nil
         }
     }
 

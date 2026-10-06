@@ -132,15 +132,30 @@ enum LocalSherpaSupport {
         }
     }
 
+    /// 声纹匹配采用的最低余弦相似度（15 号计划 G.3）：低于该值时引擎给出的
+    /// 候选代号不作为身份标签，只保留在 matchAlias 供候选展示；阈值按 13/14 号
+    /// 文档实测结论调整，不得为通过验收调低。
+    static let minimumMatchSimilarity: Float = 0.5
+
     static func makeChunkResult(_ output: Output) -> DiarizationChunkResult {
         DiarizationChunkResult(
             durationMs: Int64(output.durationMs),
             segments: output.segments.map { segment in
-                DiarizationChunkResult.Segment(
+                var label = segment.speakerLabel
+                // 相似度不足：保留匿名分组，候选身份只进 matchAlias 展示
+                if let similarity = segment.matchSimilarity,
+                   similarity < Self.minimumMatchSimilarity,
+                   label == segment.matchAlias {
+                    label = "cluster_\(abs(segment.startMs))"
+                }
+                return DiarizationChunkResult.Segment(
                     startMs: Int64(segment.startMs),
                     endMs: Int64(segment.endMs),
                     text: "",
-                    speakerLabel: segment.speakerLabel
+                    speakerLabel: label,
+                    matchAlias: segment.matchAlias,
+                    matchSimilarity: segment.matchSimilarity.map(Double.init),
+                    clusterConfidence: segment.clusterConfidence.map(Double.init)
                 )
             }
         )

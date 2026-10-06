@@ -230,6 +230,38 @@ struct HistoricalSpeakerRelabelerTests {
             ).isEmpty
         )
     }
+
+    @Test("纯时间分组结果按时间对齐，文本保护只对有文本的结果生效（15 号计划 G.2/G.3）")
+    func pureTimelineResultsAlignWithoutTextGate() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "纯时间 % \(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audio = directory.appending(path: "audio.caf")
+        try Self.makeSyntheticAudio(at: audio)
+        let person = UUID()
+        let existing: [HistoricalSpeakerRelabeler.SegmentSnapshot] = [
+            .init(id: UUID(), startMs: 0, endMs: 2_000, text: "库存需要盘点", participantId: nil, speakerWasUserConfirmed: false),
+            .init(id: UUID(), startMs: 4_000, endMs: 6_000, text: "完全不同的一段总结性文字", participantId: person, speakerWasUserConfirmed: false)
+        ]
+        let service = RecordingDiarizationFixture()
+        // 本地引擎的纯音频结果：text 为空；第 2 段与已有原话文字完全不同
+        service.cannedResult = .init(durationMs: 6_000, segments: [
+            .init(startMs: 0, endMs: 2_000, text: "", speakerLabel: "local:1",
+                  matchAlias: "p_01", matchSimilarity: 0.81, clusterConfidence: 0.9),
+            .init(startMs: 4_000, endMs: 6_000, text: "库存需要盘点", speakerLabel: "local:2")
+        ])
+        let result = try await HistoricalSpeakerRelabeler(diarization: service).diarizeRecording(
+            audioURL: audio, pauseIntervals: [],
+            existingSegments: existing, speakerReferences: []
+        )
+        // 纯时间结果第 1 段按时间对齐成功，并带出匹配详情
+        #expect(result.remoteLabels[existing[0].id]?.hasSuffix("local:1") == true)
+        #expect(result.matchDetails[existing[0].id]?.alias == "p_01")
+        #expect(abs((result.matchDetails[existing[0].id]?.similarity ?? 0) - 0.81) < 0.001)
+        // 有文本但完全不同：文本相似度保护仍在，不得对齐
+        #expect(result.remoteLabels[existing[1].id] == nil)
+    }
+
 }
 
 private final class UnsupportedKnownSpeakerDiarizationService: DiarizationServicing, @unchecked Sendable {
@@ -249,6 +281,7 @@ private final class UnsupportedKnownSpeakerDiarizationService: DiarizationServic
 private final class RecordingDiarizationFixture: DiarizationServicing, @unchecked Sendable {
     let recordingLimits: DiarizationRecordingLimits?
     let cancelCurrentTask: Bool
+    var cannedResult: DiarizationChunkResult?
     private(set) var calls = 0
     private(set) var receivedSampleRate: Double = 0
     private(set) var receivedChannels: AVAudioChannelCount = 0
@@ -266,6 +299,7 @@ private final class RecordingDiarizationFixture: DiarizationServicing, @unchecke
         receivedSampleRate = audio.processingFormat.sampleRate
         receivedChannels = audio.processingFormat.channelCount
         if cancelCurrentTask { withUnsafeCurrentTask { $0?.cancel() } }
+        if let cannedResult { return cannedResult }
         return .init(durationMs: 6_000, segments: [
             .init(startMs: 0, endMs: 2_000, text: "库存需要盘点", speakerLabel: "speaker_0"),
             .init(startMs: 2_000, endMs: 4_000, text: "交付安排下周", speakerLabel: "speaker_1"),

@@ -47,6 +47,7 @@ struct LocalSherpaDiarizationService: DiarizationServicing {
             path: "帮我分析 本地分人 % \(UUID().uuidString)", directoryHint: .isDirectory
         )
         try FileManager.default.createDirectory(at: workDirectory, withIntermediateDirectories: true)
+        // 结束、失败、取消都随 workDirectory 一起清理（15 号计划 G.1）
         defer { try? FileManager.default.removeItem(at: workDirectory) }
 
         var arguments = [
@@ -56,11 +57,30 @@ struct LocalSherpaDiarizationService: DiarizationServicing {
             "--quiet",
         ]
         if !knownSpeakers.isEmpty {
+            // 15 号计划 G.1：原始登记样本可能是 48kHz/Float32 等属性，
+            // 引擎只接受 16kHz 单声道；派生临时参考音频，原样本与登记 hash 只读不动。
             let referencesURL = workDirectory.appending(path: "references.json")
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
-            let dto = knownSpeakers.map { ReferenceDTO(alias: $0.alias, wav: $0.sampleURL.path) }
-            try encoder.encode(dto).write(to: referencesURL, options: .atomic)
+            var referenceDTOs: [ReferenceDTO] = []
+            for speaker in knownSpeakers {
+                let convertedURL = workDirectory.appending(
+                    path: "reference-\(speaker.alias).wav", directoryHint: .notDirectory
+                )
+                do {
+                    try AudioChunkExtractor.convertToIFlytekVoiceprintWAV(
+                        from: speaker.sampleURL,
+                        to: convertedURL
+                    )
+                } catch {
+                    throw DiarizationAPIError.invalidKnownSpeakerSample(
+                        alias: speaker.alias,
+                        issue: .fileMissingOrUnreadable
+                    )
+                }
+                referenceDTOs.append(ReferenceDTO(alias: speaker.alias, wav: convertedURL.path))
+            }
+            try encoder.encode(referenceDTOs).write(to: referencesURL, options: .atomic)
             arguments += ["--references", referencesURL.path]
         }
 

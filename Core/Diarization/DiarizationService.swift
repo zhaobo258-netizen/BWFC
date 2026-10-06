@@ -192,7 +192,7 @@ enum KnownSpeakerSampleIssue: Equatable, Sendable {
     case providerMinimumDuration(actualMs: Int64, minimumMs: Int64)
 }
 
-/// 云端分片识别结果（时间均为相对分片起点的毫秒）
+/// 云端识别结果（时间均为相对分片起点的毫秒）
 struct DiarizationChunkResult: Equatable, Sendable {
     /// 云端报告的总时长（毫秒）
     var durationMs: Int64
@@ -205,6 +205,12 @@ struct DiarizationChunkResult: Equatable, Sendable {
         var text: String
         /// 云端说话人标签（已知代号或云端原始标签）
         var speakerLabel: String?
+        /// 本地引擎声纹匹配详情（15 号计划 G.3）：其他 provider 为 nil。
+        /// matchAlias 是引擎给出的候选代号；相似度不足时 speakerLabel 已降级匿名，
+        /// 候选身份只作展示，不等于人工确认。
+        var matchAlias: String?
+        var matchSimilarity: Double?
+        var clusterConfidence: Double?
     }
 }
 

@@ -3047,9 +3047,19 @@ struct ProjectWorkspaceView: View {
                 analysis?.noteSpeakerContextChanged(segmentIDs: changed)
             }
             let groups = Set(result.remoteLabels.values).count
-            reviewNotice = groups == 0
+            var notice = groups == 0
                 ? "识别完成，未找到可可靠对齐的声音分组；原文与人工标注已保留。"
                 : "已区分 \(groups) 个声音组，匹配人物 \(result.assignments.count) 条原话；未识别的组可一次性指认。"
+            // 本地引擎的声纹匹配相似度摘要（15 号计划 G.3：相似度不足的候选已保留匿名）
+            let similarities = result.matchDetails.values.compactMap(\.similarity)
+            if !similarities.isEmpty {
+                let lowest = Int(((similarities.min() ?? 0) * 100).rounded())
+                let highest = Int(((similarities.max() ?? 0) * 100).rounded())
+                notice += lowest == highest
+                    ? " 声纹匹配相似度 \(lowest)%。"
+                    : " 声纹匹配相似度 \(lowest)–\(highest)%，低相似度条目已保留匿名。"
+            }
+            reviewNotice = notice
             return .completed(groups: groups, assignments: result.assignments.count)
         } catch is CancellationError {
             reviewNotice = "已停止识别，原文与人工标注已保留。"
