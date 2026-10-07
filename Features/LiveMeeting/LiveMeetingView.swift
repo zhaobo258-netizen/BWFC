@@ -493,7 +493,9 @@ struct LiveMeetingView: View {
             fileStore: environment.fileStore
         )
         recorder = recordingService
-        let controller = LocalTranscriptionController(service: environment.localTranscription)
+        let controller = LocalTranscriptionController(
+            service: environment.localTranscription.makeIndependentSessionService()
+        )
         controller.onFinalSegment = { [environment, loaded] in
             try? environment.persist(loaded)
         }
@@ -555,12 +557,10 @@ struct LiveMeetingView: View {
                         recorder?.timeline
                     }
                     // 采集线程直接喂给转写服务（服务内部按会话状态丢弃空转输入）
-                    let transcriptionService = environment.localTranscription
                     let token = UUID()
                     audioSessionToken = token
                     environment.audioCapture.setBufferHandler(token: token) { buffer in
-                        let boxed = SendableAudioBuffer(buffer)
-                        Task { await transcriptionService.feed(boxed.buffer) }
+                        transcription.feed(buffer)
                     }
                     // 始终启动编排：未配置时由 controller 进入 unconfigured，
                     // 让界面如实提示且不切分音频、不发请求。

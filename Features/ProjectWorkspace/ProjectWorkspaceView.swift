@@ -99,6 +99,7 @@ struct ProjectWorkspaceView: View {
     @State private var speakerAssignRequest: SpeakerAssignRequest?
     @State private var isRelabelingHistoricalSpeakers = false
     @State private var historicalSpeakerTask: Task<ProjectWorkspaceView.SpeakerRecognitionOutcome, Never>?
+    @State private var speakerRecognitionOperationID: UUID?
     @State private var newDeviceID: String?
     @State private var sidebarProjects: [Project] = []
     @AppStorage("bwfx.workspace.projectSidebarVisible") private var prefersProjectSidebarVisible = true
@@ -163,9 +164,7 @@ struct ProjectWorkspaceView: View {
             playback.startTicker()
         }
         .onDisappear {
-            historicalSpeakerTask?.cancel()
-            historicalSpeakerTask = nil
-            isRelabelingHistoricalSpeakers = false
+            cancelHistoricalSpeakerRelabel()
             memoryProposalID = nil
             memoryProposalTask?.cancel()
             memoryProposalTask = nil
@@ -329,8 +328,7 @@ struct ProjectWorkspaceView: View {
         }
         .confirmationDialog("录音仍在进行", isPresented: $showBackConfirmation, titleVisibility: .visible) {
             Button("结束录音并返回", role: .destructive) {
-                finishRecording()
-                attemptNavigateHome()
+                if finishRecording() { attemptNavigateHome() }
             }
             Button("继续录音", role: .cancel) {}
         } message: {
@@ -1152,7 +1150,7 @@ struct ProjectWorkspaceView: View {
         guard Self.canNavigateHome(
             afterNoteSave: noteSaved,
             afterCoCreateDraftSave: draftSaved
-        ) else {
+        ), runtimePersistence?.flush() ?? true else {
             operationError = "此前笔记或共创草稿尚未保存成功，已阻止返回。请在右栏检查错误并重试。"
             return
         }
@@ -1220,7 +1218,7 @@ struct ProjectWorkspaceView: View {
                     Circle().fill(.red).frame(width: 10, height: 10)
                 }
                 if isFinishing {
-                    Text("正在收尾…可返回首页")
+                    Text("录音已停止，正在整理…可返回首页")
                         .foregroundStyle(.secondary)
                 } else {
                     Text(project.processingStatusText)
@@ -1458,7 +1456,8 @@ struct ProjectWorkspaceView: View {
                 if project?.sourceType.isCombinedAnalysis != true {
                     Button(isRelabelingHistoricalSpeakers ? "停止识别" : "识别说话人") {
                         if isRelabelingHistoricalSpeakers {
-                            historicalSpeakerTask?.cancel()
+                            cancelHistoricalSpeakerRelabel()
+                            reviewNotice = "已停止识别，原文与人工标注已保留。"
                         } else if let project, let meeting {
                             startHistoricalSpeakerRelabel(project: project, meeting: meeting)
                         }
@@ -2189,7 +2188,9 @@ struct ProjectWorkspaceView: View {
         )
         recorder = recordingService
 
-        let controller = LocalTranscriptionController(service: environment.localTranscription)
+        let controller = LocalTranscriptionController(
+            service: environment.localTranscription.makeIndependentSessionService()
+        )
         controller.extraContextualStrings = environment.lexiconTerms
         controller.correctionRules = environment.correctionRules
         let runtimePersistence = ProjectRuntimePersistenceController(
@@ -2830,15 +2831,28 @@ struct ProjectWorkspaceView: View {
     static let speakerRecognitionFinishTimeoutSeconds: UInt64 = 1_200
 
     private func startHistoricalSpeakerRelabel(project: Project, meeting: Meeting) {
+        guard !isRelabelingHistoricalSpeakers else { return }
+        let operationID = UUID()
+        speakerRecognitionOperationID = operationID
         historicalSpeakerTask = Task {
-            await runHistoricalSpeakerRelabel(project: project, meeting: meeting)
+            await runHistoricalSpeakerRelabel(project: project, meeting: meeting, operationID: operationID)
         }
+    }
+
+    private func cancelHistoricalSpeakerRelabel() {
+        historicalSpeakerTask?.cancel()
+        historicalSpeakerTask = nil
+        speakerRecognitionOperationID = nil
+        isRelabelingHistoricalSpeakers = false
     }
 
     /// 整场人物识别核心：完成、失败、取消、跳过都返回终态，不悬挂。
     @discardableResult
-    private func runHistoricalSpeakerRelabel(project: Project, meeting: Meeting) async -> SpeakerRecognitionOutcome {
-        guard !isRelabelingHistoricalSpeakers,
+    private func runHistoricalSpeakerRelabel(
+        project: Project, meeting: Meeting, operationID: UUID
+    ) async -> SpeakerRecognitionOutcome {
+        guard !Task.isCancelled, speakerRecognitionOperationID == operationID,
+              !isRelabelingHistoricalSpeakers,
               meeting.status != .recording, meeting.status != .paused,
               !environment.importProcessing.isRunning else {
             return .skipped(reason: "识别已在进行或录音未结束")
@@ -2901,8 +2915,10 @@ struct ProjectWorkspaceView: View {
         let relabeler = HistoricalSpeakerRelabeler(diarization: service)
         isRelabelingHistoricalSpeakers = true
         defer {
-            isRelabelingHistoricalSpeakers = false
-            historicalSpeakerTask = nil
+            if speakerRecognitionOperationID == operationID {
+                isRelabelingHistoricalSpeakers = false
+                historicalSpeakerTask = nil
+            }
         }
         reviewNotice = references.isEmpty
             ? "正在识别整场声音分组；当前没有可供此服务比对的已登记声纹。"
@@ -2912,6 +2928,9 @@ struct ProjectWorkspaceView: View {
                 pauseIntervals: meeting.pauseIntervals, existingSegments: snapshots,
                 speakerReferences: Array(references.prefix(KnownSpeakerReference.maximumCount)))
             try Task.checkCancellation()
+            guard speakerRecognitionOperationID == operationID else {
+                return .skipped(reason: "识别会话已结束")
+            }
             guard (try environment.allProjects()).contains(where: { $0.id == project.id }) else {
                 return .skipped(reason: "项目已删除")
             }
@@ -2941,9 +2960,14 @@ struct ProjectWorkspaceView: View {
             reviewNotice = notice
             return .completed(groups: groups, assignments: result.assignments.count)
         } catch is CancellationError {
-            reviewNotice = "已停止识别，原文与人工标注已保留。"
+            if speakerRecognitionOperationID == operationID {
+                reviewNotice = "已停止识别，原文与人工标注已保留。"
+            }
             return .skipped(reason: "已停止识别")
         } catch {
+            guard !Task.isCancelled, speakerRecognitionOperationID == operationID else {
+                return .skipped(reason: "识别会话已结束")
+            }
             reviewNotice = "说话人识别未完成：\(error.localizedDescription)"
             return .failed(message: error.localizedDescription)
         }
@@ -2954,28 +2978,35 @@ struct ProjectWorkspaceView: View {
         project: Project,
         meeting: Meeting
     ) async -> SpeakerRecognitionOutcome {
+        guard !isRelabelingHistoricalSpeakers else {
+            return .skipped(reason: "识别已在进行")
+        }
+        let operationID = UUID()
+        speakerRecognitionOperationID = operationID
         let task = Task {
-            await runHistoricalSpeakerRelabel(project: project, meeting: meeting)
+            await runHistoricalSpeakerRelabel(project: project, meeting: meeting, operationID: operationID)
         }
         historicalSpeakerTask = task
-        let outcome = await withTaskGroup(of: SpeakerRecognitionOutcome?.self) { group in
-            group.addTask { await task.value }
-            group.addTask {
-                try? await Task.sleep(
-                    for: .seconds(Self.speakerRecognitionFinishTimeoutSeconds)
-                )
-                return nil
-            }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            return first
-        }
-        guard let outcome else {
+        switch await awaitTaskResult(
+            task,
+            timeout: .seconds(Self.speakerRecognitionFinishTimeoutSeconds),
+            shouldCancel: { speakerRecognitionOperationID != operationID }
+        ) {
+        case .completed(let outcome):
+            return outcome
+        case .timedOut:
             task.cancel()
-            _ = await task.value
+            if speakerRecognitionOperationID == operationID {
+                cancelHistoricalSpeakerRelabel()
+            }
             return .skipped(reason: "整场识别等待超时，已跳过")
+        case .cancelled:
+            task.cancel()
+            if speakerRecognitionOperationID == operationID {
+                cancelHistoricalSpeakerRelabel()
+            }
+            return .skipped(reason: "已停止识别")
         }
-        return outcome
     }
 
     /// 整场人物识别终态写入持久任务（15 号计划 F06：首页与工作台状态一致）。
@@ -2996,9 +3027,15 @@ struct ProjectWorkspaceView: View {
         case .skipped:
             break
         }
-        if let diarization, diarization.awaitingUserRetryCount > 0 {
-            jobStatus = .failedRetryable
-            errorCategory = "chunks_awaiting_user_retry"
+        if let diarization {
+            if diarization.awaitingUserRetryCount > 0 || diarization.pendingChunkCount > 0 {
+                jobStatus = .failedRetryable
+                errorCategory = "chunks_awaiting_user_retry"
+            }
+            if diarization.queuePersistenceError != nil {
+                jobStatus = .failedRetryable
+                errorCategory = "chunk_queue_save_failed"
+            }
         }
         guard let jobStatus else { return }
         project.processingJobs.removeAll { $0.kind == .diarization }
@@ -3226,12 +3263,10 @@ struct ProjectWorkspaceView: View {
                         audioOnlyNotice = "仅保存音频模式：本地转写启动失败；音频仍在保存，结束后可重新转写。"
                         return
                     }
-                    let transcriptionService = environment.localTranscription
                     let token = UUID()
                     audioSessionToken = token
                     environment.audioCapture.setBufferHandler(token: token) { buffer in
-                        let boxed = SendableAudioBuffer(buffer)
-                        Task { await transcriptionService.feed(boxed.buffer) }
+                        transcription.feed(buffer)
                     }
                     diarization?.start(for: meeting) { [weak recorder] in
                         recorder?.timeline
@@ -3676,22 +3711,37 @@ struct ProjectWorkspaceView: View {
         refreshPendingMemoryCandidates()
     }
 
-    private func finishRecording() {
-        guard let meeting, !isFinishing else { return }
+    /// 返回前先关闭本次音频文件并保存状态；不可把 stopCapture 延迟到离页之后，
+    /// 否则首页新开的录音可能被旧工作台的收尾任务停止。
+    @discardableResult
+    private func finishRecording() -> Bool {
+        guard let meeting, let recorder, !isFinishing else { return false }
         noteController?.saveNow()
         projectAIChat?.saveDraftNow()
         isFinishing = true
+        do {
+            environment.audioCapture.onLevel = nil
+            try recorder.beginFinish()
+        } catch {
+            isFinishing = false
+            operationError = error.localizedDescription
+            return false
+        }
+        environment.audioCapture.clearBufferHandler(token: audioSessionToken)
+        environment.clearProjectLive(projectID)
+        let audioStateSaved = syncAndPersist(meeting)
         Task {
+            defer { isFinishing = false }
             do {
-                environment.audioCapture.onLevel = nil
-                try recorder?.beginFinish()
-                syncAndPersist(meeting)
-                environment.audioCapture.clearBufferHandler(token: audioSessionToken)
                 await transcription?.finish()
-                await diarization?.finishAndDrain()
-                try recorder?.completeFinalizing()
-                syncAndPersist(meeting)
-                environment.clearProjectLive(projectID)
+                let drainOutcome = await diarization?.finishAndDrain()
+                try recorder.completeFinalizing()
+                guard syncAndPersist(meeting) else { return }
+                if let project, let drainOutcome, drainOutcome != .completed {
+                    recordDiarizationOutcome(.skipped(reason: "分人分片待重试"), project: project)
+                    reviewNotice = diarization?.queuePersistenceError
+                        ?? "录音已保存，部分分人处理已暂停，可稍后重试；原文与人工标注已保留。"
+                }
                 if isAudioOnlyRecording {
                     isAudioOnlyRecording = false
                     audioOnlyNotice = nil
@@ -3753,8 +3803,8 @@ struct ProjectWorkspaceView: View {
             } catch {
                 operationError = error.localizedDescription
             }
-            isFinishing = false
         }
+        return audioStateSaved
     }
 
     private var finalReportState: FinalReportCoordinator.State {

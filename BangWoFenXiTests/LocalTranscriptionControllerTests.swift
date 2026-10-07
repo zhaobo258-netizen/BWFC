@@ -250,6 +250,103 @@ final class LocalTranscriptionControllerTests {
         #expect(controller.segments.first?.state == .final)
     }
 
+    @Test("Speech 收尾不响应取消：有限返回且保留最终稿、拒绝迟到结果")
+    func unresponsiveFinishPreservesFinalTranscript() async throws {
+        let meeting = try makeMeeting()
+        let gate = UncooperativeTestGate()
+        mock.beforeFinish = { await gate.wait() }
+        mock.finalResultsOnFinish = [LocalTranscriptResult(
+            startAudioMs: 3_000, endAudioMs: 4_000, text: "已取消任务的迟到句子", isFinal: true
+        )]
+        try await controller.start(for: meeting) { nil }
+        mock.emit(LocalTranscriptResult(startAudioMs: 0, endAudioMs: 1_000,
+                                        text: "已确认的原话", isFinal: true))
+        await waitFor { meeting.segments.count == 1 }
+        let startedAt = ContinuousClock.now
+        await controller.finish(timeout: .milliseconds(50))
+        #expect(startedAt.duration(to: .now) < .seconds(1))
+        #expect(mock.cancelCount == 1)
+        #expect(controller.lastErrorDescription?.contains("超时") == true)
+        #expect(controller.segments.map(\.text) == ["已确认的原话"])
+        #expect(meeting.segments.map(\.text) == ["已确认的原话"])
+        await gate.releaseAll()
+        try await settle()
+        #expect(meeting.segments.map(\.text) == ["已确认的原话"])
+    }
+
+    @Test("不同工作台获得独立 Speech 服务")
+    func independentSpeechServicesDoNotShareSessionState() {
+        let shared = AppleSpeechTranscriptionService()
+        let first = shared.makeIndependentSessionService()
+        let second = shared.makeIndependentSessionService()
+        #expect(first !== shared)
+        #expect(second !== shared)
+        #expect(first !== second)
+    }
+
+    @Test("上一场超时只取消它自己的服务，新录音继续产生最终稿")
+    func oldWorkspaceTimeoutDoesNotCancelNewWorkspace() async throws {
+        let oldMeeting = try makeMeeting()
+        let newMeeting = try makeMeeting()
+        let gate = UncooperativeTestGate()
+        mock.beforeFinish = { await gate.wait() }
+        try await controller.start(for: oldMeeting) { nil }
+        let oldFinish = Task { await controller.finish(timeout: .milliseconds(100)) }
+        await waitFor { mock.finishCount == 1 }
+        let newService = MockLocalTranscriptionService()
+        let newController = LocalTranscriptionController(service: newService)
+        try await newController.start(for: newMeeting) { nil }
+        await oldFinish.value
+        #expect(mock.cancelCount == 1)
+        #expect(newService.cancelCount == 0)
+        #expect(newController.runState == .running)
+        newService.emit(LocalTranscriptResult(startAudioMs: 0, endAudioMs: 1_000,
+                                               text: "新一场仍然有效", isFinal: true))
+        await waitFor { newMeeting.segments.count == 1 }
+        #expect(newMeeting.segments.map(\.text) == ["新一场仍然有效"])
+        #expect(oldMeeting.segments.isEmpty)
+        await gate.releaseAll()
+        mock.finishStream()
+        await newController.cancel()
+    }
+
+    @Test("finishSession 返回但结果流不结束也有等待上限")
+    func unfinishedResultStreamDoesNotBlockFinish() async throws {
+        let meeting = try makeMeeting()
+        try await controller.start(for: meeting) { nil }
+        let startedAt = ContinuousClock.now
+        await controller.finish(timeout: .milliseconds(50))
+        #expect(startedAt.duration(to: .now) < .seconds(1))
+        #expect(mock.cancelCount == 1)
+        #expect(controller.lastErrorDescription?.contains("超时") == true)
+        mock.finishStream()
+    }
+
+    @Test("取消收尾无需等待不响应的服务，已确认稿仍在")
+    func cancelledFinishReturnsWithoutWaitingForService() async throws {
+        let meeting = try makeMeeting()
+        let gate = UncooperativeTestGate()
+        mock.beforeFinish = { await gate.wait() }
+        try await controller.start(for: meeting) { nil }
+        mock.emit(LocalTranscriptResult(startAudioMs: 0, endAudioMs: 1_000,
+                                        text: "取消仍保留", isFinal: true))
+        await waitFor { meeting.segments.count == 1 }
+        let task = Task { await controller.finish(timeout: .seconds(30)) }
+        await waitFor { mock.finishCount == 1 }
+        task.cancel()
+        let outcome = await awaitTaskResult(task, timeout: .seconds(1))
+        guard case .completed = outcome else {
+            await gate.releaseAll()
+            Issue.record("取消后 finish 必须在一秒内返回")
+            return
+        }
+        #expect(controller.lastErrorDescription?.contains("暂停") == true)
+        #expect(controller.segments.map(\.text) == ["取消仍保留"])
+        #expect(meeting.segments.map(\.text) == ["取消仍保留"])
+        await gate.releaseAll()
+        mock.finishStream()
+    }
+
     @Test("云端拆分本地多人粗块后，权威会议数组不保留旧长段")
     func cloudSplitReplacesPersistedCoarseSegment() async throws {
         let meeting = try makeMeeting()

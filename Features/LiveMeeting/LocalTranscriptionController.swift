@@ -27,6 +27,7 @@ final class LocalTranscriptionController {
 
     private var reconciler = TranscriptReconciler()
     private var collectTask: Task<Void, Never>?
+    private var sessionGeneration = 0
     private var timelineProvider: (() -> RecordingTimeline?)?
     private weak var meeting: Meeting?
     /// 全局词库词条（视图层注入；随参会人信息一并作为识别上下文）
@@ -125,6 +126,8 @@ final class LocalTranscriptionController {
             throw LocalTranscriptionError.notReady(current.issues)
         }
 
+        sessionGeneration += 1
+        let generation = sessionGeneration
         self.meeting = meeting
         self.timelineProvider = timelineProvider
         reconciler.reset(finalized: meeting.segments)
@@ -149,8 +152,10 @@ final class LocalTranscriptionController {
         collectTask = Task { [weak self] in
             guard let self else { return }
             for await result in service.results {
+                guard !Task.isCancelled, self.sessionGeneration == generation else { return }
                 self.consume(result)
             }
+            guard self.sessionGeneration == generation, !Task.isCancelled else { return }
             self.publishSessionFailure()
         }
     }
@@ -172,18 +177,46 @@ final class LocalTranscriptionController {
         }
     }
 
-    /// 结束转写：丢弃尾部临时片段（最终片段已即时入库）
-    func finish() async {
+    /// 等待尾部最终结果，但不让 Speech/XPC 未响应阻塞结束录音。
+    /// 超时或取消只丢弃临时稿；原音频及已确认稿供重新转写恢复。
+    func finish(timeout: Duration = .seconds(8)) async {
         pendingFlushTask?.cancel()
         pendingFlushTask = nil
-        await service.finishSession()
-        if let collectTask {
-            await collectTask.value
+        let generation = sessionGeneration
+        let collector = collectTask
+        // 独立任务：TaskGroup 退出会等待不合作的子任务，不能提供真实期限。
+        let finishTask = Task { [service] in
+            await service.finishSession()
+            if let collector { await collector.value }
         }
-        collectTask = nil
+        let outcome = await awaitTaskResult(finishTask, timeout: timeout) {
+            generation != self.sessionGeneration
+        }
+        guard generation == sessionGeneration else {
+            finishTask.cancel()
+            return
+        }
+        switch outcome {
+        case .timedOut, .cancelled:
+            sessionGeneration += 1
+            let cancelledGeneration = sessionGeneration
+            collectTask?.cancel()
+            collectTask = nil
+            finishTask.cancel()
+            // 服务取消先断流并释放会话，不等待底层 Speech 的取消确认。
+            await service.cancelSession()
+            guard sessionGeneration == cancelledGeneration else { return }
+            let message = Task.isCancelled
+                ? "本地转写收尾已暂停，已保留原录音与已有文稿，可重新转写补全。"
+                : "本地转写收尾超时，已保留原录音与已有文稿，可重新转写补全。"
+            lastErrorDescription = message
+            runState = .unavailable(message)
+        case .completed:
+            collectTask = nil
+            if !publishSessionFailure() { runState = .idle }
+        }
         reconciler.dropProvisional()
         publishSegments()
-        if !publishSessionFailure() { runState = .idle }
     }
 
     @discardableResult
@@ -198,16 +231,17 @@ final class LocalTranscriptionController {
         return true
     }
 
-    /// 立即取消（录音异常中止等场景）
+    /// 立即取消；已确认稿保留，迟到结果不能再写入会议。
     func cancel() async {
+        sessionGeneration += 1
         collectTask?.cancel()
         collectTask = nil
         pendingFlushTask?.cancel()
         pendingFlushTask = nil
-        await service.cancelSession()
-        reconciler.reset()
-        segments = []
+        reconciler.dropProvisional()
+        publishSegments()
         runState = .idle
+        await service.cancelSession()
     }
 
     // MARK: - 结果消费与发布节流

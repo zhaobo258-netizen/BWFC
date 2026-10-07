@@ -44,6 +44,14 @@ final class DiarizationController {
     private var timelineProvider: (() -> RecordingTimeline?)?
     private var mapper = SpeakerMapper(participants: [])
     private var processingTask: Task<Void, Never>?
+    private var processingGeneration = 0
+    private(set) var queuePersistenceError: String?
+
+    enum DrainOutcome: Equatable {
+        case completed
+        case deferred
+        case cancelled
+    }
     private var draining = false
     private var suspensionCause: SuspensionCause?
 
@@ -159,6 +167,7 @@ final class DiarizationController {
     /// 恢复既有队列（App 重启后补传）；分人 Key 未配置时进入 unconfigured
     /// （灰色显示，绝不借用分析 Key 发请求；说话人显示为待识别，可手动标注）。
     func start(for meeting: Meeting, timelineProvider: @escaping () -> RecordingTimeline?) {
+        cancel()
         mapper = SpeakerMapper(participants: [])
         attach(to: meeting)
         self.timelineProvider = timelineProvider
@@ -244,10 +253,16 @@ final class DiarizationController {
         mapper.assign(remoteLabel: label, to: participantId)
     }
 
-    /// 停止编排（不等待队列完成；结束会议请用 finishAndDrain）
+    /// 不等待 Provider 取消确认；保留队列和音频，下次可显式重试。
     func cancel() {
+        processingGeneration += 1
+        draining = false
         processingTask?.cancel()
         processingTask = nil
+        for index in queue.indices where queue[index].status == .uploading {
+            queue[index].status = .pending
+        }
+        persistQueue()
     }
 
     // MARK: - 分片产出
@@ -275,12 +290,17 @@ final class DiarizationController {
         }
     }
 
-    /// 结束会议：切尾部残缺分片并入队，等待队列处理完毕（finalizing）。
-    /// 返回时队列要么全部成功，要么进入 suspended / awaitingUserRetry。
-    /// - Parameter uptoAudioMs: 尾部截止的音频进度；nil 表示按当前时间线计算（测试可注入）
-    func finishAndDrain(uptoAudioMs: Int64? = nil) async {
-        // 未配置时连尾片也不切盘；start 仍然保留会议与时间线上下文。
-        guard canProduceChunkFiles() else { return }
+    /// 尾片先入队落盘，等待有限时间；到期保留未完成分片供显式重试。
+    /// Provider 不响应取消时也不会卡住录音收尾，迟到结果由代际检查拒绝。
+    @discardableResult
+    func finishAndDrain(
+        uptoAudioMs: Int64? = nil,
+        timeout: Duration = .seconds(8)
+    ) async -> DrainOutcome {
+        guard canProduceChunkFiles() else {
+            return queue.contains { $0.status != .succeeded } || queuePersistenceError != nil
+                ? .deferred : .completed
+        }
         if let meeting {
             let timelineAudioMs = timelineProvider?().map { $0.effectiveAudioMs(at: Date()) } ?? 0
             let audioMs = min(uptoAudioMs ?? timelineAudioMs, recordedAudioMs)
@@ -291,15 +311,30 @@ final class DiarizationController {
         }
         draining = true
         kickProcessing()
-        // 等待直到没有可处理条目（或暂停）；轮询间隔用真实延迟，退避才走注入
-        while draining {
+        let generation = processingGeneration
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while draining, generation == processingGeneration {
+            if Task.isCancelled {
+                cancel()
+                return .cancelled
+            }
             if case .suspended = cloudState { break }
             if case .unconfigured = cloudState { break }
-            let hasWork = queue.contains { $0.needsProcessing }
-            if !hasWork { break }
-            try? await Task.sleep(for: .milliseconds(100))
+            if !queue.contains(where: { $0.needsProcessing }) { break }
+            if ContinuousClock.now >= deadline {
+                cancel()
+                return .deferred
+            }
+            do { try await Task.sleep(for: .milliseconds(20)) }
+            catch {
+                cancel()
+                return .cancelled
+            }
         }
+        guard generation == processingGeneration else { return .cancelled }
         draining = false
+        return queue.contains { $0.status != .succeeded } || queuePersistenceError != nil
+            ? .deferred : .completed
     }
 
     /// 产出一个分片：从完整录音提取文件 → 入队 → 持久化
@@ -343,17 +378,21 @@ final class DiarizationController {
         guard processingTask == nil else { return }
         if case .suspended = cloudState { return }
         if case .unconfigured = cloudState { return }
+        processingGeneration += 1
+        let generation = processingGeneration
         processingTask = Task { [weak self] in
-            await self?.processQueue()
+            await self?.processQueue(generation: generation)
         }
     }
 
-    private func processQueue() async {
+    private func processQueue(generation: Int) async {
         defer {
-            processingTask = nil
-            updateCloudState()
+            if generation == processingGeneration {
+                processingTask = nil
+                updateCloudState()
+            }
         }
-        while !Task.isCancelled {
+        while !Task.isCancelled, generation == processingGeneration {
             guard let entryIndex = queue.firstIndex(where: {
                 $0.status == .pending || $0.status == .failed
             }) else { return }
@@ -364,6 +403,7 @@ final class DiarizationController {
                 let delay = retryPolicy.delayMs(beforeAttempt: entry.attemptCount + 1)
                 if delay > 0 { await sleep(delay) }
             }
+            guard !Task.isCancelled, generation == processingGeneration else { return }
             entry.status = .uploading
             queue[entryIndex] = entry
             persistQueue()
@@ -378,6 +418,7 @@ final class DiarizationController {
                 )
                 let startedAt = Date()
                 let uploaded = try await upload(entry: entry)
+                guard !Task.isCancelled, generation == processingGeneration else { return }
                 let uploadDurationMs = Int(startedAt.timeIntervalSinceNow.magnitude * 1_000)
                 AppLog.logInfo(
                     AppLog.diarization,
@@ -407,6 +448,7 @@ final class DiarizationController {
                 }
                 lastConfirmedAt = Date()
             } catch let error as DiarizationAPIError {
+                guard !Task.isCancelled, generation == processingGeneration else { return }
                 AppLog.logWarning(
                     AppLog.diarization,
                     LogSanitizer.formatEvent(
@@ -416,9 +458,11 @@ final class DiarizationController {
                     )
                 )
                 handleUploadError(error, entryIndex: entryIndex)
+                persistQueue()
                 if case .suspended = cloudState { return }
                 if queue[entryIndex].status == .awaitingUserRetry { continue }
             } catch {
+                guard !Task.isCancelled, generation == processingGeneration else { return }
                 AppLog.logError(
                     AppLog.diarization,
                     LogSanitizer.formatEvent(
@@ -848,10 +892,22 @@ final class DiarizationController {
         onQueueChanged?()
     }
 
-    private func persistQueue() {
-        guard let queueStore else { return }
-        try? queueStore.save(queue)
-        updateCloudState()
+    @discardableResult
+    private func persistQueue() -> Bool {
+        guard let queueStore else { return true }
+        do {
+            try queueStore.save(queue)
+            queuePersistenceError = nil
+            updateCloudState()
+            return true
+        } catch {
+            queuePersistenceError = "分人待处理队列保存失败，原录音仍保留，可重新识别说话人。"
+            AppLog.logError(AppLog.diarization, LogSanitizer.formatEvent(
+                "chunk_queue_save_failed", error: String(describing: type(of: error))
+            ))
+            updateCloudState()
+            return false
+        }
     }
 }
 

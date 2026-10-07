@@ -84,6 +84,27 @@ final class MeetingRecordingServiceTests {
         #expect(mock.startCaptureURLs.isEmpty, "状态校验失败时不得启动采集")
     }
 
+    @Test("结束后可另开录音，旧会话完成后台收尾不得停止新采集")
+    func deferredFinalizingDoesNotStopNextRecording() throws {
+        let first = makeReadyMeeting()
+        try service.startRecording(for: first, deviceID: nil)
+        try service.beginFinish()
+        #expect(mock.stopCount == 1, "beginFinish 返回时必须已停止本次采集")
+        #expect(first.status == .finalizing)
+        #expect(first.endedAt != nil)
+        #expect(first.audioRelativePath != nil)
+
+        let nextRecorder = MeetingRecordingService(capture: mock, fileStore: fileStore)
+        let next = makeReadyMeeting()
+        try nextRecorder.startRecording(for: next, deviceID: nil)
+        try service.completeFinalizing()
+        #expect(first.status == .completed)
+        #expect(next.status == .recording)
+        #expect(nextRecorder.activeMeeting === next)
+        #expect(mock.stopCount == 1, "异步尾句/分人完成不应再次停止共用采集器")
+        try nextRecorder.finishRecording()
+    }
+
     @Test("采集启动失败：状态回滚且不留会话")
     func startCaptureFailureRollsBack() {
         let meeting = makeReadyMeeting()

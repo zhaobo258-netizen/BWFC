@@ -77,6 +77,8 @@ extension LocalTranscriptionError: LocalizedError {
 /// 本地转写服务协议（实施计划 7.3：Apple Speech 设备端即时转写）。
 /// 协议隔离 SpeechAnalyzer，便于测试替换（实施计划第 8 节）。
 protocol LocalTranscriptionServicing: AnyObject, Sendable {
+    /// 录音工作台独占的会话服务，避免上一场后台收尾取消下一场转写。
+    func makeIndependentSessionService() -> any LocalTranscriptionServicing
     /// 结果流（临时 + 最终，按产生顺序）
     var results: AsyncStream<LocalTranscriptResult> { get }
     var sessionError: LocalTranscriptionError? { get }
@@ -99,6 +101,8 @@ protocol LocalTranscriptionServicing: AnyObject, Sendable {
 }
 
 extension LocalTranscriptionServicing {
+    // 无外部会话的注入测试服务可以复用自身；真实 Speech 实现必须隔离。
+    func makeIndependentSessionService() -> any LocalTranscriptionServicing { self }
     var sessionError: LocalTranscriptionError? { nil }
 }
 
@@ -139,6 +143,10 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
         var continuation: AsyncStream<LocalTranscriptResult>.Continuation!
         self.resultsStream = AsyncStream { continuation = $0 }
         self.resultsContinuation = continuation
+    }
+
+    func makeIndependentSessionService() -> any LocalTranscriptionServicing {
+        AppleSpeechTranscriptionService()
     }
 
     // MARK: - 可用性检查（不静默降级；结果按 TTL 缓存，杜绝热路径反复 XPC 探测）
@@ -442,11 +450,10 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
     }
 
     func finishSession() async {
-        let input = lock.withLock { inputContinuation }
-        let analyzer = lock.withLock { self.analyzer }
-        let collectTask = lock.withLock { collectorTask }
-        let generation = lock.withLock { sessionGeneration }
-        defer { cleanup() }
+        let (input, analyzer, collectTask, generation) = lock.withLock {
+            (inputContinuation, self.analyzer, collectorTask, sessionGeneration)
+        }
+        defer { cleanup(generation: generation) }
         input?.finish()
         // 有限输入结束后等待剩余音频被消费并产出最终结果。
         // finish(after: .positiveInfinity) 永远等不到对应时间点，会让导入转写永久悬挂。
@@ -455,7 +462,7 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
                 try await analyzer.finalizeAndFinishThroughEndOfInput()
             } catch {
                 failSession(.finalizationFailed, generation: generation)
-                await analyzer.cancelAndFinishNow()
+                Task { await analyzer.cancelAndFinishNow() }
                 AppLog.logError(
                     AppLog.transcription,
                     LogSanitizer.formatEvent(
@@ -463,6 +470,8 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
                         error: String(describing: type(of: error))
                     )
                 )
+                collectTask?.cancel()
+                return
             }
         }
         if let collectTask {
@@ -471,10 +480,16 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
     }
 
     func cancelSession() async {
-        lock.withLock { isCancelling = true }
-        let analyzer = lock.withLock { self.analyzer }
-        await analyzer?.cancelAndFinishNow()
-        cleanup()
+        let cancelled = lock.withLock {
+            isCancelling = true
+            return (analyzer, sessionGeneration)
+        }
+        // Speech 的 XPC 取消也可能不返回。先关闭本机会话与结果流，让 UI/导入
+        // 能退出等待；后台只持有旧 analyzer，不能清除下一次录音的状态。
+        cleanup(generation: cancelled.1, cancelCollector: true)
+        if let analyzer = cancelled.0 {
+            Task { await analyzer.cancelAndFinishNow() }
+        }
     }
 
     private func failSession(_ error: LocalTranscriptionError, generation: Int) {
@@ -486,8 +501,11 @@ final class AppleSpeechTranscriptionService: LocalTranscriptionServicing, @unche
         }
     }
 
-    private func cleanup() {
+    private func cleanup(generation: Int, cancelCollector: Bool = false) {
         lock.withLock {
+            guard generation == sessionGeneration else { return }
+            if cancelCollector { collectorTask?.cancel() }
+            inputContinuation?.finish()
             // 结果流终结：消费方（实时收集循环 / 导入收尾等待）随之退出
             resultsContinuation?.finish()
             resultsContinuation = nil

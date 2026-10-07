@@ -454,6 +454,64 @@ final class DiarizationControllerTests {
         #expect(tail.status == .succeeded)
     }
 
+    @Test("尾片超时保留落盘，忽略取消的旧请求不能覆盖重试结果")
+    func drainTimeoutPreservesTailAndRejectsLateResult() async throws {
+        let gate = UncooperativeTestGate()
+        mockDiarization.beforeResponse = { await gate.wait() }
+        try await startAll()
+        let startedAt = ContinuousClock.now
+        let outcome = await controller.finishAndDrain(
+            uptoAudioMs: 18_500, timeout: .milliseconds(50)
+        )
+        #expect(outcome == .deferred)
+        #expect(startedAt.duration(to: .now) < .seconds(1))
+        let entry = try #require(controller.queue.first)
+        #expect(entry.status == .pending)
+        let chunkURL = fileStore.chunksDirectory(for: meeting.id).appending(path: entry.fileName)
+        #expect(FileManager.default.fileExists(atPath: chunkURL.path))
+        let saved = try ChunkQueueStore(fileURL: fileStore.chunkQueueFileURL(for: meeting.id)).load()
+        #expect(saved.first?.status == .pending)
+        #expect(controller.queuePersistenceError == nil)
+        // 新请求先成功，旧任务稍后返回完全不同的内容。
+        mockDiarization.beforeResponse = nil
+        mockDiarization.resultQueue = [
+            DiarizationChunkResult(durationMs: 18_500, segments: [
+                .init(startMs: 0, endMs: 2_000, text: "重试后的有效结果", speakerLabel: nil)
+            ]),
+            DiarizationChunkResult(durationMs: 18_500, segments: [
+                .init(startMs: 5_000, endMs: 7_000, text: "旧请求的迟到结果", speakerLabel: nil)
+            ])
+        ]
+        controller.retryAwaitingUserChunks()
+        await waitUntil { self.controller.queue.first?.status == .succeeded }
+        await gate.releaseAll()
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(meeting.segments.map(\.text) == ["重试后的有效结果"])
+        #expect(controller.queue.first?.status == .succeeded)
+        #expect(controller.cloudState == .idle)
+    }
+
+    @Test("取消 drain 立即返回并持久保留 pending，不忙循环等待 Provider")
+    func cancelledDrainReturnsAndKeepsQueueRecoverable() async throws {
+        let gate = UncooperativeTestGate()
+        mockDiarization.beforeResponse = { await gate.wait() }
+        try await startAll()
+        let task = Task { await controller.finishAndDrain(uptoAudioMs: 18_500, timeout: .seconds(30)) }
+        await waitUntil { !self.mockDiarization.calls.isEmpty }
+        task.cancel()
+        let result = await awaitTaskResult(task, timeout: .seconds(1))
+        if case .completed(let outcome) = result {
+            #expect(outcome == .cancelled)
+        } else {
+            Issue.record("取消 drain 必须在一秒内返回")
+        }
+        #expect(controller.queue.first?.status == .pending)
+        let saved = try ChunkQueueStore(fileURL: fileStore.chunkQueueFileURL(for: meeting.id)).load()
+        #expect(saved.first?.status == .pending)
+        #expect(meeting.segments.isEmpty)
+        await gate.releaseAll()
+    }
+
     @Test("持续网络失败：指数退避后进入待用户重试，不无限循环")
     func persistentFailureBackoff() async throws {
         mockDiarization.persistentError = DiarizationAPIError.network

@@ -184,6 +184,38 @@ struct AudioWriteFailureTracker {
     }
 }
 
+/// 隔离引擎生命周期，允许用合成 tap 验证停机与回调的并发关系，无需打开麦克风。
+protocol AudioCaptureEngine: AnyObject, Sendable {
+    var inputFormat: AVAudioFormat { get }
+    var inputAudioUnit: AudioUnit? { get }
+    var notificationObject: AnyObject { get }
+    func installTap(format: AVAudioFormat, handler: @escaping @Sendable (AVAudioPCMBuffer) -> Void)
+    func prepare()
+    func start() throws
+    func pause()
+    /// 返回前停止并排空正在执行的 tap 回调。
+    func stop()
+}
+
+private final class SystemAudioCaptureEngine: AudioCaptureEngine, @unchecked Sendable {
+    private let engine = AVAudioEngine()
+
+    var inputFormat: AVAudioFormat { engine.inputNode.outputFormat(forBus: 0) }
+    var inputAudioUnit: AudioUnit? { engine.inputNode.audioUnit }
+    var notificationObject: AnyObject { engine }
+
+    func installTap(format: AVAudioFormat, handler: @escaping @Sendable (AVAudioPCMBuffer) -> Void) {
+        engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { buffer, _ in
+            handler(buffer)
+        }
+    }
+
+    func prepare() { engine.prepare() }
+    func start() throws { try engine.start() }
+    func pause() { engine.pause() }
+    func stop() { engine.stop() }
+}
+
 /// 基于 AVAudioEngine 的真实采集实现（阶段 1）。
 /// 线程安全：tap 回调在实时线程执行，内部状态由锁保护；
 /// 电平与断连回调均在后台线程触发，接收方需自行切换 actor。
@@ -193,7 +225,10 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
         qos: .utility
     )
 
-    private let engine = AVAudioEngine()
+    private let engine: any AudioCaptureEngine
+    /// 只序列化设备/引擎控制；tap 永不获取此锁。
+    private let lifecycleLock = NSLock()
+    /// 仅保护 tap 所需的短状态访问，持有时严禁调用引擎生命周期方法。
     private let lock = NSLock()
     private let writeFailureLock = NSLock()
 
@@ -247,7 +282,8 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
     private var disconnectObserver: NSObjectProtocol?
     private var configChangeObserver: NSObjectProtocol?
 
-    init() {
+    init(engine: any AudioCaptureEngine = SystemAudioCaptureEngine()) {
+        self.engine = engine
         // 监听当前设备断开与引擎配置变化（实施计划 11.2：麦克风拔出）
         disconnectObserver = NotificationCenter.default.addObserver(
             forName: AVCaptureDevice.wasDisconnectedNotification,
@@ -256,7 +292,7 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
         ) { [weak self] notification in
             guard let self,
                   let device = notification.object as? AVCaptureDevice else { return }
-            let currentID = self.lock.withLock { self.activeCurrentDeviceID() }
+            let currentID = self.activeCurrentDeviceID()
             // 只关心当前正在使用的设备
             if currentID == nil || currentID == device.uniqueID {
                 self.onDeviceDisconnected?()
@@ -264,7 +300,7 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
         }
         configChangeObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange,
-            object: engine,
+            object: engine.notificationObject,
             queue: nil
         ) { [weak self] _ in
             // 引擎配置变化（默认设备切换、采样率变化等）时按同样路径处理
@@ -289,7 +325,7 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
     }
 
     var activeDeviceID: String? {
-        lock.withLock { activeCurrentDeviceID() }
+        activeCurrentDeviceID()
     }
 
     var activeDeviceName: String? {
@@ -302,18 +338,18 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
 
     /// 当前实际设备 ID：用户已选则返回选定值，否则返回系统默认设备 ID（无设备时为 nil）
     private func activeCurrentDeviceID() -> String? {
-        selectedDeviceID ?? AVCaptureDevice.default(for: .audio)?.uniqueID
+        lock.withLock { selectedDeviceID } ?? AVCaptureDevice.default(for: .audio)?.uniqueID
     }
 
     func selectInputDevice(id: String?) throws {
         if let id, !inputDevices().contains(where: { $0.id == id }) {
             throw AudioCaptureError.deviceNotFound(id)
         }
-        lock.lock()
-        selectedDeviceID = id
-        lock.unlock()
-        if let id {
-            try applyDeviceToEngine(uniqueID: id)
+        try lifecycleLock.withLock {
+            if let id {
+                try applyDeviceToEngine(uniqueID: id)
+            }
+            lock.withLock { selectedDeviceID = id }
         }
     }
 
@@ -321,7 +357,7 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
     private func applyDeviceToEngine(uniqueID: String) throws {
         let deviceID = try Self.audioDeviceID(forUniqueID: uniqueID)
         var mutableDeviceID = deviceID
-        guard let audioUnit = engine.inputNode.audioUnit else {
+        guard let audioUnit = engine.inputAudioUnit else {
             throw AudioCaptureError.engineStartFailed("音频输入单元不可用")
         }
         let status = AudioUnitSetProperty(
@@ -366,25 +402,28 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
     // MARK: - 采集会话
 
     func startCapture(fileURL: URL) throws {
-        lock.lock()
-        defer { lock.unlock() }
-        let input = engine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        installTapLocked(format: format)
-        audioFile = try AVAudioFile(
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        stopCaptureDuringTransition()
+        let format = engine.inputFormat
+        installTapDuringTransition(format: format)
+        let file = try AVAudioFile(
             forWriting: fileURL,
             settings: AudioRecordingSettings.fileSettings(for: format)
         )
-        packetAppendWriter = nil
-        try prepareCaptureLocked(format: format)
+        lock.withLock {
+            audioFile = file
+            packetAppendWriter = nil
+        }
+        try prepareCaptureDuringTransition(format: format)
     }
 
     func startAppendingCapture(fileURL: URL) throws -> Int64 {
-        lock.lock()
-        defer { lock.unlock() }
-        let input = engine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        installTapLocked(format: format)
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        stopCaptureDuringTransition()
+        let format = engine.inputFormat
+        installTapDuringTransition(format: format)
 
         let existingDurationMs: Int64
         if FileManager.default.fileExists(atPath: fileURL.path),
@@ -392,16 +431,20 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
                 fileURL: fileURL,
                 format: format
            ) {
-            audioFile = nil
-            packetAppendWriter = prepared.writer
+            lock.withLock {
+                audioFile = nil
+                packetAppendWriter = prepared.writer
+            }
             existingDurationMs = prepared.existingDurationMs
         } else {
             let prepared = try Self.prepareAppendingFile(fileURL: fileURL, format: format)
-            audioFile = prepared.file
-            packetAppendWriter = nil
+            lock.withLock {
+                audioFile = prepared.file
+                packetAppendWriter = nil
+            }
             existingDurationMs = prepared.existingDurationMs
         }
-        try prepareCaptureLocked(format: format)
+        try prepareCaptureDuringTransition(format: format)
         return existingDurationMs
     }
 
@@ -535,49 +578,63 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
         )
     }
 
-    private func prepareCaptureLocked(format: AVAudioFormat) throws {
+    private func prepareCaptureDuringTransition(format: AVAudioFormat) throws {
         writeFailureLock.withLock {
             writeFailureTracker.reset()
         }
-        fileFormat = format
-        writingEnabled = true
+        lock.withLock {
+            fileFormat = format
+            writingEnabled = true
+        }
         do {
-            try startEngineLocked()
+            try startEngineDuringTransition()
         } catch {
-            writingEnabled = false
-            audioFile = nil
-            packetAppendWriter = nil
-            fileFormat = nil
+            stopCaptureDuringTransition()
             throw error
         }
     }
 
     func pauseCapture() {
-        lock.withLock {
-            writingEnabled = false
+        lifecycleLock.withLock {
             engine.pause()
+            lock.withLock { writingEnabled = false }
         }
     }
 
     func resumeCapture() throws {
-        lock.lock()
-        defer { lock.unlock() }
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
         // 设备切换后格式可能变化：与已打开文件不一致则拒绝继续，避免写出损坏文件
-        let currentFormat = engine.inputNode.outputFormat(forBus: 0)
-        if let fileFormat, currentFormat.sampleRate != fileFormat.sampleRate {
+        let currentFormat = engine.inputFormat
+        if let fileFormat = lock.withLock({ fileFormat }),
+           currentFormat.sampleRate != fileFormat.sampleRate || currentFormat.channelCount != fileFormat.channelCount {
             throw AudioCaptureError.incompatibleDeviceFormat
         }
         writeFailureLock.withLock {
             writeFailureTracker.reset()
         }
-        writingEnabled = true
-        try startEngineLocked()
+        lock.withLock { writingEnabled = true }
+        do {
+            try startEngineDuringTransition()
+        } catch {
+            engine.stop()
+            lock.withLock { writingEnabled = false }
+            throw error
+        }
     }
 
     func stopCapture() {
+        lifecycleLock.withLock {
+            stopCaptureDuringTransition()
+        }
+    }
+
+    /// AVAudioEngine.stop 会等待 tap 完成。先在状态锁外停机，允许尾帧继续落盘；
+    /// 停机返回后才释放文件，且整个过程由 lifecycleLock 阻止新会话插入。
+    private func stopCaptureDuringTransition() {
+        engine.stop()
         lock.withLock {
             writingEnabled = false
-            engine.stop()
             audioFile = nil // 关闭文件句柄
             packetAppendWriter = nil
             fileFormat = nil
@@ -588,31 +645,32 @@ final class AVAudioCaptureService: AudioCaptureServicing, @unchecked Sendable {
     }
 
     func startLevelMonitoring() throws {
-        lock.lock()
-        defer { lock.unlock() }
-        installTapLocked(format: engine.inputNode.outputFormat(forBus: 0))
-        writingEnabled = false
-        try startEngineLocked()
-    }
-
-    func stopLevelMonitoring() {
-        lock.withLock {
+        try lifecycleLock.withLock {
             engine.stop()
-            writingEnabled = false
+            lock.withLock { writingEnabled = false }
+            installTapDuringTransition(format: engine.inputFormat)
+            try startEngineDuringTransition()
         }
     }
 
-    // MARK: - 引擎与 tap（调用时必须已持锁）
+    func stopLevelMonitoring() {
+        lifecycleLock.withLock {
+            engine.stop()
+            lock.withLock { writingEnabled = false }
+        }
+    }
 
-    private func installTapLocked(format: AVAudioFormat) {
+    // MARK: - 引擎与 tap（仅持 lifecycleLock，不能持 tap 状态锁）
+
+    private func installTapDuringTransition(format: AVAudioFormat) {
         guard !tapInstalled else { return }
-        engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
+        engine.installTap(format: format) { [weak self] buffer in
             self?.processTapBuffer(buffer)
         }
         tapInstalled = true
     }
 
-    private func startEngineLocked() throws {
+    private func startEngineDuringTransition() throws {
         engine.prepare()
         do {
             try engine.start()

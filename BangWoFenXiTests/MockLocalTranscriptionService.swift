@@ -68,9 +68,11 @@ final class MockLocalTranscriptionService: LocalTranscriptionServicing, @uncheck
     /// finishSession 时结束结果流（真实服务行为；文件转写 Runner 测试需要）
     var finishEndsStream = false
     var finalResultsOnFinish: [LocalTranscriptResult] = []
+    var beforeFinish: (@Sendable () async -> Void)?
 
     func finishSession() async {
         finishCount += 1
+        await beforeFinish?()
         for result in finalResultsOnFinish {
             continuation?.yield(result)
         }

@@ -115,6 +115,7 @@ final class MockDiarizationService: DiarizationServicing, @unchecked Sendable {
     var persistentError: (any Error)?
     /// 每次调用前的人为延迟（毫秒，用于测试时序）
     var delayMs: UInt64 = 0
+    var beforeResponse: (@Sendable () async -> Void)?
 
     private(set) var calls: [(url: URL, speakers: [KnownSpeakerReference])] = []
 
@@ -123,6 +124,7 @@ final class MockDiarizationService: DiarizationServicing, @unchecked Sendable {
         knownSpeakers: [KnownSpeakerReference]
     ) async throws -> DiarizationChunkResult {
         calls.append((chunkURL, knownSpeakers))
+        await beforeResponse?()
         if delayMs > 0 {
             try? await Task.sleep(for: .milliseconds(delayMs))
         }
