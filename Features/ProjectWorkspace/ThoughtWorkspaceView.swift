@@ -420,8 +420,8 @@ struct ThoughtWorkspaceView: View {
                           systemImage: "text.quote")
                 }
                 if !summary.citedWebSources.isEmpty {
-                    Label("\(summary.citedWebSources.count) 个联网来源",
-                          systemImage: "globe")
+                    Label("\(summary.citedWebSources.count) 个资料来源",
+                          systemImage: "doc.text")
                 }
                 Spacer()
             }

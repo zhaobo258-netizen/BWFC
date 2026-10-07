@@ -34,6 +34,34 @@ struct ProjectAIChatSource: Identifiable, Codable, Sendable, Equatable, Hashable
     var title: String
     var excerpt: String
     var sourceLocation: String
+    /// Vault 内的相对路径可进入模型上下文；本机绝对路径只用于本地回链。
+    var relativePath: String? = nil
+
+    var isObsidian: Bool { localFileURL != nil }
+
+    /// 只有应用检索产生的 Obsidian Markdown 来源可打开本机文件。
+    /// 不接受网络 file URL、其他文件类型或带有额外 URL 指令的来源。
+    var localFileURL: URL? {
+        guard id.hasPrefix("obsidian_"),
+              let url = URL(string: sourceLocation),
+              url.isFileURL,
+              url.host == nil || url.host?.isEmpty == true,
+              url.user == nil, url.password == nil, url.port == nil,
+              url.query == nil, url.fragment == nil,
+              url.path.hasPrefix("/"),
+              url.pathExtension.lowercased() == "md" else { return nil }
+        return url
+    }
+
+    var openableURL: URL? {
+        if id.hasPrefix("obsidian_") { return localFileURL }
+        guard let url = URL(string: sourceLocation),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              let host = url.host, !host.isEmpty,
+              url.user == nil, url.password == nil else { return nil }
+        return url
+    }
 }
 
 enum ProjectAIChatAttachmentPolicy {

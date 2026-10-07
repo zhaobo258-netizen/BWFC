@@ -252,6 +252,9 @@ struct ProjectAIChatView: View {
                     .font(.system(size: BWTheme.fontSizeDetail))
                     .foregroundStyle(.secondary)
             }
+            if !message.sources.isEmpty {
+                sourceList(message.sources)
+            }
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -336,7 +339,7 @@ struct ProjectAIChatView: View {
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 10) {
             if hidesLegacyNoteCard {
-                // A 模式精简空态：其余操作说明已就近分布在范围条、＋ 与联网开关上。
+                // A 模式精简空态：其余说明就近分布在范围条、＋ 与检索开关上。
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "text.bubble")
                         .foregroundStyle(BWTheme.accent.opacity(0.75))
@@ -365,7 +368,7 @@ struct ProjectAIChatView: View {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "globe")
                         .foregroundStyle(.secondary)
-                    Text("开启“联网搜索”后，AI 会按需检索并在回答下方保留可打开的真实来源。")
+                    Text("开启“引用 Obsidian”可检索本机历史资料；“联网搜索”可补充公开信息。回答下方会保留可打开的真实来源。")
                         .font(.system(size: BWTheme.fontSizeDetail))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -396,11 +399,7 @@ struct ProjectAIChatView: View {
                         if controller.isSending {
                             HStack(spacing: 6) {
                                 ProgressView().controlSize(.mini)
-                                Text(
-                                    controller.isWebSearchEnabled
-                                        ? "AI 正在判断是否需要联网并结合项目内容回应…"
-                                        : "AI 正在结合录音和共创内容回应…"
-                                )
+                                Text(loadingDescription)
                                     .font(.system(size: BWTheme.fontSizeDetail))
                                     .foregroundStyle(.secondary)
                             }
@@ -694,6 +693,14 @@ struct ProjectAIChatView: View {
         if !context.conversationHistory.isEmpty {
             types.append("\(context.conversationHistory.count) 轮历史")
         }
+        if let sources = context.obsidianSources, !sources.isEmpty {
+            types.append("\(sources.count) 条 Obsidian 历史资料片段")
+        } else if context.obsidianSearchEnabled == true {
+            types.append("Obsidian 本轮未加入资料片段")
+        }
+        if let notice = context.obsidianSearchNotice, !notice.isEmpty {
+            types.append(notice)
+        }
         return Text("实际加入：" + types.joined(separator: "、"))
             .font(.system(size: BWTheme.fontSizeDetail))
             .foregroundStyle(.secondary)
@@ -749,35 +756,30 @@ struct ProjectAIChatView: View {
 
     private func sourceList(_ sources: [ProjectAIChatSource]) -> some View {
         VStack(alignment: .leading, spacing: 5) {
-            Label("联网来源", systemImage: "globe")
-                .font(.system(size: BWTheme.fontSizeLabel, weight: .semibold))
-                .foregroundStyle(.secondary)
-            ForEach(sources) { source in
-                if let url = URL(string: source.sourceLocation),
-                   url.scheme == "https" || url.scheme == "http" {
-                    Link(destination: url) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack(spacing: 4) {
-                                Text("【\(source.id)】")
-                                Text(source.title)
-                                    .lineLimit(1)
-                                Image(systemName: "arrow.up.right.square")
-                            }
-                            .font(.system(size: BWTheme.fontSizeDetail, weight: .medium))
-                            Text(source.excerpt)
-                                .font(.system(size: BWTheme.fontSizeDetail))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
-                            Text(source.providerName)
-                                .font(.system(size: BWTheme.fontSizeDetail))
-                                .foregroundStyle(.tertiary)
+            let localSources = sources.filter(\.isObsidian)
+            let webSources = sources.filter { !$0.isObsidian && $0.openableURL != nil }
+            if !localSources.isEmpty {
+                Label("Obsidian 来源 · \(localSources.count)", systemImage: "books.vertical")
+                    .font(.system(size: BWTheme.fontSizeLabel, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                ForEach(localSources) { source in
+                    localSourceRow(source)
+                }
+            }
+            if !webSources.isEmpty {
+                Label("联网来源 · \(webSources.count)", systemImage: "globe")
+                    .font(.system(size: BWTheme.fontSizeLabel, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                ForEach(webSources) { source in
+                    if let url = source.openableURL {
+                        Link(destination: url) {
+                            sourceRowContent(source, systemImage: "arrow.up.right.square")
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .buttonStyle(.plain)
+                        .frame(minHeight: BWTheme.minimumHitHeight)
+                        .help("打开来源：\(source.title)")
+                        .accessibilityLabel("联网来源 \(source.title)")
                     }
-                    .buttonStyle(.plain)
-                    .frame(minHeight: BWTheme.minimumHitHeight)
-                    .help("打开来源：\(source.title)")
-                    .accessibilityLabel("联网来源 \(source.title)")
                 }
             }
         }
@@ -786,6 +788,49 @@ struct ProjectAIChatView: View {
             Color.secondary.opacity(0.06),
             in: RoundedRectangle(cornerRadius: 7)
         )
+    }
+
+    @ViewBuilder
+    private func localSourceRow(_ source: ProjectAIChatSource) -> some View {
+        if let url = source.localFileURL {
+            VStack(alignment: .leading, spacing: 2) {
+                Button {
+                    NSWorkspace.shared.open(url)
+                } label: {
+                    sourceRowContent(source, systemImage: "doc.text")
+                }
+                .buttonStyle(.plain)
+                .frame(minHeight: BWTheme.minimumHitHeight)
+                .help("打开 Obsidian 原始 Markdown：\(source.title)")
+                .accessibilityLabel("打开 Obsidian 来源 \(source.title)")
+                Button("在 Finder 显示") {
+                    NSWorkspace.shared.activateFileViewerSelecting([url])
+                }
+                .buttonStyle(.link)
+                .font(.system(size: BWTheme.fontSizeDetail))
+                .frame(minHeight: BWTheme.minimumHitHeight)
+            }
+        }
+    }
+
+    private func sourceRowContent(_ source: ProjectAIChatSource, systemImage: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                Text("【\(source.id)】")
+                Text(source.title).lineLimit(1)
+                Image(systemName: systemImage)
+            }
+            .font(.system(size: BWTheme.fontSizeDetail, weight: .medium))
+            Text(source.excerpt)
+                .font(.system(size: BWTheme.fontSizeDetail))
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            Text(source.relativePath ?? source.providerName)
+                .font(.system(size: BWTheme.fontSizeDetail))
+                .foregroundStyle(.tertiary)
+                .lineLimit(2)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func legacyNoteCard(_ note: String) -> some View {
@@ -950,6 +995,9 @@ struct ProjectAIChatView: View {
     private var wholeScopeDescription: String {
         var enabled: [String] = ["整场原文"]
         if controller.isWebSearchEnabled { enabled.append("可按需联网") }
+        if controller.isObsidianSearchEnabled {
+            enabled.append("可检索 Obsidian 历史资料")
+        }
         if legacyNoteContextEnabled { enabled.append("获授权手写笔记") }
         if !controller.pendingAttachments.isEmpty {
             enabled.append("\(controller.pendingAttachments.count) 份引用文档")
@@ -996,6 +1044,93 @@ struct ProjectAIChatView: View {
         .frame(minHeight: BWTheme.minimumHitHeight)
     }
 
+    private var loadingDescription: String {
+        if controller.queryScope.isStrictSegments {
+            return "AI 正在结合所选原话回应…"
+        }
+        if controller.isObsidianSearchEnabled {
+            return controller.isWebSearchEnabled
+                ? "AI 正在检索历史资料，并按需结合公开信息回应…"
+                : "AI 正在检索 Obsidian 历史资料并结合本次交流回应…"
+        }
+        return controller.isWebSearchEnabled
+            ? "AI 正在判断是否需要联网并结合本次交流回应…"
+            : "AI 正在结合录音和共创内容回应…"
+    }
+
+    private var searchControls: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 7) {
+                    webSearchToggle
+                    obsidianSearchControl
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    webSearchToggle
+                    obsidianSearchControl
+                }
+            }
+            Text(searchDisclosure)
+                .font(.system(size: BWTheme.fontSizeDetail))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var webSearchToggle: some View {
+        let strict = controller.queryScope.isStrictSegments
+        return Toggle(isOn: $controller.isWebSearchEnabled) {
+            Label("联网搜索", systemImage: "globe")
+        }
+        .toggleStyle(.button)
+        .controlSize(.small)
+        .fixedSize()
+        .disabled(strict)
+        .help(strict
+              ? "所选原话范围：不联网、不检索 Obsidian，也不引用笔记、历史或文档"
+              : "开启后，AI 只向互联网发送最多两条、每条不超过 24 字的检索词；逐字稿和笔记不会发送给搜索源")
+        .accessibilityHint(strict
+                           ? "片段范围内不联网"
+                           : "控制当前工作台后续对话是否允许联网检索")
+    }
+
+    @ViewBuilder
+    private var obsidianSearchControl: some View {
+        if controller.isObsidianAvailable {
+            Toggle(isOn: $controller.isObsidianSearchEnabled) {
+                Label("引用 Obsidian", systemImage: "books.vertical")
+            }
+            .toggleStyle(.button)
+            .controlSize(.small)
+            .fixedSize()
+            .disabled(controller.queryScope.isStrictSegments)
+            .help(controller.queryScope.isStrictSegments
+                  ? "所选原话范围不检索 Obsidian；切回本次交流后可启用"
+                  : "在本机检索已连接的 Obsidian 库；匹配片段会发送给当前分析模型。切换项目或重新打开工作台后默认关闭")
+            .accessibilityHint("允许本机检索并将匹配的历史资料片段发送给当前分析模型")
+        } else {
+            Button(action: onOpenSettings) {
+                Label("连接 Obsidian", systemImage: "books.vertical")
+            }
+            .controlSize(.small)
+            .fixedSize()
+            .disabled(controller.queryScope.isStrictSegments)
+            .help("前往设置连接 Obsidian 库；连接后可启用历史资料引用")
+            .accessibilityHint("打开设置以选择并授权 Obsidian 库")
+        }
+    }
+
+    private var searchDisclosure: String {
+        if controller.queryScope.isStrictSegments {
+            return "仅读取所选原话与当前问题；不联网，不检索 Obsidian，不引用笔记、历史或文档。"
+        }
+        var text = "Obsidian 在本机检索；开启引用后，匹配片段会发送给当前分析模型。"
+        if controller.isWebSearchEnabled {
+            text += " 联网只发送短检索词。"
+        }
+        return text
+    }
+
     private var composer: some View {
         VStack(alignment: .leading, spacing: 7) {
             if !controller.pendingAttachments.isEmpty {
@@ -1011,34 +1146,7 @@ struct ProjectAIChatView: View {
 
             scopeBar
 
-            HStack(spacing: 7) {
-                let strict = controller.queryScope.isStrictSegments
-                Toggle(
-                    isOn: $controller.isWebSearchEnabled
-                ) {
-                    Label("联网搜索", systemImage: "globe")
-                }
-                .toggleStyle(.button)
-                .controlSize(.small)
-                .disabled(strict)
-                .help(strict
-                      ? "已选片段范围：不联网、不带笔记/历史/文档，只读所选原话与当前问题"
-                      : "开启后，AI 只向互联网发送最多两条、每条不超过 24 字的检索词；逐字稿和笔记不会发送给搜索源")
-                .accessibilityHint(strict
-                                   ? "片段范围内不联网"
-                                   : "控制本次及后续项目对话是否允许联网检索")
-                Text(
-                    strict
-                        ? "片段范围内不联网、不引用笔记/历史/文档"
-                        : (controller.isWebSearchEnabled
-                           ? "按需检索；逐字稿和笔记不发送给搜索源"
-                           : "仅使用项目内容和模型已有知识")
-                )
-                .font(.system(size: BWTheme.fontSizeDetail))
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-                .fixedSize(horizontal: false, vertical: true)
-            }
+            searchControls
 
             HStack(alignment: .bottom, spacing: 8) {
                 Button {

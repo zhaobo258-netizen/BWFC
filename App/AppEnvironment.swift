@@ -553,12 +553,15 @@ final class AppEnvironment {
             ?? KimiConversationAnalysisService(generationService: providerRegistry)
         self.knowledgeExpansion = knowledgeExpansion
             ?? KimiKnowledgeExpansionService(generationService: providerRegistry)
+        let obsidianProvider = obsidianVaultURL.map { ObsidianKnowledgeProvider(vaultURL: $0) }
+        self.cachedObsidianProvider = obsidianProvider
         self.projectAIChat = projectAIChat
             ?? ProjectAIChatAgent(
                 generationService: providerRegistry,
                 webSearchProvider: InternetKnowledgeProvider(
                     credentials: sharedCredentials
-                )
+                ),
+                obsidianProvider: obsidianProvider
             )
         self.finalReportGenerator = finalReportGenerator
             ?? ProjectAIOrchestrator(
@@ -814,8 +817,8 @@ final class AppEnvironment {
         }
     }
 
-    /// Obsidian 检索索引跨多次“开花”复用（actor 内含 5 分钟缓存；
-    /// 每次新建实例会让缓存失效，导致重复全量扫描 Vault）。
+    /// Obsidian 索引由项目对话与“开花”共享；每轮刷新文件状态、复用未变正文，
+    /// 避免每次新建实例而反复读取全库。
     /// Vault URL 在环境生命周期内不变，重选 Vault 会重建整个 AppEnvironment，
     /// 因此不存在旧 Vault 索引带入新 Vault 的问题。
     private var cachedObsidianProvider: ObsidianKnowledgeProvider?

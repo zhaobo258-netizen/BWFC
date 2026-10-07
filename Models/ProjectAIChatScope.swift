@@ -172,6 +172,10 @@ struct ProjectAIChatContextSnapshot: Codable, Sendable, Equatable {
     let referenceDocuments: [ProjectAIChatRequest.ReferenceDocument]
     /// 纳入历史的消息 ID（仅记录覆盖范围；恢复请求以 conversationHistory 为准）。
     let historyMessageIDs: [UUID]
+    /// 可选字段让旧 JSON 保持兼容；实际检索片段与授权随本轮冻结。
+    var obsidianSearchEnabled: Bool? = nil
+    var obsidianSources: [ProjectAIChatSource]? = nil
+    var obsidianSearchNotice: String? = nil
 }
 
 /// 范围校验的纯逻辑结果（供控制器在发送前判定，不在越界后静默回退全场）。

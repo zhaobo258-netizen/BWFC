@@ -12,7 +12,8 @@ final class ProjectAIChatController {
     private weak var project: Project?
     private var draftAutosaveTask: Task<Void, Never>?
     private var responseTask: Task<ProjectAIChatResponse, Error>?
-    private var activeRequestID: UUID?
+    private var preparationTask: Task<ProjectAIChatRequest, Error>?
+    private var activeOperationID: UUID?
     private var isRestoringDraft = false
 
     private(set) var messages: [ProjectAIChatMessage] = []
@@ -36,6 +37,9 @@ final class ProjectAIChatController {
     private(set) var draftSaveError: String?
     private(set) var contextCoverageMessage: String?
     var isWebSearchEnabled = true
+    var isObsidianAvailable = false
+    /// 当前工作台显式授权；切项目或重开后关闭，不把 Vault 连接当成云端授权。
+    var isObsidianSearchEnabled = false
     var noteContextProvider: () -> String? = { nil }
     var relatedProjectsProvider: () -> [Project] = { [] }
     /// 本场适用的已确认业务记忆（12 号 §6.1：回答时使用并说明来源）
@@ -74,6 +78,7 @@ final class ProjectAIChatController {
         noteSummaryStatus = nil
         conversationSummaries = project.note.conversationSummaries
         self.project = project
+        isObsidianSearchEnabled = false
         messages = project.aiChatMessages
         queryScope = project.aiChatQueryScope ?? .wholeConversation
         if queryScope.isStrictSegments { isWebSearchEnabled = false }
@@ -97,7 +102,10 @@ final class ProjectAIChatController {
         queryScope = project.aiChatQueryScope ?? .wholeConversation
         do {
             try persist(project)
-            if queryScope.isStrictSegments { isWebSearchEnabled = false }
+            if queryScope.isStrictSegments {
+                isWebSearchEnabled = false
+                isObsidianSearchEnabled = false
+            }
             if !hadUnansweredLastMessage {
                 errorMessage = nil
             }
@@ -188,7 +196,8 @@ final class ProjectAIChatController {
                 currentAttachments: attachments,
                 relatedProjects: relatedProjectsProvider(),
                 confirmedMemories: confirmedMemoriesProvider(),
-                webSearchEnabled: isWebSearchEnabled
+                webSearchEnabled: isWebSearchEnabled,
+                obsidianSearchEnabled: isObsidianSearchEnabled
             )
         } catch let error as ProjectAIChatBuildError {
             errorMessage = Self.scopeErrorMessage(for: error)
@@ -293,6 +302,9 @@ final class ProjectAIChatController {
                 relatedProjects: relatedProjectsProvider(),
                 confirmedMemories: confirmedMemoriesProvider(),
                 webSearchEnabled: isWebSearchEnabled,
+                // 旧消息没有当轮笔记授权/来源快照；不能用当前开关追授历史请求。
+                // 如需补查知识库，应开启引用后重新提问，建立可保存的完整新轮次。
+                obsidianSearchEnabled: false,
                 excludingMessageID: message.id
             )
         } catch let error as ProjectAIChatBuildError {
@@ -339,7 +351,9 @@ final class ProjectAIChatController {
         evidenceSnapshot: ProjectAIChatEvidenceSnapshot?,
         contextSnapshot: ProjectAIChatContextSnapshot?
     ) async {
-        activeRequestID = requestID
+        // 轮次 ID 在重试间保留，操作 ID 每次新建，防止切项目后旧检索晚到撞上同一轮。
+        let operationID = UUID()
+        activeOperationID = operationID
         noteSummaryStatus = nil
         let scope = evidenceSnapshot?.scope ?? contextSnapshot?.scope
         if scope?.isStrictSegments == true {
@@ -353,22 +367,51 @@ final class ProjectAIChatController {
         draftSaveError = nil
         isSending = true
         defer {
-            if activeRequestID == requestID {
-                activeRequestID = nil
+            if activeOperationID == operationID {
+                activeOperationID = nil
                 responseTask = nil
+                preparationTask = nil
                 isSending = false
             }
         }
 
         do {
             let service = self.service
-            let task = Task { try await service.reply(to: request) }
+            let preparation = Task { try await service.prepare(request) }
+            preparationTask = preparation
+            let prepared = try await preparation.value
+            guard activeOperationID == operationID,
+                  self.project?.id == project.id else { return }
+            var frozenContext = contextSnapshot
+            if var context = frozenContext {
+                context.obsidianSearchEnabled = prepared.obsidianSearchEnabled
+                context.obsidianSources = prepared.obsidianSources
+                context.obsidianSearchNotice = prepared.obsidianSearchNotice
+                frozenContext = context
+                if let index = project.aiChatMessages.lastIndex(where: {
+                    $0.role == .user && ($0.requestID == requestID || $0.turnID == requestID)
+                }), project.aiChatMessages[index].contextSnapshot != context {
+                    let previous = project.aiChatMessages[index].contextSnapshot
+                    project.aiChatMessages[index].contextSnapshot = context
+                    do { try persist(project) }
+                    catch {
+                        project.aiChatMessages[index].contextSnapshot = previous
+                        messages = project.aiChatMessages
+                        errorMessage = "Obsidian 来源快照保存失败，尚未发送给 AI，请重试。"
+                        return
+                    }
+                    messages = project.aiChatMessages
+                }
+            }
+            let task = Task { try await service.reply(to: prepared) }
             responseTask = task
             let response = try await task.value
-            guard activeRequestID == requestID,
+            guard activeOperationID == operationID,
                   self.project?.id == project.id else { return }
-            let reply = replyWithCorrectionStatus(response, request: request)
+            let reply = replyWithCorrectionStatus(response, request: prepared)
                 + (contextCoverageMessage.map { "\n\n" + $0 } ?? "")
+                + (prepared.obsidianSearchEnabled
+                   ? prepared.obsidianSearchNotice.map { "\n\n" + $0 } ?? "" : "")
             let assistantMessage = ProjectAIChatMessage(
                 role: .assistant,
                 text: reply,
@@ -379,7 +422,7 @@ final class ProjectAIChatController {
                 requestID: requestID,
                 queryScope: scope,
                 evidenceSnapshot: evidenceSnapshot,
-                contextSnapshot: contextSnapshot
+                contextSnapshot: frozenContext
             )
             project.aiChatMessages.append(assistantMessage)
             if let summary = response.noteSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -417,10 +460,10 @@ final class ProjectAIChatController {
                 errorMessage = "AI 已回应，但对话与笔记本地保存失败，请先复制内容；内容保留在本机内存，可稍后重新保存。"
             }
         } catch let error as AnalysisAPIError {
-            guard activeRequestID == requestID else { return }
+            guard activeOperationID == operationID else { return }
             errorMessage = Self.message(for: error)
         } catch {
-            guard activeRequestID == requestID else { return }
+            guard activeOperationID == operationID else { return }
             errorMessage = "AI 共创暂不可用，消息已保存，可直接重试。"
         }
     }
@@ -469,7 +512,9 @@ final class ProjectAIChatController {
     }
 
     private func invalidateResponse() {
-        activeRequestID = nil
+        activeOperationID = nil
+        preparationTask?.cancel()
+        preparationTask = nil
         responseTask?.cancel()
         responseTask = nil
         isSending = false
@@ -526,6 +571,8 @@ final class ProjectAIChatController {
             return "“仅所选片段”范围暂不支持引用文档；请先移除引用文档，或切换到整场对话再发送。"
         case .strictWebSearchUnsupported:
             return "“仅所选片段”范围不会使用联网搜索；请关闭“联网搜索”，或切换到整场对话。"
+        case .strictObsidianSearchUnsupported:
+            return "“仅所选片段”范围不会读取 Obsidian；请关闭“引用 Obsidian”，或切换到整场对话。"
         case .strictSelectionExceedsLimit(let characterCount):
             return "所选片段共 \(characterCount) 字，超过单次 \(ProjectAIChatRequestBuilder.maximumTranscriptCharacters) 字上限；请缩小所选片段范围后再提问。"
         }
