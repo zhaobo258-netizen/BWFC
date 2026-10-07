@@ -61,6 +61,36 @@ struct TranscriptReconcilerCloudTests {
         #expect(reconciler.finalized.count == 1)
     }
 
+    @Test("重切保留 UUID 时作用域与冲突标记随归属传递（计划 20261007 约束 7）")
+    func carriedScopeSurvivesResegmentation() {
+        var reconciler = TranscriptReconciler()
+        _ = reconciler.applyFinal(startMs: 0, endMs: 4_000, text: "本地粗块一句话")
+        let coarse = reconciler.finalized.first!
+        // 句级指认（仅这一条）+ 有历史冲突标记
+        coarse.participantId = UUID()
+        coarse.speakerWasUserConfirmed = true
+        coarse.speakerConfirmationScope = .segment
+        coarse.speakerAttributionConflict = true
+
+        // 云端细分为两条：第一条沿用原 UUID
+        _ = reconciler.applyCloudFinal(startMs: 0, endMs: 2_000,
+                                       text: "细分第一句。", participantId: nil, remoteSpeakerLabel: "p_01")
+        let outcome = reconciler.applyCloudFinal(startMs: 2_000, endMs: 4_000,
+                                                 text: "细分第二句。", participantId: nil, remoteSpeakerLabel: "p_01")
+        guard case .inserted(let second) = outcome else {
+            Issue.record("第二句应作为新片段插入")
+            return
+        }
+        let carried = reconciler.finalized.first { $0.id == coarse.id }
+        #expect(carried?.speakerConfirmationScope == .segment, "句级作用域不得退回组级兼容语义")
+        #expect(carried?.speakerAttributionConflict == true)
+        #expect(carried?.speakerWasUserConfirmed == true)
+        #expect(carried?.participantId != nil)
+        // 沿用 UUID 的新片段时间已变：撤销的时间边界核对会在视图层据此跳过
+        #expect(carried?.startMs == 0 && carried?.endMs == 2_000)
+        #expect(second.speakerConfirmationScope == nil, "新片段无 carried 归属时不继承")
+    }
+
     @Test("人工已修订片段：云端重叠结果不覆盖（实施计划 7.4 人工优先）")
     func manualEditProtected() {
         var reconciler = TranscriptReconciler()

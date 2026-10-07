@@ -537,7 +537,8 @@ final class ImportProcessingController {
         let snapshots = baseline.segments.map {
             HistoricalSpeakerRelabeler.SegmentSnapshot(
                 id: $0.id, startMs: $0.startMs, endMs: $0.endMs, text: $0.text,
-                participantId: $0.participantId, speakerWasUserConfirmed: $0.speakerWasUserConfirmed == true
+                participantId: $0.participantId, speakerWasUserConfirmed: $0.speakerWasUserConfirmed == true,
+                confirmationScope: $0.speakerConfirmationScope
             )
         }
         let result = try await HistoricalSpeakerRelabeler(diarization: service).diarizeRecording(
@@ -550,7 +551,9 @@ final class ImportProcessingController {
             guard let original = originals[segment.id], original.text == segment.text,
                   original.startMs == segment.startMs, original.endMs == segment.endMs,
                   original.participantId == segment.participantId,
-                  original.speakerWasUserConfirmed == (segment.speakerWasUserConfirmed == true) else { return nil }
+                  original.speakerWasUserConfirmed == (segment.speakerWasUserConfirmed == true),
+                  // 识别期间指认/撤销改变作用域的片段按已变化处理，不吃旧推断
+                  original.confirmationScope == segment.speakerConfirmationScope else { return nil }
             return segment.id
         })
         let protected = current.segments.filter {

@@ -15,6 +15,8 @@ struct HistoricalSpeakerRelabeler: @unchecked Sendable {
         var text: String
         var participantId: UUID?
         var speakerWasUserConfirmed: Bool
+        /// 确认作用域快照；nil 为旧记录的组级兼容语义
+        var confirmationScope: SpeakerConfirmationScope?
     }
 
     struct Result: Sendable, Equatable {
@@ -281,6 +283,9 @@ enum HistoricalSpeakerRelabelMatcher {
     ) -> [String: UUID] {
         var confirmed: [String: Set<UUID>] = [:]
         for segment in existingSegments where segment.speakerWasUserConfirmed {
+            // 句级确认不作为组级推断锚点（计划 20261007 约束 3）；
+            // 快照与当前作用域是否一致由调用方的迟到校验负责排除。
+            guard segment.confirmationScope != .segment else { continue }
             if let label = labels[segment.id], let person = segment.participantId {
                 confirmed[label, default: []].insert(person)
             }

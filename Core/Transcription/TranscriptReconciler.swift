@@ -269,7 +269,11 @@ struct TranscriptReconciler {
             source: .cloud,
             state: .final,
             isStarred: carried?.isStarred ?? false,
-            speakerWasUserConfirmed: carried?.speakerWasUserConfirmed
+            speakerWasUserConfirmed: carried?.speakerWasUserConfirmed,
+            // 重切保留 UUID 时作用域与冲突标记随人工归属保护传递，
+            // 不能因复制遗漏退回组级兼容语义（计划 20261007 约束 7）
+            speakerAttributionConflict: carried?.speakerAttributionConflict,
+            speakerConfirmationScope: carried?.speakerConfirmationScope
         )
         let insertIndex = finalized.firstIndex { $0.startMs > startMs } ?? finalized.count
         finalized.insert(segment, at: insertIndex)

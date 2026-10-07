@@ -231,6 +231,34 @@ struct HistoricalSpeakerRelabelerTests {
         )
     }
 
+    @Test("句级确认不作为整场回填的组级推断锚点（计划 20261007 约束 3）")
+    func segmentScopeConfirmationIsNotGroupAnchor() {
+        let me = UUID()
+        let groupConfirmedPerson = UUID()
+        let segmentScoped = HistoricalSpeakerRelabeler.SegmentSnapshot(
+            id: UUID(), startMs: 0, endMs: 1_000, text: "句级确认",
+            participantId: me, speakerWasUserConfirmed: true, confirmationScope: .segment)
+        let groupScoped = HistoricalSpeakerRelabeler.SegmentSnapshot(
+            id: UUID(), startMs: 2_000, endMs: 3_000, text: "组级确认",
+            participantId: groupConfirmedPerson, speakerWasUserConfirmed: true, confirmationScope: .group)
+        let legacyScoped = HistoricalSpeakerRelabeler.SegmentSnapshot(
+            id: UUID(), startMs: 4_000, endMs: 5_000, text: "旧记录无作用域",
+            participantId: me, speakerWasUserConfirmed: true, confirmationScope: nil)
+        let labels: [UUID: String] = [
+            segmentScoped.id: "local:1",
+            groupScoped.id: "local:2",
+            legacyScoped.id: "local:3",
+        ]
+        let known: [String: UUID] = [:]
+
+        let people = HistoricalSpeakerRelabelMatcher.resolvedSpeakerIDs(
+            labels: labels, knownSpeakerIDs: known, existingSegments: [segmentScoped, groupScoped, legacyScoped])
+
+        #expect(people["local:1"] == nil, "句级确认不得作为同组未选句的身份锚点")
+        #expect(people["local:2"] == groupConfirmedPerson)
+        #expect(people["local:3"] == me, "旧记录缺字段保留组级兼容语义")
+    }
+
     @Test("纯时间分组结果按时间对齐，文本保护只对有文本的结果生效（15 号计划 G.2/G.3）")
     func pureTimelineResultsAlignWithoutTextGate() async throws {
         let directory = FileManager.default.temporaryDirectory.appending(path: "纯时间 % \(UUID())")

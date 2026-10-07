@@ -748,6 +748,29 @@ final class DiarizationControllerTests {
         #expect(mockDiarization.calls.count == 1)
     }
 
+    @Test("句级确认不回灌为组级映射：刷新和重开后仅这一条的作用域仍成立")
+    func segmentScopeConfirmationDoesNotRebuildGroupMapping() {
+        let me = meeting.participants[0].id
+        let label = "chunk:0:speaker_1"
+        let segment = TranscriptSegment(startMs: 0, endMs: 2_000, text: "句级确认的一句",
+            participantId: me, remoteSpeakerLabel: label, source: .cloud, state: .final,
+            speakerWasUserConfirmed: true, speakerConfirmationScope: .segment)
+        let groupConfirmed = TranscriptSegment(startMs: 3_000, endMs: 5_000, text: "组级确认的一句",
+            participantId: me, remoteSpeakerLabel: "chunk:1:speaker_2", source: .cloud, state: .final,
+            speakerWasUserConfirmed: true, speakerConfirmationScope: .group)
+        meeting.segments = [segment, groupConfirmed]
+
+        controller.attach(to: meeting)
+        controller.refreshKnownSpeakers()
+
+        // 句级确认的标签不成为组级映射（显示仍是待识别编号，而不是人物）
+        #expect(controller.displayName(forRemoteLabel: label) != "",
+                "句级确认不得把标签映射为人物")
+        #expect(controller.displayName(forRemoteLabel: label).contains("待识别"))
+        // 组级确认的标签回灌为人物映射（显示名为空字符串 = 已知人物）
+        #expect(controller.displayName(forRemoteLabel: "chunk:1:speaker_2") == "")
+    }
+
     @Test("重开录音只读恢复失败队列：计数可见、零上传、重试可继续（15 号计划 F01）")
     func attachRestoresPersistedQueueForDisplay() async throws {
         // 预置上一场留下的队列：一个待用户重试（含失败诊断）、一个失败、一个已成功

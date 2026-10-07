@@ -1,5 +1,15 @@
 import Foundation
 
+/// 说话人人工确认的作用域（说话人左键指认计划 20261007 技术约束 2）：
+/// - nil：旧记录兼容语义——沿用既有组级语义（Mapper 重建回灌、整场回填锚点、同组回填）。
+/// - segment：句级确认（"仅这一条／仅所选"）——不作为同组未选句的身份锚点，
+///   Mapper 重建不回灌为组级映射，整场回填不作为组级推断锚点。
+/// - group：通过高级入口（同组回填/本录音其余未确认）显式确认——组级语义。
+enum SpeakerConfirmationScope: String, Codable, Sendable {
+    case segment
+    case group
+}
+
 /// 片段来源（实施计划 9.3）
 enum SegmentSource: String, Codable, Sendable {
     case local  // Apple Speech 本地转写
@@ -64,6 +74,8 @@ final class TranscriptSegment: Identifiable, Codable {
     /// 整场回填的新证据与旧自动归属矛盾、待人工确认（15 号计划 F02）。
     /// nil/false 表示无冲突；人工确认归属后清除。旧值保留以便核对，不自动改写。
     var speakerAttributionConflict: Bool?
+    /// 最近一次人工确认的作用域；缺省 nil 按旧组级兼容语义处理。
+    var speakerConfirmationScope: SpeakerConfirmationScope?
 
     init(
         id: UUID = UUID(),
@@ -82,7 +94,8 @@ final class TranscriptSegment: Identifiable, Codable {
         sourceAssetId: UUID? = nil,
         textWasUserEdited: Bool? = nil,
         speakerWasUserConfirmed: Bool? = nil,
-        speakerAttributionConflict: Bool? = nil
+        speakerAttributionConflict: Bool? = nil,
+        speakerConfirmationScope: SpeakerConfirmationScope? = nil
     ) {
         self.id = id
         self.startMs = startMs
@@ -101,5 +114,6 @@ final class TranscriptSegment: Identifiable, Codable {
         self.textWasUserEdited = textWasUserEdited
         self.speakerWasUserConfirmed = speakerWasUserConfirmed
         self.speakerAttributionConflict = speakerAttributionConflict
+        self.speakerConfirmationScope = speakerConfirmationScope
     }
 }

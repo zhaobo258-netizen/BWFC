@@ -253,4 +253,138 @@ struct SpeakerAssignFlowTests {
         )
         #expect(plan2.sampleWindow == nil, "已有声纹样本不覆盖")
     }
+
+    // MARK: - 显式选段指认（说话人左键指认计划 20261007）
+
+    @Test("显式选段只改指定语句并写入句级作用域；同标签未选句不动")
+    func explicitAssignTouchesOnlySelectedSegments() {
+        let me = UUID()
+        let other = UUID()
+        let selected = TranscriptSegment(startMs: 0, endMs: 1_000, text: "被选中",
+            remoteSpeakerLabel: "chunk:0:speaker_1", source: .cloud, state: .final)
+        let sameLabelNotSelected = TranscriptSegment(startMs: 1_000, endMs: 2_000, text: "同标签未选",
+            remoteSpeakerLabel: "chunk:0:speaker_1", source: .cloud, state: .final)
+        let noLabelSelected = TranscriptSegment(startMs: 2_000, endMs: 3_000, text: "无标签被选",
+            source: .local, state: .final)
+        let segments = [selected, sameLabelNotSelected, noLabelSelected]
+
+        let outcome = SpeakerBackfill.assignExplicit(
+            segmentIds: [selected.id, noLabelSelected.id], to: me, segments: segments)
+
+        #expect(outcome.changedSegmentIds == [selected.id, noLabelSelected.id])
+        #expect(outcome.remoteLabel == nil, "显式选段不参与组级标签传播")
+        #expect(selected.participantId == me)
+        #expect(selected.speakerWasUserConfirmed == true)
+        #expect(selected.speakerConfirmationScope == .segment)
+        #expect(selected.speakerAttributionConflict == false)
+        #expect(selected.remoteSpeakerLabel == "chunk:0:speaker_1", "声音标签保留")
+        #expect(selected.state == .final, "指认不得把文字标为人工修订")
+        #expect(sameLabelNotSelected.participantId == nil, "同标签未选句不动")
+        #expect(sameLabelNotSelected.speakerConfirmationScope == nil)
+        #expect(noLabelSelected.participantId == me)
+    }
+
+    @Test("显式选段预览逐条列出保护原因，且不修改模型")
+    func explicitPreviewListsExclusionsWithoutMutating() {
+        let me = UUID()
+        let other = UUID()
+        let protected = TranscriptSegment(startMs: 0, endMs: 1_000, text: "已确认他人",
+            participantId: other, source: .cloud, state: .final, speakerWasUserConfirmed: true)
+        let provisional = TranscriptSegment(startMs: 1_000, endMs: 2_000, text: "识别中",
+            source: .local, state: .provisional)
+        let same = TranscriptSegment(startMs: 2_000, endMs: 3_000, text: "已是此人",
+            participantId: me, source: .cloud, state: .final, speakerWasUserConfirmed: true)
+        let failed = TranscriptSegment(startMs: 3_000, endMs: 4_000, text: "识别失败但有稳定片段",
+            source: .cloud, state: .failed)
+        let missing = UUID()
+        let segments = [protected, provisional, same, failed]
+
+        let preview = SpeakerBackfill.previewExplicit(
+            segmentIds: [protected.id, provisional.id, same.id, failed.id, missing],
+            to: me, segments: segments)
+
+        #expect(preview.applicableSegmentIds == [failed.id], "失败但有稳定片段的可指认")
+        let reasons = Dictionary(uniqueKeysWithValues: preview.exclusions.map { ($0.segmentId, $0.reason) })
+        #expect(reasons[protected.id] == .confirmedToOther)
+        #expect(reasons[provisional.id] == .provisional)
+        #expect(reasons[same.id] == .alreadySamePerson)
+        #expect(reasons[missing] == .missingSegment)
+        // 预览不修改模型
+        #expect(protected.participantId == other && protected.speakerWasUserConfirmed == true)
+        #expect(failed.participantId == nil)
+        #expect(provisional.state == .provisional)
+    }
+
+    @Test("批量保护已确认他人；单条入口可显式改判（改判后 scope 仍为句级）")
+    func explicitAssignProtectsConfirmedButSingleCanOverride() {
+        let me = UUID()
+        let other = UUID()
+        let confirmedOther = TranscriptSegment(startMs: 0, endMs: 1_000, text: "确认给乙",
+            participantId: other, remoteSpeakerLabel: "chunk:0:speaker_1",
+            source: .cloud, state: .final, speakerWasUserConfirmed: true)
+
+        // 批量：包含该条 → 排除并说明，不修改
+        let batch = SpeakerBackfill.assignExplicit(
+            segmentIds: [confirmedOther.id], to: me, segments: [confirmedOther])
+        #expect(batch.changedSegmentIds.isEmpty)
+        #expect(batch.exclusions.map(\.reason) == [.confirmedToOther])
+        #expect(confirmedOther.participantId == other)
+
+        // 单条入口（显式改判）：同样走 assignExplicit——计划允许单条改判已确认句，
+        // 由 UI 层用“单条模式”区分（不进入批量保护检查）
+        let override = SpeakerBackfill.assignExplicitAllowingOverride(
+            segmentId: confirmedOther.id, to: me, segments: [confirmedOther])
+        #expect(override.changedSegmentIds == [confirmedOther.id])
+        #expect(confirmedOther.participantId == me)
+        #expect(confirmedOther.speakerWasUserConfirmed == true)
+        #expect(confirmedOther.speakerConfirmationScope == .segment)
+    }
+
+    @Test("旧组级回填写入 group 作用域并输出排除原因")
+    func legacyGroupAssignWritesGroupScopeWithExclusions() {
+        let me = UUID()
+        let other = UUID()
+        let anchor = TranscriptSegment(startMs: 0, endMs: 1_000, text: "锚点",
+            remoteSpeakerLabel: "chunk:0:speaker_1", source: .cloud, state: .final)
+        let sameGroup = TranscriptSegment(startMs: 1_000, endMs: 2_000, text: "同组",
+            remoteSpeakerLabel: "chunk:0:speaker_1", source: .cloud, state: .final)
+        let confirmedOther = TranscriptSegment(startMs: 2_000, endMs: 3_000, text: "他人已确认",
+            participantId: other, remoteSpeakerLabel: "chunk:0:speaker_1",
+            source: .cloud, state: .final, speakerWasUserConfirmed: true)
+        let again = TranscriptSegment(startMs: 3_000, endMs: 4_000, text: "已是此人",
+            participantId: me, remoteSpeakerLabel: "chunk:0:speaker_1",
+            source: .cloud, state: .final, speakerWasUserConfirmed: true)
+
+        let outcome = SpeakerBackfill.assign(
+            anchorSegmentId: anchor.id, to: me, segments: [anchor, sameGroup, confirmedOther, again])
+
+        #expect(outcome.changedSegmentIds == [anchor.id, sameGroup.id])
+        #expect(outcome.remoteLabel == "chunk:0:speaker_1")
+        #expect(anchor.speakerConfirmationScope == .group)
+        #expect(sameGroup.speakerConfirmationScope == .group)
+        let reasons = Dictionary(uniqueKeysWithValues: outcome.exclusions.map { ($0.segmentId, $0.reason) })
+        #expect(reasons[confirmedOther.id] == .confirmedToOther)
+        #expect(reasons[again.id] == .alreadySamePerson)
+    }
+
+    @Test("作用域字段随旧 JSON 缺省为 nil，新记录可往返")
+    func scopeFieldBackwardCompatible() throws {
+        let legacyJSON = """
+        {"id":"\(UUID().uuidString)","startMs":0,"endMs":1000,"text":"旧片段",
+         "source":"cloud","state":"final","isStarred":false,
+         "createdAt":700000000,"updatedAt":700000000}
+        """
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+        let segment = try decoder.decode(TranscriptSegment.self, from: Data(legacyJSON.utf8))
+        #expect(segment.speakerConfirmationScope == nil)
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .secondsSince1970
+        let fresh = TranscriptSegment(startMs: 0, endMs: 1_000, text: "新片段",
+            source: .cloud, state: .final, speakerConfirmationScope: .segment)
+        let restored = try decoder.decode(
+            TranscriptSegment.self, from: encoder.encode(fresh))
+        #expect(restored.speakerConfirmationScope == .segment)
+    }
 }

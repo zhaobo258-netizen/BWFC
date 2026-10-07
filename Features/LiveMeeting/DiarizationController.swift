@@ -148,7 +148,10 @@ final class DiarizationController {
             if segment.participantId == nil || previouslyRegistered.contains(label) {
                 rebuilt.register(remoteLabel: label)
             }
+            // 句级确认（"仅这一条／仅所选"）不回灌为组级映射：
+            // 否则刷新或重开后，单条确认会变成整组规则（计划 20261007 约束 2）。
             if segment.speakerWasUserConfirmed == true,
+               segment.speakerConfirmationScope != .segment,
                let participantID = segment.participantId, validIDs.contains(participantID) {
                 confirmedAssignments[label, default: []].insert(participantID)
             }

@@ -2629,6 +2629,194 @@ struct ProjectWorkspaceView: View {
         }
     }
 
+    // MARK: - 显式选段指认（单条快捷 / 多选批量；说话人左键指认计划 20261007）
+
+    /// 最近一次指认的可撤销记录（仅当前工作台会话内；离页或重启不承诺恢复）。
+    /// 保存操作前全部归属字段与时间/来源边界，撤销时逐条核对。
+    struct SpeakerAttributionUndo: Equatable {
+        struct Entry: Equatable {
+            var startMs: Int64
+            var endMs: Int64
+            var sourceAssetId: UUID?
+            var participantId: UUID?
+            var speakerWasUserConfirmed: Bool?
+            var speakerAttributionConflict: Bool?
+            var speakerConfirmationScope: SpeakerConfirmationScope?
+        }
+
+        enum Kind: Equatable {
+            case single
+            case batch
+        }
+
+        var kind: Kind
+        var speakerID: UUID
+        var entries: [UUID: Entry]
+        var occurredAt: Date
+    }
+
+    @State private var lastAttributionUndo: SpeakerAttributionUndo?
+
+    /// 指认范围预览（不修改模型）：给批量预览弹层与空提交说明用
+    private func previewExplicitAssign(
+        segmentIds: [UUID],
+        speaker: Speaker
+    ) -> SpeakerBackfill.Preview? {
+        guard let meeting else { return nil }
+        return SpeakerBackfill.previewExplicit(
+            segmentIds: segmentIds, to: speaker.id, segments: meeting.segments
+        )
+    }
+
+    /// 显式选段指认：只改指定语句，一次变更集一次提交；不同组回填、不学声纹、不启动整场回查。
+    /// - Parameters:
+    ///   - expectedApplicable: 预览时确定的可修改清单；提交时重新校验，不一致拒绝使用过期预览
+    ///   - kind: single / batch（撤销记录用途）
+    /// - Returns: nil 表示保存失败（已完整回滚）；否则返回实际修改与跳过明细
+    @discardableResult
+    private func performExplicitSegmentAssign(
+        segmentIds: [UUID],
+        speaker: Speaker,
+        expectedApplicable: [UUID]? = nil,
+        kind: SpeakerAttributionUndo.Kind
+    ) -> (changed: [UUID], skipped: [SpeakerBackfill.Exclusion])? {
+        guard let project, let meeting else { return nil }
+        // 目标人物必须在当前本场人物列表中（人物被删除或合并后的旧预览不得提交）
+        guard project.speakers.contains(where: { $0.id == speaker.id }) else {
+            operationError = "目标人物已不存在或已变更，请重新选择人物。"
+            return nil
+        }
+        let segments = meeting.segments
+        // 提交前重新校验存在性、状态、当前归属；预览后范围变化则拒绝过期预览
+        let preview = SpeakerBackfill.previewExplicit(
+            segmentIds: segmentIds, to: speaker.id, segments: segments
+        )
+        if let expectedApplicable, expectedApplicable != preview.applicableSegmentIds {
+            operationError = "所选语句的范围已变化（可能已重新分段或归属已变化），请重新预览后再指认。"
+            return nil
+        }
+        if preview.applicableSegmentIds.isEmpty {
+            let confirmedOther = preview.exclusions.filter {
+                $0.reason == .confirmedToOther
+            }.count
+            if confirmedOther > 0 {
+                operationError = "所选语句已人工确认给其他人，批量不覆盖；请用单条入口逐句改判。"
+            } else {
+                operationError = "所选语句无需修改（已属于该人物或不可指认）。"
+            }
+            return (changed: [], skipped: preview.exclusions)
+        }
+
+        // 变更集：保存操作前全部归属字段与时间/来源边界
+        var entries: [UUID: SpeakerAttributionUndo.Entry] = [:]
+        for id in preview.applicableSegmentIds {
+            guard let segment = segments.first(where: { $0.id == id }) else { continue }
+            entries[id] = SpeakerAttributionUndo.Entry(
+                startMs: segment.startMs, endMs: segment.endMs,
+                sourceAssetId: segment.sourceAssetId,
+                participantId: segment.participantId,
+                speakerWasUserConfirmed: segment.speakerWasUserConfirmed,
+                speakerAttributionConflict: segment.speakerAttributionConflict,
+                speakerConfirmationScope: segment.speakerConfirmationScope
+            )
+        }
+
+        let outcome = SpeakerBackfill.assignExplicit(
+            segmentIds: segmentIds, to: speaker.id, segments: segments
+        )
+        guard persistAndRefresh(meeting) else {
+            // 保存失败：完整恢复全部归属字段（约束 4），选择保留可重试
+            for segment in segments where entries[segment.id] != nil {
+                if let previous = entries[segment.id] {
+                    segment.participantId = previous.participantId
+                    segment.speakerWasUserConfirmed = previous.speakerWasUserConfirmed
+                    segment.speakerAttributionConflict = previous.speakerAttributionConflict
+                    segment.speakerConfirmationScope = previous.speakerConfirmationScope
+                }
+            }
+            transcription?.refreshSegments()
+            reviewNotice = "说话人标注未保存；已选语句保留，请重试。"
+            return nil
+        }
+        lastAttributionUndo = SpeakerAttributionUndo(
+            kind: kind,
+            speakerID: speaker.id,
+            entries: entries,
+            occurredAt: Date()
+        )
+        analysis?.noteSpeakerContextChanged(segmentIDs: outcome.changedSegmentIds)
+        return (changed: outcome.changedSegmentIds, skipped: outcome.exclusions)
+    }
+
+    /// 撤销最近一次指认（单条/批量通用）：
+    /// 只恢复本次改动的归属字段、确认标记、冲突标记与作用域；
+    /// 文字、星标、笔记与后来编辑一律不动；已重新分段或归属再次变化的条目跳过并列明原因。
+    private func undoLastAttribution() {
+        guard let record = lastAttributionUndo, let meeting else { return }
+        let segments = meeting.segments
+        // 撤销前状态快照：撤销保存失败时按它恢复，保持可重试
+        var beforeUndo: [UUID: SpeakerAttributionUndo.Entry] = [:]
+        var restored: [UUID] = []
+        var skippedReasons: [String] = []
+        for segment in segments where record.entries[segment.id] != nil {
+            guard let entry = record.entries[segment.id] else { continue }
+            beforeUndo[segment.id] = SpeakerAttributionUndo.Entry(
+                startMs: segment.startMs, endMs: segment.endMs,
+                sourceAssetId: segment.sourceAssetId,
+                participantId: segment.participantId,
+                speakerWasUserConfirmed: segment.speakerWasUserConfirmed,
+                speakerAttributionConflict: segment.speakerAttributionConflict,
+                speakerConfirmationScope: segment.speakerConfirmationScope
+            )
+            // 时间/来源边界表明该句已重新分段：跳过
+            guard segment.startMs == entry.startMs, segment.endMs == entry.endMs,
+                  segment.sourceAssetId == entry.sourceAssetId else {
+                skippedReasons.append("一条已重新分段，跳过")
+                continue
+            }
+            // 归属后来再次变化（用户改判/旧任务覆盖）：不覆盖后来的决定
+            guard segment.participantId == record.speakerID,
+                  segment.speakerWasUserConfirmed == true,
+                  segment.speakerConfirmationScope == .segment else {
+                skippedReasons.append("一条归属已再次变化，跳过")
+                continue
+            }
+            segment.participantId = entry.participantId
+            segment.speakerWasUserConfirmed = entry.speakerWasUserConfirmed
+            segment.speakerAttributionConflict = entry.speakerAttributionConflict
+            segment.speakerConfirmationScope = entry.speakerConfirmationScope
+            // 撤销作为一次新编辑记录当前时间，不回退后来其他编辑的时间
+            segment.updatedAt = Date()
+            restored.append(segment.id)
+        }
+        guard !restored.isEmpty else {
+            reviewNotice = skippedReasons.isEmpty
+                ? "没有可撤销的内容。"
+                : "撤销未执行：" + skippedReasons.joined(separator: "；") + "。"
+            return
+        }
+        guard persistAndRefresh(meeting) else {
+            for segment in segments where beforeUndo[segment.id] != nil {
+                if let state = beforeUndo[segment.id] {
+                    segment.participantId = state.participantId
+                    segment.speakerWasUserConfirmed = state.speakerWasUserConfirmed
+                    segment.speakerAttributionConflict = state.speakerAttributionConflict
+                    segment.speakerConfirmationScope = state.speakerConfirmationScope
+                }
+            }
+            transcription?.refreshSegments()
+            reviewNotice = "撤销未保存；归属保持撤销前状态，可重试。"
+            return
+        }
+        lastAttributionUndo = nil
+        analysis?.noteSpeakerContextChanged(segmentIDs: restored)
+        if skippedReasons.isEmpty {
+            reviewNotice = "已撤销最近一次指认（\(restored.count) 条）。"
+        } else {
+            reviewNotice = "已撤销 \(restored.count) 条；" + skippedReasons.joined(separator: "；") + "。"
+        }
+    }
+
     /// 指认落地：回填同标签历史片段 + 自动提取声纹 + 前向匹配。
     /// 声纹提取失败不阻断指认（回填仍生效，样本可后续手录）。
     private func performTranscriptSpeakerAssign(
@@ -2646,7 +2834,8 @@ struct ProjectWorkspaceView: View {
             return false
         }
         let previousAttribution = Dictionary(uniqueKeysWithValues: segments.map {
-            ($0.id, ($0.participantId, $0.speakerWasUserConfirmed, $0.updatedAt))
+            ($0.id, ($0.participantId, $0.speakerWasUserConfirmed,
+                     $0.speakerAttributionConflict, $0.speakerConfirmationScope, $0.updatedAt))
         })
         let plan = SpeakerAssignPlanner.makePlan(
             anchorSegmentId: anchorSegmentId,
@@ -2661,7 +2850,9 @@ struct ProjectWorkspaceView: View {
                 if let previous = previousAttribution[segment.id] {
                     segment.participantId = previous.0
                     segment.speakerWasUserConfirmed = previous.1
-                    segment.updatedAt = previous.2
+                    segment.speakerAttributionConflict = previous.2
+                    segment.speakerConfirmationScope = previous.3
+                    segment.updatedAt = previous.4
                 }
             }
             transcription?.refreshSegments()
@@ -2910,7 +3101,8 @@ struct ProjectWorkspaceView: View {
         let snapshots = meeting.segments.map {
             HistoricalSpeakerRelabeler.SegmentSnapshot(id: $0.id, startMs: $0.startMs, endMs: $0.endMs,
                 text: $0.text, participantId: $0.participantId,
-                speakerWasUserConfirmed: $0.speakerWasUserConfirmed == true)
+                speakerWasUserConfirmed: $0.speakerWasUserConfirmed == true,
+                confirmationScope: $0.speakerConfirmationScope)
         }
         let relabeler = HistoricalSpeakerRelabeler(diarization: service)
         isRelabelingHistoricalSpeakers = true
@@ -3069,7 +3261,9 @@ struct ProjectWorkspaceView: View {
             guard let original = originals[segment.id], original.text == segment.text,
                   original.startMs == segment.startMs, original.endMs == segment.endMs,
                   original.participantId == segment.participantId,
-                  original.speakerWasUserConfirmed == (segment.speakerWasUserConfirmed == true) else { return nil }
+                  original.speakerWasUserConfirmed == (segment.speakerWasUserConfirmed == true),
+                  // 识别期间指认/撤销改变作用域的片段按已变化处理
+                  original.confirmationScope == segment.speakerConfirmationScope else { return nil }
             return segment.id
         })
         let invalidAnchorLabels = Set(snapshots.filter {
