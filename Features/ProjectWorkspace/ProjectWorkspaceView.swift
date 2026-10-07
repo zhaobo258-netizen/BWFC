@@ -225,6 +225,13 @@ struct ProjectWorkspaceView: View {
             quickAssignSegmentID = nil
             lastAttributionUndo = nil
         }
+        // 批量模式 Esc 退出（计划 §三.61：再按 Esc 退出，只清除未提交选择）
+        .onExitCommand {
+            if isBatchSelectMode {
+                exitBatchSelectMode()
+                reviewNotice = "已退出批量指认。"
+            }
+        }
         .confirmationDialog("结束录音？", isPresented: $showEndConfirmation, titleVisibility: .visible) {
             Button("结束录音", role: .destructive) { finishRecording() }
             Button("取消", role: .cancel) {}
@@ -663,19 +670,17 @@ struct ProjectWorkspaceView: View {
                     quickAssignSegmentID = segment.id
                 },
                 onQuickAssignPick: { segment, speaker in
-                    quickAssignSegmentID = nil
-                    performQuickAssign(segment: segment, speaker: speaker)
+                    // 保存成功才关弹层；失败保留弹层原地重试（审查修复 4）
+                    let ok = performQuickAssign(segment: segment, speaker: speaker)
+                    return ok
                 },
                 onQuickAssignCreate: { segment, name, role in
-                    quickAssignSegmentID = nil
                     createAndQuickAssign(segment: segment, name: name, role: role)
                 },
                 onQuickAssignClear: { segment in
-                    quickAssignSegmentID = nil
                     clearAttribution(segment: segment)
                 },
                 onQuickAssignStartBatch: { segment in
-                    quickAssignSegmentID = nil
                     enterBatchSelectMode(selecting: segment)
                 },
                 onQuickAssignDismiss: {
@@ -847,11 +852,12 @@ struct ProjectWorkspaceView: View {
             batchSelectionAnchorID = id
             return
         }
-        let range = startIndex...endIndex
-        for index in range where ordered[index] != id {
+        // 向上/向下连续范围都支持（审查修复 2：min/max 防 trap）
+        let lower = min(startIndex, endIndex)
+        let upper = max(startIndex, endIndex)
+        for index in lower...upper {
             batchSelectedSegmentIds.insert(ordered[index])
         }
-        batchSelectedSegmentIds.insert(id)
     }
 
     private func quotePageHeader(meeting: Meeting,
@@ -2986,23 +2992,13 @@ struct ProjectWorkspaceView: View {
             allowOverride: allowOverride
         )
         if let expectedBoundaries {
-            guard Set(expectedBoundaries.keys) == Set(preview.applicableSegmentIds) else {
-                operationError = "所选语句的范围已变化（可能已重新分段或归属已变化），请重新预览后再指认。"
+            guard Self.frozenBoundariesStillValid(
+                frozen: expectedBoundaries,
+                applicable: preview.applicableSegmentIds,
+                segments: segments
+            ) else {
+                operationError = "所选语句已重新分段或归属已变化，请重新预览后再指认。"
                 return nil
-            }
-            for id in preview.applicableSegmentIds {
-                guard let frozen = expectedBoundaries[id],
-                      let current = segments.first(where: { $0.id == id }),
-                      current.startMs == frozen.startMs,
-                      current.endMs == frozen.endMs,
-                      current.sourceAssetId == frozen.sourceAssetId,
-                      current.participantId == frozen.participantId,
-                      current.speakerWasUserConfirmed == frozen.speakerWasUserConfirmed,
-                      current.speakerAttributionConflict == frozen.speakerAttributionConflict,
-                      current.speakerConfirmationScope == frozen.speakerConfirmationScope else {
-                    operationError = "所选语句已重新分段或归属已变化，请重新预览后再指认。"
-                    return nil
-                }
             }
         }
         if preview.applicableSegmentIds.isEmpty {
@@ -3032,36 +3028,28 @@ struct ProjectWorkspaceView: View {
             )
         }
 
+        // 单条快捷/右键改判同一策略贯穿预览与执行（审查修复 1）
         let outcome = SpeakerBackfill.assignExplicit(
-            segmentIds: segmentIds, to: speaker.id, segments: segments
+            segmentIds: segmentIds, to: speaker.id, segments: segments,
+            allowOverride: allowOverride
         )
+        if outcome.changedSegmentIds.isEmpty {
+            // 零变更（如单条"已是此人"）：不落盘、不覆盖有效的撤销记录（审查修复 1）
+            return (changed: [], skipped: outcome.exclusions)
+        }
         guard persistAndRefresh(meeting) else {
-            // 保存失败：applyRuntime 已把新值拷进 project.segments（权威内存），
-            // 必须同时还原两棵模型的全部归属字段与 updatedAt（审查修复 2）
-            for segment in segments where entries[segment.id] != nil {
-                if let previous = entries[segment.id] {
-                    segment.participantId = previous.participantId
-                    segment.speakerWasUserConfirmed = previous.speakerWasUserConfirmed
-                    segment.speakerAttributionConflict = previous.speakerAttributionConflict
-                    segment.speakerConfirmationScope = previous.speakerConfirmationScope
-                    segment.updatedAt = previous.updatedAt
-                }
-            }
-            if let projectSegments = project.segments as [TranscriptSegment]? {
-                for segment in projectSegments where entries[segment.id] != nil {
-                    if let previous = entries[segment.id] {
-                        segment.participantId = previous.participantId
-                        segment.speakerWasUserConfirmed = previous.speakerWasUserConfirmed
-                        segment.speakerAttributionConflict = previous.speakerAttributionConflict
-                        segment.speakerConfirmationScope = previous.speakerConfirmationScope
-                        segment.updatedAt = previous.updatedAt
-                    }
-                }
-            }
+            Self.rollbackAttributionState(
+                entries: entries,
+                meetingSegments: meeting.segments,
+                projectSegments: project.segments
+            )
             transcription?.refreshSegments()
             reviewNotice = "说话人标注未保存；已选语句保留，请重试。"
             return nil
         }
+        // 成功后同步派生映射（审查修复 3）：组级语义变化立即反映到后续分片显示；
+        // attach 只读重建，不新增声纹学习或组级授权，失败路径不调用
+        diarization?.attach(to: meeting)
         lastAttributionUndo = SpeakerAttributionUndo(
             kind: kind,
             speakerID: speaker.id,
@@ -3072,19 +3060,77 @@ struct ProjectWorkspaceView: View {
         return (changed: outcome.changedSegmentIds, skipped: outcome.exclusions)
     }
 
+    /// 冻结边界核对（审查修复 3，可单测）：预览清单一致且每条的
+    /// 时间/来源/归属/作用域与预览时一致；重切保留 UUID 或归属变化都会拒绝。
+    static func frozenBoundariesStillValid(
+        frozen: [UUID: SpeakerAttributionUndo.Entry],
+        applicable: [UUID],
+        segments: [TranscriptSegment]
+    ) -> Bool {
+        guard Set(frozen.keys) == Set(applicable) else { return false }
+        let byID = Dictionary(segments.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        for id in applicable {
+            guard let boundary = frozen[id],
+                  let current = byID[id],
+                  current.startMs == boundary.startMs,
+                  current.endMs == boundary.endMs,
+                  current.sourceAssetId == boundary.sourceAssetId,
+                  current.participantId == boundary.participantId,
+                  current.speakerWasUserConfirmed == boundary.speakerWasUserConfirmed,
+                  current.speakerAttributionConflict == boundary.speakerAttributionConflict,
+                  current.speakerConfirmationScope == boundary.speakerConfirmationScope else {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// 归属字段失败回滚（审查修复 2/4）：applyRuntime 会把 meeting.segments 拷进
+    /// project.segments（权威内存），两棵模型必须同时还原，含 updatedAt。
+    /// 静态纯函数：失败注入测试可直接验证字段完整性。
+    static func rollbackAttributionState(
+        entries: [UUID: SpeakerAttributionUndo.Entry],
+        meetingSegments: [TranscriptSegment],
+        projectSegments: [TranscriptSegment]?
+    ) {
+        for segment in meetingSegments where entries[segment.id] != nil {
+            if let previous = entries[segment.id] {
+                segment.participantId = previous.participantId
+                segment.speakerWasUserConfirmed = previous.speakerWasUserConfirmed
+                segment.speakerAttributionConflict = previous.speakerAttributionConflict
+                segment.speakerConfirmationScope = previous.speakerConfirmationScope
+                segment.updatedAt = previous.updatedAt
+            }
+        }
+        for segment in projectSegments ?? [] where entries[segment.id] != nil {
+            if let previous = entries[segment.id] {
+                segment.participantId = previous.participantId
+                segment.speakerWasUserConfirmed = previous.speakerWasUserConfirmed
+                segment.speakerAttributionConflict = previous.speakerAttributionConflict
+                segment.speakerConfirmationScope = previous.speakerConfirmationScope
+                segment.updatedAt = previous.updatedAt
+            }
+        }
+    }
+
     /// 撤销最近一次指认（单条/批量通用）：
     /// 只恢复本次改动的归属字段、确认标记、冲突标记与作用域；
     /// 文字、星标、笔记与后来编辑一律不动；已重新分段或归属再次变化的条目跳过并列明原因。
     private func undoLastAttribution() {
-        guard let record = lastAttributionUndo, let meeting else { return }
+        guard let record = lastAttributionUndo, let project, let meeting else { return }
         let segments = meeting.segments
         // 撤销前状态快照：撤销保存失败时按它恢复，保持可重试
         var beforeUndo: [UUID: SpeakerAttributionUndo.Entry] = [:]
         var restored: [UUID] = []
         var skippedReasons: [String] = []
-        for segment in segments where record.entries[segment.id] != nil {
-            guard let entry = record.entries[segment.id] else { continue }
-            beforeUndo[segment.id] = SpeakerAttributionUndo.Entry(
+        var missingCount = 0
+        for (entryID, entry) in record.entries {
+            guard let segment = segments.first(where: { $0.id == entryID }) else {
+                // 计划 §五：不复活已删除片段，跳过并列明原因
+                missingCount += 1
+                continue
+            }
+            beforeUndo[entryID] = SpeakerAttributionUndo.Entry(
                 startMs: segment.startMs, endMs: segment.endMs,
                 sourceAssetId: segment.sourceAssetId,
                 participantId: segment.participantId,
@@ -3100,21 +3146,34 @@ struct ProjectWorkspaceView: View {
                 continue
             }
             // 归属后来再次变化：不覆盖后来的决定。按操作类型核对"本次操作留下的状态"；
-            // 后续云端文字更新不改这些归属字段，不阻塞撤销。
+            // 后续云端文字更新不改这些归属字段，不阻塞撤销。冲突字段也在核对内。
             let matchesPostOperationState: Bool
             switch record.kind {
             case .single, .batch:
                 matchesPostOperationState = segment.participantId == record.speakerID
                     && segment.speakerWasUserConfirmed == true
                     && segment.speakerConfirmationScope == .segment
+                    && segment.speakerAttributionConflict == false
             case .clear:
                 matchesPostOperationState = segment.participantId == nil
                     && segment.speakerWasUserConfirmed == true
                     && segment.speakerConfirmationScope == .segment
+                    && segment.speakerAttributionConflict == false
             }
             guard matchesPostOperationState else {
                 skippedReasons.append("一条归属已再次变化，跳过")
                 continue
+            }
+            // 恢复目标人物必须仍存在（审查修复 6）：人物已删除不恢复悬空归属
+            if let previousParticipant = entry.participantId,
+               project.speakers.first(where: { $0.id == previousParticipant }) == nil,
+               (try? environment.allProjects().first?.segments) != nil {
+                let personStillExists = ((try? environment.personLibraryStore.load()) ?? [])
+                    .contains { $0.id == previousParticipant }
+                guard personStillExists else {
+                    skippedReasons.append("一条的原归属人物已删除，跳过")
+                    continue
+                }
             }
             segment.participantId = entry.participantId
             segment.speakerWasUserConfirmed = entry.speakerWasUserConfirmed
@@ -3122,7 +3181,10 @@ struct ProjectWorkspaceView: View {
             segment.speakerConfirmationScope = entry.speakerConfirmationScope
             // 撤销作为一次新编辑记录当前时间，不回退后来其他编辑的时间
             segment.updatedAt = Date()
-            restored.append(segment.id)
+            restored.append(entryID)
+        }
+        if missingCount > 0 {
+            skippedReasons.append("\(missingCount) 条片段已不存在，跳过")
         }
         guard !restored.isEmpty else {
             reviewNotice = skippedReasons.isEmpty
@@ -3131,32 +3193,18 @@ struct ProjectWorkspaceView: View {
             return
         }
         guard persistAndRefresh(meeting) else {
-            // 撤销保存失败：同时还原两棵模型（applyRuntime 已拷贝）与 updatedAt
-            for segment in segments where beforeUndo[segment.id] != nil {
-                if let state = beforeUndo[segment.id] {
-                    segment.participantId = state.participantId
-                    segment.speakerWasUserConfirmed = state.speakerWasUserConfirmed
-                    segment.speakerAttributionConflict = state.speakerAttributionConflict
-                    segment.speakerConfirmationScope = state.speakerConfirmationScope
-                    segment.updatedAt = state.updatedAt
-                }
-            }
-            if let project, let projectSegments = project.segments as [TranscriptSegment]? {
-                for segment in projectSegments where beforeUndo[segment.id] != nil {
-                    if let state = beforeUndo[segment.id] {
-                        segment.participantId = state.participantId
-                        segment.speakerWasUserConfirmed = state.speakerWasUserConfirmed
-                        segment.speakerAttributionConflict = state.speakerAttributionConflict
-                        segment.speakerConfirmationScope = state.speakerConfirmationScope
-                        segment.updatedAt = state.updatedAt
-                    }
-                }
-            }
+            // 撤销保存失败：两棵模型与 updatedAt 完整还原，撤销记录保留可重试
+            Self.rollbackAttributionState(
+                entries: beforeUndo,
+                meetingSegments: segments,
+                projectSegments: project.segments
+            )
             transcription?.refreshSegments()
             reviewNotice = "撤销未保存；归属保持撤销前状态，可重试。"
             return
         }
         lastAttributionUndo = nil
+        diarization?.attach(to: meeting)
         analysis?.noteSpeakerContextChanged(segmentIDs: restored)
         if skippedReasons.isEmpty {
             reviewNotice = "已撤销最近一次指认（\(restored.count) 条）。"
@@ -3167,55 +3215,66 @@ struct ProjectWorkspaceView: View {
 
     // MARK: - 快捷指认执行（单条；句级作用域，不同组回填）
 
-    private func performQuickAssign(segment: TranscriptSegment, speaker: Speaker) {
+    @discardableResult
+    private func performQuickAssign(segment: TranscriptSegment, speaker: Speaker) -> Bool {
         guard let meeting,
               meeting.segments.contains(where: { $0.id == segment.id }) else {
             operationError = "这句话还在识别中，等它定稿后再指认。"
-            return
+            return false
         }
         guard let result = performExplicitSegmentAssign(
             segmentIds: [segment.id],
             speaker: speaker,
             kind: .single
-        ) else { return }
+        ) else { return false }
         if result.changed.isEmpty {
+            // 零变更（已是此人等）：不关弹层也无需保存；给出原因
             if let exclusion = result.skipped.first {
                 reviewNotice = "没有修改：\(exclusion.displayText)。"
             }
-            return
+            return false
         }
         reviewNotice = "已指认为 \(speaker.displayName) · 撤销"
+        return true
     }
 
     /// 快捷弹层新建人物：复用既有人物/说话人协调入口，创建成功后立即指认当前句。
     /// 创建成功但指认失败时分别说明，不伪报整体成功。
-    private func createAndQuickAssign(segment: TranscriptSegment, name: String, role: String?) {
-        guard let project, let meeting else { return }
-        guard let speaker = createSpeakerInProject(name: name, role: role, project: project) else { return }
+    @discardableResult
+    private func createAndQuickAssign(segment: TranscriptSegment, name: String, role: String?) -> Bool {
+        guard let project, let meeting else { return false }
+        guard let speaker = createSpeakerInProject(name: name, role: role, project: project) else {
+            return false
+        }
         guard meeting.segments.contains(where: { $0.id == segment.id }) else {
             operationError = "人物已创建；但这句话还在识别中，定稿后请在人物列表中选择指认。"
-            return
+            return true
         }
         guard let result = performExplicitSegmentAssign(
             segmentIds: [segment.id],
             speaker: speaker,
             kind: .single
         ) else {
-            operationError = "人物已创建并加入本场；但指认保存失败，请重新选择该人物指认。"
-            return
+            operationError = "人物已创建并加入本场；但指认保存失败，请在人物列表中重新指认。"
+            return false
         }
-        reviewNotice = result.changed.isEmpty
-            ? "人物已创建；没有修改归属（\(result.skipped.first?.displayText ?? "无需修改")）。"
-            : "已指认为 \(speaker.displayName) · 撤销"
+        if result.changed.isEmpty {
+            reviewNotice = "人物已创建；没有修改归属（\(result.skipped.first?.displayText ?? "无需修改")）。"
+            return false
+        }
+        reviewNotice = "已指认为 \(speaker.displayName) · 撤销"
+        return true
     }
 
-    /// 清除归属（快捷弹层“更多操作”）：记录可撤销，恢复时回到清除前状态
-    private func clearAttribution(segment: TranscriptSegment) {
-        guard let meeting,
+    /// 清除归属（快捷弹层“更多操作”）：记录可撤销，恢复时回到清除前状态。
+    /// 返回 false 表示保存失败（两棵模型已完整回滚），弹层可原地重试。
+    @discardableResult
+    private func clearAttribution(segment: TranscriptSegment) -> Bool {
+        guard let project, let meeting,
               let target = meeting.segments.first(where: { $0.id == segment.id }),
               target.state != .provisional else {
             operationError = "这句话还在识别中，定稿后再修改归属。"
-            return
+            return false
         }
         // 记录清除前状态供撤销
         let entries: [UUID: SpeakerAttributionUndo.Entry] = [
@@ -3229,44 +3288,64 @@ struct ProjectWorkspaceView: View {
                 updatedAt: target.updatedAt
             )
         ]
-        let previousState = (target.participantId, target.speakerWasUserConfirmed,
-                             target.speakerAttributionConflict,
-                             target.speakerConfirmationScope, target.updatedAt)
         MeetingTranscriptEditor.clearSpeaker(target)
         // clearSpeaker 会置 confirmed=true（“明确清空”也是人工决定）；scope 记为句级
         target.speakerConfirmationScope = .segment
         guard persistAndRefresh(meeting) else {
-            target.participantId = previousState.0
-            target.speakerWasUserConfirmed = previousState.1
-            target.speakerAttributionConflict = previousState.2
-            target.speakerConfirmationScope = previousState.3
-            target.updatedAt = previousState.4
+            Self.rollbackAttributionState(
+                entries: entries,
+                meetingSegments: meeting.segments,
+                projectSegments: project.segments
+            )
             transcription?.refreshSegments()
             operationError = "清除归属未保存，请重试。"
-            return
+            return false
         }
+        diarization?.attach(to: meeting)
         lastAttributionUndo = SpeakerAttributionUndo(
-            kind: .clear, speakerID: previousState.0 ?? UUID(),
+            kind: .clear, speakerID: entries[segment.id]?.participantId ?? UUID(),
             entries: entries, occurredAt: Date()
         )
         analysis?.noteSpeakerContextChanged(segmentIDs: [segment.id])
         reviewNotice = "已清除这一条的归属 · 撤销"
+        return true
     }
 
-    /// 在本场创建说话人（复用人物协调入口；返回 nil 时已给出错误说明）
+    /// 在本场创建说话人并建立 Person 关联（审查修复 5：与现有新建路径同一协调语义，
+    /// 但不做任何组级传播）。返回 nil 时已给出错误说明；失败完整回滚人物与关联。
     private func createSpeakerInProject(name: String, role: String?, project: Project) -> Speaker? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let personID = UUID()
         let speaker = Speaker(
             cloudAlias: SpeakerPanelLogic.nextCloudAlias(existing: project.speakers),
-            displayName: name,
-            role: role
+            displayName: trimmed, role: role,
+            colorToken: SpeakerPanelLogic.nextColorToken(existing: project.speakers),
+            isUserConfirmed: true, personId: personID
         )
+        let person = Person(id: personID, displayName: trimmed, role: role,
+            colorToken: speaker.colorToken,
+            speakerLinks: [PersonSpeakerLink(projectID: project.id, speakerID: speaker.id,
+                speakerDisplayName: trimmed, linkedAt: Date())])
+        do {
+            _ = try environment.personLibraryStore.insert(person)
+        } catch {
+            operationError = "人物未保存：\(error.localizedDescription)"
+            return nil
+        }
         project.speakers.append(speaker)
         guard persistProject(fields: .speakers) else {
-            if let index = project.speakers.firstIndex(where: { $0.id == speaker.id }) {
-                project.speakers.remove(at: index)
+            project.speakers.removeAll { $0.id == speaker.id }
+            if let meeting {
+                SpeakerPanelLogic.syncRuntimeParticipants(speakers: project.speakers, meeting: meeting)
             }
+            try? environment.personLibraryStore.deletePerson(personID: personID)
             operationError = "人物保存失败，未创建；请重试。"
             return nil
+        }
+        // 立即同步运行时参会人：原话行显示查 meeting.participants
+        if let meeting {
+            SpeakerPanelLogic.syncRuntimeParticipants(speakers: project.speakers, meeting: meeting)
         }
         return speaker
     }
@@ -3294,9 +3373,13 @@ struct ProjectWorkspaceView: View {
                 continue
             }
             let applicable = preview.applicableSegmentIds.contains(id)
+            // 与原话列表一致：合并录音显示来源内时间（审查修复 8）
+            let relativeMs = project.map {
+                ProjectHomeSupport.sourceRelativeStartMs(for: segment, in: $0)
+            } ?? segment.startMs
             summaries.append(BatchAssignPreviewContext.SegmentSummary(
                 id: id,
-                timeText: TranscriptRowView.formatMs(segment.startMs),
+                timeText: TranscriptRowView.formatMs(relativeMs),
                 text: String(segment.text.prefix(80)),
                 sourceTitle: project.flatMap {
                     ProjectHomeSupport.sourceRecording(for: segment, in: $0)?.title
@@ -3534,6 +3617,8 @@ struct ProjectWorkspaceView: View {
         }
     }
 
+    /// 高级入口的范围描述（审查修复 8）：按来源录音统计该标签下的实际可修改数与
+    /// 受保护数，不用标签总数冒充修改数；合并录音标签相同时不跨来源合并。
     private func speakerGroupDescription(for request: SpeakerAssignRequest) -> String? {
         guard !request.isAnalysisItem,
               let id = request.source.transcriptSegmentId,
@@ -3541,9 +3626,36 @@ struct ProjectWorkspaceView: View {
         guard let label = anchor.remoteSpeakerLabel, !label.isEmpty else {
             return "当前原话尚未分组，本次只确认这一条；可先用“识别说话人”按声音分组。"
         }
-        let count = meeting?.segments.filter { $0.remoteSpeakerLabel == label }.count ?? 1
+        guard let meeting else { return nil }
+        // 按来源录音分组统计（sourceAssetId 为来源项目 ID；普通录音为 nil 单来源）
+        let sameLabel = meeting.segments.filter { $0.remoteSpeakerLabel == label }
+        var bySource: [UUID?: (modifiable: Int, protected: Int)] = [:]
+        for segment in sameLabel {
+            guard segment.state != .provisional else { continue }
+            let key = segment.sourceAssetId
+            var entry = bySource[key] ?? (0, 0)
+            if segment.speakerWasUserConfirmed == true,
+               segment.participantId != anchor.participantId {
+                entry.protected += 1
+            } else if segment.participantId != anchor.participantId
+                || segment.speakerWasUserConfirmed != true {
+                entry.modifiable += 1
+            }
+            bySource[key] = entry
+        }
         let name = diarization?.displayName(forRemoteLabel: label) ?? "本声音组"
-        return "\(name) · 本组 \(count) 条原话，一次指认即可批量归属；已确认给其他人的原话会保留。"
+        let sources = project?.sourceRecordings ?? []
+        let parts = bySource.sorted { ($0.key?.uuidString ?? "") < ($1.key?.uuidString ?? "") }
+            .map { key, value -> String in
+                let sourceName = key.flatMap { id in
+                    sources.first { $0.projectID == id }?.title
+                }
+                let prefix = sourceName.map { "「\($0)」" } ?? ""
+                return "\(prefix)可修改 \(value.modifiable) 条"
+                    + (value.protected > 0 ? "、保留已确认 \(value.protected) 条" : "")
+            }
+        return "\(name) · 高级批量将按同声音组归属（同来源内）：" + parts.joined(separator: "；")
+            + "。本操作会应用组级映射并可能学习声纹。"
     }
 
     /// 整场人物识别的终态结果（15 号计划 A.3：收尾流程等待终态后再生成总结）

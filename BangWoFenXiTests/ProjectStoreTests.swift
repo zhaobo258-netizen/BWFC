@@ -1219,6 +1219,102 @@ final class ProjectStoreTests {
         project.speakers.first { $0.displayName == name }?.id
     }
 
+    @Test("生产回滚函数还原两棵模型全部归属字段与 updatedAt（审查修复 2）")
+    @MainActor
+    func rollbackAttributionStateRestoresBothModels() {
+        let speakerA = UUID()
+        let originalConflict = true
+        let originalScope = SpeakerConfirmationScope.group
+        let originalUpdatedAt = Date(timeIntervalSince1970: 700_000_000)
+        // 两棵模型用同一片段实例语义：相同 UUID 才能按 entries 索引回滚
+        let fixedSegmentID = UUID()
+        let makeOriginal = { [TranscriptSegment(
+            id: fixedSegmentID,
+            startMs: 0, endMs: 1_000, text: "归属片段",
+            participantId: speakerA, source: .cloud, state: .final,
+            speakerAttributionConflict: originalConflict,
+            speakerConfirmationScope: originalScope
+        )] }
+        // 操作前的 updatedAt 单独覆盖（init 里默认 Date()）
+        func stamp(_ segments: [TranscriptSegment]) -> [TranscriptSegment] {
+            segments.forEach { $0.updatedAt = originalUpdatedAt }
+            return segments
+        }
+        let before = stamp(makeOriginal())
+        let entry = ProjectWorkspaceView.SpeakerAttributionUndo.Entry(
+            startMs: before[0].startMs, endMs: before[0].endMs,
+            sourceAssetId: before[0].sourceAssetId,
+            participantId: before[0].participantId,
+            speakerWasUserConfirmed: before[0].speakerWasUserConfirmed,
+            speakerAttributionConflict: before[0].speakerAttributionConflict,
+            speakerConfirmationScope: before[0].speakerConfirmationScope,
+            updatedAt: before[0].updatedAt
+        )
+        let entries: [UUID: ProjectWorkspaceView.SpeakerAttributionUndo.Entry] = [before[0].id: entry]
+
+        // 模拟已应用的指认（meeting 与 project 两棵模型都被改写）
+        let meetingSegments = makeOriginal()
+        let projectSegments = makeOriginal()
+        for segment in meetingSegments + projectSegments {
+            segment.participantId = UUID()
+            segment.speakerWasUserConfirmed = true
+            segment.speakerAttributionConflict = false
+            segment.speakerConfirmationScope = .segment
+            segment.updatedAt = Date(timeIntervalSince1970: 800_000_000)
+        }
+
+        ProjectWorkspaceView.rollbackAttributionState(
+            entries: entries,
+            meetingSegments: meetingSegments,
+            projectSegments: projectSegments
+        )
+
+        for segment in meetingSegments + projectSegments {
+            #expect(segment.participantId == speakerA)
+            #expect(segment.speakerWasUserConfirmed == nil)
+            #expect(segment.speakerAttributionConflict == originalConflict)
+            #expect(segment.speakerConfirmationScope == originalScope)
+            #expect(segment.updatedAt == originalUpdatedAt, "updatedAt 必须一并还原")
+        }
+    }
+
+    @Test("冻结边界核对拒绝 UUID 保留但时间/来源/归属变化的重切片段（审查修复 3）")
+    @MainActor
+    func frozenBoundariesRejectResegmentedCarriedUUID() {
+        let segmentID = UUID()
+        let frozenEntry = ProjectWorkspaceView.SpeakerAttributionUndo.Entry(
+            startMs: 0, endMs: 2_000, sourceAssetId: nil,
+            participantId: nil, speakerWasUserConfirmed: nil,
+            speakerAttributionConflict: nil, speakerConfirmationScope: nil,
+            updatedAt: Date(timeIntervalSince1970: 700_000_000)
+        )
+        let frozen: [UUID: ProjectWorkspaceView.SpeakerAttributionUndo.Entry] = [segmentID: frozenEntry]
+
+        func currentSegment(startMs: Int64, endMs: Int64, source: UUID?) -> TranscriptSegment {
+            let segment = TranscriptSegment(id: segmentID, startMs: startMs, endMs: endMs,
+                text: "重切后保留 UUID", source: .cloud, state: .final)
+            segment.sourceAssetId = source
+            return segment
+        }
+
+        // 完全一致 → 通过
+        #expect(ProjectWorkspaceView.frozenBoundariesStillValid(
+            frozen: frozen, applicable: [segmentID],
+            segments: [currentSegment(startMs: 0, endMs: 2_000, source: nil)]))
+        // 云端重切保留 UUID 但边界变化 → 拒绝
+        #expect(!ProjectWorkspaceView.frozenBoundariesStillValid(
+            frozen: frozen, applicable: [segmentID],
+            segments: [currentSegment(startMs: 0, endMs: 1_200, source: nil)]))
+        // 来源资产变化（合并录音语境）→ 拒绝
+        #expect(!ProjectWorkspaceView.frozenBoundariesStillValid(
+            frozen: frozen, applicable: [segmentID],
+            segments: [currentSegment(startMs: 0, endMs: 2_000, source: UUID())]))
+        // 预览清单与当前可修改清单不一致 → 拒绝
+        #expect(!ProjectWorkspaceView.frozenBoundariesStillValid(
+            frozen: frozen, applicable: [UUID()],
+            segments: [currentSegment(startMs: 0, endMs: 2_000, source: nil)]))
+    }
+
     @Test("批量指认幂等解除冲突标记；原话行冲突显示后缀")
     @MainActor
     func speakerBackfillAndRowDisplayHandleConflict() {

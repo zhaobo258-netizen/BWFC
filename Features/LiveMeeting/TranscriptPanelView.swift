@@ -119,10 +119,11 @@ struct TranscriptPanelView: View {
     var quickAssignCurrentSpeaker: ((TranscriptSegment) -> UUID?)? = nil
     /// 打开弹层（工作台路由：同一时间只保留一个人物选择面板）
     var onQuickAssignOpen: ((TranscriptSegment) -> Void)? = nil
-    var onQuickAssignPick: ((TranscriptSegment, Speaker) -> Void)? = nil
-    var onQuickAssignCreate: ((TranscriptSegment, String, String?) -> Void)? = nil
-    /// 清除归属（弹层“更多操作”，与指认具备同等撤销能力）
-    var onQuickAssignClear: ((TranscriptSegment) -> Void)? = nil
+    /// 返回 true 表示已成功保存（弹层关闭）；false 表示失败（弹层保留可重试）
+    var onQuickAssignPick: ((TranscriptSegment, Speaker) -> Bool)? = nil
+    var onQuickAssignCreate: ((TranscriptSegment, String, String?) -> Bool)? = nil
+    /// 清除归属（弹层“更多操作”，与指认具备同等撤销能力）；返回 true 表示已保存
+    var onQuickAssignClear: ((TranscriptSegment) -> Bool)? = nil
     /// 从单条弹层进入批量模式（自动勾选当前句）
     var onQuickAssignStartBatch: ((TranscriptSegment) -> Void)? = nil
     var onQuickAssignDismiss: (() -> Void)? = nil
@@ -202,8 +203,17 @@ struct TranscriptPanelView: View {
                     scrollToLatest(proxy: proxy)
                 }
                 .onChange(of: segments.last?.text) { _, _ in
-                    // 临时片段文字就地更新时保持贴底
+                    // 追加中更新末句文字同样不得把批量视图拉到底部（审查修复 7）
+                    guard !isBatchMode else { return }
                     scrollToLatest(proxy: proxy)
+                }
+                .onChange(of: isBatchMode) { _, batch in
+                    if batch {
+                        // 进入批量：取消挂起的滚动并解除贴底，位置留在用户当前查看处
+                        pendingScrollTask?.cancel()
+                        pendingScrollTask = nil
+                        if pinnedToBottom { pinnedToBottom = false }
+                    }
                 }
                 .onChange(of: highlightedSegmentID) { _, newValue in
                     // 点击证据：定位到对应片段（滚动 + 高亮）
@@ -316,9 +326,7 @@ struct TranscriptPanelView: View {
             row: row,
             showsSpeakerButton: showsButton,
             onSpeakerTap: segment.map { seg in { handleSpeakerAreaTap(seg) } },
-            onToggleSelect: segment.map { seg in
-                { onToggleSelect?(seg.id, !selectedSegmentIds.contains(seg.id)) }
-            }
+            onToggleSelect: segment.map { seg in { handleSpeakerAreaTap(seg) } }
         )
         .popover(
             isPresented: quickAssignPopoverShown(for: row),
@@ -329,10 +337,13 @@ struct TranscriptPanelView: View {
                     segment: seg,
                     speakers: quickAssignSpeakers,
                     currentSpeakerID: quickAssignCurrentSpeaker?(seg),
-                    onPick: { onQuickAssignPick?(seg, $0) },
-                    onCreate: { onQuickAssignCreate?(seg, $0, $1) },
-                    onClear: { onQuickAssignClear?(seg) },
-                    onStartBatch: { onQuickAssignStartBatch?(seg) }
+                    onPick: { if onQuickAssignPick?(seg, $0) == true { onQuickAssignDismiss?() } },
+                    onCreate: { if onQuickAssignCreate?(seg, $0, $1) == true { onQuickAssignDismiss?() } },
+                    onClear: { if onQuickAssignClear?(seg) == true { onQuickAssignDismiss?() } },
+                    onStartBatch: {
+                        onQuickAssignStartBatch?(seg)
+                        onQuickAssignDismiss?()
+                    }
                 )
             }
         }
@@ -364,8 +375,9 @@ struct TranscriptPanelView: View {
     /// 非批量模式下打开人物弹层（由工作台单一弹层路由持有）。
     private func handleSpeakerAreaTap(_ segment: TranscriptSegment) {
         if isBatchMode {
-            let useShift = NSEvent.modifierFlags.contains(.shift)
-            if useShift {
+            // 批量模式：复选框/头像/姓名统一走这里（审查修复 2）；
+            // Shift 为连续范围，普通点击切换勾选
+            if NSEvent.modifierFlags.contains(.shift) {
                 onShiftSelect?(segment.id)
             } else {
                 onToggleSelect?(segment.id, !selectedSegmentIds.contains(segment.id))
