@@ -4,6 +4,14 @@ import SwiftUI
 /// 从总结条目或转写行进入，选已有说话人或输入姓名新建。
 /// 总结卡片归属与转写说话人修改分开，避免把多段证据误当成同一个人的声音。
 struct SpeakerAssignSheet: View {
+    /// 弹层用途（说话人左键指认计划 20261007）：复用同一人物列表，避免两套行为
+    enum Mode: Equatable {
+        /// 旧模式：单锚点 + 高级范围选项（同组回填/其余未确认）
+        case advanced
+        /// 批量模式：为已勾选的语句集合指定人物；不含组级范围选项
+        case batch(selectedCount: Int)
+    }
+
     @Environment(\.dismiss) private var dismiss
 
     let speakers: [Speaker]
@@ -12,6 +20,7 @@ struct SpeakerAssignSheet: View {
     let isAnalysisItem: Bool
     let canAlsoAssignTranscript: Bool
     var groupDescription: String? = nil
+    var mode: Mode = .advanced
     let onPickExisting: (Speaker, Bool, Bool) -> Bool
     let onCreate: (String, String?, Bool, Bool) -> Bool
 
@@ -26,28 +35,18 @@ struct SpeakerAssignSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("这是谁说的？")
-                .font(.headline)
-            if !anchorText.isEmpty {
-                Text("“\(anchorText)”")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(3)
-                    .fixedSize(horizontal: false, vertical: true)
+            switch mode {
+            case .advanced:
+                advancedHeader
+            case .batch(let selectedCount):
+                batchHeader(selectedCount: selectedCount)
             }
-            Text(isAnalysisItem
-                 ? "这里确认的是这条 AI 内容归谁，不会把多段证据静默当成同一个人的声音。"
-                 : (groupDescription ?? "这里会批量修改同一声音组的原话，并从已确认的 2–10 秒单人发言学习永久声纹。"))
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
-
             if isAnalysisItem, canAlsoAssignTranscript {
                 Toggle("同时把唯一一条证据原话标给此人", isOn: $alsoAssignTranscript)
                     .font(.caption)
             }
 
-            if !isAnalysisItem {
+            if mode == .advanced, !isAnalysisItem {
                 Toggle("将本录音里其余未确认发言也标为此人", isOn: $assignAllUnconfirmed)
                     .font(.caption)
                 if assignAllUnconfirmed {
@@ -120,6 +119,35 @@ struct SpeakerAssignSheet: View {
         }
         .padding(20)
         .frame(width: 420)
+    }
+
+    @ViewBuilder
+    private var advancedHeader: some View {
+        Text("这是谁说的？")
+            .font(.headline)
+        if !anchorText.isEmpty {
+            Text("“\(anchorText)”")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        Text(isAnalysisItem
+             ? "这里确认的是这条 AI 内容归谁，不会把多段证据静默当成同一个人的声音。"
+             : (groupDescription ?? "这里会批量修改同一声音组的原话，并从已确认的 2–10 秒单人发言学习永久声纹。"))
+            .font(.caption)
+            .foregroundStyle(.tertiary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    @ViewBuilder
+    private func batchHeader(selectedCount: Int) -> some View {
+        Text("给所选 \(selectedCount) 条语句指定人物")
+            .font(.headline)
+        Text("选定人物后会先预览实际范围；已人工确认给其他人的语句会保留原归属。")
+            .font(.caption)
+            .foregroundStyle(.tertiary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     private func createIfValid() {

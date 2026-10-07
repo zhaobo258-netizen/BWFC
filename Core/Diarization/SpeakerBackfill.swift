@@ -58,10 +58,12 @@ enum SpeakerBackfill {
     // MARK: - 显式选段（单条快捷 / 多选批量）
 
     /// 预览显式选段的实际影响范围；不修改任何片段。
+    /// allowOverride 仅用于单条显式改判入口：已确认他人的这一句允许改判（用户直接点选）。
     static func previewExplicit(
         segmentIds: [UUID],
         to speakerId: UUID,
-        segments: [TranscriptSegment]
+        segments: [TranscriptSegment],
+        allowOverride: Bool = false
     ) -> Preview {
         let byID = Dictionary(segments.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         var applicable: [UUID] = []
@@ -80,7 +82,8 @@ enum SpeakerBackfill {
                 continue
             }
             if segment.speakerWasUserConfirmed == true,
-               segment.participantId != nil, segment.participantId != speakerId {
+               segment.participantId != nil, segment.participantId != speakerId,
+               !allowOverride {
                 exclusions.append(Exclusion(segmentId: id, reason: .confirmedToOther))
                 continue
             }
@@ -102,9 +105,13 @@ enum SpeakerBackfill {
         segmentIds: [UUID],
         to speakerId: UUID,
         segments: [TranscriptSegment],
-        now: Date = Date()
+        now: Date = Date(),
+        allowOverride: Bool = false
     ) -> Outcome {
-        let preview = previewExplicit(segmentIds: segmentIds, to: speakerId, segments: segments)
+        let preview = previewExplicit(
+            segmentIds: segmentIds, to: speakerId, segments: segments,
+            allowOverride: allowOverride
+        )
         let applicable = Set(preview.applicableSegmentIds)
         guard !applicable.isEmpty else {
             return Outcome(changedSegmentIds: [], remoteLabel: nil, exclusions: preview.exclusions)
@@ -149,12 +156,10 @@ enum SpeakerBackfill {
             return Outcome(changedSegmentIds: [], remoteLabel: nil,
                            exclusions: [Exclusion(segmentId: segmentId, reason: .alreadySamePerson)])
         }
-        segment.participantId = speakerId
-        segment.speakerWasUserConfirmed = true
-        segment.speakerAttributionConflict = false
-        segment.speakerConfirmationScope = .segment
-        segment.updatedAt = now
-        return Outcome(changedSegmentIds: [segmentId], remoteLabel: nil, exclusions: [])
+        return assignExplicit(
+            segmentIds: [segmentId], to: speakerId, segments: segments,
+            now: now, allowOverride: true
+        )
     }
 
     // MARK: - 组级回填（高级入口保留）

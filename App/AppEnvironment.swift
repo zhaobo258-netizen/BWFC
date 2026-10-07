@@ -194,8 +194,13 @@ enum ProjectPersistence {
                 guard let existing = storedByID[segment.id],
                       segment.state == .edited
                         || segment.speakerWasUserConfirmed == true
+                        // 确认标记、冲突标记与作用域的任何变化（含撤销：true→false）都要落盘，
+                        // 否则"确认→撤销回同一人"的四项旧条件全不成立，磁盘保留确认状态
+                        || segment.speakerWasUserConfirmed != existing.speakerWasUserConfirmed
                         || segment.participantId != existing.participantId
-                        || segment.isStarred != existing.isStarred else {
+                        || segment.isStarred != existing.isStarred
+                        || segment.speakerAttributionConflict != existing.speakerAttributionConflict
+                        || segment.speakerConfirmationScope != existing.speakerConfirmationScope else {
                     return nil
                 }
                 return (segment.id, segment)

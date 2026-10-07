@@ -748,6 +748,33 @@ final class DiarizationControllerTests {
         #expect(mockDiarization.calls.count == 1)
     }
 
+    @Test("组级锚点改判为句级后刷新，旧 label 映射不残留（审查修复 4）")
+    func groupAnchorChangedToSegmentDropsStaleManualMapping() {
+        let speakerA = meeting.participants[0]
+        let speakerB = Participant(cloudAlias: "p_02", displayName: "乙", side: .counterpart)
+        meeting.participants.append(speakerB)
+        let label = "chunk:0:speaker_1"
+        // 第一步：组级确认 → 映射 label→甲 生效
+        let segment = TranscriptSegment(startMs: 0, endMs: 2_000, text: "同组原话",
+            participantId: speakerA.id, remoteSpeakerLabel: label, source: .cloud, state: .final,
+            speakerWasUserConfirmed: true, speakerConfirmationScope: .group)
+        meeting.segments = [segment]
+        controller.attach(to: meeting)
+        controller.refreshKnownSpeakers()
+        #expect(controller.displayName(forRemoteLabel: label) == "", "组级确认应映射为甲")
+
+        // 第二步：把最后一个组级锚点改判为乙（句级）
+        segment.participantId = speakerB.id
+        segment.speakerConfirmationScope = .segment
+
+        // 第三步：刷新（rebuildSpeakerMapper）——旧 label→甲 的派生缓存不得残留
+        controller.attach(to: meeting)
+        controller.refreshKnownSpeakers()
+        let display = controller.displayName(forRemoteLabel: label)
+        #expect(display.contains("待识别") || display.contains("人物"),
+                "失效的锚点派生缓存必须丢弃，实际：\(display)")
+    }
+
     @Test("句级确认不回灌为组级映射：刷新和重开后仅这一条的作用域仍成立")
     func segmentScopeConfirmationDoesNotRebuildGroupMapping() {
         let me = meeting.participants[0].id

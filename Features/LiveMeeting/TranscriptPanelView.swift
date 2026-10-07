@@ -13,6 +13,10 @@ struct TranscriptRowData: Equatable, Identifiable {
     var speakerColorToken: String?
     var sourceRecordingTitle: String?
     var isHighlighted: Bool
+    /// 批量模式（说话人左键指认计划 20261007）：显示复选框
+    var isBatchMode: Bool = false
+    /// 批量模式中的选中态（以片段 UUID 为准，由工作台持有）
+    var isSelected: Bool = false
 
     /// 由片段映射（纯函数，可单测）
     static func make(
@@ -21,7 +25,9 @@ struct TranscriptRowData: Equatable, Identifiable {
         unknownDisplay: String?,
         highlightedID: UUID?,
         sourceRecordingTitle: String? = nil,
-        displayStartMs: Int64? = nil
+        displayStartMs: Int64? = nil,
+        isBatchMode: Bool = false,
+        isSelected: Bool = false
     ) -> TranscriptRowData {
         let participant = segment.participantId.flatMap { id in
             participants.first(where: { $0.id == id })
@@ -38,7 +44,9 @@ struct TranscriptRowData: Equatable, Identifiable {
             speakerName: (participant?.displayName ?? (unknownDisplay ?? "识别中")) + conflictSuffix,
             speakerColorToken: participant?.colorToken,
             sourceRecordingTitle: sourceRecordingTitle,
-            isHighlighted: segment.id == highlightedID
+            isHighlighted: segment.id == highlightedID,
+            isBatchMode: isBatchMode,
+            isSelected: isSelected
         )
     }
 }
@@ -101,6 +109,32 @@ struct TranscriptPanelView: View {
     var sourceRecordingTitle: ((TranscriptSegment) -> String?)? = nil
     var sourceRecordingStartMs: ((TranscriptSegment) -> Int64)? = nil
 
+    // MARK: 左键快捷指认（说话人左键指认计划 20261007；工作台单一弹层路由）
+
+    /// 当前打开人物弹层的片段（nil = 无弹层；同一时间只有一个）
+    var quickAssignSegmentID: UUID? = nil
+    /// 本场可选人物（快捷弹层列表）
+    var quickAssignSpeakers: [Speaker] = []
+    /// 弹层内当前已归属人物（用于勾选态展示）
+    var quickAssignCurrentSpeaker: ((TranscriptSegment) -> UUID?)? = nil
+    /// 打开弹层（工作台路由：同一时间只保留一个人物选择面板）
+    var onQuickAssignOpen: ((TranscriptSegment) -> Void)? = nil
+    var onQuickAssignPick: ((TranscriptSegment, Speaker) -> Void)? = nil
+    var onQuickAssignCreate: ((TranscriptSegment, String, String?) -> Void)? = nil
+    /// 清除归属（弹层“更多操作”，与指认具备同等撤销能力）
+    var onQuickAssignClear: ((TranscriptSegment) -> Void)? = nil
+    /// 从单条弹层进入批量模式（自动勾选当前句）
+    var onQuickAssignStartBatch: ((TranscriptSegment) -> Void)? = nil
+    var onQuickAssignDismiss: (() -> Void)? = nil
+
+    // MARK: 多选批量（计划 20261007 §三）
+
+    var isBatchMode: Bool = false
+    var selectedSegmentIds: Set<UUID> = []
+    var onToggleSelect: ((UUID, Bool) -> Void)? = nil
+    /// Shift 连续范围选择（锚点由工作台持有）
+    var onShiftSelect: ((UUID) -> Void)? = nil
+
     /// 是否贴底自动滚动
     @State private var pinnedToBottom = true
     @State private var pendingScrollTask: Task<Void, Never>?
@@ -135,19 +169,7 @@ struct TranscriptPanelView: View {
                             .padding(.top, 28)
                         }
                         ForEach(rows) { row in
-                            TranscriptRowView(row: row)
-                                .onTapGesture(count: 2) {
-                                    if let segment = segments.first(where: { $0.id == row.id }) {
-                                        onPlaySegment?(segment)
-                                    }
-                                }
-                                .contextMenu {
-                                    if let onPlaySegment,
-                                       let segment = segments.first(where: { $0.id == row.id }) {
-                                        Button("从此处回听") { onPlaySegment(segment) }
-                                    }
-                                    rowContextMenu(for: row)
-                                }
+                            assignRow(row)
                         }
                     }
                     .padding(.horizontal, 16)
@@ -174,6 +196,9 @@ struct TranscriptPanelView: View {
                     }
                 }
                 .onChange(of: segments.count) { _, _ in
+                    // 多选时暂停自动追随（计划 20261007 §三）：新到达的原话不自动入选，
+                    // 退出批量后由用户通过“回到最新”恢复跟随
+                    guard !isBatchMode else { return }
                     scrollToLatest(proxy: proxy)
                 }
                 .onChange(of: segments.last?.text) { _, _ in
@@ -275,8 +300,82 @@ struct TranscriptPanelView: View {
                 unknownDisplay: unknownSpeakerDisplay?(segment),
                 highlightedID: highlightedSegmentID,
                 sourceRecordingTitle: sourceRecordingTitle?(segment),
-                displayStartMs: sourceRecordingStartMs?(segment)
+                displayStartMs: sourceRecordingStartMs?(segment),
+                isBatchMode: isBatchMode,
+                isSelected: selectedSegmentIds.contains(segment.id)
             )
+        }
+    }
+
+    /// 行构造（拆出以控制类型检查复杂度）：批量状态、弹层锚点与手势隔离
+    @ViewBuilder
+    private func assignRow(_ row: TranscriptRowData) -> some View {
+        let segment = segments.first(where: { $0.id == row.id })
+        let showsButton = onQuickAssignPick != nil && segment != nil
+        TranscriptRowView(
+            row: row,
+            showsSpeakerButton: showsButton,
+            onSpeakerTap: segment.map { seg in { handleSpeakerAreaTap(seg) } },
+            onToggleSelect: segment.map { seg in
+                { onToggleSelect?(seg.id, !selectedSegmentIds.contains(seg.id)) }
+            }
+        )
+        .popover(
+            isPresented: quickAssignPopoverShown(for: row),
+            arrowEdge: .bottom
+        ) {
+            if let seg = segment {
+                QuickSpeakerAssignPopover(
+                    segment: seg,
+                    speakers: quickAssignSpeakers,
+                    currentSpeakerID: quickAssignCurrentSpeaker?(seg),
+                    onPick: { onQuickAssignPick?(seg, $0) },
+                    onCreate: { onQuickAssignCreate?(seg, $0, $1) },
+                    onClear: { onQuickAssignClear?(seg) },
+                    onStartBatch: { onQuickAssignStartBatch?(seg) }
+                )
+            }
+        }
+        .onTapGesture(count: 2) {
+            if let segment {
+                onPlaySegment?(segment)
+            }
+        }
+        .contextMenu {
+            if let onPlaySegment, let segment {
+                Button("从此处回听") { onPlaySegment(segment) }
+            }
+            rowContextMenu(for: row)
+        }
+    }
+
+    private func quickAssignPopoverShown(for row: TranscriptRowData) -> Binding<Bool> {
+        Binding(
+            get: { quickAssignSegmentID == row.id },
+            set: { shown in
+                if !shown, quickAssignSegmentID == row.id {
+                    onQuickAssignDismiss?()
+                }
+            }
+        )
+    }
+
+    /// 头像/姓名区域点击：批量模式下切换勾选（Shift 为连续范围），
+    /// 非批量模式下打开人物弹层（由工作台单一弹层路由持有）。
+    private func handleSpeakerAreaTap(_ segment: TranscriptSegment) {
+        if isBatchMode {
+            let useShift = NSEvent.modifierFlags.contains(.shift)
+            if useShift {
+                onShiftSelect?(segment.id)
+            } else {
+                onToggleSelect?(segment.id, !selectedSegmentIds.contains(segment.id))
+            }
+            return
+        }
+        if quickAssignSegmentID == segment.id {
+            onQuickAssignDismiss?()
+        } else {
+            onQuickAssignOpen?(segment)
         }
     }
 
@@ -364,6 +463,11 @@ struct TranscriptPanelView: View {
 /// 单个转写片段行（Equatable：row 未变则 body 零重建）
 struct TranscriptRowView: View, Equatable {
     let row: TranscriptRowData
+    /// 头像/姓名是否作为左键指认按钮（原话与标记页启用）
+    var showsSpeakerButton: Bool = false
+    var onSpeakerTap: (() -> Void)? = nil
+    /// 批量模式复选框点击
+    var onToggleSelect: (() -> Void)? = nil
 
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.row == rhs.row
@@ -371,16 +475,26 @@ struct TranscriptRowView: View, Equatable {
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            BWSpeakerDot(name: row.speakerName, color: speakerColor, size: 22)
+            if row.isBatchMode {
+                Button {
+                    onToggleSelect?()
+                } label: {
+                    Image(systemName: row.isSelected ? "checkmark.circle.fill" : "circle")
+                        .font(.body)
+                        .foregroundStyle(row.isSelected ? BWTheme.accent : .secondary)
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.plain)
+                .help(row.isSelected ? "取消勾选" : "勾选这一条")
+                .accessibilityLabel(row.isSelected ? "取消勾选这一条" : "勾选这一条")
+                .padding(.top, 1)
+            }
+            speakerArea
                 .padding(.top, 1)
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text(row.speakerName)
-                        .font(.caption)
-                        .fontWeight(.semibold)
-                        .foregroundStyle(speakerColor)
-                        .lineLimit(1)
+                    speakerLabel
                     Text(Self.formatMs(row.startMs))
                         .font(.caption2)
                         .monospacedDigit()
@@ -417,9 +531,80 @@ struct TranscriptRowView: View, Equatable {
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(
-            row.isHighlighted ? BWTheme.accent.opacity(0.14) : Color.clear,
+            rowBackground,
             in: RoundedRectangle(cornerRadius: 8)
         )
+    }
+
+    /// 选中底纹 > 证据高亮 > 无
+    private var rowBackground: Color {
+        if row.isSelected { return BWTheme.accent.opacity(0.10) }
+        if row.isHighlighted { return BWTheme.accent.opacity(0.14) }
+        return .clear
+    }
+
+    /// 头像：批量模式下是勾选区域；否则在启用指认的页面是弹层按钮
+    private var speakerArea: some View {
+        Group {
+            if showsSpeakerButton, !row.isBatchMode {
+                Button {
+                    onSpeakerTap?()
+                } label: {
+                    BWSpeakerDot(name: row.speakerName, color: speakerColor, size: 22)
+                        .frame(minWidth: 22, minHeight: 22)
+                }
+                .buttonStyle(.plain)
+                .help("指认说话人")
+                .accessibilityLabel("指认这句话的说话人")
+            } else if row.isBatchMode {
+                Button {
+                    onToggleSelect?()
+                } label: {
+                    BWSpeakerDot(name: row.speakerName, color: speakerColor, size: 22)
+                        .frame(minWidth: 22, minHeight: 22)
+                }
+                .buttonStyle(.plain)
+                .help(row.isSelected ? "取消勾选" : "勾选这一条")
+                .accessibilityLabel(row.isSelected ? "取消勾选这一条" : "勾选这一条")
+            } else {
+                BWSpeakerDot(name: row.speakerName, color: speakerColor, size: 22)
+            }
+        }
+    }
+
+    /// 姓名标签：启用指认时同为按钮；批量模式点击等同勾选
+    @ViewBuilder
+    private var speakerLabel: some View {
+        if showsSpeakerButton, !row.isBatchMode {
+            Button {
+                onSpeakerTap?()
+            } label: {
+                Text(row.speakerName)
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(speakerColor)
+                    .lineLimit(1)
+            }
+            .buttonStyle(.plain)
+            .help("指认说话人")
+        } else if row.isBatchMode {
+            Button {
+                onToggleSelect?()
+            } label: {
+                Text(row.speakerName)
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(speakerColor)
+                    .lineLimit(1)
+            }
+            .buttonStyle(.plain)
+        } else {
+            Text(row.speakerName)
+                .font(.caption)
+                .fontWeight(.semibold)
+                .foregroundStyle(speakerColor)
+                .lineLimit(1)
+        }
     }
 
     private var speakerColor: Color {
@@ -456,6 +641,145 @@ struct TranscriptRowView: View, Equatable {
     static func formatMs(_ ms: Int64) -> String {
         let totalSeconds = max(0, ms / 1000)
         return String(format: "%02d:%02d", totalSeconds / 60, totalSeconds % 60)
+    }
+}
+
+/// 左键快捷指认弹层（说话人左键指认计划 20261007 §二）：
+/// 一次点击打开、一次点击人物完成；注明“仅修改这一条”，
+/// 不同组回填、不学声纹、不启动整场回查。
+struct QuickSpeakerAssignPopover: View {
+    let segment: TranscriptSegment
+    let speakers: [Speaker]
+    let currentSpeakerID: UUID?
+    var onPick: (Speaker) -> Void
+    var onCreate: (String, String?) -> Void
+    /// 清除归属（更多操作；具备同等撤销能力）
+    var onClear: (() -> Void)? = nil
+    /// 进入多选批量（自动勾选当前句）
+    var onStartBatch: (() -> Void)? = nil
+
+    @State private var searchText = ""
+    @State private var newName = ""
+    @State private var newRole = ""
+    @Environment(\.dismiss) private var dismiss
+
+    private var filteredSpeakers: [Speaker] {
+        let query = searchText.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty else { return speakers }
+        return speakers.filter {
+            $0.displayName.localizedCaseInsensitiveContains(query)
+                || ($0.role ?? "").localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    private var trimmedName: String {
+        newName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("这句话是谁说的")
+                .font(.headline)
+            Text("仅修改这一条；原文：" + String(segment.text.prefix(60)))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if speakers.count > 6 {
+                TextField("按姓名或角色搜索", text: $searchText)
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.small)
+            }
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(filteredSpeakers) { speaker in
+                        Button {
+                            onPick(speaker)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: currentSpeakerID == speaker.id
+                                    ? "checkmark.circle.fill" : "circle")
+                                    .foregroundStyle(currentSpeakerID == speaker.id
+                                        ? BWTheme.accent : .secondary)
+                                    .font(.caption)
+                                BWSpeakerDot(name: speaker.displayName,
+                                             color: colorForToken(speaker.colorToken), size: 20)
+                                Text(speaker.displayName)
+                                    .font(.callout)
+                                if let role = speaker.role, !role.isEmpty {
+                                    Text(role)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                                Spacer()
+                                if speaker.voiceSamplePath != nil {
+                                    Image(systemName: "waveform")
+                                        .font(.caption)
+                                        .foregroundStyle(.green)
+                                        .help("已有声纹样本")
+                                }
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.vertical, 2)
+                    }
+                    if filteredSpeakers.isEmpty {
+                        Text("没有匹配的人物")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            }
+            .frame(maxHeight: 180)
+
+            Divider()
+
+            VStack(spacing: 6) {
+                TextField("新人物姓名（本场添加）", text: $newName)
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.small)
+                    .onSubmit(createIfValid)
+                TextField("角色 / 职位（可选）", text: $newRole)
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.small)
+                    .onSubmit(createIfValid)
+                Button("添加人物并指认") { createIfValid() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(trimmedName.isEmpty)
+            }
+
+            HStack(spacing: 10) {
+                if onStartBatch != nil {
+                    Button("选择多条后指认…") {
+                        onStartBatch?()
+                    }
+                    .controlSize(.small)
+                }
+                if onClear != nil, currentSpeakerID != nil {
+                    Button("清除归属", role: .destructive) {
+                        onClear?()
+                    }
+                    .controlSize(.small)
+                }
+                Spacer()
+                Button("取消") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                    .controlSize(.small)
+            }
+        }
+        .padding(14)
+        .frame(width: 300)
+    }
+
+    private func createIfValid() {
+        guard !trimmedName.isEmpty else { return }
+        let role = newRole.trimmingCharacters(in: .whitespacesAndNewlines)
+        onCreate(trimmedName, role.isEmpty ? nil : role)
     }
 }
 

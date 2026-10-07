@@ -156,8 +156,17 @@ final class DiarizationController {
                 confirmedAssignments[label, default: []].insert(participantID)
             }
         }
+        // 手工映射回灌必须仍有现存组级确认支持（计划 20261007 审查修复 4）：
+        // 否则把最后一个组级锚点改判/撤销后，label→旧人的派生缓存仍会残留，
+        // 让"仅这一条"的作用域在刷新后退回整组规则。
+        let groupAnchored = confirmedAssignments
+            .filter { $0.value.count == 1 }
+            .mapValues { $0.first! }
         let manual = mapper.manualAssignments.filter { validIDs.contains($0.value) }
-        rebuilt.restoreManualAssignments(manual.filter { confirmedAssignments[$0.key] == nil })
+        let supportedManual = manual
+            .filter { groupAnchored[$0.key] == $0.value }
+            .filter { confirmedAssignments[$0.key] == nil }
+        rebuilt.restoreManualAssignments(supportedManual)
         for (label, participants) in confirmedAssignments where participants.count == 1 {
             if let participantID = participants.first {
                 rebuilt.assign(remoteLabel: label, to: participantID)

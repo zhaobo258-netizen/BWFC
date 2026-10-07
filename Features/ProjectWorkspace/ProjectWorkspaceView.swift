@@ -210,6 +210,21 @@ struct ProjectWorkspaceView: View {
         .onChange(of: router.requestedFinalReportProjectID) { _, _ in
             openRequestedFinalReportIfNeeded()
         }
+        // 批量选择范围保护（计划 20261007 §三.60）：
+        // 人物筛选、原话/标记页切换或项目切换都会改变列表范围——
+        // 关闭弹层并清空选择，不保留不可见的勾选项。
+        .onChange(of: transcriptSpeakerFilter) { _, _ in
+            clearBatchSelectionIfAny()
+        }
+        .onChange(of: understandingPage) { _, _ in
+            clearBatchSelectionIfAny()
+        }
+        .onChange(of: projectID) { _, _ in
+            clearBatchSelectionIfAny()
+            exitBatchSelectMode()
+            quickAssignSegmentID = nil
+            lastAttributionUndo = nil
+        }
         .confirmationDialog("结束录音？", isPresented: $showEndConfirmation, titleVisibility: .visible) {
             Button("结束录音", role: .destructive) { finishRecording() }
             Button("取消", role: .cancel) {}
@@ -290,6 +305,12 @@ struct ProjectWorkspaceView: View {
                     }
                 )
             }
+        }
+        .sheet(item: $batchPickRequest) { request in
+            batchPickSheet(request)
+        }
+        .sheet(item: $batchPreview) { context in
+            batchPreviewSheet(context)
         }
         .sheet(isPresented: $showTranscriptReviewCandidates) {
             TranscriptReviewCandidatesSheet(
@@ -633,10 +654,204 @@ struct ProjectWorkspaceView: View {
                 sourceRecordingStartMs: { segment in
                     guard let project else { return segment.startMs }
                     return ProjectHomeSupport.sourceRelativeStartMs(for: segment, in: project)
+                },
+                quickAssignSegmentID: quickAssignSegmentID,
+                quickAssignSpeakers: project?.speakers ?? [],
+                quickAssignCurrentSpeaker: { segment in segment.participantId },
+                onQuickAssignOpen: { segment in
+                    guard !isBatchSelectMode else { return }
+                    quickAssignSegmentID = segment.id
+                },
+                onQuickAssignPick: { segment, speaker in
+                    quickAssignSegmentID = nil
+                    performQuickAssign(segment: segment, speaker: speaker)
+                },
+                onQuickAssignCreate: { segment, name, role in
+                    quickAssignSegmentID = nil
+                    createAndQuickAssign(segment: segment, name: name, role: role)
+                },
+                onQuickAssignClear: { segment in
+                    quickAssignSegmentID = nil
+                    clearAttribution(segment: segment)
+                },
+                onQuickAssignStartBatch: { segment in
+                    quickAssignSegmentID = nil
+                    enterBatchSelectMode(selecting: segment)
+                },
+                onQuickAssignDismiss: {
+                    quickAssignSegmentID = nil
+                },
+                isBatchMode: isBatchSelectMode,
+                selectedSegmentIds: batchSelectedSegmentIds,
+                onToggleSelect: { id, selected in
+                    toggleBatchSelection(id: id, selected: selected, segments: segments)
+                },
+                onShiftSelect: { id in
+                    shiftSelect(id: id, segments: segments)
                 }
             )
+            if isBatchSelectMode {
+                batchActionBar(segments: segments)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    /// 批量操作栏（计划 20261007 §三：已选 N 条 · 选择人物 · 清空选择 · 完成）
+    private func batchActionBar(segments: [TranscriptSegment]) -> some View {
+        HStack(spacing: 10) {
+            Text("已选 \(batchSelectedSegmentIds.count) 条")
+                .font(.callout)
+                .fontWeight(.medium)
+            Button("选择人物") {
+                guard !batchSelectedSegmentIds.isEmpty else { return }
+                batchPickRequest = BatchPickRequest(
+                    segmentIds: orderedSelectedIds(segments: segments)
+                )
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .disabled(batchSelectedSegmentIds.isEmpty)
+            Button("全选当前列表") {
+                // 只选当前筛选/标记页结果内的可操作语句（权威片段、非识别中），
+                // 含滚动区域外匹配行；人物相关保护在预览阶段逐条复核
+                let byID = Dictionary(
+                    uniqueKeysWithValues: (meeting?.segments ?? []).map { ($0.id, $0) }
+                )
+                let selectable = Set(segments.filter { segment in
+                    guard let authoritative = byID[segment.id] else { return false }
+                    return authoritative.state != .provisional
+                }.map(\.id))
+                batchSelectedSegmentIds = selectable
+                batchSelectionAnchorID = segments.last(where: { selectable.contains($0.id) })?.id
+            }
+            .controlSize(.small)
+            .help("只选择当前列表内的可操作语句；不等于全录音未确认发言")
+            Button("清空选择") {
+                batchSelectedSegmentIds.removeAll()
+                batchSelectionAnchorID = nil
+            }
+            .controlSize(.small)
+            .disabled(batchSelectedSegmentIds.isEmpty)
+            Spacer()
+            if let undo = lastAttributionUndo {
+                Button("撤销指认") { undoLastAttribution() }
+                    .controlSize(.small)
+            }
+            Button("完成") { exitBatchSelectMode() }
+                .controlSize(.small)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(BWTheme.accent.opacity(0.06))
+    }
+
+    /// 批量“选择人物”弹层（复用 SpeakerAssignSheet 列表与新建；无组级范围选项）
+    private func batchPickSheet(_ request: BatchPickRequest) -> some View {
+        Group {
+            if let project {
+                SpeakerAssignSheet(
+                    speakers: project.speakers,
+                    anchorText: "",
+                    isAnalysisItem: false,
+                    canAlsoAssignTranscript: false,
+                    mode: .batch(selectedCount: request.segmentIds.count),
+                    onPickExisting: { speaker, _, _ in
+                        openBatchPreview(speaker: speaker)
+                        return false
+                    },
+                    onCreate: { name, role, _, _ in
+                        createBatchSpeakerAndPreview(name: name, role: role, project: project)
+                    }
+                )
+            }
+        }
+    }
+
+    private func createBatchSpeakerAndPreview(
+        name: String,
+        role: String?,
+        project: Project
+    ) -> Bool {
+        guard let speaker = createSpeakerInProject(name: name, role: role, project: project) else {
+            return false
+        }
+        openBatchPreview(speaker: speaker)
+        return false
+    }
+
+    /// 批量范围预览弹层
+    private func batchPreviewSheet(_ context: BatchAssignPreviewContext) -> some View {
+        BatchAssignPreviewSheet(
+            context: context,
+            onCommit: {
+                commitBatchAssign()
+            },
+            onClose: { batchPreview = nil }
+        )
+    }
+
+    /// 已选语句按展示顺序排列（预览与撤销记录都按时间序）
+    private func orderedSelectedIds(segments: [TranscriptSegment]) -> [UUID] {
+        segments.map(\.id).filter { batchSelectedSegmentIds.contains($0) }
+    }
+
+    private func enterBatchSelectMode(selecting segment: TranscriptSegment? = nil) {
+        isBatchSelectMode = true
+        batchSelectedSegmentIds.removeAll()
+        batchSelectionAnchorID = nil
+        if let segment {
+            batchSelectedSegmentIds.insert(segment.id)
+            batchSelectionAnchorID = segment.id
+        }
+    }
+
+    private func exitBatchSelectMode() {
+        isBatchSelectMode = false
+        batchSelectedSegmentIds.removeAll()
+        batchSelectionAnchorID = nil
+        batchPickRequest = nil
+    }
+
+    /// 列表范围变化：只清除未提交的选择与弹层；批量模式本身保留，用户可重新勾选
+    private func clearBatchSelectionIfAny() {
+        quickAssignSegmentID = nil
+        batchPreview = nil
+        batchPickRequest = nil
+        if isBatchSelectMode, !batchSelectedSegmentIds.isEmpty {
+            batchSelectedSegmentIds.removeAll()
+            batchSelectionAnchorID = nil
+            reviewNotice = "列表范围已变化，已清空选择。"
+        }
+    }
+
+    private func toggleBatchSelection(id: UUID, selected: Bool, segments: [TranscriptSegment]) {
+        if selected {
+            batchSelectedSegmentIds.insert(id)
+            batchSelectionAnchorID = id
+        } else {
+            batchSelectedSegmentIds.remove(id)
+            if batchSelectionAnchorID == id {
+                batchSelectionAnchorID = nil
+            }
+        }
+    }
+
+    /// Shift 连续范围选择：从锚点到当前行（按当前展示顺序）
+    private func shiftSelect(id: UUID, segments: [TranscriptSegment]) {
+        let ordered = segments.map(\.id)
+        guard let anchor = batchSelectionAnchorID ?? ordered.first(where: { batchSelectedSegmentIds.contains($0) }),
+              let startIndex = ordered.firstIndex(where: { $0 == anchor }),
+              let endIndex = ordered.firstIndex(where: { $0 == id }) else {
+            batchSelectedSegmentIds.insert(id)
+            batchSelectionAnchorID = id
+            return
+        }
+        let range = startIndex...endIndex
+        for index in range where ordered[index] != id {
+            batchSelectedSegmentIds.insert(ordered[index])
+        }
+        batchSelectedSegmentIds.insert(id)
     }
 
     private func quotePageHeader(meeting: Meeting,
@@ -648,6 +863,27 @@ struct ProjectWorkspaceView: View {
                     .foregroundStyle(BWTheme.accent)
             } else {
                 Label("录音文稿", systemImage: "doc.text.magnifyingglass")
+            }
+            // 批量指认入口（计划 20261007 §三：原话页顶部入口）
+            if !isBatchSelectMode {
+                Button {
+                    enterBatchSelectMode()
+                } label: {
+                    Label("批量指认", systemImage: "checklist")
+                }
+                .controlSize(.small)
+                .disabled(allSegments.isEmpty)
+                .help("勾选多条原话后一次性指认给同一个人")
+            }
+            // 最近一次指认撤销（计划 20261007 §五：提示消失后仍能撤销）
+            if lastAttributionUndo != nil {
+                Button {
+                    undoLastAttribution()
+                } label: {
+                    Label("撤销指认", systemImage: "arrow.uturn.backward")
+                }
+                .controlSize(.small)
+                .help("撤销最近一次指认（仅当前工作台会话内保留）")
             }
             Spacer(minLength: 0)
             Menu {
@@ -697,6 +933,9 @@ struct ProjectWorkspaceView: View {
         .frame(minHeight: 40)
     }
 
+    /// 右键菜单的说话人修改：与左键快捷指认同一套明确范围规则（计划 20261007 §四.75）——
+    /// 只改这一条（句级确认），不同组回填、不学声纹、不启动整场回查；
+    /// 组级回填集中在“指认或批量标注…”高级入口。
     private func assignSpeakerFromTranscript(segment: TranscriptSegment,
                                              participant: Participant?) {
         guard let project else { return }
@@ -709,9 +948,19 @@ struct ProjectWorkspaceView: View {
             return
         }
         if let speaker = project.speakers.first(where: { $0.id == participant.id }) {
-            _ = performTranscriptSpeakerAssign(anchorSegmentId: segment.id, speaker: speaker)
+            // 单条显式改判：允许改判已确认给他人的这一句（用户直接点选的结果）
+            guard let meeting,
+                  let result = performExplicitSegmentAssign(
+                    segmentIds: [segment.id],
+                    speaker: speaker,
+                    kind: .single
+                  ) else { return }
+            reviewNotice = result.changed.isEmpty
+                ? "没有修改：\(result.skipped.first?.displayText ?? "已属于该人物")。"
+                : "已指认为 \(speaker.displayName) · 撤销"
         } else {
             MeetingTranscriptEditor.assignSpeaker(segment, to: participant)
+            segment.speakerConfirmationScope = .segment
             if let meeting {
                 persistAndRefresh(meeting)
                 analysis?.noteSpeakerContextChanged(segmentIDs: [segment.id])
@@ -2642,11 +2891,14 @@ struct ProjectWorkspaceView: View {
             var speakerWasUserConfirmed: Bool?
             var speakerAttributionConflict: Bool?
             var speakerConfirmationScope: SpeakerConfirmationScope?
+            var updatedAt: Date
         }
 
         enum Kind: Equatable {
             case single
             case batch
+            /// 清除归属（弹层"更多操作"）：撤销时校验"当前为已确认空归属"
+            case clear
         }
 
         var kind: Kind
@@ -2656,6 +2908,41 @@ struct ProjectWorkspaceView: View {
     }
 
     @State private var lastAttributionUndo: SpeakerAttributionUndo?
+    // 批量多选与快捷弹层状态（计划 20261007 §三；选择以片段 UUID 为准）
+    @State private var quickAssignSegmentID: UUID?
+    @State private var isBatchSelectMode = false
+    @State private var batchSelectedSegmentIds: Set<UUID> = []
+    @State private var batchSelectionAnchorID: UUID?
+    /// 批量“选择人物”弹层（复用 SpeakerAssignSheet 的列表与新建）
+    @State private var batchPickRequest: BatchPickRequest?
+    /// 批量范围预览弹层（保存预览时的可修改清单，提交时重新校验）
+    @State private var batchPreview: BatchAssignPreviewContext?
+
+    /// 批量选人物弹层的载体（sheet(item:)）
+    struct BatchPickRequest: Identifiable {
+        let id = UUID()
+        let segmentIds: [UUID]
+    }
+
+    /// 批量预览上下文：预览快照 + 目标人物；提交时用 expectedApplicable 拒绝过期预览
+    struct BatchAssignPreviewContext: Identifiable {
+        let id = UUID()
+        let speaker: Speaker
+        let segmentIds: [UUID]
+        let preview: SpeakerBackfill.Preview
+        let segmentSummaries: [SegmentSummary]
+        /// 预览时的边界与归属快照（提交时核对，拒绝过期预览）
+        var frozenBoundaries: [UUID: FrozenBoundary] = [:]
+
+        struct SegmentSummary: Identifiable, Equatable {
+            var id: UUID
+            var timeText: String
+            var text: String
+            var sourceTitle: String?
+            var isApplicable: Bool
+            var exclusionText: String?
+        }
+    }
 
     /// 指认范围预览（不修改模型）：给批量预览弹层与空提交说明用
     private func previewExplicitAssign(
@@ -2673,11 +2960,15 @@ struct ProjectWorkspaceView: View {
     ///   - expectedApplicable: 预览时确定的可修改清单；提交时重新校验，不一致拒绝使用过期预览
     ///   - kind: single / batch（撤销记录用途）
     /// - Returns: nil 表示保存失败（已完整回滚）；否则返回实际修改与跳过明细
+    /// 冻结预览边界（审查修复 3）：预览时每条候选的时间、来源、归属、作用域快照；
+    /// 提交时逐条核对，云端重切保留 UUID 或归属/作用域变化都会拒绝过期预览。
+    typealias FrozenBoundary = SpeakerAttributionUndo.Entry
+
     @discardableResult
     private func performExplicitSegmentAssign(
         segmentIds: [UUID],
         speaker: Speaker,
-        expectedApplicable: [UUID]? = nil,
+        expectedBoundaries: [UUID: FrozenBoundary]? = nil,
         kind: SpeakerAttributionUndo.Kind
     ) -> (changed: [UUID], skipped: [SpeakerBackfill.Exclusion])? {
         guard let project, let meeting else { return nil }
@@ -2687,13 +2978,32 @@ struct ProjectWorkspaceView: View {
             return nil
         }
         let segments = meeting.segments
+        // 单条快捷/右键改判允许改已确认给他人的这一句；批量保持保护
+        let allowOverride = kind == .single
         // 提交前重新校验存在性、状态、当前归属；预览后范围变化则拒绝过期预览
         let preview = SpeakerBackfill.previewExplicit(
-            segmentIds: segmentIds, to: speaker.id, segments: segments
+            segmentIds: segmentIds, to: speaker.id, segments: segments,
+            allowOverride: allowOverride
         )
-        if let expectedApplicable, expectedApplicable != preview.applicableSegmentIds {
-            operationError = "所选语句的范围已变化（可能已重新分段或归属已变化），请重新预览后再指认。"
-            return nil
+        if let expectedBoundaries {
+            guard Set(expectedBoundaries.keys) == Set(preview.applicableSegmentIds) else {
+                operationError = "所选语句的范围已变化（可能已重新分段或归属已变化），请重新预览后再指认。"
+                return nil
+            }
+            for id in preview.applicableSegmentIds {
+                guard let frozen = expectedBoundaries[id],
+                      let current = segments.first(where: { $0.id == id }),
+                      current.startMs == frozen.startMs,
+                      current.endMs == frozen.endMs,
+                      current.sourceAssetId == frozen.sourceAssetId,
+                      current.participantId == frozen.participantId,
+                      current.speakerWasUserConfirmed == frozen.speakerWasUserConfirmed,
+                      current.speakerAttributionConflict == frozen.speakerAttributionConflict,
+                      current.speakerConfirmationScope == frozen.speakerConfirmationScope else {
+                    operationError = "所选语句已重新分段或归属已变化，请重新预览后再指认。"
+                    return nil
+                }
+            }
         }
         if preview.applicableSegmentIds.isEmpty {
             let confirmedOther = preview.exclusions.filter {
@@ -2717,7 +3027,8 @@ struct ProjectWorkspaceView: View {
                 participantId: segment.participantId,
                 speakerWasUserConfirmed: segment.speakerWasUserConfirmed,
                 speakerAttributionConflict: segment.speakerAttributionConflict,
-                speakerConfirmationScope: segment.speakerConfirmationScope
+                speakerConfirmationScope: segment.speakerConfirmationScope,
+                updatedAt: segment.updatedAt
             )
         }
 
@@ -2725,13 +3036,26 @@ struct ProjectWorkspaceView: View {
             segmentIds: segmentIds, to: speaker.id, segments: segments
         )
         guard persistAndRefresh(meeting) else {
-            // 保存失败：完整恢复全部归属字段（约束 4），选择保留可重试
+            // 保存失败：applyRuntime 已把新值拷进 project.segments（权威内存），
+            // 必须同时还原两棵模型的全部归属字段与 updatedAt（审查修复 2）
             for segment in segments where entries[segment.id] != nil {
                 if let previous = entries[segment.id] {
                     segment.participantId = previous.participantId
                     segment.speakerWasUserConfirmed = previous.speakerWasUserConfirmed
                     segment.speakerAttributionConflict = previous.speakerAttributionConflict
                     segment.speakerConfirmationScope = previous.speakerConfirmationScope
+                    segment.updatedAt = previous.updatedAt
+                }
+            }
+            if let projectSegments = project.segments as [TranscriptSegment]? {
+                for segment in projectSegments where entries[segment.id] != nil {
+                    if let previous = entries[segment.id] {
+                        segment.participantId = previous.participantId
+                        segment.speakerWasUserConfirmed = previous.speakerWasUserConfirmed
+                        segment.speakerAttributionConflict = previous.speakerAttributionConflict
+                        segment.speakerConfirmationScope = previous.speakerConfirmationScope
+                        segment.updatedAt = previous.updatedAt
+                    }
                 }
             }
             transcription?.refreshSegments()
@@ -2766,7 +3090,8 @@ struct ProjectWorkspaceView: View {
                 participantId: segment.participantId,
                 speakerWasUserConfirmed: segment.speakerWasUserConfirmed,
                 speakerAttributionConflict: segment.speakerAttributionConflict,
-                speakerConfirmationScope: segment.speakerConfirmationScope
+                speakerConfirmationScope: segment.speakerConfirmationScope,
+                updatedAt: segment.updatedAt
             )
             // 时间/来源边界表明该句已重新分段：跳过
             guard segment.startMs == entry.startMs, segment.endMs == entry.endMs,
@@ -2774,10 +3099,20 @@ struct ProjectWorkspaceView: View {
                 skippedReasons.append("一条已重新分段，跳过")
                 continue
             }
-            // 归属后来再次变化（用户改判/旧任务覆盖）：不覆盖后来的决定
-            guard segment.participantId == record.speakerID,
-                  segment.speakerWasUserConfirmed == true,
-                  segment.speakerConfirmationScope == .segment else {
+            // 归属后来再次变化：不覆盖后来的决定。按操作类型核对"本次操作留下的状态"；
+            // 后续云端文字更新不改这些归属字段，不阻塞撤销。
+            let matchesPostOperationState: Bool
+            switch record.kind {
+            case .single, .batch:
+                matchesPostOperationState = segment.participantId == record.speakerID
+                    && segment.speakerWasUserConfirmed == true
+                    && segment.speakerConfirmationScope == .segment
+            case .clear:
+                matchesPostOperationState = segment.participantId == nil
+                    && segment.speakerWasUserConfirmed == true
+                    && segment.speakerConfirmationScope == .segment
+            }
+            guard matchesPostOperationState else {
                 skippedReasons.append("一条归属已再次变化，跳过")
                 continue
             }
@@ -2796,12 +3131,25 @@ struct ProjectWorkspaceView: View {
             return
         }
         guard persistAndRefresh(meeting) else {
+            // 撤销保存失败：同时还原两棵模型（applyRuntime 已拷贝）与 updatedAt
             for segment in segments where beforeUndo[segment.id] != nil {
                 if let state = beforeUndo[segment.id] {
                     segment.participantId = state.participantId
                     segment.speakerWasUserConfirmed = state.speakerWasUserConfirmed
                     segment.speakerAttributionConflict = state.speakerAttributionConflict
                     segment.speakerConfirmationScope = state.speakerConfirmationScope
+                    segment.updatedAt = state.updatedAt
+                }
+            }
+            if let project, let projectSegments = project.segments as [TranscriptSegment]? {
+                for segment in projectSegments where beforeUndo[segment.id] != nil {
+                    if let state = beforeUndo[segment.id] {
+                        segment.participantId = state.participantId
+                        segment.speakerWasUserConfirmed = state.speakerWasUserConfirmed
+                        segment.speakerAttributionConflict = state.speakerAttributionConflict
+                        segment.speakerConfirmationScope = state.speakerConfirmationScope
+                        segment.updatedAt = state.updatedAt
+                    }
                 }
             }
             transcription?.refreshSegments()
@@ -2815,6 +3163,196 @@ struct ProjectWorkspaceView: View {
         } else {
             reviewNotice = "已撤销 \(restored.count) 条；" + skippedReasons.joined(separator: "；") + "。"
         }
+    }
+
+    // MARK: - 快捷指认执行（单条；句级作用域，不同组回填）
+
+    private func performQuickAssign(segment: TranscriptSegment, speaker: Speaker) {
+        guard let meeting,
+              meeting.segments.contains(where: { $0.id == segment.id }) else {
+            operationError = "这句话还在识别中，等它定稿后再指认。"
+            return
+        }
+        guard let result = performExplicitSegmentAssign(
+            segmentIds: [segment.id],
+            speaker: speaker,
+            kind: .single
+        ) else { return }
+        if result.changed.isEmpty {
+            if let exclusion = result.skipped.first {
+                reviewNotice = "没有修改：\(exclusion.displayText)。"
+            }
+            return
+        }
+        reviewNotice = "已指认为 \(speaker.displayName) · 撤销"
+    }
+
+    /// 快捷弹层新建人物：复用既有人物/说话人协调入口，创建成功后立即指认当前句。
+    /// 创建成功但指认失败时分别说明，不伪报整体成功。
+    private func createAndQuickAssign(segment: TranscriptSegment, name: String, role: String?) {
+        guard let project, let meeting else { return }
+        guard let speaker = createSpeakerInProject(name: name, role: role, project: project) else { return }
+        guard meeting.segments.contains(where: { $0.id == segment.id }) else {
+            operationError = "人物已创建；但这句话还在识别中，定稿后请在人物列表中选择指认。"
+            return
+        }
+        guard let result = performExplicitSegmentAssign(
+            segmentIds: [segment.id],
+            speaker: speaker,
+            kind: .single
+        ) else {
+            operationError = "人物已创建并加入本场；但指认保存失败，请重新选择该人物指认。"
+            return
+        }
+        reviewNotice = result.changed.isEmpty
+            ? "人物已创建；没有修改归属（\(result.skipped.first?.displayText ?? "无需修改")）。"
+            : "已指认为 \(speaker.displayName) · 撤销"
+    }
+
+    /// 清除归属（快捷弹层“更多操作”）：记录可撤销，恢复时回到清除前状态
+    private func clearAttribution(segment: TranscriptSegment) {
+        guard let meeting,
+              let target = meeting.segments.first(where: { $0.id == segment.id }),
+              target.state != .provisional else {
+            operationError = "这句话还在识别中，定稿后再修改归属。"
+            return
+        }
+        // 记录清除前状态供撤销
+        let entries: [UUID: SpeakerAttributionUndo.Entry] = [
+            segment.id: SpeakerAttributionUndo.Entry(
+                startMs: target.startMs, endMs: target.endMs,
+                sourceAssetId: target.sourceAssetId,
+                participantId: target.participantId,
+                speakerWasUserConfirmed: target.speakerWasUserConfirmed,
+                speakerAttributionConflict: target.speakerAttributionConflict,
+                speakerConfirmationScope: target.speakerConfirmationScope,
+                updatedAt: target.updatedAt
+            )
+        ]
+        let previousState = (target.participantId, target.speakerWasUserConfirmed,
+                             target.speakerAttributionConflict,
+                             target.speakerConfirmationScope, target.updatedAt)
+        MeetingTranscriptEditor.clearSpeaker(target)
+        // clearSpeaker 会置 confirmed=true（“明确清空”也是人工决定）；scope 记为句级
+        target.speakerConfirmationScope = .segment
+        guard persistAndRefresh(meeting) else {
+            target.participantId = previousState.0
+            target.speakerWasUserConfirmed = previousState.1
+            target.speakerAttributionConflict = previousState.2
+            target.speakerConfirmationScope = previousState.3
+            target.updatedAt = previousState.4
+            transcription?.refreshSegments()
+            operationError = "清除归属未保存，请重试。"
+            return
+        }
+        lastAttributionUndo = SpeakerAttributionUndo(
+            kind: .clear, speakerID: previousState.0 ?? UUID(),
+            entries: entries, occurredAt: Date()
+        )
+        analysis?.noteSpeakerContextChanged(segmentIDs: [segment.id])
+        reviewNotice = "已清除这一条的归属 · 撤销"
+    }
+
+    /// 在本场创建说话人（复用人物协调入口；返回 nil 时已给出错误说明）
+    private func createSpeakerInProject(name: String, role: String?, project: Project) -> Speaker? {
+        let speaker = Speaker(
+            cloudAlias: SpeakerPanelLogic.nextCloudAlias(existing: project.speakers),
+            displayName: name,
+            role: role
+        )
+        project.speakers.append(speaker)
+        guard persistProject(fields: .speakers) else {
+            if let index = project.speakers.firstIndex(where: { $0.id == speaker.id }) {
+                project.speakers.remove(at: index)
+            }
+            operationError = "人物保存失败，未创建；请重试。"
+            return nil
+        }
+        return speaker
+    }
+
+    // MARK: - 批量选择人物与范围预览（计划 20261007 §三.4）
+
+    /// 批量模式选定人物后：预览实际范围（人物、选中数、可修改数、受保护数、逐条原因）
+    private func openBatchPreview(speaker: Speaker) {
+        guard let meeting else { return }
+        let ids = batchPickRequest?.segmentIds ?? orderedSelectedIds(segments: meeting.segments)
+        let preview = SpeakerBackfill.previewExplicit(
+            segmentIds: ids, to: speaker.id, segments: meeting.segments
+        )
+        var summaries: [BatchAssignPreviewContext.SegmentSummary] = []
+        let byID = Dictionary(uniqueKeysWithValues: meeting.segments.map { ($0.id, $0) })
+        let exclusionByID = Dictionary(uniqueKeysWithValues: preview.exclusions.map { ($0.segmentId, $0) })
+        for id in ids {
+            guard let segment = byID[id] else {
+                summaries.append(BatchAssignPreviewContext.SegmentSummary(
+                    id: id, timeText: "", text: "（片段已不存在）",
+                    sourceTitle: nil, isApplicable: false,
+                    exclusionText: SpeakerBackfill.Exclusion(
+                        segmentId: id, reason: .missingSegment
+                    ).displayText))
+                continue
+            }
+            let applicable = preview.applicableSegmentIds.contains(id)
+            summaries.append(BatchAssignPreviewContext.SegmentSummary(
+                id: id,
+                timeText: TranscriptRowView.formatMs(segment.startMs),
+                text: String(segment.text.prefix(80)),
+                sourceTitle: project.flatMap {
+                    ProjectHomeSupport.sourceRecording(for: segment, in: $0)?.title
+                },
+                isApplicable: applicable,
+                exclusionText: applicable ? nil : exclusionByID[id]?.displayText
+            ))
+        }
+        // 冻结预览边界：提交时逐条核对（重切/归属变化拒绝过期预览）
+        var frozen: [UUID: FrozenBoundary] = [:]
+        for id in preview.applicableSegmentIds {
+            if let segment = byID[id] {
+                frozen[id] = FrozenBoundary(
+                    startMs: segment.startMs, endMs: segment.endMs,
+                    sourceAssetId: segment.sourceAssetId,
+                    participantId: segment.participantId,
+                    speakerWasUserConfirmed: segment.speakerWasUserConfirmed,
+                    speakerAttributionConflict: segment.speakerAttributionConflict,
+                    speakerConfirmationScope: segment.speakerConfirmationScope,
+                    updatedAt: segment.updatedAt
+                )
+            }
+        }
+        batchPickRequest = nil
+        batchPreview = BatchAssignPreviewContext(
+            speaker: speaker, segmentIds: ids, preview: preview,
+            segmentSummaries: summaries, frozenBoundaries: frozen
+        )
+    }
+
+    /// 预览确认后一次提交（过期预览在 performExplicitSegmentAssign 内被拒绝）。
+    /// 返回 false 表示未提交（范围过期或保存失败），弹层保留并提示。
+    @discardableResult
+    private func commitBatchAssign() -> Bool {
+        guard let context = batchPreview, let speaker = project?.speakers.first(
+            where: { $0.id == context.speaker.id }
+        ) else { return false }
+        guard let result = performExplicitSegmentAssign(
+            segmentIds: context.segmentIds,
+            speaker: speaker,
+            expectedBoundaries: context.frozenBoundaries,
+            kind: .batch
+        ) else { return false }
+        batchPreview = nil
+        batchSelectedSegmentIds.removeAll()
+        batchSelectionAnchorID = nil
+        if result.changed.isEmpty {
+            let skippedCount = result.skipped.count
+            reviewNotice = "没有可修改的语句（\(skippedCount) 条排除，见预览原因）；不执行空提交。"
+            return true
+        }
+        let protectedCount = result.skipped.filter { $0.reason == .confirmedToOther }.count
+        reviewNotice = protectedCount > 0
+            ? "已将 \(result.changed.count) 条指认为 \(speaker.displayName)，另 \(protectedCount) 条保留原归属 · 撤销"
+            : "已将 \(result.changed.count) 条指认为 \(speaker.displayName) · 撤销"
+        return true
     }
 
     /// 指认落地：回填同标签历史片段 + 自动提取声纹 + 前向匹配。

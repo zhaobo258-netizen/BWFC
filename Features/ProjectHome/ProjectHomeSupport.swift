@@ -338,7 +338,10 @@ enum ProjectHomeSupport {
             languageCode: segment.languageCode,
             sourceAssetId: sourceProjectID,
             textWasUserEdited: segment.textWasUserEdited,
-            speakerWasUserConfirmed: segment.speakerWasUserConfirmed
+            speakerWasUserConfirmed: segment.speakerWasUserConfirmed,
+            // 归属审计字段随人工归属保护一起复制；缺失会把句级确认退回组级兼容语义
+            speakerAttributionConflict: segment.speakerAttributionConflict,
+            speakerConfirmationScope: segment.speakerConfirmationScope
         )
     }
 

@@ -1130,6 +1130,95 @@ final class ProjectStoreTests {
         #expect(segment.speakerConfidence == .high)
     }
 
+    @Test("撤销归属经真实 persist 落盘：确认→撤销回同一人后重读为未确认（审查修复 1）")
+    @MainActor
+    func undoAttributionPersistsThroughManualSegmentsMerge() throws {
+        let base = makeCaseDirectory("undo-attribution-persist")
+        let environment = AppEnvironment(
+            meetingStore: InMemoryMeetingStore(),
+            fileStore: MeetingFileStore(baseDirectory: base),
+            projectStore: try JSONProjectStore(directory: base),
+            credentialServiceName: "com.zhaobo.BangWoFenXi.tests.undo-attr-\(UUID().uuidString)"
+        )
+        let speakerID = UUID()
+        let project = Project(title: "撤销落盘", sourceType: .liveRecording)
+        project.speakers = [Speaker(id: speakerID, cloudAlias: "p_01", displayName: "甲")]
+        let segment = TranscriptSegment(startMs: 0, endMs: 1_000, text: "自动归属",
+            participantId: speakerID, source: .cloud, state: .final)
+        project.segments = [segment]
+        try environment.persist(project)
+
+        // 手工句级确认（自动 A → 确认 A，人物没变但 confirmed/scope 变化）
+        segment.speakerWasUserConfirmed = true
+        segment.speakerConfirmationScope = .segment
+        try environment.persist(project, fields: .manualSegments)
+        var stored = try #require(try environment.allProjects().first)
+        var storedSegment = try #require(stored.segments.first { $0.id == segment.id })
+        #expect(storedSegment.speakerWasUserConfirmed == true)
+        #expect(storedSegment.speakerConfirmationScope == .segment)
+
+        // 撤销：回到同一人物但未确认、无作用域——四项旧条件全不成立
+        segment.speakerWasUserConfirmed = nil
+        segment.speakerConfirmationScope = nil
+        try environment.persist(project, fields: .manualSegments)
+        stored = try #require(try environment.allProjects().first)
+        storedSegment = try #require(stored.segments.first { $0.id == segment.id })
+        #expect(storedSegment.speakerWasUserConfirmed == nil, "撤销必须落盘")
+        #expect(storedSegment.speakerConfirmationScope == nil, "作用域撤销必须落盘")
+
+        // 冲突标记变化同样落盘
+        segment.speakerAttributionConflict = true
+        try environment.persist(project, fields: .manualSegments)
+        stored = try #require(try environment.allProjects().first)
+        storedSegment = try #require(stored.segments.first { $0.id == segment.id })
+        #expect(storedSegment.speakerAttributionConflict == true)
+    }
+
+    @Test("合并录音复制句级作用域与冲突标记，重开不退回组级兼容语义（审查修复 5）")
+    @MainActor
+    func mergedRecordingCarriesScopeThroughCopyAndReload() throws {
+        let base = makeCaseDirectory("merge-scope-copy")
+        let environment = AppEnvironment(
+            meetingStore: InMemoryMeetingStore(),
+            fileStore: MeetingFileStore(baseDirectory: base),
+            projectStore: try JSONProjectStore(directory: base),
+            credentialServiceName: "com.zhaobo.BangWoFenXi.tests.merge-scope-\(UUID().uuidString)"
+        )
+        let source = Project(title: "来源录音", sourceType: .liveRecording)
+        let speaker = Speaker(cloudAlias: "p_01", displayName: "甲")
+        source.speakers = [speaker]
+        let segment = TranscriptSegment(startMs: 0, endMs: 1_000, text: "句级确认的片段",
+            participantId: speaker.id, source: .cloud, state: .final,
+            speakerWasUserConfirmed: true, speakerAttributionConflict: false,
+            speakerConfirmationScope: .segment)
+        source.segments = [segment]
+        source.status = .ready
+        try environment.persist(source)
+        // 合并入口要求至少两场录音且都有可用文稿；第二场给一条最终片段
+        let filler = Project(title: "第二场", sourceType: .liveRecording)
+        filler.status = .ready
+        filler.segments = [TranscriptSegment(startMs: 0, endMs: 1_000, text: "第二场的一句话",
+            source: .local, state: .final)]
+        try environment.persist(filler)
+        let combined = try ProjectHomeSupport.makeCombinedAnalysisProject(from: [source, filler])
+        try environment.persist(combined)
+        let stored = try #require(try environment.allProjects().first { $0.id == combined.id })
+        let copied = try #require(stored.segments.first { $0.text == "句级确认的片段" })
+        #expect(copied.speakerConfirmationScope == .segment, "合并复制不得退回组级兼容语义")
+        #expect(copied.speakerWasUserConfirmed == true)
+        #expect(copied.speakerAttributionConflict == false)
+        #expect(copied.participantId == copiedSpeakerID(in: stored, named: "甲"),
+                "复制后指向合并项目内的人物副本")
+        // 不反写来源录音
+        let sourceReloaded = try #require(try environment.allProjects().first { $0.id == source.id })
+        #expect(sourceReloaded.segments.first?.sourceAssetId == nil)
+    }
+
+    /// 合并项目里按姓名找人物副本 ID
+    private func copiedSpeakerID(in project: Project, named name: String) -> UUID? {
+        project.speakers.first { $0.displayName == name }?.id
+    }
+
     @Test("批量指认幂等解除冲突标记；原话行冲突显示后缀")
     @MainActor
     func speakerBackfillAndRowDisplayHandleConflict() {
