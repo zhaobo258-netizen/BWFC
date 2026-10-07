@@ -1532,82 +1532,6 @@ struct ProjectWorkspaceView: View {
         }
     }
 
-    private func transcriptColumn(meeting: Meeting) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            columnHeader("录音文稿")
-            if meeting.status != .recording && meeting.status != .paused && !isFinishing {
-                playbackBar
-            }
-            TranscriptPanelView(
-                // 控制器只反映本会话实时转写；只读回看与导入项目用已持久化片段
-                segments: (transcription?.segments.isEmpty ?? true) ? meeting.segments : (transcription?.segments ?? []),
-                participants: meeting.participants,
-                unknownSpeakerDisplay: { segment in
-                    guard segment.participantId == nil else { return nil }
-                    return diarization?.displayName(forRemoteLabel: segment.remoteSpeakerLabel)
-                },
-                highlightedSegmentID: highlightedSegmentID,
-                liveAudioLevel: meeting.status == .recording ? liveAudioLevel : nil,
-                emptyTitle: meeting.status == .recording ? "等待第一段发言" : "还没有可用文稿",
-                emptyDetail: meeting.status == .recording
-                    ? "开始说话后，实时转写会显示在这里"
-                    : "先回听原音频检查收音，再尝试重新转写。",
-                onPlaySegment: { segment in locateEvidence(segmentID: segment.id) },
-                onAssignSpeaker: { segment, participant in
-                    if let participant {
-                        if let speaker = project?.speakers.first(where: { $0.id == participant.id }) {
-                            _ = performTranscriptSpeakerAssign(
-                                anchorSegmentId: segment.id,
-                                speaker: speaker
-                            )
-                        } else {
-                            MeetingTranscriptEditor.assignSpeaker(segment, to: participant)
-                            persistAndRefresh(meeting)
-                            analysis?.noteSpeakerContextChanged(segmentIDs: [segment.id])
-                        }
-                    } else {
-                        MeetingTranscriptEditor.clearSpeaker(segment)
-                        persistAndRefresh(meeting)
-                        analysis?.noteSpeakerContextChanged(segmentIDs: [segment.id])
-                    }
-                },
-                onEditText: { segment, newText in
-                    MeetingTranscriptEditor.editText(segment, to: newText)
-                    persistAndRefresh(meeting)
-                    analysis?.noteSpeakerContextChanged(segmentIDs: [segment.id])
-                },
-                onToggleStar: { segment in
-                    MeetingTranscriptEditor.toggleStar(segment)
-                    persistAndRefresh(meeting)
-                },
-                onGlobalCorrect: { wrong, right in
-                    globalCorrect(wrong: wrong, right: right, meeting: meeting)
-                },
-                onRequestSpeakerAssignment: { segment in
-                    speakerAssignRequest = SpeakerAssignRequest(
-                        source: .transcript(segmentId: segment.id),
-                        anchorText: String(segment.text.prefix(80))
-                    )
-                },
-                sourceRecordingTitle: { segment in
-                    guard let project else { return nil }
-                    return ProjectHomeSupport.sourceRecording(
-                        for: segment,
-                        in: project
-                    )?.title
-                },
-                sourceRecordingStartMs: { segment in
-                    guard let project else { return segment.startMs }
-                    return ProjectHomeSupport.sourceRelativeStartMs(
-                        for: segment,
-                        in: project
-                    )
-                }
-            )
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-    }
-
     private func analysisColumn(meeting: Meeting) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(spacing: 7) {
@@ -1817,52 +1741,6 @@ struct ProjectWorkspaceView: View {
                 ? (project.scenario?.displayName ?? "未设置")
                 : "自动判断"
         )
-    }
-
-    private var noteColumn: some View {
-        Group {
-            if let projectAIChat, let project {
-                ProjectAIChatView(
-                    controller: projectAIChat,
-                    legacyNoteMarkdown: noteController?.markdown
-                        ?? project.note.markdown,
-                    legacyNoteContextEnabled: project.noteAIContextEnabled,
-                    canReanalyze: project.segments.contains {
-                        ($0.state == .final || $0.state == .edited)
-                            && !$0.text.trimmingCharacters(
-                                in: .whitespacesAndNewlines
-                            ).isEmpty
-                    },
-                    onLegacyNoteContextChanged: setNoteAIContextEnabled,
-                    onReanalyze: {
-                        Task { await analysis?.generateFinalAnalysis() }
-                    },
-                    onOpenSettings: router.showSettings,
-                    speechController: environment.answerSpeechController
-                )
-            } else {
-                ContentUnavailableView(
-                    "AI 共创笔记正在准备",
-                    systemImage: "bubble.left.and.text.bubble.right"
-                )
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-    }
-
-    private func columnHeader(_ title: String) -> some View {
-        HStack(spacing: 7) {
-            RoundedRectangle(cornerRadius: 1.5)
-                .fill(BWTheme.accent)
-                .frame(width: 3, height: 13)
-            Text(title)
-                .font(.subheadline)
-                .fontWeight(.semibold)
-            Spacer()
-        }
-        .padding(.horizontal, 16)
-        .frame(minHeight: 44)
-        .background(.bar)
     }
 
     // MARK: - 底部录音条（录音/暂停时始终可达：暂停 / 继续 / 标记 / 结束）
@@ -2369,6 +2247,7 @@ struct ProjectWorkspaceView: View {
                 try environment.persist(project, fields: .aiContext)
             }
         )
+        chatController.isObsidianAvailable = environment.obsidianVaultURL != nil
         chatController.noteContextProvider = { [weak noteController, weak project] in
             project?.note.combinedMarkdown(manualMarkdown: noteController?.markdown)
         }

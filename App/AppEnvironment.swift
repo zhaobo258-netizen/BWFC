@@ -876,6 +876,12 @@ final class AppEnvironment {
     /// 临时分片与队列状态）。导出文件由用户自行选择保存位置，不在应用目录内，
     /// 不产生需要清理的导出缓存。
     func deleteMeeting(_ meeting: Meeting) throws {
+        // 15 号计划 H.2：V1 迁移保留旧 Meeting id，V2 权威项目的音频复用同一目录。
+        // 同 ID 的 V2 项目仍存在时，旧界面删除会连带删掉权威录音——拒绝并指引工作台。
+        let projects = try projectStore.loadProjects()
+        if projects.contains(where: { $0.id == meeting.id }) {
+            throw ProjectWriteError.migratedProjectStillExists
+        }
         var meetings = try meetingStore.loadMeetings()
         meetings.removeAll { $0.id == meeting.id }
         try meetingStore.saveMeetings(meetings)
@@ -1222,11 +1228,15 @@ final class AppEnvironment {
 enum ProjectWriteError: LocalizedError {
     case storageUnavailable
     case projectDeleted
+    /// V1 旧入口要删除的会议已迁移为 V2 权威项目（15 号计划 H.2）
+    case migratedProjectStillExists
 
     var errorDescription: String? {
         switch self {
         case .storageUnavailable: return "存储位置不可用，请重新连接原知识库后重试。"
         case .projectDeleted: return "录音已删除，后台结果未保存。"
+        case .migratedProjectStillExists:
+            return "这份录音已迁移为权威项目数据；请在项目工作台删除项目，旧界面删除会连带删除同一份录音文件。"
         }
     }
 }

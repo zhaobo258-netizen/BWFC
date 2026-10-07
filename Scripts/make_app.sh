@@ -79,5 +79,19 @@ codesign --force --sign "$SIGNING_IDENTITY" --entitlements "$ROOT/Entitlements.p
 echo "==> 签名校验"
 codesign -dv "$APP_DIR" 2>&1 | sed 's/^/    /'
 
+# 构建清单（15 号计划 H.4）：精确源码 SHA 与产物 hash，不从文件时间猜构建来源
+{
+    echo "app_path=$APP_DIR"
+    echo "version=${APP_VERSION}"
+    echo "config=${CONFIG}"
+    echo "git_head=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "git_dirty=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+    echo "binary_sha256=$(shasum -a 256 "$APP_DIR/Contents/MacOS/${BINARY_NAME}" | awk '{print $1}')"
+    echo "engine_sha256=$(shasum -a 256 "$APP_DIR/Contents/MacOS/$ENGINE_NAME" | awk '{print $1}')"
+    echo "dylib_sha256_libsherpa=$(shasum -a 256 "$APP_DIR/Contents/Frameworks/libsherpa-onnx-c-api.dylib" | awk '{print $1}')"
+    echo "dylib_sha256_onnxruntime=$(shasum -a 256 "$APP_DIR/Contents/Frameworks/libonnxruntime.dylib" | awk '{print $1}')"
+    echo "signing_identity=$SIGNING_IDENTITY"
+} > "$ROOT/build/构建清单-v${APP_VERSION}.txt"
+echo "==> 构建清单：$ROOT/build/构建清单-v${APP_VERSION}.txt"
 echo "==> 完成：$APP_DIR"
 echo "    启动：open \"$APP_DIR\""

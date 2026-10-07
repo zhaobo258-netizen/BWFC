@@ -61,6 +61,34 @@ final class MeetingDeletionTests {
         #expect(!FileManager.default.fileExists(atPath: chunksDir.path))
     }
 
+    @Test("已迁移为 V2 权威项目的同 ID 会议拒绝旧入口删除，录音保留（15 号计划 H.2）")
+    func migratedProjectBlocksLegacyMeetingDeletion() throws {
+        // V1 迁移保留旧 Meeting id；V2 权威项目的音频复用同一相对路径（同一物理文件）
+        let meeting = Stage5Fixtures.makeCompletedMeeting()
+        try environment.persist(meeting)
+        let project = Project(id: meeting.id, title: "已迁移项目", sourceType: .liveRecording)
+        project.runtimeAssetRelativePath = meeting.audioRelativePath
+        try environment.persist(project)
+
+        let meetingDir = try fileStore.ensureMeetingDirectory(for: meeting.id)
+        let audioURL = meetingDir.appending(path: MeetingFileStore.recordingFileName)
+        try Data([0x01, 0x02]).write(to: audioURL)
+
+        // 旧界面删除入口：同 ID V2 项目存在时必须拒绝，且不动共享媒体
+        #expect(throws: ProjectWriteError.migratedProjectStillExists) {
+            try environment.deleteMeeting(meeting)
+        }
+        #expect(try environment.allMeetings().contains { $0.id == meeting.id })
+        #expect(try environment.allProjects().contains { $0.id == meeting.id })
+        #expect(FileManager.default.fileExists(atPath: audioURL.path))
+
+        // 权威项目删除后，旧入口恢复正常语义
+        try environment.deleteProject(project)
+        try environment.deleteMeeting(meeting)
+        #expect(try environment.allMeetings().isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: meetingDir.path))
+    }
+
     @Test("删除其中一场不影响其他会议")
     func deleteKeepsOthers() throws {
         let meetingA = Stage5Fixtures.makeCompletedMeeting()

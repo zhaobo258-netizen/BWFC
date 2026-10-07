@@ -69,12 +69,28 @@ swiftc -parse-as-library -swift-version 6 -O \
     -o "$APP_DIR/Contents/MacOS/$BINARY_NAME" \
     "${SOURCES[@]}"
 
+echo "==> 构建本地分人引擎（与 make_app.sh 同一装配来源；15 号计划 F15）"
+ENGINE_NAME="bangwo-local-diarization"
+ENGINE_SRC="$ROOT/Helpers/LocalDiarization"
+BWFX_ENGINE_RPATH="@executable_path/../Frameworks" \
+    BWFX_ENGINE_OUT="$ROOT/build/$ENGINE_NAME" \
+    bash "$ENGINE_SRC/build.sh"
+
 echo "==> 组装 .app"
-mkdir -p "$APP_DIR/Contents/Resources"
+mkdir -p "$APP_DIR/Contents/Resources" "$APP_DIR/Contents/Frameworks"
 cp "$INFO_PLIST" "$APP_DIR/Contents/Info.plist"
 cp "$ICON" "$APP_DIR/Contents/Resources/AppIcon.icns"
+cp "$ROOT/build/$ENGINE_NAME" "$APP_DIR/Contents/MacOS/$ENGINE_NAME"
+cp "$ROOT/build/engine-deps/lib/libsherpa-onnx-c-api.dylib" "$APP_DIR/Contents/Frameworks/" 2>/dev/null || \
+    { echo "错误：缺少引擎共享库（build/engine-deps/lib）" >&2; exit 1; }
+cp "$ROOT/build/engine-deps/lib/libonnxruntime.dylib" "$APP_DIR/Contents/Frameworks/"
 
 echo "==> 稳定身份签名：$SIGNING_IDENTITY"
+# 嵌套代码先签（与 make_app.sh 同序），外层再带 entitlements 签名
+codesign --force --sign "$SIGNING_IDENTITY" \
+    "$APP_DIR/Contents/Frameworks/libsherpa-onnx-c-api.dylib" \
+    "$APP_DIR/Contents/Frameworks/libonnxruntime.dylib"
+codesign --force --sign "$SIGNING_IDENTITY" "$APP_DIR/Contents/MacOS/$ENGINE_NAME"
 codesign --force --sign "$SIGNING_IDENTITY" \
     --entitlements "$ENTITLEMENTS" "$APP_DIR"
 
@@ -87,5 +103,20 @@ if ! grep -Fxq "Authority=$SIGNING_IDENTITY" "$BUILD_DIR/signature.txt"; then
     exit 1
 fi
 
+# 构建清单（15 号计划 H.4）：精确源码 SHA 与产物 hash，不从文件时间猜构建来源
+{
+    echo "app_path=$APP_DIR"
+    echo "version=${APP_VERSION}"
+    echo "build=${BUILD_NUM}"
+    echo "config=native-swiftc-release"
+    echo "git_head=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "git_dirty=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+    echo "binary_sha256=$(shasum -a 256 "$APP_DIR/Contents/MacOS/${BINARY_NAME}" | awk '{print $1}')"
+    echo "engine_sha256=$(shasum -a 256 "$APP_DIR/Contents/MacOS/$ENGINE_NAME" | awk '{print $1}')"
+    echo "dylib_sha256_libsherpa=$(shasum -a 256 "$APP_DIR/Contents/Frameworks/libsherpa-onnx-c-api.dylib" | awk '{print $1}')"
+    echo "dylib_sha256_onnxruntime=$(shasum -a 256 "$APP_DIR/Contents/Frameworks/libonnxruntime.dylib" | awk '{print $1}')"
+    echo "signing_identity=$SIGNING_IDENTITY"
+} > "$BUILD_DIR/构建清单-v${APP_VERSION}.txt"
+echo "==> 构建清单：$BUILD_DIR/构建清单-v${APP_VERSION}.txt"
 echo "完整 App 路径：$APP_DIR"
 echo "版本：${APP_VERSION}（build ${BUILD_NUM}）"
