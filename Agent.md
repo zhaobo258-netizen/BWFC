@@ -1,16 +1,17 @@
 # Agent.md — 给后续维护本项目的 AI 协作者
 
-> 你是《帮我分析》Mac App 的维护者。这是一个“对话记录与理解”工具（知识花园版）：本地录音/音视频导入 + Apple Speech 本地转写 + 可配置分析模型 + 实时/完整总结 + 多知识来源开花 + 项目制自适应工作台。V1 谈判版功能全部保留兼容。
-> 通用协作先读 [AGENTS.md](AGENTS.md)；本文件保留项目事实与维护约束，按当前任务读取相关章节；当前基础产品边界以 `../03_帮我分析_知识花园版_产品开发文档_20260722.md` 为准；后续人物库、业务记忆、CRM 与私人助理路线及本轮修复验收边界见 `../12_帮我分析_私人助理产品开发文档_20260905.md`（V1 历史见 `../01_…MVP开发实施计划.md`）；历史排查过程见 `开发日志.md`。
-> 当前本地版本：`v2.8.0 (20)`（2026-09-09）。A版原生双区、人物分层、逐轮AI来源快照、严格原话范围和笔记摘入恢复已实现；865项/97套件通过。正式 `/Applications/帮我分析.app` 已稳定签名、备份后原子更新并启动核验。36个项目、6位人物、4个声音档案及746个媒体文件保留；资料差异与真实使用边界见 `交付说明.md`。本轮未推送远端。
-> 03 号文档阶段 A–D 已本地实现；Obsidian 权威存储已接入，结构化项目页/block link 尚未落地。12 号文档中的独立人物库、需确认的业务记忆、轻 CRM 与回答朗读已形成可测试的本地闭环；专用硬件、持续语音对话和长期自主助理仍属后续路线。真实模型、外部 MCP、多人识别与录音硬件闭环仍待现场验收。
+《帮我分析》是录音知识工作台，当前包含 A 版双区、人物库、业务记忆、轻 CRM、回答朗读及项目对话 Obsidian 引用。旧 Meeting 路由保留兼容，不再定义产品主流程。
+
+通用协作先读 [AGENTS.md](AGENTS.md)。产品入口改为 [PRODUCT.md](PRODUCT.md)，功能与数据规则见其配套文档；当前代码差异和待验收项见[现状差异与验收](docs/product/现状差异与验收.md)。外层 03、12 号文档保留历史设计；13、14 号本地分人的人工确认、真实评测及分阶段授权继续有效，不能因代码已有入口就取消验收。
+
+版本、测试和安装事实统一在[交付说明](交付说明.md)维护，历史经过见[开发日志](开发日志.md)。本文件不再维护第二套“当前版本”与测试数量。2026-10-07 已记录暂缓正式 App 更新，后续统一发布仍按老板的新指令推进。
 
 ## 1. 环境现实（重要）
 
-- 本机**没有 Xcode**，只有 Command Line Tools（Swift 6.3.2，macOS 26.5.2，arm64）。`xcodebuild` 不可用。
+- 既有环境记录为 Apple Silicon、macOS 26、Swift 6 Command Line Tools，无完整 Xcode；开始构建时核对实际工具链。当前项目不依赖 `xcodebuild`。
 - 因此不是 Xcode 工程，而是 **SPM 可执行包 + 自制 .app 打包脚本**。不要尝试 `xcodebuild`，不要引入 xcodegen/tuist 依赖。
 - CLT 缺陷两条（已绕行，勿"修复"回退）：
-  1. 无 `SwiftDataMacros` 宏 → 模型是纯 Swift 类，持久化走 `MeetingStoring` 协议 + JSON 原子写入。装 Xcode 后可加回 `@Model` + SwiftData 实现，字段零改动。
+  1. 无 `SwiftDataMacros` 宏 → 模型是纯 Swift 类，持久化走 `ProjectStoring` / `MeetingStoring` 与人物、业务库的 JSON 原子写入。SwiftData 回迁属于未来单独评估，不能直接承诺零改动迁移。
   2. `swift test` 静默不执行 → **必须用 `Scripts/run_tests.sh` 跑测试**（它把源码+测试编入独立执行器真实执行）。
 
 ## 2. 常用命令
@@ -18,7 +19,7 @@
 ```bash
 cd /Users/zhaobo/系统软件开发/帮我分析-同声翻译/帮我分析
 swift build                 # 编译，要求 0 警告（Swift 6 严格并发）
-Scripts/run_tests.sh        # 全部测试（2026-09-05 最终 782 例/89 套件通过；BWFX_IT_MEDIA=1 另加媒体探针）
+Scripts/run_tests.sh        # 真实执行测试；BWFX_IT_MEDIA=1 另加媒体探针
 Scripts/make_app.sh         # 产出带版本后缀的 build/帮我分析-v<版本>.app（稳定本机身份签名）
 Scripts/soak_test.sh 3600 1 # 60 分钟录音稳定性（本版本未复跑，旧结果不代表本版本）
 ```
@@ -46,7 +47,7 @@ Models/     V2：Project（权威模型，analysisSnapshots/legacy* 兼容字段
             ProjectAIChat（背景纠正与项目问答，最多 60 条）、
             ProcessingJob、ArchiveState
             V1 保留：Meeting（运行时桥接用）、Participant、TranscriptSegment、AnalysisSnapshot、Insight
-Features/   ProjectHome / ProjectWorkspace（宽/紧凑/窄屏 + 四个 AI 页签）/
+Features/   ProjectHome / ProjectWorkspace（A 版双区、窄区切换 + 整体理解内四个页签）/
             ProjectImport（含 finalReport Job）/ People（人物库 Person 优先页）/
             BusinessProjects（轻 CRM 业务项目页）/ Settings（Root 弹层分类设置）；
             旧 MeetingList/LiveMeeting/MeetingReview 保留兼容
@@ -54,7 +55,7 @@ Core/
   Audio/        AVAudioEngine 采集、录音编排、回放、暂停时间轴、AnswerSpeech（回答朗读）
   Transcription/ SpeechTranscriber 封装、TranscriptReconciler（合并去重核心纯逻辑）
   Import/       AudioImportService（检查/提取）、FileTranscriptionRunner、ImportPlanner（Job 编排/续跑）
-  Diarization/  20s 分片、上传队列（持久化+退避）、OpenAI 兼容 diarize、SpeakerMapper
+  Diarization/  20s 分片、上传队列（持久化+退避）、OpenAI/火山/讯飞、本地整场实验引擎、SpeakerMapper
   Person/       PersonLibraryStore（persons.json + 人物关系事务/撤销/合并）、PersonMigration（首次档案迁移 + 失败回滚）、
                 BusinessProjectStore（business-projects.json + 归组建议）
   Analysis/     AIProviderRegistry（Kimi/OpenAI-compatible）、
@@ -66,7 +67,7 @@ Core/
   Persistence/  ProjectStore + MeetingStore（JSON 原子写）、ProjectMigration（V1→V2）、ProjectAssetRepair
   Security/     LocalCredentialStore、CloudAPIKeyStore（按 provider 分条目）、
                 KimiOAuth（设备码登录客户端 + 凭证存储 + actor 凭证提供者，自动刷新）
-  Logging/      OSLog + 脱敏；Export/ Markdown/JSON
+  Logging/      OSLog + 脱敏；Export/ V2 分项 Markdown 与音频，V1 保留 Markdown/JSON
 ```
 
 关键约定：
@@ -77,7 +78,7 @@ Core/
 - **Person 是人物身份真源**：`Speaker.personId` 跨录音关联；姓名不作合并键，声音样本是可选附件。合并保留主样本与 `additionalVoiceProfileIDs`，无声纹人物不受自动声纹候选数量限制。
 - 人物关联、合并、删除、“这是我”、元数据与声音附件变更通过共享协调入口同步人物库、录音、候选与业务项目；写失败回滚。撤销只恢复该次改动的字段，不覆盖后来新增的文稿、笔记或跟进结果；不能复活已删除录音或不存在的声音附件。
 - 人物迁移仅首次运行；源数据读取失败必须停止，不能 `try? load` 后用空库继续。备份成功后才迁移，人物与录音落盘成功后才写完成标记；后续新声纹走显式人物创建/关联入口，不能靠重启补写而复活已删除人物。
-- 业务记忆只有人工确认后才参与上下文，同时核验生效日期、人物/业务项目作用域与来源版本；`BusinessProject.id` 与录音 `Project.id` 不可混用。候选确认要重验当前证据与归属；来源或人物关系变化进入复核，拒绝的候选不能自动重建为有效记忆。
+- 业务记忆只有人工确认后才参与新轮次上下文，并核验生效日期、人物/业务项目作用域与来源版本；旧对话的快照重试会恢复当时资料，不能宣称每次重试都重验当前记忆；`BusinessProject.id` 与录音 `Project.id` 不可混用。候选确认要重验当前证据与归属；来源或人物关系变化进入复核，拒绝的候选不能自动重建为有效记忆。
 - 原 Vault 不可用时禁止在临时目录另写人物、业务项目或新录音。恢复入口只重新授权并验证原库，重启后接入；不把临时目录当作迁移来源。
 - Kimi/分人固定模型、网关、超时集中在 `Core/Analysis/CloudModelConfig.swift`；用户自定义分析模型只通过 `AIProviderConfigurationStore` 管理，视图和业务代码不得直接读取 Endpoint 或 Key。
 - 所有 AI 文本生成走 `AITextGenerationServing` / `AIProviderRegistry`；每次请求只读一次非敏感配置快照。凭证明文保存在当前 App 的 UserDefaults 域，设置中的保存与删除必须同步刷新配置状态，不得写入项目、日志或导出文件。
@@ -87,18 +88,18 @@ Core/
 - 项目对话中只有用户消息会作为后续实时分析/开花的背景，不能充当逐字稿证据。仅当用户本轮明确给出错词和正词、模型返回包含该错词的真实片段 ID，且 App 在当前逐字稿再次核验通过时，才可复用全局纠错链路修改逐字稿并加入后续转写规则；普通讨论、背景补充或 AI 猜测不得改写原稿。
 - 项目对话的联网搜索默认开启，每轮最多向搜索 Provider 发送两条、每条不超过 24 字的短检索词；逐字稿、笔记、引用文档和历史对话不得发送给搜索 Provider。网页摘要一律标记为不可信数据，回答只能引用当轮真实存在的 `web_N` 来源 ID。
 - 项目对话的 Obsidian 引用独立显式授权，默认关闭、切项目或重开工作台后关闭；连接 Vault 不等于笔记上云授权。仅读取原已授权 Vault 内 Markdown，每轮最多 6 篇 × 1,800 字，模型接收相对出处与片段；本机绝对路径只用于本地来源回链。新轮次先保存来源快照再请求模型，重试复用冻结资料；旧无快照消息不能借用当前开关新增检索。严格原话范围不检索知识库，不把部分检索说成读完全部资料。
-- 用户笔记默认不上云。`noteAIContextEnabled` 按项目授权后，项目对话、开花与完整总结在请求开始时读取编辑器最新文本（最多 20,000 字符）；不逐键上传，外部 MCP 仍只收最长 24 字短检索词。
+- 用户笔记默认不上云。`noteAIContextEnabled` 按项目授权后，新项目对话和开花读取编辑器最新文本，完整总结读取已保存笔记（最多 20,000 字符）；旧对话重试沿用原快照；不逐键上传，外部 MCP 仍只收最长 24 字短检索词。
 - 完整总结以完整逐字稿和分析证据账本为事实来源；用户主动发送的项目对话、AI 反馈和获授权的旧笔记只能进入独立的 `collaborationSummary`，必须标明不是录音事实，也不得查询互联网/MCP。
 - 所有耗时纯逻辑（分片规划、退避、合并去重、触发器、时间轴换算、Job 编排）都是可单测的值类型；AVFoundation/Speech 只做薄壳。
 
-## 4. 云端配置现状
+## 4. 服务配置与凭证边界
 
 | 用途 | Provider | 端点 | 凭证 |
 |---|---|---|---|
 | 实时分析/完整总结/项目对话/开花 | Kimi | `https://api.kimi.com/coding/v1/messages`（Kimi Code Anthropic 协议；默认 `k3-256k`，可选 `k3` / `kimi-for-coding`；K3 保持 thinking，max_tokens 32768，超时 240s） | **Kimi 账号登录（OAuth，推荐）**：本机明文条目 `kimi-oauth`；后备静态 API Key：条目 `kimi` |
 | 项目对话联网搜索 | Kimi Code Managed Search | `https://api.kimi.com/coding/v1/search`（`text_query`；仅短检索词）；失败时回退中文维基百科 | 复用 Kimi 账号登录凭证；不新增凭证条目 |
 | 当前统一分析模型（可选） | OpenAI-compatible | 用户配置的 HTTPS 或 localhost Base URL + `/chat/completions`，模型 ID 由用户填写 | 独立本机明文条目 `analysis-openai-compatible` |
-| 说话人识别 | OpenAI 兼容 | `POST /v1/audio/transcriptions`，`gpt-4o-transcribe-diarize` | `diarization`（当前**未配置**，灰态零请求） |
+| 说话人识别 | OpenAI 兼容 / 火山 / 讯飞 / 本地实验，另可关闭 | 具体能力与限制见[Provider 对照](docs/product/现状差异与验收.md)及 `Core/Diarization` | 云端各自独立凭证，本地引擎无 Key；本机是否已配置须另行核对 |
 | 外部知识来源 | 多个只读 Streamable HTTP MCP | 每个连接独立 Endpoint；先 `initialize` + `tools/list`，仅启用明确搜索/读取工具 | 每个连接独立 `knowledge-mcp.<UUID>`；旧单连接保留 `knowledge-mcp` |
 
 - **Kimi OAuth（2026-07-24 落地，替代旧 agent-gw 通道）**：
@@ -109,10 +110,10 @@ Core/
 - Kimi、OpenAI-compatible 分析、分人和每个 MCP 凭证**互不外借**；某 Provider 401 只暂停它自己。运行时存储域为 `com.zhaobo.BangWoFenXi.credentials.local.v1`，不读取或迁移旧钥匙串条目；升级后需在设置中重新登录或重新填写一次。
 - Kimi 无音频分人接口——这是已确认的能力缺口，不是 bug。接新分人 provider 时实现 `DiarizationServicing` 协议即可。
 - Kimi 网关无 JSON Schema 强制能力 → 系统提示词约束 + 本地严格解码（V1 `AnalysisSchema` / V2 `ConversationAnalysisSchema`）+ 证据存在性过滤兜底；不合规输出按 `invalidResponse` 丢弃并保留上一版。
-- 默认优先 `k3-256k`：与 K3 同一模型能力、256K 上下文且额度消耗约为 `k3` 1M 的一半；K3 权限不足的 401 必须显示“凭证或模型权限”，禁止静默切到 K2.7/K2.6。K3 不发送禁用 thinking 参数，缺省推理强度为 high。
+- 源码默认优先 `k3-256k`；模型能力与费用不由本仓文档作时效承诺。权限不足必须如实显示“凭证或模型权限”，禁止静默改投模型；请求参数以 `CloudModelConfig` 和当前 Provider 实现为准。
 - OpenAI-compatible 走标准 Chat Completions、本地严格 JSON 解码且禁止 HTTP 重定向；连接测试只发送 `ping` 最小探测，不发送项目数据。
 - MCP 只接受 HTTPS 或 localhost HTTP，禁止重定向；多候选只读工具必须由用户选择后再次测试。删除连接要同时删除独立 Token，但不得删除历史来源结果。
-- 真实延迟参考：10 分钟会议上下文，单次分析约 75–95 秒。不要在调度层假设 60 秒内返回。
+- 历史记录中的单次分析约 75–95 秒只作排障参考，不能作为当前延迟或服务承诺。调度触发间隔不等于模型完成时延。
 
 ## 5. 血泪教训（不要再踩）
 
@@ -142,13 +143,10 @@ Core/
 - 不做：翻译、回应建议/话术、测谎、情绪或心理诊断、敏感人格推断、账号体系、移动端/Windows、App Store 外发；允许基于真实发言证据生成可观察的表达与沟通画像。
 - 内部原型使用稳定本机签名，尚未公证、未外发；汇报分清"本地已做/本地已验证/远端已生效/客户可交付/真实使用已验证"。
 
-## 7. 当前版本与未决事项（接手先看）
+## 7. 当前接手路径
 
-1. `v2.7.2 (18)` 完成四项反馈修复：历史声音组编号恢复与批量指认；已登记人物声纹刷新、可靠身份补全及单次整场识别；开花取消复位和分阶段展示；基于原话的业务动机与替代解释。详情见 `交付说明.md`。
-2. 2026-09-05 最终本地验证：`swift build` 0 警告，`Scripts/run_tests.sh` 811 例 / 89 套件通过；稳定签名包通过 `codesign --verify --deep --strict`。不使用普通 `swift test` 的构建结果代替执行。
-3. 隔离原生 UI 已验证：人物编号、同组两条批量指认、两场人物身份显示、未连接服务提示、开花取消/重试/失败与AI先显示、动机四行窄列排版。使用生产视图和合成资料，不代表真实声纹准确率。
-4. 正式 `/Applications/帮我分析.app` v2.7.2 (18) 已启动，历史录音人物编号和识别入口可见；8 份权威 JSON 与 309 个媒体文件升级前后保持一致。Git 交付以任务回执及父目录 12 号文档 §13.7 的现场提交核对为准。
-5. 本版本真实短录音/音视频导入、真实 Kimi/OpenAI-compatible 请求、授权笔记开花、完整总结、多人声纹和外部 MCP 尚未完成现场验收。仅用获得授权的合成或专用测试资料，不以真实客户录音或笔记作探针。
-6. 专用硬件收音/外放、持续语音交互与自主执行不是当前已交付能力。现有朗读为用户点击后调用系统 TTS，可停止；人物记忆依赖可复核来源与人工确认，不是自动训练模型。
-7. 本版本未复跑 60 分钟稳定性与跨设备真实噪声场景。历史延迟约 75–95 秒/版，不能宣称达到 60 秒更新目标；设备格式变化、收音环境与多人重叠发言仍需专项验收。
-8. 装 Xcode 后才考虑 SwiftData/`swift test` 工具链回迁；当前保持 SPM、JSON 与独立测试执行器架构。
+1. 先核对 `git status`、当前提交与正在进行的工作；产品文档的代码基线不代替现场检查。
+2. 阅读[现状差异与验收](docs/product/现状差异与验收.md)，区分代码已接入、记录中的测试通过、真实效果待验收及未安装。特别保留本地分人自动门禁、候选确认、讯飞身份映射与收尾取消的差异。
+3. 正式包版本、构建清单、签名、源码绑定和安装验证分别核对，不能从显示名称、文件时间或同一版本号推断已安装最新改动。
+4. 真实录音重处理、正式安装、数据纠正及新增第三方上传沿用当前授权边界；不能用文档重构或旧测试记录替代授权。
+5. 如需验证，按变更选择 `Scripts/run_tests.sh` 与隔离原生 UI；真实资料、生产凭据和原 Vault 不作为默认探针。本地引擎保留独立进程及无 Python 运行时的架构。
