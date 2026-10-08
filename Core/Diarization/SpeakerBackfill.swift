@@ -164,7 +164,79 @@ enum SpeakerBackfill {
 
     // MARK: - 组级回填（高级入口保留）
 
+    struct GroupPlan: Equatable, Sendable {
+        /// 锚点来源录音（sourceAssetId）；普通录音为 nil。同组扩展不得跨来源。
+        var anchorSourceAssetId: UUID?
+        var remoteLabel: String?
+        /// 允许修改的片段（含锚点）
+        var applicableSegmentIds: [UUID]
+        var exclusions: [Exclusion]
+    }
+
+    /// 组级资格判定（计划 §四/约束 5；预览与执行共享同一判定）：
+    /// 锚点本身必改（用户直接点选）；同标签扩展与"本录音其余未确认"
+    /// 都限定在锚点同一来源录音内，不跨来源传播。
+    static func groupAssignmentPlan(
+        anchorSegmentId: UUID,
+        to speakerId: UUID,
+        segments: [TranscriptSegment],
+        includeAllUnconfirmed: Bool = false
+    ) -> GroupPlan? {
+        guard let anchor = segments.first(where: { $0.id == anchorSegmentId }) else { return nil }
+        let label = anchor.remoteSpeakerLabel
+        let anchorSource = anchor.sourceAssetId
+        var applicable: [UUID] = []
+        var exclusions: [Exclusion] = []
+        for segment in segments {
+            let isAnchor = segment.id == anchorSegmentId
+            let sameSource = segment.sourceAssetId == anchorSource
+            let sameLabel = label != nil && sameSource
+                && segment.remoteSpeakerLabel == label
+            let eligibleUnconfirmed = includeAllUnconfirmed && sameSource
+                && segment.speakerWasUserConfirmed != true
+                && (segment.state == .final || segment.state == .edited)
+            guard isAnchor || sameLabel || eligibleUnconfirmed else { continue }
+            if !isAnchor,
+               segment.speakerWasUserConfirmed == true,
+               segment.participantId != speakerId {
+                exclusions.append(Exclusion(segmentId: segment.id, reason: .confirmedToOther))
+                continue
+            }
+            if segment.participantId == speakerId,
+               segment.speakerWasUserConfirmed == true,
+               segment.speakerAttributionConflict != true {
+                exclusions.append(Exclusion(segmentId: segment.id, reason: .alreadySamePerson))
+                continue
+            }
+            applicable.append(segment.id)
+        }
+        return GroupPlan(
+            anchorSourceAssetId: anchorSource,
+            remoteLabel: label,
+            applicableSegmentIds: applicable,
+            exclusions: exclusions
+        )
+    }
+
+    /// 组级预览（纯计算，不修改模型）：按选定目标人物计算实际修改数与保护数
+    static func previewGroupAssign(
+        anchorSegmentId: UUID,
+        to speakerId: UUID,
+        segments: [TranscriptSegment],
+        includeAllUnconfirmed: Bool = false
+    ) -> (plan: GroupPlan, preview: Preview)? {
+        guard let plan = groupAssignmentPlan(
+            anchorSegmentId: anchorSegmentId, to: speakerId,
+            segments: segments, includeAllUnconfirmed: includeAllUnconfirmed
+        ) else { return nil }
+        return (plan, Preview(
+            applicableSegmentIds: plan.applicableSegmentIds,
+            exclusions: plan.exclusions
+        ))
+    }
+
     /// 把 anchor 片段指认为 speakerId，并回填同标签片段（组级确认，scope=.group）。
+    /// 同组扩展限定锚点同一来源录音（计划约束 5）；预览与执行共享 groupAssignmentPlan。
     /// - Returns: 修改与排除明细；anchor 已是该说话人时可能为空数组
     @discardableResult
     static func assign(
@@ -174,43 +246,26 @@ enum SpeakerBackfill {
         includeAllUnconfirmed: Bool = false,
         now: Date = Date()
     ) -> Outcome {
-        guard let anchor = segments.first(where: { $0.id == anchorSegmentId }) else {
+        guard let plan = groupAssignmentPlan(
+            anchorSegmentId: anchorSegmentId, to: speakerId,
+            segments: segments, includeAllUnconfirmed: includeAllUnconfirmed
+        ) else {
             return Outcome(changedSegmentIds: [], remoteLabel: nil, exclusions: [])
         }
-        let label = anchor.remoteSpeakerLabel
+        let applicable = Set(plan.applicableSegmentIds)
         var changed: [UUID] = []
-        var exclusions: [Exclusion] = []
-        for segment in segments {
-            let isAnchor = segment.id == anchorSegmentId
-            let sameLabel = label != nil && segment.remoteSpeakerLabel == label
-            let eligibleUnconfirmed = includeAllUnconfirmed
-                && segment.speakerWasUserConfirmed != true
-                && (segment.state == .final || segment.state == .edited)
-            guard isAnchor || sameLabel || eligibleUnconfirmed else { continue }
-            // 另一位用户明确确认过的片段不能被一次批量操作覆盖；锚点允许改判。
-            if !isAnchor,
-               segment.speakerWasUserConfirmed == true,
-               segment.participantId != speakerId {
-                exclusions.append(Exclusion(segmentId: segment.id, reason: .confirmedToOther))
-                continue
-            }
-            if segment.participantId != speakerId || segment.speakerWasUserConfirmed != true {
-                segment.participantId = speakerId
-                segment.speakerWasUserConfirmed = true
-                segment.speakerAttributionConflict = false
-                segment.speakerConfirmationScope = .group
-                segment.updatedAt = now
-                changed.append(segment.id)
-            } else if segment.speakerAttributionConflict == true {
-                // 幂等指认也解除历史冲突标记：人工确认优先
-                segment.speakerAttributionConflict = false
-                segment.speakerConfirmationScope = .group
-                segment.updatedAt = now
-                changed.append(segment.id)
-            } else {
-                exclusions.append(Exclusion(segmentId: segment.id, reason: .alreadySamePerson))
-            }
+        for segment in segments where applicable.contains(segment.id) {
+            segment.participantId = speakerId
+            segment.speakerWasUserConfirmed = true
+            segment.speakerAttributionConflict = false
+            segment.speakerConfirmationScope = .group
+            segment.updatedAt = now
+            changed.append(segment.id)
         }
-        return Outcome(changedSegmentIds: changed, remoteLabel: label, exclusions: exclusions)
+        return Outcome(
+            changedSegmentIds: changed,
+            remoteLabel: plan.remoteLabel,
+            exclusions: plan.exclusions
+        )
     }
 }

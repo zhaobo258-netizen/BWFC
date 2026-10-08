@@ -243,6 +243,13 @@ final class DiarizationController {
         kickProcessing()
     }
 
+    /// 成功指认/撤销/清除后的纯映射刷新（审查修复 B）：
+    /// 只重建派生映射，不读取、不恢复、不改写持久化队列——
+    /// 录音中有上传未返回时，活跃分片不得被改成失败展示。
+    func refreshSpeakerMapping() {
+        rebuildSpeakerMapper()
+    }
+
     /// 说话人列表变化后刷新映射（工作台「说话人」面板编辑后调用；
     /// 后续分片按新映射解析，已确认片段不回改）。
     /// 手工指认的标签映射跨重建保留（09 号计划需求 2）。

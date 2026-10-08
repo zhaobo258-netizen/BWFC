@@ -367,6 +367,67 @@ struct SpeakerAssignFlowTests {
         #expect(reasons[again.id] == .alreadySamePerson)
     }
 
+    @Test("高级组级回填不跨来源：合并项目两来源同标签只改锚点来源（审查修复 A）")
+    func groupAssignConfinedToAnchorSource() {
+        let me = UUID()
+        let sourceA = UUID()
+        let sourceB = UUID()
+        let label = "chunk:0:speaker_1"
+        let anchorA = TranscriptSegment(startMs: 0, endMs: 1_000, text: "A来源锚点",
+            participantId: nil, remoteSpeakerLabel: label, source: .cloud, state: .final)
+        anchorA.sourceAssetId = sourceA
+        let sameSource = TranscriptSegment(startMs: 1_000, endMs: 2_000, text: "A来源同组",
+            remoteSpeakerLabel: label, source: .cloud, state: .final)
+        sameSource.sourceAssetId = sourceA
+        let otherSourceSameLabel = TranscriptSegment(startMs: 2_000, endMs: 3_000, text: "B来源同标签",
+            remoteSpeakerLabel: label, source: .cloud, state: .final)
+        otherSourceSameLabel.sourceAssetId = sourceB
+        let otherUnconfirmed = TranscriptSegment(startMs: 3_000, endMs: 4_000, text: "B来源未确认",
+            source: .cloud, state: .final)
+        otherUnconfirmed.sourceAssetId = sourceB
+        let segments = [anchorA, sameSource, otherSourceSameLabel, otherUnconfirmed]
+
+        // 预览按选定目标算实际范围，不含 B 来源
+        let preview = SpeakerBackfill.previewGroupAssign(
+            anchorSegmentId: anchorA.id, to: me, segments: segments,
+            includeAllUnconfirmed: true)
+        #expect(preview != nil)
+        #expect(Set(preview!.plan.applicableSegmentIds) == Set([anchorA.id, sameSource.id]))
+        #expect(preview!.plan.anchorSourceAssetId == sourceA)
+        // 执行与预览一致；B 来源同标签/未确认一律不动
+        let outcome = SpeakerBackfill.assign(
+            anchorSegmentId: anchorA.id, to: me, segments: segments,
+            includeAllUnconfirmed: true)
+        #expect(outcome.changedSegmentIds == [anchorA.id, sameSource.id])
+        #expect(otherSourceSameLabel.participantId == nil)
+        #expect(otherUnconfirmed.participantId == nil)
+        #expect(otherSourceSameLabel.speakerConfirmationScope == nil)
+        #expect(anchorA.speakerConfirmationScope == .group)
+    }
+
+    @Test("组级预览按选定目标统计保护数，与执行排除一致")
+    func groupPreviewCountsProtectedByTarget() {
+        let target = UUID()
+        let other = UUID()
+        let anchor = TranscriptSegment(startMs: 0, endMs: 1_000, text: "锚点",
+            remoteSpeakerLabel: "chunk:0:speaker_1", source: .cloud, state: .final)
+        let confirmedToOther = TranscriptSegment(startMs: 1_000, endMs: 2_000, text: "已确认他人",
+            participantId: other, remoteSpeakerLabel: "chunk:0:speaker_1",
+            source: .cloud, state: .final, speakerWasUserConfirmed: true)
+        let alreadySame = TranscriptSegment(startMs: 2_000, endMs: 3_000, text: "已是目标",
+            participantId: target, remoteSpeakerLabel: "chunk:0:speaker_1",
+            source: .cloud, state: .final, speakerWasUserConfirmed: true)
+
+        let preview = SpeakerBackfill.previewGroupAssign(
+            anchorSegmentId: anchor.id, to: target, segments: [anchor, confirmedToOther, alreadySame])
+        #expect(preview?.preview.applicableSegmentIds == [anchor.id])
+        let reasons = Dictionary(uniqueKeysWithValues: preview!.preview.exclusions.map {
+            ($0.segmentId, $0.reason)
+        })
+        #expect(reasons[confirmedToOther.id] == .confirmedToOther)
+        #expect(reasons[alreadySame.id] == .alreadySamePerson)
+    }
+
     @Test("作用域字段随旧 JSON 缺省为 nil，新记录可往返")
     func scopeFieldBackwardCompatible() throws {
         let legacyJSON = """

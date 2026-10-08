@@ -461,6 +461,18 @@ final class AppEnvironment {
 
     /// 持久化是否不可用（初始化失败时降级为内存库并提示）
     let isPersistentStorageUnavailable: Bool
+    /// 测试钩子：模拟原 Vault 断开后保存失败，验证失败路径不静默。
+    /// 生产代码不调用；仅测试通过 markPersistentStorageUnavailableForTesting 注入。
+    private(set) var testForcedStorageUnavailable = false
+
+    /// 仅测试使用：开启后所有 persist 抛 storageUnavailable（恢复原 Vault 断开语义）
+    func markPersistentStorageUnavailableForTesting() {
+        testForcedStorageUnavailable = true
+    }
+    /// 仅测试使用：解除注入
+    func clearPersistentStorageUnavailableForTesting() {
+        testForcedStorageUnavailable = false
+    }
 
     init(
         meetingStore: any MeetingStoring,
@@ -909,6 +921,7 @@ final class AppEnvironment {
         fields: ProjectFieldOwnership = .all
     ) throws {
         guard !isPersistentStorageUnavailable else { throw ProjectWriteError.storageUnavailable }
+        if testForcedStorageUnavailable { throw ProjectWriteError.storageUnavailable }
         guard !deletedProjectIDs.contains(project.id) else { throw ProjectWriteError.projectDeleted }
         var projects = try projectStore.loadProjects()
         ProjectPersistence.upsert(project, into: &projects, fields: fields)

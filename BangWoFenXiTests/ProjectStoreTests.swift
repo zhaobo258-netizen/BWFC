@@ -1278,6 +1278,73 @@ final class ProjectStoreTests {
         }
     }
 
+    @Test("保存失败注入：指认落盘失败后磁盘与两棵模型均保持旧值（审查修复 2 生产路径）")
+    @MainActor
+    func persistFailureKeepsDiskAndModelsUntouched() throws {
+        let base = makeCaseDirectory("assign-persist-failure")
+        let environment = AppEnvironment(
+            meetingStore: InMemoryMeetingStore(),
+            fileStore: MeetingFileStore(baseDirectory: base),
+            projectStore: try JSONProjectStore(directory: base),
+            credentialServiceName: "com.zhaobo.BangWoFenXi.tests.assign-fail-\(UUID().uuidString)"
+        )
+        let speakerID = UUID()
+        let project = Project(title: "保存失败注入", sourceType: .liveRecording)
+        project.speakers = [Speaker(id: speakerID, cloudAlias: "p_01", displayName: "甲")]
+        let segment = TranscriptSegment(startMs: 0, endMs: 1_000, text: "注入片段",
+            source: .cloud, state: .final)
+        project.segments = [segment]
+        try environment.persist(project)
+
+        // 制造持久层不可用（原 Vault 断开的真实生产语义），指认保存必然失败
+        environment.markPersistentStorageUnavailableForTesting()
+        let newSpeaker = UUID()
+        segment.participantId = newSpeaker
+        segment.speakerWasUserConfirmed = true
+        segment.speakerConfirmationScope = .segment
+        segment.speakerAttributionConflict = false
+        segment.updatedAt = Date(timeIntervalSince1970: 800_000_000)
+
+        // 生产保存路径直接失败（不静默成功）
+        #expect(throws: ProjectWriteError.self) {
+            try environment.persist(project, fields: .manualSegments)
+        }
+        // 失败后磁盘保持旧值（不部分写入）
+        let stored = try #require(try environment.allProjects().first)
+        let storedSegment = try #require(stored.segments.first { $0.id == segment.id })
+        #expect(storedSegment.participantId == nil)
+        #expect(storedSegment.speakerWasUserConfirmed == nil)
+        #expect(storedSegment.speakerConfirmationScope == nil)
+        // 生产失败路径用 rollbackAttributionState 还原两棵模型后与磁盘一致
+        let entries: [UUID: ProjectWorkspaceView.SpeakerAttributionUndo.Entry] = [
+            segment.id: .init(
+                startMs: 0, endMs: 1_000, sourceAssetId: nil,
+                participantId: nil, speakerWasUserConfirmed: nil,
+                speakerAttributionConflict: nil, speakerConfirmationScope: nil,
+                updatedAt: segment.createdAt
+            )
+        ]
+        ProjectWorkspaceView.rollbackAttributionState(
+            entries: entries, meetingSegments: [segment], projectSegments: stored.segments
+        )
+        #expect(segment.participantId == nil)
+        #expect(segment.speakerWasUserConfirmed == nil)
+        #expect(segment.speakerConfirmationScope == nil)
+        #expect(segment.speakerAttributionConflict == nil)
+        #expect(segment.updatedAt == segment.createdAt)
+        // 解除注入后重新应用同一变更集（用户重试）→ 成功落盘
+        environment.clearPersistentStorageUnavailableForTesting()
+        segment.participantId = newSpeaker
+        segment.speakerWasUserConfirmed = true
+        segment.speakerConfirmationScope = .segment
+        segment.speakerAttributionConflict = false
+        try environment.persist(project, fields: .manualSegments)
+        let retried = try #require(try environment.allProjects().first)
+        let retriedSegment = try #require(retried.segments.first { $0.id == segment.id })
+        #expect(retriedSegment.participantId == newSpeaker)
+        #expect(retriedSegment.speakerConfirmationScope == .segment)
+    }
+
     @Test("冻结边界核对拒绝 UUID 保留但时间/来源/归属变化的重切片段（审查修复 3）")
     @MainActor
     func frozenBoundariesRejectResegmentedCarriedUUID() {

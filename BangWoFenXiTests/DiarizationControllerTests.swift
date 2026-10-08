@@ -748,6 +748,30 @@ final class DiarizationControllerTests {
         #expect(mockDiarization.calls.count == 1)
     }
 
+    @Test("纯映射刷新不改写队列：录音中 uploading 分片保持活跃（审查修复 B）")
+    func refreshSpeakerMappingKeepsActiveUploadState() async throws {
+        let store = ChunkQueueStore(fileURL: fileStore.chunkQueueFileURL(for: meeting.id))
+        // 模拟真实活跃上传：处理循环把条目置为 uploading 后被 mock 延迟挂住
+        mockDiarization.delayMs = 2_000
+        defer { mockDiarization.delayMs = 0 }
+        try await startAll()
+        controller.produceChunks(uptoAudioMs: 20_000)
+        await waitUntil { self.controller.queue.first?.status == .uploading }
+        #expect(controller.queue.first?.status == .uploading, "测试前置：活跃上传条目")
+        let diskBefore = try #require(store.load().first)
+        #expect(diskBefore.status == .uploading)
+
+        // 指认成功路径使用的纯映射刷新：内存与磁盘队列都不被改写
+        controller.refreshSpeakerMapping()
+        #expect(controller.queue.first?.status == .uploading)
+        let diskAfter = try #require(store.load().first)
+        #expect(diskAfter.status == .uploading, "磁盘队列同样不被改写")
+
+        controller.cancel()
+        mockDiarization.delayMs = 0
+        // attach 的 uploading→failed 崩溃恢复语义由 restartRecovery 单独覆盖
+    }
+
     @Test("组级锚点改判为句级后刷新，旧 label 映射不残留（审查修复 4）")
     func groupAnchorChangedToSegmentDropsStaleManualMapping() {
         let speakerA = meeting.participants[0]
