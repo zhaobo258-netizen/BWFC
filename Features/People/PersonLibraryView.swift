@@ -1,8 +1,8 @@
 import SwiftUI
 
-/// 独立人物库（产品文档 12 号 §5）。
-/// 人物优先：无声纹也能建人；声纹与表达画像放次级管理区。
-/// 旧「历史人物库（声纹档案）」保留为声音样本管理入口。
+/// 独立人物库（界面设计定稿 v1.0）：左列表（搜索/新建/人物行）+ 右详情
+/// （身份与操作、声音档案、背景与画像、关联录音、待确认事项、合并与删除）。
+/// 人物优先：无声纹也能建人；声纹与表达画像放次级区域；候选身份不得伪装成人工确认。
 struct PersonLibraryPage: View {
     @Environment(AppEnvironment.self) private var environment
     @Environment(AppRouter.self) private var router
@@ -13,40 +13,59 @@ struct PersonLibraryPage: View {
     @State private var errorMessage: String?
     @State private var isCreatingPerson = false
     @State private var isShowingVoiceManagement = false
-    @State private var isSelectingMergeTarget = false
+    @State private var search = ""
 
     private var selectedPerson: Person? {
         persons.first { $0.id == selectedPersonID }
     }
 
-    var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            HStack(spacing: 0) {
-                personList
-                    .frame(width: 260)
-                Divider()
-                Group {
-                    if let selectedPerson {
-                        PersonDetailPane(
-                            person: selectedPerson,
-                            projects: projects,
-                            onChanged: reload
-                        )
-                        .id(selectedPerson.id)
-                    } else {
-                        ContentUnavailableView(
-                            "选择或新建人物",
-                            systemImage: "person.crop.circle",
-                            description: Text("人物不需要声纹样本；从录音指认或手工关联后跨录音连续。")
-                        )
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
+    private var visiblePersons: [Person] {
+        let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return persons }
+        return persons.filter {
+            $0.displayName.localizedStandardContains(query)
+                || ($0.role?.localizedStandardContains(query) ?? false)
         }
-        .background(BWTheme.columnBackground.opacity(0.72))
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            listPane
+                .frame(width: 280)
+            Rectangle().fill(BWTheme.border).frame(width: 1)
+            Group {
+                if let selectedPerson {
+                    PersonDetailPane(
+                        person: selectedPerson,
+                        projects: projects,
+                        onChanged: reload,
+                        onOpenVoiceManagement: { isShowingVoiceManagement = true }
+                    )
+                    .id(selectedPerson.id)
+                } else {
+                    VStack(spacing: 10) {
+                        Image(systemName: "person.crop.circle")
+                            .font(.system(size: 28))
+                            .foregroundStyle(BWTheme.ink3)
+                        Text("选择或新建人物")
+                            .font(.system(size: BWTheme.fontSizeBody, weight: .medium))
+                            .foregroundStyle(BWTheme.ink2)
+                        Text("人物不需要声纹样本；从录音指认或手工关联后跨录音连续。")
+                            .font(.system(size: BWTheme.fontSizeLabel))
+                            .foregroundStyle(BWTheme.ink3)
+                            .multilineTextAlignment(.center)
+                        Button("＋ 新建人物") { isCreatingPerson = true }
+                            .buttonStyle(.borderedProminent)
+                            .tint(BWTheme.accentButton)
+                            .controlSize(.small)
+                    }
+                    .padding(32)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(BWTheme.canvas)
         .sheet(isPresented: $isCreatingPerson) {
             PersonCreateSheet { name, role, background in
                 createPerson(name: name, role: role, background: background)
@@ -62,79 +81,83 @@ struct PersonLibraryPage: View {
         .task { reload() }
     }
 
-    private var header: some View {
-        HStack(spacing: 10) {
-            Button {
-                router.showProjectHome()
-            } label: {
-                Label("返回", systemImage: "chevron.left")
-            }
-            Label("人物库", systemImage: "person.2")
-                .font(.headline)
-            Text("\(persons.count) 位人物")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Spacer()
-            if environment.personLibraryStore.canUndo {
-                Button {
-                    do {
-                        try environment.undoPersonChange()
-                        reload()
-                    } catch {
-                        errorMessage = "撤销失败：\(error.localizedDescription)"
-                    }
-                } label: {
-                    Label("撤销上次人物操作", systemImage: "arrow.uturn.backward")
-                }
-                .help("撤销最近一次指认、合并、修改或删除")
-            }
-            Button {
-                isShowingVoiceManagement = true
-            } label: {
-                Label("声音档案管理", systemImage: "waveform")
-            }
-            .help("声纹样本、自动带入与讯飞注册（可选能力）")
-            Button {
-                isCreatingPerson = true
-            } label: {
-                Label("新建人物", systemImage: "person.badge.plus")
-            }
-            .buttonStyle(.borderedProminent)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-    }
+    // MARK: - 左列：列表
 
-    private var personList: some View {
-        List(selection: Binding(
-            get: { selectedPersonID.map(OptionalSelection.person) },
-            set: { selection in
-                selectedPersonID = selection?.personID
+    private var listPane: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("人物库")
+                    .font(.system(size: BWTheme.fontSizeSectionTitle, weight: .semibold))
+                    .foregroundStyle(BWTheme.ink)
+                Spacer()
+                Button {
+                    isCreatingPerson = true
+                } label: {
+                    Text("＋ 新建人物")
+                        .font(.system(size: BWTheme.fontSizeLabel, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 12)
+                        .frame(height: BWTheme.minimumHitHeight)
+                        .background(BWTheme.accentButton, in: RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+                .help("新建人物：不需要声纹，名字也不是主键")
             }
-        )) {
-            ForEach(persons) { person in
-                PersonRow(person: person, projectCount: uniqueProjectCount(person))
-                    .tag(OptionalSelection.person(person.id))
+            .padding(.horizontal, 16)
+            .padding(.top, 16)
+            .padding(.bottom, 10)
+
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 12))
+                    .foregroundStyle(BWTheme.ink3)
+                TextField("搜索人物…", text: $search)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: BWTheme.fontSizeLabel))
+                    .foregroundStyle(BWTheme.ink)
             }
-        }
-        .listStyle(.sidebar)
-        .overlay(alignment: .bottom) {
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(BWTheme.panel, in: RoundedRectangle(cornerRadius: 9))
+            .overlay(
+                RoundedRectangle(cornerRadius: 9).strokeBorder(BWTheme.border, lineWidth: 1)
+            )
+            .padding(.horizontal, 16)
+            .padding(.bottom, 10)
+
+            ScrollView {
+                LazyVStack(spacing: 4) {
+                    ForEach(visiblePersons) { person in
+                        PersonRow(
+                            person: person,
+                            projectCount: uniqueProjectCount(person),
+                            isSelected: person.id == selectedPersonID
+                        ) {
+                            selectedPersonID = person.id
+                        }
+                    }
+                    if visiblePersons.isEmpty {
+                        Text(search.isEmpty
+                             ? "还没有人物。点右上角「新建人物」开始。"
+                             : "没有匹配的人物。")
+                            .font(.system(size: BWTheme.fontSizeDetail))
+                            .foregroundStyle(BWTheme.ink3)
+                            .padding(.vertical, 28)
+                    }
+                }
+                .padding(.horizontal, 10)
+            }
+
             if let errorMessage {
                 Text(errorMessage)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .padding(6)
-                    .background(.regularMaterial)
-                    .padding(6)
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(BWTheme.danger)
+                    .padding(8)
+                    .frame(maxWidth: .infinity)
+                    .background(BWTheme.panel)
             }
         }
-    }
-
-    private struct OptionalSelection: Hashable {
-        let personID: UUID
-        static func person(_ id: UUID) -> OptionalSelection {
-            OptionalSelection(personID: id)
-        }
+        .background(BWTheme.canvas)
     }
 
     private func uniqueProjectCount(_ person: Person) -> Int {
@@ -171,42 +194,63 @@ struct PersonLibraryPage: View {
     }
 }
 
+/// 人物行：头像点 + 姓名（我）+ 角色 + 声纹/无声纹标签 + 录音场数
 private struct PersonRow: View {
     let person: Person
     let projectCount: Int
+    let isSelected: Bool
+    let onSelect: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 6) {
-                if person.isCurrentUser {
-                    Image(systemName: "person.crop.circle.badge.checkmark")
-                        .foregroundStyle(BWTheme.accent)
+        Button(action: onSelect) {
+            HStack(spacing: 10) {
+                BWSpeakerDot(
+                    name: person.displayName,
+                    color: person.isCurrentUser ? BWTheme.evidence : BWTheme.accent,
+                    size: 32
+                )
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(person.displayName)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(BWTheme.ink)
+                            .lineLimit(1)
+                        if person.isCurrentUser {
+                            Text("我")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(BWTheme.evidence, in: RoundedRectangle(cornerRadius: 4))
+                        }
+                    }
+                    Text(person.role ?? "\(projectCount) 场录音")
+                        .font(.system(size: BWTheme.fontSizeDetail))
+                        .foregroundStyle(BWTheme.ink3)
+                        .lineLimit(1)
                 }
-                Text(person.displayName)
-                    .fontWeight(.medium)
-                if person.linkedVoiceProfileID == nil {
-                    Text("无声纹")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1)
-                        .background(Color.secondary.opacity(0.1), in: Capsule())
-                }
+                Spacer(minLength: 4)
+                Text(person.linkedVoiceProfileID != nil ? "声纹" : "无声纹")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(person.linkedVoiceProfileID != nil ? BWTheme.ok : BWTheme.ink3)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(
+                        person.linkedVoiceProfileID != nil
+                            ? BWTheme.okBg : BWTheme.sunken,
+                        in: RoundedRectangle(cornerRadius: 5)
+                    )
             }
-            HStack(spacing: 8) {
-                Text("\(projectCount) 场录音")
-                let active = person.activeMemories.count
-                let review = person.memoryEntries.filter { $0.status == .needsReview }.count
-                if active > 0 { Text("\(active) 条有效记忆") }
-                if review > 0 {
-                    Text("\(review) 条待复核")
-                        .foregroundStyle(.orange)
-                }
-            }
-            .font(.caption2)
-            .foregroundStyle(.secondary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 9)
+            .background(
+                isSelected ? BWTheme.accentSoft : Color.clear,
+                in: RoundedRectangle(cornerRadius: 9)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 9))
         }
-        .padding(.vertical, 2)
+        .buttonStyle(.plain)
+        .accessibilityLabel("人物 \(person.displayName)")
     }
 }
 
@@ -265,14 +309,17 @@ private struct PersonCreateSheet: View {
     }
 }
 
-/// 人物详情（12 号 §5.4：姓名与人工背景在上，交往、确认事项、待确认依次展示，
-/// 表达观察与声音样本在次级区域）。
+/// 人物详情（定稿版）：
+/// 身份头（含设为我/编辑/合并/撤销/删除）→ 声音档案 → 背景与画像 → 关联录音 → 待确认事项。
+/// 业务记忆管理保留在「背景与画像」区内；合并与删除移入身份头操作。
 struct PersonDetailPane: View {
     @Environment(AppEnvironment.self) private var environment
     @Environment(AppRouter.self) private var router
     let person: Person
     let projects: [Project]
     let onChanged: () -> Void
+    /// 打开声音档案管理（由列表页持有的 sheet 入口）
+    var onOpenVoiceManagement: () -> Void = {}
 
     @State private var editedBackground: String?
     @State private var isSelectingSpeaker = false
@@ -280,6 +327,7 @@ struct PersonDetailPane: View {
     @State private var actionError: String?
     @State private var isAddingMemory = false
     @State private var isEditingIdentity = false
+    @State private var isConfirmingDelete = false
     @State private var newMemoryText = ""
     @State private var supersededMemoryID: UUID?
 
@@ -287,18 +335,35 @@ struct PersonDetailPane: View {
         Dictionary(projects.map { ($0.id, $0.title) }, uniquingKeysWith: { first, _ in first })
     }
 
+    /// 待确认身份候选：录音中已关联到本人物、但归属尚未人工确认的说话人槽位
+    private var pendingIdentityLinks: [(project: Project, speaker: Speaker)] {
+        projects.flatMap { project in
+            project.speakers
+                .filter { $0.personId == person.id && !$0.isUserConfirmed }
+                .map { (project: project, speaker: $0) }
+        }
+    }
+
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                identitySection
-                memorySection
-                engagementSection
+            VStack(alignment: .leading, spacing: 20) {
+                identityHeader
+                if let actionError {
+                    Label(actionError, systemImage: "exclamationmark.triangle")
+                        .font(.system(size: BWTheme.fontSizeDetail))
+                        .foregroundStyle(BWTheme.danger)
+                }
                 voiceSection
-                dangerSection
+                backgroundSection
+                recordingsSection
+                pendingSection
             }
-            .padding(18)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 20)
+            .frame(maxWidth: 860)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(BWTheme.canvas)
         .sheet(isPresented: $isEditingIdentity) {
             PersonCreateSheet(initialPerson: person) { name, role, background in
                 do {
@@ -348,40 +413,163 @@ struct PersonDetailPane: View {
         } message: {
             Text("保存后作为人工背景使用，不作为录音原话。")
         }
+        .confirmationDialog(
+            "删除「\(person.displayName)」？",
+            isPresented: $isConfirmingDelete,
+            titleVisibility: .visible
+        ) {
+            Button("删除人物", role: .destructive) { deletePerson() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("仅解除人物与录音的关联；已确认的原话归属记录不受影响，声音样本在声音档案管理中另行处理。可在人物库页用「撤销」恢复最近一次操作。")
+        }
     }
 
-    // MARK: - 身份与人工背景
+    // MARK: - 身份头
 
-    private var identitySection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(person.displayName)
-                    .font(.title2)
-                    .fontWeight(.semibold)
-                if person.isCurrentUser {
-                    Label("这是我", systemImage: "person.crop.circle.badge.checkmark")
-                        .font(.caption)
-                        .foregroundStyle(BWTheme.accent)
+    private var identityHeader: some View {
+        HStack(alignment: .top, spacing: 14) {
+            BWSpeakerDot(
+                name: person.displayName,
+                color: person.isCurrentUser ? BWTheme.evidence : BWTheme.accent,
+                size: 44
+            )
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 8) {
+                    Text(person.displayName)
+                        .font(.system(size: 24, weight: .bold))
+                        .foregroundStyle(BWTheme.ink)
+                    if person.isCurrentUser {
+                        Text("我")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(BWTheme.evidence, in: RoundedRectangle(cornerRadius: 5))
+                    }
                 }
-                Spacer()
-                Button("编辑资料") { isEditingIdentity = true }
-                Toggle("这是我", isOn: Binding(
-                    get: { person.isCurrentUser },
-                    set: { newValue in setCurrentUser(newValue) }
-                ))
-                .toggleStyle(.checkbox)
-                .disabled(person.isCurrentUser)
+                Text([
+                    person.role,
+                    "关联 \(Set(person.speakerLinks.map(\.projectID)).count) 场录音"
+                ].compactMap { $0 }.joined(separator: " · "))
+                    .font(.system(size: BWTheme.fontSizeLabel))
+                    .foregroundStyle(BWTheme.ink2)
             }
-            if let role = person.role, !role.isEmpty {
-                Text(role)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+            Spacer(minLength: 10)
+            VStack(alignment: .trailing, spacing: 6) {
+                HStack(spacing: 8) {
+                    if !person.isCurrentUser {
+                        headerButton("设为我") { setCurrentUser(true) }
+                    }
+                    headerButton("编辑资料") { isEditingIdentity = true }
+                    headerButton("合并…") { isSelectingMergeTarget = true }
+                        .disabled(((try? environment.personLibraryStore.load()) ?? []).count < 2)
+                }
+                HStack(spacing: 8) {
+                    if environment.personLibraryStore.canUndo {
+                        headerButton("撤销上次人物操作") {
+                            do {
+                                try environment.undoPersonChange()
+                                onChanged()
+                            } catch {
+                                actionError = "撤销失败：\(error.localizedDescription)"
+                            }
+                        }
+                    }
+                    headerButton("删除", tint: BWTheme.danger) { isConfirmingDelete = true }
+                }
             }
+        }
+    }
+
+    private func headerButton(
+        _ title: String,
+        tint: Color = BWTheme.ink2,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(title, action: action)
+            .font(.system(size: BWTheme.fontSizeDetail, weight: .medium))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 12)
+            .frame(height: BWTheme.minimumHitHeight)
+            .background(BWTheme.panel, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8).strokeBorder(BWTheme.border, lineWidth: 1)
+            )
+            .buttonStyle(.plain)
+    }
+
+    // MARK: - 声音档案
+
+    private var voiceSection: some View {
+        sectionCard(
+            title: "声音档案",
+            moreTitle: "管理样本",
+            more: { onOpenVoiceManagement() }
+        ) {
+            if let profileID = person.linkedVoiceProfileID {
+                let profile = ((try? environment.speakerVoiceProfileStore.loadForManagement()) ?? [])
+                    .first { $0.id == profileID }
+                if let profile {
+                    HStack(spacing: 10) {
+                        Image(systemName: "waveform")
+                            .foregroundStyle(BWTheme.evidence)
+                        Text("样本 · \(profile.sampleDurationMs / 1_000) 秒")
+                            .font(.system(size: BWTheme.fontSizeLabel))
+                            .foregroundStyle(BWTheme.ink)
+                        Text("有效")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(BWTheme.ok)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(BWTheme.okBg, in: RoundedRectangle(cornerRadius: 5))
+                        if profile.isAutoEnabled {
+                            Text("自动带入新录音")
+                                .font(.system(size: 11))
+                                .foregroundStyle(BWTheme.accent)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(BWTheme.accentSoft, in: RoundedRectangle(cornerRadius: 5))
+                        }
+                        if profile.iflytekFeatureID != nil {
+                            Text("讯飞已注册")
+                                .font(.system(size: 11))
+                                .foregroundStyle(BWTheme.ok)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(BWTheme.okBg, in: RoundedRectangle(cornerRadius: 5))
+                        }
+                        Spacer()
+                    }
+                } else {
+                    Text("声纹档案记录缺失（样本可能已损坏）；人物不受影响。")
+                        .font(.system(size: BWTheme.fontSizeDetail))
+                        .foregroundStyle(BWTheme.ink2)
+                }
+            } else {
+                Text("这位人物没有声音样本；不影响建人、关联录音与业务记忆。")
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(BWTheme.ink2)
+            }
+            Text("声纹是可选附件，不是人物本身。自动认人结果均需人工确认，相似度低时保持匿名。")
+                .font(.system(size: BWTheme.fontSizeDetail))
+                .foregroundStyle(BWTheme.ink3)
+        }
+    }
+
+    // MARK: - 背景与画像（含业务记忆管理）
+
+    private var backgroundSection: some View {
+        sectionCard(
+            title: "背景与画像",
+            moreTitle: "编辑资料",
+            more: { isEditingIdentity = true }
+        ) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Text("人工背景")
-                        .font(.subheadline)
-                        .fontWeight(.semibold)
+                        .font(.system(size: BWTheme.fontSizeDetail, weight: .bold))
+                        .foregroundStyle(BWTheme.ink2)
                     Spacer()
                     if let edited = editedBackground, edited != (person.backgroundContext ?? "") {
                         Button("保存背景") { saveBackground(edited) }
@@ -394,45 +582,47 @@ struct PersonDetailPane: View {
                         set: { editedBackground = $0 }
                     )
                 )
-                .font(.callout)
+                .font(.system(size: BWTheme.fontSizeBody))
                 .frame(minHeight: 64)
                 .scrollContentBackground(.hidden)
-                .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+                .background(BWTheme.sunken.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
                 Text("人工背景是老板确认的长期信息，不冒充任何一场录音的原话。")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(BWTheme.ink3)
             }
+
+            memoryBlock
         }
     }
 
-    // MARK: - 记忆
-
-    private var memorySection: some View {
+    private var memoryBlock: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Label("业务记忆", systemImage: "brain.head.profile")
-                    .font(.subheadline)
-                    .fontWeight(.semibold)
+                Text("业务记忆")
+                    .font(.system(size: BWTheme.fontSizeDetail, weight: .bold))
+                    .foregroundStyle(BWTheme.ink2)
                 Text("有效 \(person.activeMemories.count) · 待复核 \(person.memoryEntries.filter { $0.status == .needsReview }.count)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(BWTheme.ink3)
+                Spacer()
+                Button {
+                    newMemoryText = ""
+                    supersededMemoryID = nil
+                    isAddingMemory = true
+                } label: {
+                    Label("手工添加", systemImage: "plus")
+                        .font(.system(size: BWTheme.fontSizeDetail))
+                }
+                .controlSize(.mini)
             }
             if person.memoryEntries.isEmpty {
-                Text("暂无记忆。录音结束后确认候选，或在此手工添加。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text("暂无记忆。录音结束后确认候选，或手工添加。")
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(BWTheme.ink3)
             }
             ForEach(person.memoryEntries.sorted { $0.createdAt > $1.createdAt }) { entry in
                 memoryRow(entry)
             }
-            Button {
-                newMemoryText = ""
-                supersededMemoryID = nil
-                isAddingMemory = true
-            } label: {
-                Label("手工添加记忆", systemImage: "plus")
-            }
-            .controlSize(.mini)
         }
     }
 
@@ -440,19 +630,20 @@ struct PersonDetailPane: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Text(entry.kind.displayName)
-                    .font(.caption2)
+                    .font(.system(size: 11))
                     .padding(.horizontal, 5)
                     .padding(.vertical, 2)
                     .background(
                         entry.status == .needsReview
-                            ? Color.orange.opacity(0.16)
-                            : BWTheme.accent.opacity(0.14),
+                            ? BWTheme.warnBg
+                            : BWTheme.accentSoft,
                         in: Capsule()
                     )
+                    .foregroundStyle(entry.status == .needsReview ? BWTheme.warn : BWTheme.accent)
                 Text(entry.status.displayName)
-                    .font(.caption2)
+                    .font(.system(size: 11))
                     .foregroundStyle(
-                        entry.status == .active ? BWTheme.accent : .secondary
+                        entry.status == .active ? BWTheme.accent : BWTheme.ink3
                     )
                 Spacer()
                 if entry.status == .active {
@@ -472,160 +663,160 @@ struct PersonDetailPane: View {
                         .controlSize(.mini)
                 }
             }
-            Text(entry.content).font(.callout)
+            Text(entry.content)
+                .font(.system(size: BWTheme.fontSizeBody))
+                .foregroundStyle(BWTheme.ink)
             Text("作用域：\(entry.scope.displayText)")
-                .font(.caption2).foregroundStyle(.secondary)
+                .font(.system(size: BWTheme.fontSizeDetail))
+                .foregroundStyle(BWTheme.ink3)
             if let reason = entry.reviewReason, entry.status == .needsReview {
                 Text("需复核原因：\(reason)")
-                    .font(.caption2)
-                    .foregroundStyle(.orange)
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(BWTheme.warn)
             }
             if let source = entry.source {
-                Text("来源：\(projectTitles[source.recordingID] ?? "已删除录音") · 更新 \(entry.updatedAt.formatted(date: .abbreviated, time: .shortened))")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                if projectTitles[source.recordingID] != nil {
-                    Button("查看来源原话") {
-                        router.showProjectWorkspace(source.recordingID, autoStart: false, evidenceSegmentID: source.segmentID)
+                HStack(spacing: 6) {
+                    Text("来源：\(projectTitles[source.recordingID] ?? "已删除录音") · 更新 \(entry.updatedAt.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.system(size: BWTheme.fontSizeDetail))
+                        .foregroundStyle(BWTheme.ink3)
+                    if projectTitles[source.recordingID] != nil {
+                        Button("查看来源原话") {
+                            router.showProjectWorkspace(source.recordingID, autoStart: false, evidenceSegmentID: source.segmentID)
+                        }
+                        .font(.system(size: BWTheme.fontSizeDetail))
+                        .foregroundStyle(BWTheme.evidence)
+                        .underline()
+                        .buttonStyle(.plain)
                     }
-                    .controlSize(.mini)
                 }
             } else {
                 Text(entry.isManuallyAuthored ? "来源：人工添加" : "来源：无（待确认）")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(BWTheme.ink3)
             }
-        }
-        .padding(9)
-        .background(Color.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
-    }
-
-    // MARK: - 交往
-
-    private var engagementSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Label("最近交往", systemImage: "clock.arrow.circlepath")
-                    .font(.subheadline)
-                    .fontWeight(.semibold)
-                Spacer()
-                Button {
-                    isSelectingSpeaker = true
-                } label: {
-                    Label("关联录音说话人", systemImage: "link")
-                }
-                .controlSize(.mini)
-                .help("把某场录音里的说话人槽位手工关联到这位人物（跨录音认人的手工方式）")
-            }
-            if person.speakerLinks.isEmpty {
-                Text("尚无关联录音。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            ForEach(person.speakerLinks.sorted { $0.linkedAt > $1.linkedAt }) { link in
-                HStack(spacing: 8) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(projectTitles[link.projectID] ?? "未知录音")
-                            .font(.callout)
-                        Text("说话人：\(link.speakerDisplayName) · 关联于 \(link.linkedAt.formatted(date: .abbreviated, time: .omitted))")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button("打开录音") {
-                        router.showProjectWorkspace(link.projectID, autoStart: false)
-                    }
-                    .controlSize(.mini)
-                    Button("解除关联") {
-                        unlinkSpeaker(link)
-                    }
-                    .controlSize(.mini)
-                }
-                .padding(8)
-                .background(Color.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
-            }
-        }
-    }
-
-    // MARK: - 声音样本（次级区域）
-
-    private var voiceSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Label("声音样本（可选）", systemImage: "waveform")
-                .font(.subheadline)
-                .fontWeight(.semibold)
-            if let profileID = person.linkedVoiceProfileID {
-                let profile = ((try? environment.speakerVoiceProfileStore.loadForManagement()) ?? [])
-                    .first { $0.id == profileID }
-                if let profile {
-                    HStack(spacing: 8) {
-                        Text("已挂接声纹：\(profile.sampleDurationMs / 1000) 秒样本")
-                            .font(.caption)
-                        if profile.isAutoEnabled {
-                            Text("自动带入新录音")
-                                .font(.caption2)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 2)
-                                .background(BWTheme.accent.opacity(0.12), in: Capsule())
-                        }
-                        if let featureID = profile.iflytekFeatureID {
-                            Text("讯飞已注册")
-                                .font(.caption2)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 2)
-                                .background(Color.green.opacity(0.14), in: Capsule())
-                                .help("讯飞 feature ID：\(featureID)")
-                        }
-                        Spacer()
-                    }
-                } else {
-                    Text("声纹档案记录缺失（样本可能已损坏）；人物不受影响。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            } else {
-                Text("这位人物没有声音样本；不影响建人、关联录音与业务记忆。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Text("试听、录制、讯飞注册等声音管理在「声音档案管理」中完成。")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
         }
         .padding(10)
-        .background(Color.secondary.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+        .background(BWTheme.sunken.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
     }
 
-    // MARK: - 合并与删除
+    // MARK: - 关联录音
 
-    private var dangerSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Label("合并与删除", systemImage: "square.stack.3d.up")
-                    .font(.subheadline)
-                    .fontWeight(.semibold)
-                Spacer()
-                Button {
-                    isSelectingMergeTarget = true
-                } label: {
-                    Label("合并另一位人物", systemImage: "arrow.triangle.merge")
-                }
-                .controlSize(.mini)
-                .disabled(((try? environment.personLibraryStore.load()) ?? []).count < 2)
-                Button("删除人物", role: .destructive) {
-                    deletePerson()
-                }
-                .controlSize(.mini)
+    private var recordingsSection: some View {
+        sectionCard(
+            title: "关联录音",
+            moreTitle: "关联说话人",
+            more: { isSelectingSpeaker = true }
+        ) {
+            if person.speakerLinks.isEmpty {
+                Text("尚无关联录音。把某场录音里的说话人槽位关联到这位人物后，会出现在这里。")
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(BWTheme.ink3)
             }
-            Text("同名不自动合并；合并前会展示关联录音、背景冲突与样本来源。删除人物仅解除关联，声音样本在声音档案管理中另行处理。")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            if let actionError {
-                Text(actionError)
-                    .font(.caption)
-                    .foregroundStyle(.red)
+            ForEach(person.speakerLinks.sorted { $0.linkedAt > $1.linkedAt }) { link in
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(projectTitles[link.projectID] ?? "未知录音")
+                            .font(.system(size: BWTheme.fontSizeBody, weight: .medium))
+                            .foregroundStyle(BWTheme.ink)
+                            .lineLimit(1)
+                        Text("说话人：\(link.speakerDisplayName) · 关联于 \(link.linkedAt.formatted(date: .abbreviated, time: .omitted))")
+                            .font(.system(size: BWTheme.fontSizeDetail))
+                            .foregroundStyle(BWTheme.ink3)
+                    }
+                    Spacer(minLength: 8)
+                    Button("打开") {
+                        router.showProjectWorkspace(link.projectID, autoStart: false)
+                    }
+                    .font(.system(size: BWTheme.fontSizeDetail, weight: .medium))
+                    .foregroundStyle(BWTheme.evidence)
+                    .underline()
+                    .buttonStyle(.plain)
+                    Button("解除") {
+                        unlinkSpeaker(link)
+                    }
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(BWTheme.ink3)
+                    .buttonStyle(.plain)
+                }
+                .padding(.vertical, 6)
             }
         }
+    }
+
+    // MARK: - 待确认事项
+
+    @ViewBuilder
+    private var pendingSection: some View {
+        let reviewMemories = person.memoryEntries.filter { $0.status == .needsReview }
+        if !pendingIdentityLinks.isEmpty || !reviewMemories.isEmpty {
+            sectionCard(title: "待确认事项", moreTitle: nil, more: nil) {
+                ForEach(pendingIdentityLinks, id: \.speaker.id) { item in
+                    HStack(spacing: 8) {
+                        Circle().fill(BWTheme.warn).frame(width: 7, height: 7)
+                        Text("「\(item.project.title)」的「\(item.speaker.displayName)」已关联本人物，但归属尚未人工确认")
+                            .font(.system(size: BWTheme.fontSizeLabel))
+                            .foregroundStyle(BWTheme.ink)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 8)
+                        Button("去确认") {
+                            router.showProjectWorkspace(item.project.id, autoStart: false)
+                        }
+                        .font(.system(size: BWTheme.fontSizeDetail, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 10)
+                        .frame(height: 26)
+                        .background(BWTheme.accentButton, in: RoundedRectangle(cornerRadius: 7))
+                        .buttonStyle(.plain)
+                    }
+                }
+                ForEach(reviewMemories) { entry in
+                    HStack(spacing: 8) {
+                        Circle().fill(BWTheme.warn).frame(width: 7, height: 7)
+                        Text("记忆待复核：\(entry.content)")
+                            .font(.system(size: BWTheme.fontSizeLabel))
+                            .foregroundStyle(BWTheme.ink)
+                            .lineLimit(2)
+                        Spacer(minLength: 8)
+                        Button("重新确认有效") { reactivateMemory(entry) }
+                            .controlSize(.mini)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - 区块容器
+
+    private func sectionCard<Content: View>(
+        title: String,
+        moreTitle: String?,
+        more: (() -> Void)?,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text(title)
+                    .font(.system(size: BWTheme.fontSizeSectionTitle, weight: .semibold))
+                    .foregroundStyle(BWTheme.ink)
+                Spacer()
+                if let moreTitle, let more {
+                    Button(moreTitle, action: more)
+                        .font(.system(size: BWTheme.fontSizeDetail, weight: .medium))
+                        .foregroundStyle(BWTheme.evidence)
+                        .underline()
+                        .buttonStyle(.plain)
+                }
+            }
+            VStack(alignment: .leading, spacing: 10) {
+                content()
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(BWTheme.panel, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12).strokeBorder(BWTheme.border, lineWidth: 1)
+        )
     }
 
     // MARK: - 操作
@@ -923,7 +1114,7 @@ struct PersonMergeSheet: View {
                     }
                 }
             }
-            Text("合并后可在人物库「撤销上次人物操作」恢复。")
+            Text("合并后可在人物库撤销最近一次人物操作恢复。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             HStack {

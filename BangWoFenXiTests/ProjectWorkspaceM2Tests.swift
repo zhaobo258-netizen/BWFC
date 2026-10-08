@@ -4,25 +4,27 @@ import Testing
 @testable import BangWoFenXi
 
 /// A 版双区布局边界（M2）：扣除常驻项目侧栏后按可用宽度判定双区/单区。
+/// 2026-10-08 定稿调整：左区最小 400→440，最小双区宽度 800→812（左440+右360+gap12），
+/// 800–811 的临界宽度按「最小值不满足提前转单区」走单区。
 @Suite("A版双区布局")
 final class WorkspaceZoneLayoutTests {
-    @Test("637 预览宽与不足双区下限走单区，960 起满足最小宽度走双区")
+    @Test("637 预览宽与不足双区下限走单区，812 起满足最小宽度走双区")
     func modeBoundaries() {
         #expect(WorkspaceDualZonePolicy.mode(for: 637) == .single)
         #expect(WorkspaceDualZonePolicy.mode(for: 799) == .single)
-        #expect(WorkspaceDualZonePolicy.mode(for: 800) == .dual)
+        // 定稿 v1.0：左最小 440，800 已放不下双区最小值
+        #expect(WorkspaceDualZonePolicy.mode(for: 800) == .single)
+        #expect(WorkspaceDualZonePolicy.mode(for: 812) == .dual)
         #expect(WorkspaceDualZonePolicy.mode(for: 960) == .dual)
     }
 
-    @Test("双区宽度满足左400右360且恒等：left + right + gap == usableWidth")
+    @Test("双区宽度满足左440右360且恒等：left + right + gap == usableWidth")
     func solveKeepsInvariantAndMinimums() {
-        for total: CGFloat in [800, 960, 1_024, 1_200] {
+        for total: CGFloat in [812, 960, 1_024, 1_200] {
             let widths = WorkspaceDualZonePolicy.solve(usableWidth: total)
             #expect(widths.left + widths.right + WorkspaceDualZonePolicy.gap == total)
-            if total >= 800 {
-                #expect(widths.left >= WorkspaceDualZonePolicy.leftMinimum)
-                #expect(widths.right >= WorkspaceDualZonePolicy.rightMinimum)
-            }
+            #expect(widths.left >= WorkspaceDualZonePolicy.leftMinimum)
+            #expect(widths.right >= WorkspaceDualZonePolicy.rightMinimum)
         }
         // 不足最小宽度也不产生负值
         let tiny = WorkspaceDualZonePolicy.solve(usableWidth: 637)

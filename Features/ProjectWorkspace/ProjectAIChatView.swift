@@ -581,11 +581,20 @@ struct ProjectAIChatView: View {
             }
             .padding(9)
             .background(
+                // 定稿：用户消息 accentSoft 底；AI 回复卡 replyBg 底 + 左 3pt accentLine 竖条
                 (message.role == .user
-                    ? BWTheme.accent.opacity(0.10)
-                    : Color.secondary.opacity(0.07)),
+                    ? BWTheme.accentSoft
+                    : BWTheme.replyBg),
                 in: RoundedRectangle(cornerRadius: 10)
             )
+            .overlay(alignment: .leading) {
+                if message.role == .assistant {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(BWTheme.accentLine)
+                        .frame(width: 3)
+                        .padding(.vertical, 8)
+                }
+            }
             if message.role == .assistant {
                 Spacer(minLength: 28)
             }

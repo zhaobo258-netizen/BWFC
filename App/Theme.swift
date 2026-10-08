@@ -1,37 +1,93 @@
 import SwiftUI
 import AppKit
 
-/// 《帮我分析》设计系统（参考得到系学习工具质感：纸感底色、暖橙主色、卡片化信息层级）。
+/// 《帮我分析》设计系统（界面设计定稿 v1.0，2026-10-08；沿用 A 版纸感/暖橙规范）。
 /// 所有颜色均为明暗双态动态色；视图统一经 bwCard() / BWBadge 等取用，不散落魔法值。
+/// Token 与《SwiftUI实现规格 v1.0》第一节一一对应；深色模式采用双 accent 方案：
+/// 强调文字/选中态提亮（accent #D97B45），按钮底色保持深橙（accentButton #B85A2E），
+/// 两者混用会导致按钮白字或强调文字对比度不达标，禁止互换。
 enum BWTheme {
-    // MARK: - 颜色
+    // MARK: - 颜色（定稿 Token）
 
-    /// 主强调色：暖橙
-    static let accent = Color(light: NSColor(srgbRed: 0.98, green: 0.45, blue: 0.12, alpha: 1),
-                              dark: NSColor(srgbRed: 1.00, green: 0.52, blue: 0.22, alpha: 1))
+    /// 工作台底色（画布）
+    static let canvas = Color(lightHex: 0xF5F4F0, darkHex: 0x1C1D1A)
+    /// 卡片/正文/弹层面板
+    static let panel = Color(lightHex: 0xFFFFFF, darkHex: 0x262724)
+    /// 下沉面（头像底、分隔块）
+    static let sunken = Color(lightHex: 0xEBE9E1, darkHex: 0x363732)
+
+    /// 主文字
+    static let ink = Color(lightHex: 0x252824, darkHex: 0xECEDE8)
+    /// 次文字
+    static let ink2 = Color(lightHex: 0x62665E, darkHex: 0xA8ABA0)
+    /// 三级文字
+    static let ink3 = Color(lightHex: 0x92958A, darkHex: 0x7C7F74)
+
+    /// 强调文字/选中态（深色下提亮）
+    static let accent = Color(lightHex: 0xA94B22, darkHex: 0xD97B45)
+    /// 强调软底（选中底/新内容标记）
+    static let accentSoft = Color(lightHex: 0xFAE7DC, darkHex: 0x3A291C)
+    /// 强调描边（卡片 hover、回复卡竖条）
+    static let accentLine = Color(lightHex: 0xE8A35C, darkHex: 0x8A5A34)
+    /// 主按钮底色（深色下保持深橙，白字对比度 4.6:1）
+    static let accentButton = Color(lightHex: 0xA94B22, darkHex: 0xB85A2E)
+
+    /// 依据链接（必带下划线）
+    static let evidence = Color(lightHex: 0x375F85, darkHex: 0x7BA3CC)
+
+    /// 推测卡底色（必带文字标签，颜色不单独承担语义）
+    static let inferBg = Color(lightHex: 0xFFF8EF, darkHex: 0x33291D)
+    /// 推测标签底色
+    static let inferTag = Color(lightHex: 0xF5E4CB, darkHex: 0x4A3A24)
+    /// 推测标签/文字
+    static let inferInk = Color(lightHex: 0x8F5A14, darkHex: 0xD9A85C)
+
+    /// 内容分隔线
+    static let border = Color(lightHex: 0xDEDED5, darkHex: 0x3B3C36)
+
+    /// 状态语义三色
+    static let ok = Color(lightHex: 0x2E7D52, darkHex: 0x63B487)
+    static let warn = Color(lightHex: 0xB26A1B, darkHex: 0xD9A05B)
+    static let danger = Color(lightHex: 0xB3402E, darkHex: 0xE07A5F)
+
+    /// 状态浅底（chip/徽章底色，深浅分别实测）
+    static let okBg = Color(lightHex: 0xE3EFE7, darkHex: 0x223A2C)
+    static let warnBg = Color(lightHex: 0xFDF6EC, darkHex: 0x33291D)
+    static let dangerBg = Color(lightHex: 0xFBEFEA, darkHex: 0x3D2420)
+    static let runBg = Color(lightHex: 0xEAF0F6, darkHex: 0x22303C)
+
+    /// AI 回复卡底色（左 3pt accentLine 竖条）
+    static let replyBg = Color(lightHex: 0xFFF9F1, darkHex: 0x2E2820)
+    /// 录音中 LIVE 红点/徽标（两态同色）
+    static let liveRed = Color(lightHex: 0xD64B33, darkHex: 0xD64B33)
+    /// 星标原话高亮（文本底部 62% 高亮带）
+    static let starMark = Color(lightHex: 0xFCE9B8, darkHex: 0x5C4A20)
+
+    // MARK: - 旧 Token 兼容映射（已按定稿值重定向，逐步收敛到新命名）
+
     /// 主强调色的深端（渐变用）
-    static let accentDeep = Color(light: NSColor(srgbRed: 0.92, green: 0.33, blue: 0.06, alpha: 1),
-                                  dark: NSColor(srgbRed: 0.95, green: 0.40, blue: 0.10, alpha: 1))
-    /// 纸感底色（窗口背景）
-    static let paper = Color(light: NSColor(srgbRed: 0.972, green: 0.960, blue: 0.937, alpha: 1),
-                             dark: NSColor(srgbRed: 0.118, green: 0.110, blue: 0.102, alpha: 1))
-    /// 卡片底色
-    static let card = Color(light: NSColor.white,
-                            dark: NSColor(srgbRed: 0.165, green: 0.157, blue: 0.149, alpha: 1))
-    /// 卡片描边
-    static let cardStroke = Color(light: NSColor(white: 0, alpha: 0.07),
-                                  dark: NSColor(white: 1, alpha: 0.09))
-    /// 栏背景（工作台左右栏的轻微区分）
-    static let columnBackground = Color(light: NSColor(srgbRed: 0.984, green: 0.976, blue: 0.960, alpha: 1),
-                                        dark: NSColor(srgbRed: 0.133, green: 0.125, blue: 0.118, alpha: 1))
+    static let accentDeep = Color(lightHex: 0x8A3A1B, darkHex: 0xC96B38)
+    /// 纸感底色（窗口背景）→ canvas
+    static let paper = canvas
+    /// 卡片底色 → panel
+    static let card = panel
+    /// 卡片描边 → border
+    static let cardStroke = border
+    /// 栏背景 → canvas
+    static let columnBackground = canvas
 
-    /// 主按钮渐变（得到系橙）
+    /// 主按钮渐变（品牌标等少数装饰位保留）
     static var accentGradient: LinearGradient {
-        LinearGradient(colors: [accent, accentDeep],
+        LinearGradient(colors: [accentButton, accentDeep],
                        startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 
-    // MARK: - 语义尺寸（A 版 M2：正文 14–16pt，辅助/来源 ≥12pt，命中区 ≥32pt）
+    // MARK: - 语义尺寸（定稿：正文 14 起、辅助 12–13、命中区 ≥32）
+
+    /// 页面标题 24–28
+    static let fontSizePageTitle: CGFloat = 26
+    /// 区块标题 16–18 Semibold
+    static let fontSizeSectionTitle: CGFloat = 17
     /// 正文阅读字号
     static let fontSizeBody: CGFloat = 15
     /// 次级/来源字号（≥12pt 的可访问下限）
@@ -40,8 +96,12 @@ enum BWTheme {
     static let fontSizeLabel: CGFloat = 13
     /// 控件最小命中高度
     static let minimumHitHeight: CGFloat = 32
+    /// 次按钮高度 32–36
+    static let secondaryActionHeight: CGFloat = 34
     /// 主行动（发送等）高度
     static let primaryActionHeight: CGFloat = 36
+    /// 全屏第一动作（标记此刻）高度
+    static let heroActionHeight: CGFloat = 44
     /// 证据/来源按钮最小宽度
     static let minimumHitWidth: CGFloat = 32
 }
@@ -53,6 +113,22 @@ extension Color {
             appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
         })
     }
+
+    /// 明暗双态动态色（sRGB 十六进制，如 0xF5F4F0）
+    init(lightHex: UInt32, darkHex: UInt32) {
+        self.init(light: NSColor(hex: lightHex), dark: NSColor(hex: darkHex))
+    }
+}
+
+extension NSColor {
+    convenience init(hex: UInt32) {
+        self.init(
+            srgbRed: CGFloat((hex >> 16) & 0xFF) / 255,
+            green: CGFloat((hex >> 8) & 0xFF) / 255,
+            blue: CGFloat(hex & 0xFF) / 255,
+            alpha: 1
+        )
+    }
 }
 
 // MARK: - 卡片
@@ -63,17 +139,16 @@ private struct BWCardModifier: ViewModifier {
     func body(content: Content) -> some View {
         content
             .padding(padding)
-            .background(BWTheme.card, in: RoundedRectangle(cornerRadius: 12))
+            .background(BWTheme.panel, in: RoundedRectangle(cornerRadius: 12))
             .overlay(
                 RoundedRectangle(cornerRadius: 12)
-                    .strokeBorder(BWTheme.cardStroke, lineWidth: 1)
+                    .strokeBorder(BWTheme.border, lineWidth: 1)
             )
-            .shadow(color: .black.opacity(0.05), radius: 3, y: 1)
     }
 }
 
 extension View {
-    /// 统一卡片样式：白卡、圆角 12、细描边、极浅投影
+    /// 统一卡片样式：panel 底、圆角 12、1pt border，无堆叠阴影（定稿决策）
     func bwCard(padding: CGFloat = 12) -> some View {
         modifier(BWCardModifier(padding: padding))
     }
@@ -88,7 +163,7 @@ struct BWBadge: View {
 
     var body: some View {
         Text(text)
-            .font(.caption2)
+            .font(.system(size: BWTheme.fontSizeDetail))
             .fontWeight(.medium)
             .padding(.horizontal, 7)
             .padding(.vertical, 2.5)

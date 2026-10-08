@@ -10,6 +10,8 @@ struct FinalReportView: View {
     var relatedProjects: [Project] = []
 
     @State private var selectedReportID: UUID?
+    /// 阅读层开关（定稿 F12/S05：限宽 800 居中阅读层，Esc 关闭回原位置）
+    @State private var isReaderPresented = false
 
     private var reports: [FinalReportSnapshot] {
         project.finalReportSnapshots.sorted { $0.version > $1.version }
@@ -56,6 +58,22 @@ struct FinalReportView: View {
                 selectedReportID = ids.first
             }
         }
+        .overlay {
+            // 阅读层以覆盖层呈现，不重建底层 ScrollView——
+            // 关闭后回原滚动位置（S05）
+            if isReaderPresented, let report = selectedReport {
+                FinalReportReadingLayer(
+                    project: project,
+                    report: report,
+                    allReports: reports,
+                    onSelectReport: { selectedReportID = $0 },
+                    onEvidenceTap: onEvidenceTap,
+                    onClose: { isReaderPresented = false }
+                )
+                .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.15), value: isReaderPresented)
     }
 
     private func reportHeader(_ report: FinalReportSnapshot) -> some View {
@@ -97,6 +115,9 @@ struct FinalReportView: View {
                 Text("\(report.providerName) · \(report.modelID)")
                     .lineLimit(1)
                 Spacer()
+                Button("阅读模式") { isReaderPresented = true }
+                    .controlSize(.small)
+                    .help("限宽 800 的居中阅读层；Esc 关闭回到原位置")
                 Button("重新生成", action: onGenerate)
                     .controlSize(.small)
                     .disabled(state == .generating || !isAIConfigured)
@@ -446,5 +467,216 @@ struct FinalReportView: View {
         project.processingJobs.contains {
             $0.kind == .finalReport && $0.status == .running
         }
+    }
+}
+
+/// 完整总结阅读层（定稿 F12/S05）：
+/// 限宽 800 居中、遮罩点击与 Esc 关闭、关闭后回到原滚动位置（底层视图不重建）。
+/// 引用链接沿用同一 onEvidenceTap 出口，可定位原话。
+private struct FinalReportReadingLayer: View {
+    let project: Project
+    let report: FinalReportSnapshot
+    let allReports: [FinalReportSnapshot]
+    var onSelectReport: (UUID) -> Void
+    var onEvidenceTap: (UUID) -> Void
+    var onClose: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.4)
+                .ignoresSafeArea()
+                .onTapGesture { onClose() }
+
+            VStack(spacing: 0) {
+                HStack {
+                    Spacer()
+                    Button(action: onClose) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(BWTheme.ink2)
+                            .frame(width: BWTheme.minimumHitWidth, height: BWTheme.minimumHitHeight)
+                            .contentShape(RoundedRectangle(cornerRadius: 7))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("关闭阅读层")
+                    .help("关闭（Esc）")
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 10)
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        // 标题与元信息
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("\(project.title) · 完整总结")
+                                .font(.system(size: 26, weight: .bold))
+                                .foregroundStyle(BWTheme.ink)
+                            HStack(spacing: 10) {
+                                Text("第 \(report.version) 版\(report.id == allReports.first?.id ? " · 当前版本" : " · 历史版本")")
+                                Text("生成于 \(report.generatedAt.formatted(date: .numeric, time: .shortened))")
+                                Text("基于最终文稿（\(project.segments.filter { $0.state == .final || $0.state == .edited }.count) 条）")
+                            }
+                            .font(.system(size: BWTheme.fontSizeDetail))
+                            .foregroundStyle(BWTheme.ink2)
+                            if allReports.count > 1 {
+                                Picker("报告版本", selection: Binding(
+                                    get: { report.id },
+                                    set: { onSelectReport($0) }
+                                )) {
+                                    ForEach(allReports) { item in
+                                        Text("第 \(item.version) 版").tag(item.id)
+                                    }
+                                }
+                                .labelsHidden()
+                                .frame(maxWidth: 130)
+                                .accessibilityLabel("完整总结版本")
+                            }
+                        }
+
+                        Text(FinalReportSpeakerProjector.project(report.headline, speakers: project.speakers))
+                            .font(.system(size: 20, weight: .semibold))
+                            .foregroundStyle(BWTheme.ink)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        Text(FinalReportSpeakerProjector.project(report.overview, speakers: project.speakers))
+                            .font(.system(size: BWTheme.fontSizeBody))
+                            .foregroundStyle(BWTheme.ink2)
+                            .lineSpacing(6)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        if let collaboration = report.collaborationSummary {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Label("我的思考与 AI 共创", systemImage: "bubble.left.and.text.bubble.right")
+                                    .font(.system(size: BWTheme.fontSizeLabel, weight: .semibold))
+                                    .foregroundStyle(BWTheme.accent)
+                                Text(collaboration)
+                                    .font(.system(size: BWTheme.fontSizeBody))
+                                    .lineSpacing(5)
+                                    .textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Text("本节来自用户想法、此前笔记与 AI 反馈，不等同于录音事实")
+                                    .font(.system(size: BWTheme.fontSizeDetail))
+                                    .foregroundStyle(BWTheme.ink3)
+                            }
+                            .padding(12)
+                            .background(BWTheme.accentSoft.opacity(0.5), in: RoundedRectangle(cornerRadius: 12))
+                        }
+
+                        // 正文分节
+                        ForEach(FinalReportItemCategory.allCases, id: \.self) { category in
+                            let items = report.items.filter { $0.category == category }
+                            if !items.isEmpty {
+                                readerGroup(category: category, items: items)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 28)
+                    .padding(.bottom, 32)
+                    .padding(.top, 4)
+                    // 行长 25–45 字：限宽 800（含 padding）
+                    .frame(maxWidth: 800)
+                    .frame(maxWidth: .infinity)
+                }
+            }
+            .background(BWTheme.panel, in: RoundedRectangle(cornerRadius: 14))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14).strokeBorder(BWTheme.border, lineWidth: 1)
+            )
+            .padding(.horizontal, 24)
+            .padding(.vertical, 20)
+            .frame(maxWidth: 856)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onExitCommand { onClose() }
+    }
+
+    private func readerGroup(
+        category: FinalReportItemCategory,
+        items: [FinalReportItem]
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(BWTheme.accentButton)
+                    .frame(width: 6, height: 6)
+                Text(category.displayName)
+                    .font(.system(size: BWTheme.fontSizeSectionTitle, weight: .semibold))
+                    .foregroundStyle(BWTheme.ink)
+            }
+            if category == .decision || category == .actionItem {
+                Text("请点开原话证据核对后再作为结论使用；模型整理不能替代人工核验。")
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(BWTheme.ink3)
+            }
+            ForEach(items) { item in
+                readerItem(item)
+            }
+        }
+    }
+
+    private func readerItem(_ item: FinalReportItem) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if item.category == .chapter,
+               let firstEvidenceID = item.evidenceSegmentIds.first,
+               let segment = project.segments.first(where: { $0.id == firstEvidenceID }) {
+                let source = ProjectHomeSupport.sourceRecording(for: segment, in: project)
+                Text([
+                    source?.title,
+                    readerTimeString(ProjectHomeSupport.sourceRelativeStartMs(for: segment, in: project))
+                ].compactMap { $0 }.joined(separator: " · "))
+                    .font(.system(size: BWTheme.fontSizeLabel, weight: .semibold))
+                    .foregroundStyle(BWTheme.accent)
+            }
+            // 结构化人物引用投影（15 号计划 D.2）：@代号 按当前人物真源显示
+            Text(FinalReportSpeakerProjector.project(item.text, speakers: project.speakers))
+                .font(.system(size: BWTheme.fontSizeBody))
+                .lineSpacing(5)
+                .foregroundStyle(BWTheme.ink)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 8) {
+                if item.epistemicStatus != .explicit {
+                    BWTagChip(text: "推断")
+                }
+                if let deadline = item.deadlineText {
+                    Text("期限：\(deadline)")
+                        .font(.system(size: BWTheme.fontSizeDetail))
+                        .foregroundStyle(BWTheme.ink2)
+                }
+                ForEach(Array(item.evidenceSegmentIds.prefix(4)), id: \.self) { id in
+                    Button {
+                        onEvidenceTap(id)
+                    } label: {
+                        Text(readerEvidenceLabel(for: id))
+                            .font(.system(size: BWTheme.fontSizeDetail, weight: .medium))
+                            .foregroundStyle(BWTheme.evidence)
+                            .underline()
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("查看这条结论的原话证据")
+                }
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func readerEvidenceLabel(for id: UUID) -> String {
+        guard let segment = project.segments.first(where: { $0.id == id }) else {
+            return "原话证据"
+        }
+        return readerTimeString(segment.startMs)
+    }
+
+    private func readerTimeString(_ milliseconds: Int64) -> String {
+        let seconds = max(0, milliseconds / 1_000)
+        return String(
+            format: "%02d:%02d:%02d",
+            seconds / 3_600,
+            (seconds % 3_600) / 60,
+            seconds % 60
+        )
     }
 }

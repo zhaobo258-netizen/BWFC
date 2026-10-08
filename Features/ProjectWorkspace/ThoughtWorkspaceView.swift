@@ -284,24 +284,31 @@ struct ThoughtWorkspaceView: View {
         HStack(spacing: 6) {
             if let saveError = noteController.saveError {
                 Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
-                Text("笔记保存失败：\(saveError)")
+                    .foregroundStyle(BWTheme.warn)
+                Text("保存失败：\(saveError)")
                     .font(.system(size: BWTheme.fontSizeDetail))
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(BWTheme.warn)
                     .lineLimit(1)
                 Spacer()
                 Button("重试") { _ = noteController.saveNow() }
                     .controlSize(.small)
-            } else if let savedAt = noteController.lastSavedAt {
-                Text("已自动保存 \(savedAt.formatted(date: .omitted, time: .shortened))")
+            } else if noteController.hasPendingChanges {
+                // 定稿 S07 三态：保存中 / 已保存于本机 HH:mm / 保存失败常驻
+                Text("保存中…")
                     .font(.system(size: BWTheme.fontSizeDetail))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(BWTheme.ink3)
+                Spacer()
+            } else if let savedAt = noteController.lastSavedAt {
+                Text("已保存于本机 \(savedAt.formatted(date: .omitted, time: .shortened))")
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(BWTheme.ink2)
+                Spacer()
             } else {
                 Text("笔记仅保存在本机")
                     .font(.system(size: BWTheme.fontSizeDetail))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(BWTheme.ink3)
+                Spacer()
             }
-            Spacer()
             if let insertNotice {
                 Text(insertNotice)
                     .font(.system(size: BWTheme.fontSizeDetail))

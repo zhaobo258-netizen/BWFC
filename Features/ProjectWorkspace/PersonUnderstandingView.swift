@@ -49,14 +49,15 @@ struct PersonUnderstandingView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                // 身份三态分色分标签（定稿 S06）：人工确认=ok / 已关联待确认=accent / 匿名=灰；
+                // 候选不得伪装成人工确认
                 Text(person.identity.statusText)
                     .font(.system(size: BWTheme.fontSizeDetail, weight: .medium))
-                    .foregroundStyle(person.identity.isUserConfirmed ? Color.green : Color.orange)
+                    .foregroundStyle(Self.identityColor(person.identity))
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3)
                     .background(
-                        (person.identity.isUserConfirmed ? Color.green : Color.orange)
-                            .opacity(0.12),
+                        Self.identityColor(person.identity).opacity(0.12),
                         in: Capsule()
                     )
                     .accessibilityLabel("身份状态：" + person.identity.statusText)
@@ -82,10 +83,11 @@ struct PersonUnderstandingView: View {
             HStack(spacing: 6) {
                 Image(systemName: "lightbulb")
                     .font(.system(size: BWTheme.fontSizeDetail))
-                    .foregroundStyle(BWTheme.accent)
-                Text("可能动机（推测）")
+                    .foregroundStyle(BWTheme.inferInk)
+                Text("可能动机")
                     .font(.system(size: BWTheme.fontSizeLabel, weight: .semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(BWTheme.ink2)
+                BWTagChip(text: "推测")
             }
             if person.possibleMotives.isEmpty {
                 HStack(spacing: 6) {
@@ -95,7 +97,7 @@ struct PersonUnderstandingView: View {
                          : "暂无可推断的动机内容。")
                 }
                 .font(.system(size: BWTheme.fontSizeDetail))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(BWTheme.ink3)
                 .fixedSize(horizontal: false, vertical: true)
             } else {
                 ForEach(person.possibleMotives) { entry in
@@ -103,6 +105,17 @@ struct PersonUnderstandingView: View {
                 }
             }
         }
+        .padding(10)
+        .background(BWTheme.inferBg, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    /// 身份三态颜色：人工确认 / 已关联待确认 / 匿名
+    private static func identityColor(
+        _ identity: AnalysisPresentationMapper.Identity
+    ) -> Color {
+        if identity.isUserConfirmed { return BWTheme.ok }
+        if identity.isPersonLinked { return BWTheme.accent }
+        return BWTheme.ink3
     }
 
     private func section(_ title: String,
@@ -130,7 +143,7 @@ struct PersonUnderstandingView: View {
                 .textSelection(.enabled)
             HStack(spacing: 6) {
                 BWBadge(text: entry.epistemicStatus == .explicit ? "明确表达" : "AI 推断",
-                        color: entry.epistemicStatus == .explicit ? .green : .orange)
+                        color: entry.epistemicStatus == .explicit ? BWTheme.ok : BWTheme.inferInk)
                 Text(entry.displayCategory)
                     .font(.system(size: BWTheme.fontSizeDetail))
                     .foregroundStyle(.secondary)
@@ -204,7 +217,7 @@ struct PersonUnderstandingView: View {
                         .textSelection(.enabled)
                     HStack(spacing: 6) {
                         BWBadge(text: entry.epistemicStatus == .explicit ? "明确表达" : "AI 推断",
-                                color: entry.epistemicStatus == .explicit ? .green : .orange)
+                                color: entry.epistemicStatus == .explicit ? BWTheme.ok : BWTheme.inferInk)
                         Text(entry.displayCategory)
                             .font(.system(size: BWTheme.fontSizeDetail))
                             .foregroundStyle(.secondary)

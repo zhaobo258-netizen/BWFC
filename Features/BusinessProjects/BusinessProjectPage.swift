@@ -1,8 +1,9 @@
 import SwiftUI
 
-/// 轻 CRM 业务项目页（产品文档 12 号 §7）。
-/// 回答“要达成什么、当前依据是什么、下一步由谁确认”；
-/// 跟进闭环：候选（在工作台确认）→ 待跟进 → 进行中 → 已完成（记录实际结果）。
+/// 轻 CRM 业务项目页（界面设计定稿 v1.0）：左列表 + 右详情（目标、参与人物、
+/// 跟进三列看板、关联录音、有效背景）。
+/// 跟进闭环：候选（在工作台确认）→ 待跟进 → 进行中 → 已完成（必填实际结果）；
+/// 责任人与期限没有原话支持时标「待核对」，不由系统臆造。
 struct BusinessProjectPage: View {
     @Environment(AppEnvironment.self) private var environment
     @Environment(AppRouter.self) private var router
@@ -19,33 +20,42 @@ struct BusinessProjectPage: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            HStack(spacing: 0) {
-                listPane
-                    .frame(width: 280)
-                Divider()
-                Group {
-                    if let selected {
-                        BusinessProjectDetailPane(
-                            businessProject: selected,
-                            projects: projects,
-                            onChanged: reload
-                        )
-                        .id(selected.id)
-                    } else {
-                        ContentUnavailableView(
-                            "选择或新建业务项目",
-                            systemImage: "briefcase",
-                            description: Text("业务项目把人物、录音与已确认跟进连起来；先建一个真实业务闭环。")
-                        )
+        HStack(spacing: 0) {
+            listPane
+                .frame(width: 280)
+            Rectangle().fill(BWTheme.border).frame(width: 1)
+            Group {
+                if let selected {
+                    BusinessProjectDetailPane(
+                        businessProject: selected,
+                        projects: projects,
+                        onChanged: reload
+                    )
+                    .id(selected.id)
+                } else {
+                    VStack(spacing: 10) {
+                        Image(systemName: "briefcase")
+                            .font(.system(size: 28))
+                            .foregroundStyle(BWTheme.ink3)
+                        Text("选择或新建业务项目")
+                            .font(.system(size: BWTheme.fontSizeBody, weight: .medium))
+                            .foregroundStyle(BWTheme.ink2)
+                        Text("业务项目把人物、录音与已确认跟进连起来；先建一个真实业务闭环。")
+                            .font(.system(size: BWTheme.fontSizeLabel))
+                            .foregroundStyle(BWTheme.ink3)
+                            .multilineTextAlignment(.center)
+                        Button("＋ 新建业务项目") { isCreating = true }
+                            .buttonStyle(.borderedProminent)
+                            .tint(BWTheme.accentButton)
+                            .controlSize(.small)
                     }
+                    .padding(32)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .background(BWTheme.columnBackground.opacity(0.72))
+        .background(BWTheme.canvas)
         .sheet(isPresented: $isCreating) {
             BusinessProjectCreateSheet(
                 suggestions: BusinessProjectStore.groupingSuggestions(
@@ -73,19 +83,51 @@ struct BusinessProjectPage: View {
         .task { reload() }
     }
 
-    private var header: some View {
-        HStack(spacing: 10) {
-            Button {
-                router.showProjectHome()
-            } label: {
-                Label("返回", systemImage: "chevron.left")
+    // MARK: - 左列：项目列表
+
+    private var listPane: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("业务项目")
+                    .font(.system(size: BWTheme.fontSizeSectionTitle, weight: .semibold))
+                    .foregroundStyle(BWTheme.ink)
+                Spacer()
+                Button {
+                    isCreating = true
+                } label: {
+                    Text("＋ 新建")
+                        .font(.system(size: BWTheme.fontSizeLabel, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 12)
+                        .frame(height: BWTheme.minimumHitHeight)
+                        .background(BWTheme.accentButton, in: RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
             }
-            Label("业务项目", systemImage: "briefcase")
-                .font(.headline)
-            Text("\(businessProjects.count) 个项目")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Spacer()
+            .padding(.horizontal, 16)
+            .padding(.top, 16)
+            .padding(.bottom, 10)
+
+            ScrollView {
+                LazyVStack(spacing: 4) {
+                    ForEach(businessProjects) { businessProject in
+                        BusinessProjectRow(
+                            businessProject: businessProject,
+                            isSelected: businessProject.id == selectedID
+                        ) {
+                            selectedID = businessProject.id
+                        }
+                    }
+                    if businessProjects.isEmpty {
+                        Text("还没有业务项目。点右上角「新建」，或从下方归组建议开始。")
+                            .font(.system(size: BWTheme.fontSizeDetail))
+                            .foregroundStyle(BWTheme.ink3)
+                            .padding(.vertical, 24)
+                    }
+                }
+                .padding(.horizontal, 10)
+            }
+
             if !BusinessProjectStore.groupingSuggestions(
                 recordings: projects,
                 existingBusinessProjects: businessProjects
@@ -93,39 +135,29 @@ struct BusinessProjectPage: View {
                 Button {
                     isShowingSuggestions = true
                 } label: {
-                    Label("从业务分类归组建议", systemImage: "square.grid.2x2")
+                    Text("从业务分类归组建议…")
+                        .font(.system(size: BWTheme.fontSizeDetail, weight: .medium))
+                        .foregroundStyle(BWTheme.evidence)
+                        .underline()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
                 .help("把已有录音的业务分类整理成业务项目（仅建议，不自动认定同一项目）")
             }
-            Button {
-                isCreating = true
-            } label: {
-                Label("新建业务项目", systemImage: "plus")
-            }
-            .buttonStyle(.borderedProminent)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-    }
 
-    private var listPane: some View {
-        List(selection: $selectedID) {
-            ForEach(businessProjects) { businessProject in
-                BusinessProjectRow(businessProject: businessProject)
-                    .tag(businessProject.id as UUID?)
-            }
-        }
-        .listStyle(.sidebar)
-        .overlay(alignment: .bottom) {
             if let errorMessage {
                 Text(errorMessage)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .padding(6)
-                    .background(.regularMaterial)
-                    .padding(6)
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(BWTheme.danger)
+                    .padding(8)
+                    .frame(maxWidth: .infinity)
+                    .background(BWTheme.panel)
             }
         }
+        .background(BWTheme.canvas)
     }
 
     private func reload() {
@@ -173,40 +205,57 @@ struct BusinessProjectPage: View {
     }
 }
 
+/// 项目行：名称 + 录音数/人数/跟进/逾期；归档态弱化
 private struct BusinessProjectRow: View {
     let businessProject: BusinessProject
+    let isSelected: Bool
+    let onSelect: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack {
-                Text(businessProject.name)
-                    .fontWeight(.medium)
-                if businessProject.status == .archived {
-                    Text("已归档")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+        Button(action: onSelect) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(businessProject.name)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(
+                            businessProject.status == .archived ? BWTheme.ink3 : BWTheme.ink
+                        )
+                        .lineLimit(1)
+                    if businessProject.status == .archived {
+                        Text("已归档")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(BWTheme.ink3)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(BWTheme.sunken, in: RoundedRectangle(cornerRadius: 4))
+                    }
                 }
+                HStack(spacing: 8) {
+                    Text("\(businessProject.linkedProjectIDs.count) 场录音")
+                    Text("\(businessProject.participantPersonIDs.count) 人")
+                    let overdue = businessProject.overdueFollowUps.count
+                    if overdue > 0 {
+                        Text("\(overdue) 项逾期")
+                            .fontWeight(.semibold)
+                            .foregroundStyle(BWTheme.danger)
+                    } else if !businessProject.openFollowUps.isEmpty {
+                        Text("\(businessProject.openFollowUps.count) 项跟进")
+                            .foregroundStyle(BWTheme.accent)
+                    }
+                }
+                .font(.system(size: BWTheme.fontSizeDetail))
+                .foregroundStyle(BWTheme.ink3)
             }
-            HStack(spacing: 8) {
-                Text("\(businessProject.linkedProjectIDs.count) 场录音")
-                let open = businessProject.openFollowUps.count
-                let overdue = businessProject.overdueFollowUps.count
-                if open > 0 {
-                    Text("\(open) 项跟进中")
-                        .foregroundStyle(overdue > 0 ? .orange : BWTheme.accent)
-                }
-                if overdue > 0 {
-                    Text("\(overdue) 项逾期")
-                        .foregroundStyle(.orange)
-                }
-            }
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-            Text(businessProject.lastActivityAt.formatted(date: .abbreviated, time: .omitted))
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 9)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                isSelected ? BWTheme.accentSoft : Color.clear,
+                in: RoundedRectangle(cornerRadius: 9)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 9))
         }
-        .padding(.vertical, 2)
+        .buttonStyle(.plain)
     }
 }
 
@@ -309,7 +358,7 @@ private struct BusinessProjectSuggestionsSheet: View {
     }
 }
 
-/// 业务项目详情：目标、参与人物、关联录音、跟进闭环。
+/// 业务项目详情：目标、参与人物、跟进看板、关联录音、有效背景。
 struct BusinessProjectDetailPane: View {
     @Environment(AppEnvironment.self) private var environment
     @Environment(AppRouter.self) private var router
@@ -335,21 +384,24 @@ struct BusinessProjectDetailPane: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 20) {
                 headerSection
-                followUpSection
-                recordingsSection
-                participantsSection
-                backgroundSection
                 if let actionError {
-                    Text(actionError)
-                        .font(.caption)
-                        .foregroundStyle(.red)
+                    Label(actionError, systemImage: "exclamationmark.triangle")
+                        .font(.system(size: BWTheme.fontSizeDetail))
+                        .foregroundStyle(BWTheme.danger)
                 }
+                participantsSection
+                followUpBoard
+                recordingsSection
+                backgroundSection
             }
-            .padding(18)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 20)
+            .frame(maxWidth: 1080)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(BWTheme.canvas)
         .sheet(isPresented: $isSelectingRecordings) {
             RecordingLinkPickerSheet(
                 businessProject: businessProject,
@@ -417,24 +469,41 @@ struct BusinessProjectDetailPane: View {
         }
     }
 
+    // MARK: - 头部（名称 / 目标 / 归档）
+
     private var headerSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
                 Text(businessProject.name)
-                    .font(.title2)
-                    .fontWeight(.semibold)
+                    .font(.system(size: 24, weight: .bold))
+                    .foregroundStyle(BWTheme.ink)
+                if businessProject.status == .archived {
+                    Text("已归档")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(BWTheme.ink3)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(BWTheme.sunken, in: RoundedRectangle(cornerRadius: 5))
+                }
                 Spacer()
-                Toggle("归档", isOn: Binding(
-                    get: { businessProject.status == .archived },
-                    set: { newValue in setArchived(newValue) }
-                ))
-                .toggleStyle(.checkbox)
+                Button(businessProject.status == .archived ? "恢复项目" : "归档") {
+                    setArchived(businessProject.status != .archived)
+                }
+                .font(.system(size: BWTheme.fontSizeDetail, weight: .medium))
+                .foregroundStyle(BWTheme.ink2)
+                .padding(.horizontal, 12)
+                .frame(height: BWTheme.minimumHitHeight)
+                .background(BWTheme.panel, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8).strokeBorder(BWTheme.border, lineWidth: 1)
+                )
+                .buttonStyle(.plain)
             }
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Text("目标说明")
-                        .font(.subheadline)
-                        .fontWeight(.semibold)
+                        .font(.system(size: BWTheme.fontSizeDetail, weight: .bold))
+                        .foregroundStyle(BWTheme.ink2)
                     Spacer()
                     if let edited = editedGoal,
                        edited != (businessProject.goalStatement ?? "") {
@@ -452,194 +521,31 @@ struct BusinessProjectDetailPane: View {
                         set: { editedGoal = $0 }
                     )
                 )
-                .font(.callout)
+                .font(.system(size: BWTheme.fontSizeBody))
+                .foregroundStyle(BWTheme.ink)
                 .frame(minHeight: 54)
                 .scrollContentBackground(.hidden)
-                .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+                .background(BWTheme.panel, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8).strokeBorder(BWTheme.border, lineWidth: 1)
+                )
             }
         }
     }
 
-    private var followUpSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Label("跟进事项", systemImage: "point.3.connected.trianglepath.dotted")
-                    .font(.subheadline)
-                    .fontWeight(.semibold)
-                Text("待跟进 \(businessProject.followUps.filter { $0.handlingStatus == .pending }.count) · 进行中 \(businessProject.followUps.filter { $0.handlingStatus == .inProgress }.count) · 已完成 \(businessProject.followUps.filter { $0.handlingStatus == .completed }.count)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            if businessProject.followUps.isEmpty {
-                Text("暂无跟进。录音结束后的跟进候选可在工作台确认到这里。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            ForEach(businessProject.followUps.sorted {
-                ($0.completedAt ?? .distantFuture) < ($1.completedAt ?? .distantFuture)
-            }) { followUp in
-                followUpRow(followUp)
-            }
-        }
-    }
-
-    private func followUpRow(_ followUp: FollowUp) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(
-                        followUp.handlingStatus == .completed
-                            ? Color.green
-                            : followUp.handlingStatus == .inProgress
-                                ? BWTheme.accent
-                                : Color.secondary.opacity(0.4)
-                    )
-                    .frame(width: 7, height: 7)
-                Text(followUp.title)
-                    .font(.callout)
-                    .strikethrough(followUp.handlingStatus == .completed)
-                Spacer()
-                if followUp.confirmationStatus == .candidate {
-                    Text("候选")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            HStack(spacing: 10) {
-                Text("责任人：\(ownerName(followUp))")
-                Text("期限：\(followUp.dueDate.map { $0.formatted(date: .abbreviated, time: .omitted) } ?? "未定")")
-                if followUp.handlingStatus != .completed,
-                   let due = followUp.dueDate, due < Date() {
-                    Text("已逾期")
-                        .foregroundStyle(.orange)
-                }
-                Text(followUp.handlingStatus.displayName)
-            }
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-            if followUp.handlingStatus == .completed {
-                if let note = followUp.resultNote {
-                    Text("结果：\(note)")
-                        .font(.caption)
-                }
-                Text("完成于 \(followUp.completedAt?.formatted(date: .abbreviated, time: .shortened) ?? "-")")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-            if let source = followUp.source {
-                let recording = projects.first { $0.id == source.recordingID }
-                let sourceIsCurrent = recording.map {
-                    BusinessMemoryCandidateBuilder.sourceIsCurrent(
-                        project: $0, segmentID: source.segmentID, version: source.sourceVersion
-                    )
-                } ?? false
-                Text(sourceIsCurrent ? "来源：原话证据" : "来源需复核：录音、原话或人物归属已变化")
-                    .font(.caption2)
-                    .foregroundStyle(sourceIsCurrent ? Color.secondary : .orange)
-                Text(source.snippet)
-                    .font(.caption)
-                    .textSelection(.enabled)
-                if let recording {
-                    Button("打开来源录音：\(recording.title)") {
-                        router.showProjectWorkspace(
-                            recording.id, autoStart: false, evidenceSegmentID: source.segmentID
-                        )
-                    }
-                    .controlSize(.mini)
-                }
-            } else {
-                Text("来源：未记录可核验的原话证据")
-                    .font(.caption2)
-                    .foregroundStyle(.orange)
-            }
-            if followUp.handlingStatus != .completed {
-                HStack(spacing: 8) {
-                    if followUp.handlingStatus == .pending {
-                        Button("开始跟进") { setHandling(followUp, .inProgress) }
-                            .controlSize(.mini)
-                    } else {
-                        Button("恢复待跟进") { setHandling(followUp, .pending) }
-                            .controlSize(.mini)
-                    }
-                    Button("完成（记录结果）") {
-                        actionError = nil
-                        completingFollowUpID = followUp.id
-                    }
-                    .controlSize(.mini)
-                    Spacer()
-                }
-            }
-        }
-        .padding(9)
-        .background(Color.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
-    }
-
-    private func ownerName(_ followUp: FollowUp) -> String {
-        if let personID = followUp.ownerPersonID,
-           let person = persons.first(where: { $0.id == personID }) {
-            return person.displayName
-        }
-        return followUp.ownerDisplayText ?? "未明确"
-    }
-
-    private var recordingsSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Label("关联录音", systemImage: "waveform")
-                    .font(.subheadline)
-                    .fontWeight(.semibold)
-                Spacer()
-                Button {
-                    isSelectingRecordings = true
-                } label: {
-                    Label("关联录音", systemImage: "link")
-                }
-                .controlSize(.mini)
-            }
-            if linkedRecordings.isEmpty {
-                Text("尚未关联录音；关联后问答与总结会带上本项目的记忆与背景。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            ForEach(linkedRecordings) { project in
-                HStack(spacing: 8) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(project.title)
-                            .font(.callout)
-                        Text("\(project.lastActivityAt.formatted(date: .abbreviated, time: .omitted)) · \(project.speakers.count) 位说话人")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button("打开") {
-                        router.showProjectWorkspace(project.id, autoStart: false)
-                    }
-                    .controlSize(.mini)
-                }
-                .padding(8)
-                .background(Color.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
-            }
-        }
-    }
+    // MARK: - 参与人物
 
     private var participantsSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Label("参与人物", systemImage: "person.2")
-                    .font(.subheadline)
-                    .fontWeight(.semibold)
-                Spacer()
-                Button {
-                    isSelectingParticipants = true
-                } label: {
-                    Label("选择人物", systemImage: "person.badge.plus")
-                }
-                .controlSize(.mini)
-            }
+        sectionShell(
+            title: "参与人物",
+            note: nil,
+            moreTitle: "编辑",
+            more: { isSelectingParticipants = true }
+        ) {
             if businessProject.participantPersonIDs.isEmpty {
                 Text("尚未选择参与人物。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(BWTheme.ink3)
             } else {
                 FlowParticipantChips(
                     names: businessProject.participantPersonIDs.compactMap { id in
@@ -650,37 +556,332 @@ struct BusinessProjectDetailPane: View {
         }
     }
 
-    private var backgroundSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text("有效背景")
-                    .font(.subheadline)
-                    .fontWeight(.semibold)
-                Spacer()
-                if let edited = editedBackground,
-                   edited != (businessProject.backgroundContext ?? "") {
-                    Button("保存背景") {
-                        if updateFields({ $0.backgroundContext = edited }) {
-                            editedBackground = nil
-                        }
-                    }
-                    .controlSize(.mini)
+    // MARK: - 跟进看板（三列：待跟进 → 进行中 → 已完成）
+
+    private var followUpBoard: some View {
+        sectionShell(
+            title: "跟进看板",
+            note: "完成必须填写实际结果；责任人与期限来自原话，缺了就是待核对",
+            moreTitle: nil,
+            more: nil
+        ) {
+            if businessProject.followUps.isEmpty {
+                Text("暂无跟进。录音结束后的跟进候选在工作台确认后进入这里。")
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(BWTheme.ink3)
+            } else {
+                HStack(alignment: .top, spacing: 10) {
+                    followUpColumn(
+                        title: "待跟进",
+                        status: .pending,
+                        items: businessProject.followUps.filter { $0.handlingStatus == .pending }
+                    )
+                    followUpColumn(
+                        title: "进行中",
+                        status: .inProgress,
+                        items: businessProject.followUps.filter { $0.handlingStatus == .inProgress }
+                    )
+                    followUpColumn(
+                        title: "已完成",
+                        status: .completed,
+                        items: businessProject.followUps
+                            .filter { $0.handlingStatus == .completed }
+                            .sorted { ($0.completedAt ?? .distantPast) > ($1.completedAt ?? .distantPast) }
+                    )
                 }
             }
-            TextEditor(
-                text: Binding(
-                    get: { editedBackground ?? businessProject.backgroundContext ?? "" },
-                    set: { editedBackground = $0 }
-                )
-            )
-            .font(.callout)
-            .frame(minHeight: 54)
-            .scrollContentBackground(.hidden)
-            .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
-            Text("项目背景供 AI 作为已确认上下文使用，不冒充任何一场录音的原话。")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
         }
+    }
+
+    private func followUpColumn(
+        title: String,
+        status: FollowUpHandlingStatus,
+        items: [FollowUp]
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(status == .completed ? BWTheme.ok
+                          : status == .inProgress ? BWTheme.accent
+                          : BWTheme.ink3.opacity(0.5))
+                    .frame(width: 7, height: 7)
+                Text(title)
+                    .font(.system(size: BWTheme.fontSizeLabel, weight: .semibold))
+                    .foregroundStyle(BWTheme.ink2)
+                Text("\(items.count)")
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(BWTheme.ink3)
+            }
+            .padding(.horizontal, 4)
+
+            VStack(spacing: 8) {
+                ForEach(items) { followUp in
+                    followUpCard(followUp)
+                }
+                if items.isEmpty {
+                    Text("—")
+                        .font(.system(size: BWTheme.fontSizeDetail))
+                        .foregroundStyle(BWTheme.ink3)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                }
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .top)
+        .background(BWTheme.sunken.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func followUpCard(_ followUp: FollowUp) -> some View {
+        let overdue = followUp.handlingStatus != .completed
+            && (followUp.dueDate ?? .distantFuture) < Date()
+        return VStack(alignment: .leading, spacing: 6) {
+            Text(followUp.title)
+                .font(.system(size: BWTheme.fontSizeLabel, weight: .medium))
+                .foregroundStyle(BWTheme.ink)
+                .strikethrough(followUp.handlingStatus == .completed)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 8) {
+                // 责任人/期限缺原话支持时标「待核对」，不臆造
+                if let owner = ownerDisplayText(followUp) {
+                    Text(owner)
+                        .foregroundStyle(BWTheme.ink2)
+                } else {
+                    Text("责任人待核对")
+                        .fontWeight(.semibold)
+                        .foregroundStyle(BWTheme.warn)
+                }
+                if let due = followUp.dueDate {
+                    Text(overdue
+                         ? "\(due.formatted(date: .abbreviated, time: .omitted)) 到期 · 已逾期"
+                         : due.formatted(date: .abbreviated, time: .omitted))
+                        .foregroundStyle(overdue ? BWTheme.danger : BWTheme.ink2)
+                        .fontWeight(overdue ? .semibold : .regular)
+                } else {
+                    Text("期限未定")
+                        .foregroundStyle(BWTheme.ink3)
+                }
+            }
+            .font(.system(size: BWTheme.fontSizeDetail))
+
+            if followUp.handlingStatus == .completed {
+                if let note = followUp.resultNote, !note.isEmpty {
+                    Text("实际结果：\(note)")
+                        .font(.system(size: BWTheme.fontSizeDetail))
+                        .foregroundStyle(BWTheme.ink2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text("完成于 \(followUp.completedAt?.formatted(date: .abbreviated, time: .shortened) ?? "-")")
+                    .font(.system(size: 11))
+                    .foregroundStyle(BWTheme.ink3)
+            }
+
+            if let source = followUp.source {
+                let recording = projects.first { $0.id == source.recordingID }
+                let sourceIsCurrent = recording.map {
+                    BusinessMemoryCandidateBuilder.sourceIsCurrent(
+                        project: $0, segmentID: source.segmentID, version: source.sourceVersion
+                    )
+                } ?? false
+                if let recording {
+                    Button {
+                        router.showProjectWorkspace(
+                            recording.id, autoStart: false, evidenceSegmentID: source.segmentID
+                        )
+                    } label: {
+                        Text("来源 \(recording.title)")
+                            .font(.system(size: BWTheme.fontSizeDetail, weight: .medium))
+                            .foregroundStyle(BWTheme.evidence)
+                            .underline()
+                            .lineLimit(1)
+                    }
+                    .buttonStyle(.plain)
+                    .help(source.snippet)
+                }
+                if !sourceIsCurrent {
+                    Text("来源需复核：录音、原话或人物归属已变化")
+                        .font(.system(size: 11))
+                        .foregroundStyle(BWTheme.warn)
+                }
+            } else {
+                Text("来源：未记录可核验的原话证据")
+                    .font(.system(size: 11))
+                    .foregroundStyle(BWTheme.warn)
+            }
+
+            if followUp.handlingStatus != .completed {
+                HStack(spacing: 8) {
+                    if followUp.handlingStatus == .pending {
+                        cardButton("开始跟进", primary: false) {
+                            setHandling(followUp, .inProgress)
+                        }
+                    } else {
+                        cardButton("恢复待跟进", primary: false) {
+                            setHandling(followUp, .pending)
+                        }
+                    }
+                    cardButton("填写结果并完成", primary: true) {
+                        actionError = nil
+                        completingFollowUpID = followUp.id
+                    }
+                }
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(BWTheme.panel, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(overdue ? BWTheme.danger : BWTheme.border, lineWidth: 1)
+        )
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(overdue ? BWTheme.dangerBg.opacity(0.35) : .clear)
+        )
+        .opacity(followUp.handlingStatus == .completed ? 0.75 : 1)
+    }
+
+    private func cardButton(_ title: String, primary: Bool, action: @escaping () -> Void) -> some View {
+        Button(title, action: action)
+            .font(.system(size: BWTheme.fontSizeDetail, weight: primary ? .semibold : .regular))
+            .foregroundStyle(primary ? Color.white : BWTheme.ink2)
+            .padding(.horizontal, 10)
+            .frame(height: 26)
+            .background(
+                primary ? BWTheme.accentButton : Color.clear,
+                in: RoundedRectangle(cornerRadius: 7)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 7)
+                    .strokeBorder(primary ? .clear : BWTheme.border, lineWidth: 1)
+            )
+            .buttonStyle(.plain)
+    }
+
+    /// 责任人显示：关联人物被删除后回退到原文表述；两者皆无返回 nil（界面标待核对）
+    private func ownerDisplayText(_ followUp: FollowUp) -> String? {
+        if let personID = followUp.ownerPersonID,
+           let person = persons.first(where: { $0.id == personID }) {
+            return person.displayName
+        }
+        if let text = followUp.ownerDisplayText,
+           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return text
+        }
+        return nil
+    }
+
+    // MARK: - 关联录音
+
+    private var recordingsSection: some View {
+        sectionShell(
+            title: "关联录音",
+            note: nil,
+            moreTitle: "关联",
+            more: { isSelectingRecordings = true }
+        ) {
+            if linkedRecordings.isEmpty {
+                Text("尚未关联录音；关联后问答与总结会带上本项目的记忆与背景。")
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(BWTheme.ink3)
+            }
+            ForEach(linkedRecordings) { project in
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(project.title)
+                            .font(.system(size: BWTheme.fontSizeBody, weight: .medium))
+                            .foregroundStyle(BWTheme.ink)
+                            .lineLimit(1)
+                        Text("\(project.lastActivityAt.formatted(date: .abbreviated, time: .omitted)) · \(project.speakers.count) 位说话人")
+                            .font(.system(size: BWTheme.fontSizeDetail))
+                            .foregroundStyle(BWTheme.ink3)
+                    }
+                    Spacer(minLength: 8)
+                    Button("打开") {
+                        router.showProjectWorkspace(project.id, autoStart: false)
+                    }
+                    .font(.system(size: BWTheme.fontSizeDetail, weight: .medium))
+                    .foregroundStyle(BWTheme.evidence)
+                    .underline()
+                    .buttonStyle(.plain)
+                }
+                .padding(.vertical, 6)
+            }
+        }
+    }
+
+    // MARK: - 有效背景
+
+    private var backgroundSection: some View {
+        sectionShell(title: "有效背景", note: nil, moreTitle: nil, more: nil) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Spacer()
+                    if let edited = editedBackground,
+                       edited != (businessProject.backgroundContext ?? "") {
+                        Button("保存背景") {
+                            if updateFields({ $0.backgroundContext = edited }) {
+                                editedBackground = nil
+                            }
+                        }
+                        .controlSize(.mini)
+                    }
+                }
+                TextEditor(
+                    text: Binding(
+                        get: { editedBackground ?? businessProject.backgroundContext ?? "" },
+                        set: { editedBackground = $0 }
+                    )
+                )
+                .font(.system(size: BWTheme.fontSizeBody))
+                .foregroundStyle(BWTheme.ink)
+                .frame(minHeight: 54)
+                .scrollContentBackground(.hidden)
+                .background(BWTheme.sunken.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+                Text("项目背景供 AI 作为已确认上下文使用，不冒充任何一场录音的原话。")
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(BWTheme.ink3)
+            }
+        }
+    }
+
+    // MARK: - 区块容器
+
+    private func sectionShell<Content: View>(
+        title: String,
+        note: String?,
+        moreTitle: String?,
+        more: (() -> Void)?,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(title)
+                    .font(.system(size: BWTheme.fontSizeSectionTitle, weight: .semibold))
+                    .foregroundStyle(BWTheme.ink)
+                if let note {
+                    Text(note)
+                        .font(.system(size: BWTheme.fontSizeDetail))
+                        .foregroundStyle(BWTheme.ink3)
+                }
+                Spacer()
+                if let moreTitle, let more {
+                    Button(moreTitle, action: more)
+                        .font(.system(size: BWTheme.fontSizeDetail, weight: .medium))
+                        .foregroundStyle(BWTheme.evidence)
+                        .underline()
+                        .buttonStyle(.plain)
+                }
+            }
+            content()
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(BWTheme.panel, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12).strokeBorder(BWTheme.border, lineWidth: 1)
+        )
     }
 
     // MARK: - 操作
@@ -792,11 +993,15 @@ private struct FlowParticipantChips: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
                 ForEach(Array(names.enumerated()), id: \.offset) { _, name in
-                    Text(name)
-                        .font(.caption)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(BWTheme.accent.opacity(0.12), in: Capsule())
+                    HStack(spacing: 6) {
+                        BWSpeakerDot(name: name, color: BWTheme.accent, size: 22)
+                        Text(name)
+                            .font(.system(size: BWTheme.fontSizeLabel))
+                            .foregroundStyle(BWTheme.ink)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(BWTheme.accentSoft, in: Capsule())
                 }
             }
         }

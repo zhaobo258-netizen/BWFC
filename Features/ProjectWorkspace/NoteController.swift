@@ -15,6 +15,8 @@ final class NoteController {
     private(set) var lastSavedAt: Date?
     /// 最近一次保存失败的真实描述（保存失败 edge case：如实显示，不掩盖）
     private(set) var saveError: String?
+    /// 防抖窗口内待落盘的改动（笔记卡「保存中…」三态文案的中间态；定稿 S07）
+    private(set) var hasPendingChanges = false
     /// 可观察的摘入记录，让收起笔记时的归结卡也能即时刷新。
     private(set) var insertedSummaryIDs: [UUID]
 
@@ -46,6 +48,7 @@ final class NoteController {
     func update(markdown newValue: String) {
         guard !isLoading else { return }
         markdown = newValue
+        hasPendingChanges = true
         scheduleAutosave()
     }
 
@@ -96,8 +99,10 @@ final class NoteController {
             try persist(project)
             lastSavedAt = Date()
             saveError = nil
+            hasPendingChanges = false
         } catch {
             // 保存失败：如实记录错误类别（不吞掉、不伪装成功）；正文与路径不进日志
+            // hasPendingChanges 保持 true：改动仍未落盘，状态条继续显示「保存失败」并可重试
             saveError = String(describing: type(of: error))
             AppLog.logError(AppLog.persistence, LogSanitizer.formatEvent("note_save_failed", error: String(describing: type(of: error))))
         }

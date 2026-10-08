@@ -496,6 +496,81 @@ enum ProjectHomeSupport {
     /// 本机目录尚未创建时的提示文案
     static let missingStorageDirectoryMessage = "本机保存目录尚未创建。"
 
+    // MARK: - 全库搜索与流水线展示（界面定稿 v1.0 首页）
+
+    /// 首页全库搜索（真实本地检索，不伪造能力）：
+    /// 标题命中，或最终/人工修订文稿正文命中；实时草稿片段不参与，避免搜到还会变的字。
+    static func matchesSearch(_ project: Project, query rawQuery: String) -> Bool {
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return true }
+        if project.title.localizedStandardContains(query) { return true }
+        return project.segments.contains { segment in
+            (segment.state == .final || segment.state == .edited)
+                && segment.text.localizedStandardContains(query)
+        }
+    }
+
+    /// 导入/收尾流水线的一行展示步骤（原型「提取音轨→本地转写→分人→分析→完整总结」）。
+    /// 只从持久 processingJobs 投影：没有相关任务的项目返回空，不凭状态文案猜进度（S02 同口径）。
+    struct PipelineStep: Equatable {
+        enum State: Equatable {
+            case done
+            case running
+            case todo
+            case failed
+
+            /// 一行展示用的状态符号
+            var mark: String {
+                switch self {
+                case .done: return "✓"
+                case .running: return "●"
+                case .todo: return "○"
+                case .failed: return "✗"
+                }
+            }
+        }
+
+        let title: String
+        let state: State
+
+        init(title: String, state: State) {
+            self.title = title
+            self.state = state
+        }
+    }
+
+    /// 流水线步骤对应的任务种类顺序
+    private static let pipelineKinds: [(ProcessingJobKind, String)] = [
+        (.audioExtraction, "提取音轨"),
+        (.transcription, "本地转写"),
+        (.diarization, "分人识别"),
+        (.analysis, "分析"),
+        (.finalReport, "完整总结")
+    ]
+
+    static func pipelineSteps(for project: Project) -> [PipelineStep] {
+        var steps: [PipelineStep] = []
+        for (kind, title) in pipelineKinds {
+            guard let job = project.processingJobs
+                .filter({ $0.kind == kind })
+                .max(by: { $0.updatedAt < $1.updatedAt }) else {
+                continue
+            }
+            let state: PipelineStep.State
+            switch job.status {
+            case .completed: state = .done
+            case .running, .pending: state = .running
+            case .failedRetryable, .failedFinal: state = .failed
+            }
+            steps.append(PipelineStep(title: title, state: state))
+        }
+        // 全部完成后不再刷屏（正常 = 不可见）
+        if !steps.isEmpty && steps.allSatisfy({ $0.state == .done }) {
+            return []
+        }
+        return steps
+    }
+
     // MARK: - 删除项目
 
     /// 为什么不「移到废纸篓」：App Sandbox 下 `trashItem` 落到容器自己的

@@ -25,7 +25,7 @@ struct BangWoFenXiApp: App {
     }
 }
 
-/// 顶层视图：按路由切换页面；启动时检查麦克风权限与未正常结束的会议
+/// 顶层视图：宽边栏 + 按路由切换页面；启动时检查麦克风权限与未正常结束的会议
 struct RootView: View {
     @Environment(AppRouter.self) private var router
     @Environment(AppEnvironment.self) private var environment
@@ -35,29 +35,20 @@ struct RootView: View {
     /// 同时覆盖 V2 项目（projects.json，权威存储）与 V1 遗留会议
     @State private var abnormalItems: [AbnormalRecoveryItem] = []
     @State private var finalReportNotification: FinalReportCoordinator.Completion?
+    /// 边栏外观选择（深色/浅色/跟随系统），与 WorkspaceSidebar 共用同一存储键
+    @AppStorage("bwfx.appearance") private var appearance: String = SidebarAppearance.system.rawValue
 
     var body: some View {
-        Group {
-            switch router.route {
-            case .projectHome:
-                ProjectHomeView()
-            case .projectWorkspace(let id, let autoStart):
-                ProjectWorkspaceView(projectID: id, autoStart: autoStart)
-                    .id(id)
-            case .peopleLibrary:
-                PersonLibraryPage()
-            case .businessProjects:
-                BusinessProjectPage()
-            case .meetingList:
-                MeetingListView()
-            case .meetingSetup(let id):
-                MeetingSetupView(meetingID: id)
-            case .liveMeeting(let id):
-                LiveMeetingView(meetingID: id)
-            case .meetingReview(let id):
-                MeetingReviewView(meetingID: id)
+        GeometryReader { proxy in
+            HStack(spacing: 0) {
+                // 界面定稿 v1.0：232pt 宽边栏常驻；窗口 ≤1023pt 自动折叠为 64pt（S01）
+                WorkspaceSidebar(forcedCollapsed: proxy.size.width <= 1023)
+                routedContent
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            .background(BWTheme.canvas)
         }
+        .preferredColorScheme(SidebarAppearance(rawValue: appearance)?.colorScheme)
         .sheet(
             isPresented: Binding(
                 get: { router.isSettingsPresented },
@@ -141,6 +132,32 @@ struct RootView: View {
                     try? await Task.sleep(for: .seconds(8))
                     dismissNotification(matching: completion)
                 }
+            }
+        }
+    }
+
+    /// 路由内容（不含边栏；边栏常驻外层）
+    @ViewBuilder
+    private var routedContent: some View {
+        Group {
+            switch router.route {
+            case .projectHome:
+                ProjectHomeView()
+            case .projectWorkspace(let id, let autoStart):
+                ProjectWorkspaceView(projectID: id, autoStart: autoStart)
+                    .id(id)
+            case .peopleLibrary:
+                PersonLibraryPage()
+            case .businessProjects:
+                BusinessProjectPage()
+            case .meetingList:
+                MeetingListView()
+            case .meetingSetup(let id):
+                MeetingSetupView(meetingID: id)
+            case .liveMeeting(let id):
+                LiveMeetingView(meetingID: id)
+            case .meetingReview(let id):
+                MeetingReviewView(meetingID: id)
             }
         }
     }

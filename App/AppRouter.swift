@@ -29,6 +29,9 @@ final class AppRouter {
     var requestedFinalReportProjectID: UUID?
     private var requestedEvidence: (projectID: UUID, segmentID: UUID)?
     var requestedEvidenceSegmentID: UUID? { requestedEvidence?.segmentID }
+    /// 边栏「开始录音」一次性请求令牌：由首页消费，
+    /// 复用首页既有知情确认与建项目链路，不另起第二条开录路径（界面定稿 v1.0 接线）。
+    private(set) var startRecordingRequestToken: UUID?
 
     func showProjectHome() {
         requestedEvidence = nil
@@ -75,6 +78,21 @@ final class AppRouter {
 
     func showSettings() {
         isSettingsPresented = true
+    }
+
+    /// 边栏「开始录音」：先回首页，再由首页消费一次性令牌启动录音
+    func requestStartRecording() {
+        requestedEvidence = nil
+        requestedFinalReportProjectID = nil
+        route = .projectHome
+        startRecordingRequestToken = UUID()
+    }
+
+    /// 首页消费开录令牌；每个令牌只生效一次
+    func consumeStartRecordingRequest() -> Bool {
+        guard startRecordingRequestToken != nil else { return false }
+        startRecordingRequestToken = nil
+        return true
     }
 
     func closeSettings() {

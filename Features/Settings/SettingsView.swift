@@ -237,14 +237,14 @@ struct SettingsView: View {
     }
 
     private var diarizationProviderSection: some View {
+        // 定稿：五种分人服务边界逐卡写明，本地引擎标「实验」；
+        // 选中只改表单态，保存后从下一次会议生效（队列冻结原 Provider）
         Section("云端高精度转写与分人") {
-            Picker("Provider", selection: $diarizationConfiguration.selectedProvider) {
+            VStack(spacing: 8) {
                 ForEach(DiarizationProvider.allCases, id: \.self) { provider in
-                    Text(provider.displayName)
-                        .tag(provider)
+                    diarizationProviderCard(provider)
                 }
             }
-            .pickerStyle(.segmented)
             Button("保存默认 Provider") {
                 saveDiarizationConfiguration()
             }
@@ -254,6 +254,73 @@ struct SettingsView: View {
             Text("关闭云端增强不会关闭本地录音和 Apple Speech。Provider 变更只影响下一次会议，待处理分片不会静默改投其他服务。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    /// 分人 Provider 卡片：能力边界逐卡写明；「实验」与「当前」用标签，不靠颜色猜
+    private func diarizationProviderCard(_ provider: DiarizationProvider) -> some View {
+        let isSelected = diarizationConfiguration.selectedProvider == provider
+        return Button {
+            diarizationConfiguration.selectedProvider = provider
+        } label: {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: isSelected ? "largecircle.fill.circle" : "circle")
+                    .foregroundStyle(isSelected ? BWTheme.accent : BWTheme.ink3)
+                    .padding(.top, 2)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text(provider.displayName)
+                            .font(.system(size: BWTheme.fontSizeLabel, weight: .semibold))
+                            .foregroundStyle(BWTheme.ink)
+                        if provider == .localSherpaOnnx {
+                            Text("实验")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(BWTheme.inferInk)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(BWTheme.inferTag, in: RoundedRectangle(cornerRadius: 4))
+                        }
+                        if isSelected {
+                            Text("当前")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(BWTheme.accent)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(BWTheme.accentSoft, in: RoundedRectangle(cornerRadius: 4))
+                        }
+                    }
+                    Text(Self.diarizationBoundaryText(provider))
+                        .font(.system(size: BWTheme.fontSizeDetail))
+                        .foregroundStyle(BWTheme.ink2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 8)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(BWTheme.panel, in: RoundedRectangle(cornerRadius: 10))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(isSelected ? BWTheme.accent : BWTheme.border, lineWidth: 1)
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// 各 Provider 的能力边界（行为真源：docs/product/功能与交互.md §5 与现状差异文档）
+    private static func diarizationBoundaryText(_ provider: DiarizationProvider) -> String {
+        switch provider {
+        case .disabled:
+            return "只做本地录音与 Apple 转写，不认人"
+        case .openAICompatible:
+            return "会中分片 + 整场；上传派生音频与参考样本"
+        case .volcengine:
+            return "会中分片，匿名声音组，无整场入口"
+        case .iflytek:
+            return "会中 + 整场（5 小时 / 500MB）；声纹需注册 feature"
+        case .localSherpaOnnx:
+            return "仅整场 ≤2 小时；不联网、不需要 Key；模型缺失时明确报错"
         }
     }
 

@@ -32,19 +32,20 @@ enum WorkspaceZoneMode: Equatable {
 }
 
 /// 双区宽度求解（纯逻辑，可单测）。
-/// 常量对齐产品 A 版：常驻项目侧栏宽度由调用方在传入 usableWidth 前扣除；
+/// 常量对齐界面设计定稿 v1.0（2026-10-08）：左「理解与回看」最小 440、右「笔记与 AI」最小 360，
+/// 占比 58:42；最小值放不下时提前转单区。常驻项目侧栏宽度由调用方在传入 usableWidth 前扣除；
 /// 这里只消费真正可用的正文宽度。
 enum WorkspaceDualZonePolicy {
-    /// 扣除项目侧栏后的最小双区宽度
-    static let minimumDualZoneWidth: CGFloat = 800
-    /// 左「理解与回看」最小宽度
-    static let leftMinimum: CGFloat = 400
+    /// 左「理解与回看」最小宽度（定稿：440）
+    static let leftMinimum: CGFloat = 440
     /// 右「笔记与 AI」最小宽度
     static let rightMinimum: CGFloat = 360
     /// 两区之间的留白（分隔条等效间距）
     static let gap: CGFloat = 12
     /// 默认左右占比（58/42）
     static let leftFraction: Double = 0.58
+    /// 扣除项目侧栏后的最小双区宽度（= 左最小 + 右最小 + 留白；不足时提前转单区）
+    static let minimumDualZoneWidth: CGFloat = leftMinimum + rightMinimum + gap
 
     struct Widths: Equatable {
         var left: CGFloat
