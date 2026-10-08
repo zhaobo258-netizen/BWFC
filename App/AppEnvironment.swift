@@ -76,7 +76,8 @@ enum ProjectPersistence {
     static func upsert(
         _ incoming: Project,
         into projects: inout [Project],
-        fields: ProjectFieldOwnership
+        fields: ProjectFieldOwnership,
+        explicitSegmentIDs: Set<UUID>? = nil
     ) {
         guard let index = projects.firstIndex(where: { $0.id == incoming.id }) else {
             projects.append(incoming)
@@ -125,7 +126,10 @@ enum ProjectPersistence {
             stored.pauseIntervals = incoming.pauseIntervals
             stored.legacyMetadata = incoming.legacyMetadata
             stored.legacySnapshots = incoming.legacySnapshots
-            mergePipelineSegments(incoming.segments, into: stored)
+            mergePipelineSegments(
+                incoming.segments, into: stored,
+                explicitSegmentIDs: explicitSegmentIDs ?? []
+            )
             stored.lastActivityAt = incoming.lastActivityAt
         case .analysis:
             stored.analysisSnapshots = incoming.analysisSnapshots
@@ -211,7 +215,8 @@ enum ProjectPersistence {
 
     private static func mergePipelineSegments(
         _ incoming: [TranscriptSegment],
-        into stored: Project
+        into stored: Project,
+        explicitSegmentIDs: Set<UUID> = []
     ) {
         let storedByID = Dictionary(
             stored.segments.map { ($0.id, $0) },
@@ -219,6 +224,12 @@ enum ProjectPersistence {
         )
         let incomingIDs = Set(incoming.map(\.id))
         var merged = incoming.map { segment in
+            // 显式人工归属变更（指认/撤销/改判/清除）无条件采用 runtime 值：
+            // 撤销把 confirmed 行改回未确认时，下方 confirmed 保护会错误保留磁盘旧对象，
+            // 导致落盘丢失而保存报成功（最终复核 P1）。保护只针对自动管线更新。
+            if explicitSegmentIDs.contains(segment.id) {
+                return segment
+            }
             guard let existing = storedByID[segment.id],
                   existing.state == .edited
                     || existing.textWasUserEdited == true
@@ -916,15 +927,23 @@ final class AppEnvironment {
     }
 
     /// 保存单个项目；导入项目按调用方字段所有权合并，避免并发副本互相覆盖。
+    /// - Parameters:
+    ///   - explicitSegmentIDs: 显式人工归属变更涉及的片段（录音中 .recordingRuntime
+    ///     管线对 confirmed 行有合并保护；这些 IDs 必须无条件采用 runtime 值，
+    ///     否则撤销/改判/清除会被静默丢弃而保存却报成功——最终复核 P1）。
     func persist(
         _ project: Project,
-        fields: ProjectFieldOwnership = .all
+        fields: ProjectFieldOwnership = .all,
+        explicitSegmentIDs: Set<UUID>? = nil
     ) throws {
         guard !isPersistentStorageUnavailable else { throw ProjectWriteError.storageUnavailable }
         if testForcedStorageUnavailable { throw ProjectWriteError.storageUnavailable }
         guard !deletedProjectIDs.contains(project.id) else { throw ProjectWriteError.projectDeleted }
         var projects = try projectStore.loadProjects()
-        ProjectPersistence.upsert(project, into: &projects, fields: fields)
+        ProjectPersistence.upsert(
+            project, into: &projects, fields: fields,
+            explicitSegmentIDs: explicitSegmentIDs
+        )
         try projectStore.saveProjects(projects)
     }
 

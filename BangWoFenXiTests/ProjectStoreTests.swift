@@ -1378,6 +1378,163 @@ final class ProjectStoreTests {
         #expect(retried.segments.allSatisfy { $0.participantId == speakerB })
     }
 
+    // MARK: - 录音持久化管线（.recordingRuntime + explicitSegmentIDs）回归（最终复核 P1）
+
+    /// 生产录音持久化事务的最小复刻：
+    /// makeRuntimeMeeting → mutate runtime → applyRuntime → persist(.recordingRuntime, explicitIDs)。
+    /// 磁盘预置一条「其他来源已确认」行（模拟并行写入），验证保护不吞显式变更、并行内容不丢。
+    @MainActor
+    private func makeRecordingPersistenceFixture(
+        directoryName: String,
+        credentialTag: String
+    ) throws -> (AppEnvironment, Project, Meeting, UUID, UUID) {
+        let base = makeCaseDirectory(directoryName)
+        let environment = AppEnvironment(
+            meetingStore: InMemoryMeetingStore(),
+            fileStore: MeetingFileStore(baseDirectory: base),
+            projectStore: try JSONProjectStore(directory: base),
+            credentialServiceName: "com.zhaobo.BangWoFenXi.tests.\(credentialTag)-\(UUID().uuidString)"
+        )
+        let speakerA = UUID()
+        let speakerB = UUID()
+        let project = Project(title: "录音管线", sourceType: .liveRecording)
+        project.speakers = [
+            Speaker(id: speakerA, cloudAlias: "p_01", displayName: "甲"),
+            Speaker(id: speakerB, cloudAlias: "p_02", displayName: "乙"),
+        ]
+        project.segments = [
+            TranscriptSegment(startMs: 0, endMs: 1_000, text: "目标行",
+                remoteSpeakerLabel: "chunk:0:speaker_1", source: .cloud, state: .final),
+            TranscriptSegment(startMs: 1_000, endMs: 2_000, text: "并行确认行",
+                participantId: speakerA, source: .cloud, state: .final,
+                speakerWasUserConfirmed: true),
+        ]
+        project.note = NoteDocument(markdown: "手写笔记。")
+        try environment.persist(project)
+        let meeting = try ProjectRuntimeSession.makeRuntimeMeeting(from: project)
+        return (environment, project, meeting, speakerA, speakerB)
+    }
+
+    @Test("录音管线撤销落盘：confirmed 行撤销不再被合并保护吞掉（最终复核 P1）")
+    @MainActor
+    func recordingUndoPersistsThroughRuntimePipeline() throws {
+        let (environment, project, meeting, speakerA, speakerB) = try makeRecordingPersistenceFixture(
+            directoryName: "rec-undo", credentialTag: "rec-undo")
+        // 磁盘预置：目标行已确认给乙（此前某次指认落盘）
+        _ = SpeakerBackfill.assign(
+            anchorSegmentId: meeting.segments[0].id, to: speakerB, segments: meeting.segments)
+        try ProjectRuntimeSession.applyRuntime(meeting, to: project)
+        try environment.persist(project, fields: .recordingRuntime)
+        let afterAssign = try #require(try environment.allProjects().first)
+        #expect(try #require(afterAssign.segments.first).participantId == speakerB,
+                "前置：磁盘含 B")
+
+        // 录音中撤销：before/after → undoDecision → 恢复 runtime 树 → persist(.recordingRuntime, IDs)
+        let before = ProjectWorkspaceView.attributionEntry(of: meeting.segments[0])
+        let after = ProjectWorkspaceView.attributionEntry(of: meeting.segments[0])
+        let record = ProjectWorkspaceView.SpeakerAttributionUndo(
+            kind: .group, speakerID: speakerB,
+            entries: [meeting.segments[0].id: before],
+            afterEntries: [meeting.segments[0].id: after],
+            occurredAt: Date())
+        switch ProjectWorkspaceView.undoDecision(
+            for: meeting.segments[0], before: before, after: after,
+            speakers: project.speakers) {
+        case .apply:
+            meeting.segments[0].participantId = nil
+            meeting.segments[0].speakerWasUserConfirmed = nil
+            meeting.segments[0].speakerAttributionConflict = nil
+            meeting.segments[0].speakerConfirmationScope = nil
+        case .skip(let reason):
+            Issue.record("撤销不得跳过：\(reason)")
+        }
+        try ProjectRuntimeSession.applyRuntime(meeting, to: project)
+        // 关键：录音字段 + 显式 IDs（生产 syncAndPersist 链路）
+        try environment.persist(
+            project, fields: .recordingRuntime,
+            explicitSegmentIDs: [meeting.segments[0].id])
+        let stored = try #require(try environment.allProjects().first)
+        let undone = try #require(stored.segments.first { $0.id == meeting.segments[0].id })
+        #expect(undone.participantId == nil, "撤销必须落盘，不得被 confirmed 保护吞掉")
+        #expect(undone.speakerWasUserConfirmed == nil)
+        #expect(undone.speakerConfirmationScope == nil)
+        // 并行确认行与笔记不受影响
+        let untouched = try #require(stored.segments.first { $0.text == "并行确认行" })
+        #expect(untouched.participantId == speakerA && untouched.speakerWasUserConfirmed == true)
+        #expect(stored.note.markdown == "手写笔记。")
+    }
+
+    @Test("录音管线撤销失败重试：磁盘保持 B，解除注入后重试成功（最终复核 P1）")
+    @MainActor
+    func recordingUndoFailureRetry() throws {
+        let (environment, project, meeting, _, speakerB) = try makeRecordingPersistenceFixture(
+            directoryName: "rec-undo-retry", credentialTag: "rec-undo-retry")
+        _ = SpeakerBackfill.assign(
+            anchorSegmentId: meeting.segments[0].id, to: speakerB, segments: meeting.segments)
+        try ProjectRuntimeSession.applyRuntime(meeting, to: project)
+        try environment.persist(project, fields: .recordingRuntime)
+
+        // 撤销 runtime 树
+        meeting.segments[0].participantId = nil
+        meeting.segments[0].speakerWasUserConfirmed = nil
+        meeting.segments[0].speakerConfirmationScope = nil
+        try ProjectRuntimeSession.applyRuntime(meeting, to: project)
+
+        environment.markPersistentStorageUnavailableForTesting()
+        #expect(throws: ProjectWriteError.self) {
+            try environment.persist(
+                project, fields: .recordingRuntime,
+                explicitSegmentIDs: [meeting.segments[0].id])
+        }
+        // 失败：磁盘保持 B（可重试状态）
+        let duringFailure = try #require(try environment.allProjects().first)
+        #expect(duringFailure.segments.first?.participantId == speakerB)
+
+        environment.clearPersistentStorageUnavailableForTesting()
+        try environment.persist(
+            project, fields: .recordingRuntime,
+            explicitSegmentIDs: [meeting.segments[0].id])
+        let retried = try #require(try environment.allProjects().first)
+        #expect(retried.segments.first?.participantId == nil)
+        #expect(retried.segments.first?.speakerConfirmationScope == nil)
+    }
+
+    @Test("录音管线改判与清除：confirmed 行 A→B 改判、清除均落盘（最终复核 P1）")
+    @MainActor
+    func recordingReassignAndClearPersist() throws {
+        let (environment, project, meeting, speakerA, speakerB) = try makeRecordingPersistenceFixture(
+            directoryName: "rec-reassign-clear", credentialTag: "rec-reassign")
+        // 预置：目标行已确认给甲
+        meeting.segments[0].participantId = speakerA
+        meeting.segments[0].speakerWasUserConfirmed = true
+        meeting.segments[0].speakerConfirmationScope = .segment
+        try ProjectRuntimeSession.applyRuntime(meeting, to: project)
+        try environment.persist(project, fields: .recordingRuntime)
+
+        // 改判 A→B（单条显式改判语义）经录音管线落盘
+        meeting.segments[0].participantId = speakerB
+        try ProjectRuntimeSession.applyRuntime(meeting, to: project)
+        try environment.persist(
+            project, fields: .recordingRuntime,
+            explicitSegmentIDs: [meeting.segments[0].id])
+        let afterReassign = try #require(try environment.allProjects().first)
+        #expect(try #require(afterReassign.segments.first).participantId == speakerB,
+                "confirmed 行改判必须落盘")
+
+        // 清除归属经录音管线落盘
+        MeetingTranscriptEditor.clearSpeaker(meeting.segments[0])
+        meeting.segments[0].speakerConfirmationScope = .segment
+        try ProjectRuntimeSession.applyRuntime(meeting, to: project)
+        try environment.persist(
+            project, fields: .recordingRuntime,
+            explicitSegmentIDs: [meeting.segments[0].id])
+        let afterClear = try #require(try environment.allProjects().first)
+        let cleared = try #require(afterClear.segments.first)
+        #expect(cleared.participantId == nil)
+        #expect(cleared.speakerWasUserConfirmed == true, "清除是明确人工决定")
+        #expect(cleared.speakerConfirmationScope == .segment)
+    }
+
     @Test("组级生产事务：指认落盘→重读含 B+group→撤销落盘→重读旧值（第四轮复核）")
     @MainActor
     func groupAssignUndoReloadRoundTrip() throws {

@@ -202,7 +202,7 @@ final class ProjectRuntimeSessionTests {
         let controller = ProjectRuntimePersistenceController(
             meeting: meeting,
             project: project,
-            persist: { _ in persistCount += 1 },
+            persist: { _, _ in persistCount += 1 },
             debounce: .milliseconds(50)
         )
 
@@ -238,7 +238,7 @@ final class ProjectRuntimeSessionTests {
         let controller = ProjectRuntimePersistenceController(
             meeting: meeting,
             project: project,
-            persist: { _ in persistCount += 1 },
+            persist: { _, _ in persistCount += 1 },
             debounce: .seconds(60)
         )
 
@@ -336,7 +336,7 @@ final class ProjectRuntimeSessionTests {
         var persistCount = 0
         let controller = ProjectRuntimePersistenceController(
             meeting: meeting, project: project,
-            persist: { _ in persistCount += 1 },
+            persist: { _, _ in persistCount += 1 },
             debounce: .milliseconds(20)
         )
 
@@ -363,7 +363,7 @@ final class ProjectRuntimeSessionTests {
         var persistCount = 0
         let controller = ProjectRuntimePersistenceController(
             meeting: meeting, project: project,
-            persist: { _ in persistCount += 1 },
+            persist: { _, _ in persistCount += 1 },
             debounce: .milliseconds(30)
         )
 
@@ -389,7 +389,7 @@ final class ProjectRuntimeSessionTests {
         var attempts = 0
         let controller = ProjectRuntimePersistenceController(
             meeting: meeting, project: project,
-            persist: { _ in
+            persist: { _, _ in
                 attempts += 1
                 if attempts == 1 { throw MeetingStoreError.directoryUnavailable }
             },
@@ -423,7 +423,7 @@ final class ProjectRuntimeSessionTests {
         let meeting = try ProjectRuntimeSession.makeRuntimeMeeting(from: project)
         let controller = ProjectRuntimePersistenceController(
             meeting: meeting, project: project,
-            persist: { _ in throw MeetingStoreError.directoryUnavailable },
+            persist: { _, _ in throw MeetingStoreError.directoryUnavailable },
             debounce: .milliseconds(10)
         )
 

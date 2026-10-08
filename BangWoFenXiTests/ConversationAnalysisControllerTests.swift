@@ -340,7 +340,7 @@ final class ConversationAnalysisControllerTests {
         var persistedCount = 0
         let runtime = ProjectRuntimePersistenceController(
             meeting: meeting, project: project,
-            persist: { _ in persistedCount += 1 }, debounce: .seconds(60)
+            persist: { _, _ in persistedCount += 1 }, debounce: .seconds(60)
         )
         transcription.onFinalSegment = { runtime.schedule() }
         transcription.onNewFinalSegment = { segmentID in

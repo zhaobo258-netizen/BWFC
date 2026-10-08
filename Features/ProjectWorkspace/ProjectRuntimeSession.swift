@@ -173,10 +173,14 @@ enum ProjectRuntimeSession {
 final class ProjectRuntimePersistenceController {
     private let meeting: Meeting
     private let project: Project
-    private let persist: (Project) throws -> Void
+    /// persist 闭包第二个参数：显式人工归属变更片段（最终复核 P1：
+    /// 录音管线对 confirmed 行的合并保护不得吞掉撤销/改判/清除）
+    private let persist: (Project, Set<UUID>?) throws -> Void
     private let debounce: Duration
     private let onFailure: (Error) -> Void
     private var flushTask: Task<Void, Never>?
+    /// 待落盘的显式归属变更片段；成功落盘前保留（失败重试仍强制）
+    private var pendingExplicitSegmentIDs: Set<UUID>?
     /// 单调递增的落盘任务代号：只有当前代号的任务有权清空 flushTask，
     /// 避免 await 边界后 cancel() 作用在已被替换的引用上导致重复写盘。
     private var flushGeneration = 0
@@ -196,7 +200,7 @@ final class ProjectRuntimePersistenceController {
     init(
         meeting: Meeting,
         project: Project,
-        persist: @escaping (Project) throws -> Void,
+        persist: @escaping (Project, Set<UUID>?) throws -> Void,
         debounce: Duration = .seconds(2),
         onFailure: @escaping (Error) -> Void = { _ in }
     ) {
@@ -205,6 +209,16 @@ final class ProjectRuntimePersistenceController {
         self.persist = persist
         self.debounce = debounce
         self.onFailure = onFailure
+    }
+
+    /// 标记显式归属变更片段并在下次落盘时无条件采用 runtime 值；
+    /// 落盘成功前保留（写失败重试仍强制），成功后清空。
+    func markExplicitSegmentIDs(_ ids: Set<UUID>) {
+        if let pending = pendingExplicitSegmentIDs {
+            pendingExplicitSegmentIDs = pending.union(ids)
+        } else {
+            pendingExplicitSegmentIDs = ids
+        }
     }
 
     func schedule() {
@@ -242,7 +256,8 @@ final class ProjectRuntimePersistenceController {
         writeAttemptCount += 1
         do {
             try ProjectRuntimeSession.applyRuntime(meeting, to: project)
-            try persist(project)
+            try persist(project, pendingExplicitSegmentIDs)
+            pendingExplicitSegmentIDs = nil
             hasPendingChanges = false
             saveError = nil
             consecutiveFailures = 0

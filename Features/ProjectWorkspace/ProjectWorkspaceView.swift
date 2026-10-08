@@ -919,7 +919,10 @@ struct ProjectWorkspaceView: View {
                 afterCommit[id] = Self.attributionEntry(of: segment)
             }
         }
-        guard persistAndRefresh(meeting) else {
+        guard persistAndRefresh(
+            meeting,
+            explicitSegmentIDs: Set(outcome.changedSegmentIds)
+        ) else {
             Self.rollbackAttributionState(
                 entries: beforeCommit,
                 meetingSegments: meeting.segments,
@@ -2702,11 +2705,14 @@ struct ProjectWorkspaceView: View {
         let runtimePersistence = ProjectRuntimePersistenceController(
             meeting: meeting,
             project: project,
-            persist: { [environment] project in
+            persist: { [environment] project, explicitSegmentIDs in
                 let fields: ProjectFieldOwnership = self.didStartSessionThisView && !self.isRetranscribing
                     ? .recordingRuntime
                     : .manualSegments
-                try environment.persist(project, fields: fields)
+                try environment.persist(
+                    project, fields: fields,
+                    explicitSegmentIDs: self.didStartSessionThisView ? explicitSegmentIDs : nil
+                )
             },
             onFailure: { error in
                 self.operationError = "项目保存失败（\(String(describing: type(of: error)))）"
@@ -2848,9 +2854,15 @@ struct ProjectWorkspaceView: View {
 
     /// 运行时 → Project 回写并落库（所有状态变化的统一出口）
     @discardableResult
-    private func syncAndPersist(_ meeting: Meeting) -> Bool {
+    private func syncAndPersist(
+        _ meeting: Meeting,
+        explicitSegmentIDs: Set<UUID>? = nil
+    ) -> Bool {
         guard let project else { return false }
         if let runtimePersistence {
+            if let ids = explicitSegmentIDs {
+                runtimePersistence.markExplicitSegmentIDs(ids)
+            }
             if runtimePersistence.flush(force: true) {
                 operationError = nil
                 reloadSidebarProjects()
@@ -2863,7 +2875,10 @@ struct ProjectWorkspaceView: View {
             let fields: ProjectFieldOwnership = didStartSessionThisView && !isRetranscribing
                 ? .recordingRuntime
                 : .manualSegments
-            try environment.persist(project, fields: fields)
+            try environment.persist(
+                project, fields: fields,
+                explicitSegmentIDs: explicitSegmentIDs
+            )
             operationError = nil
             reloadSidebarProjects()
             return true
@@ -2952,8 +2967,11 @@ struct ProjectWorkspaceView: View {
 
     /// 人工编辑后持久化并刷新转写视图
     @discardableResult
-    private func persistAndRefresh(_ meeting: Meeting) -> Bool {
-        let didPersist = syncAndPersist(meeting)
+    private func persistAndRefresh(
+        _ meeting: Meeting,
+        explicitSegmentIDs: Set<UUID>? = nil
+    ) -> Bool {
+        let didPersist = syncAndPersist(meeting, explicitSegmentIDs: explicitSegmentIDs)
         transcription?.refreshSegments()
         return didPersist
     }
@@ -3383,7 +3401,10 @@ struct ProjectWorkspaceView: View {
                 afterEntries[id] = Self.attributionEntry(of: segment)
             }
         }
-        guard persistAndRefresh(meeting) else {
+        guard persistAndRefresh(
+            meeting,
+            explicitSegmentIDs: Set(outcome.changedSegmentIds)
+        ) else {
             Self.rollbackAttributionState(
                 entries: entries,
                 meetingSegments: meeting.segments,
@@ -3507,7 +3528,7 @@ struct ProjectWorkspaceView: View {
                 : "撤销未执行：" + skippedReasons.joined(separator: "；") + "。"
             return
         }
-        guard persistAndRefresh(meeting) else {
+        guard persistAndRefresh(meeting, explicitSegmentIDs: Set(restored)) else {
             // 撤销保存失败：两棵模型与 updatedAt 完整还原，撤销记录保留可重试
             Self.rollbackAttributionState(
                 entries: beforeUndo,
@@ -3601,7 +3622,7 @@ struct ProjectWorkspaceView: View {
         let afterEntries: [UUID: SpeakerAttributionUndo.Entry] = [
             segment.id: Self.attributionEntry(of: target)
         ]
-        guard persistAndRefresh(meeting) else {
+        guard persistAndRefresh(meeting, explicitSegmentIDs: [segment.id]) else {
             Self.rollbackAttributionState(
                 entries: entries,
                 meetingSegments: meeting.segments,
