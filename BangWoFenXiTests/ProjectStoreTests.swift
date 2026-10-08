@@ -1278,6 +1278,24 @@ final class ProjectStoreTests {
         }
     }
 
+    @Test("Shift 连续范围双向选择：锚点在上/在下都覆盖完整区间（第四轮复核 UI 逻辑）")
+    @MainActor
+    func shiftRangeCoversBothDirections() {
+        let ids = (0..<8).map { _ in UUID() }
+        // 锚点在上（3），当前在下（6）：3–6
+        #expect(Set(ProjectWorkspaceView.shiftRange(
+            anchorIndex: 3, currentIndex: 6, ordered: ids)) == Set(ids[3...6]))
+        // 锚点在下（6），当前在上（3）：3–6（双向）
+        #expect(Set(ProjectWorkspaceView.shiftRange(
+            anchorIndex: 6, currentIndex: 3, ordered: ids)) == Set(ids[3...6]))
+        // 同点：只含自身
+        #expect(ProjectWorkspaceView.shiftRange(
+            anchorIndex: 4, currentIndex: 4, ordered: ids) == [ids[4]])
+        // 越界防御：空结果不 trap
+        #expect(ProjectWorkspaceView.shiftRange(
+            anchorIndex: 0, currentIndex: 99, ordered: ids).isEmpty)
+    }
+
     @Test("组级生产事务：保存失败还原两棵独立活模型树（第四轮复核）")
     @MainActor
     func groupAssignSaveFailureRestoresTwoLiveModelTrees() throws {

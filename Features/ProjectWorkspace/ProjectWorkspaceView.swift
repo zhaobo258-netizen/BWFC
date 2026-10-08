@@ -1095,11 +1095,21 @@ struct ProjectWorkspaceView: View {
             return
         }
         // 向上/向下连续范围都支持（审查修复 2：min/max 防 trap）
-        let lower = min(startIndex, endIndex)
-        let upper = max(startIndex, endIndex)
-        for index in lower...upper {
-            batchSelectedSegmentIds.insert(ordered[index])
-        }
+        batchSelectedSegmentIds.formUnion(Self.shiftRange(
+            anchorIndex: startIndex, currentIndex: endIndex, ordered: ordered))
+    }
+
+    /// Shift 范围的纯计算（双向：锚点在上或在下都成立；可单测）
+    static func shiftRange(
+        anchorIndex: Int,
+        currentIndex: Int,
+        ordered: [UUID]
+    ) -> [UUID] {
+        guard ordered.indices.contains(anchorIndex),
+              ordered.indices.contains(currentIndex) else { return [] }
+        let lower = min(anchorIndex, currentIndex)
+        let upper = max(anchorIndex, currentIndex)
+        return Array(ordered[lower...upper])
     }
 
     private func quotePageHeader(meeting: Meeting,
