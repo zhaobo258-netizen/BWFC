@@ -393,6 +393,8 @@ struct ProjectWorkspaceView: View {
                 if let project, let meeting {
                     topBar(project: project, meeting: meeting, mode: mode)
                     Divider()
+                    // 定稿 W1：状态条只挂「需要处理」的项；正常态整行不渲染（正常 = 不可见）
+                    statusBar(project: project, meeting: meeting)
                     if recorder?.writeFailureInterrupted == true {
                         writeFailureBanner
                     } else if recorder?.deviceInterrupted == true {
@@ -497,38 +499,47 @@ struct ProjectWorkspaceView: View {
 
     private func aContent(meeting: Meeting) -> some View {
         GeometryReader { geo in
-            let widths = WorkspaceDualZonePolicy.solve(usableWidth: geo.size.width)
+            // 定稿：双区为两张 panel 卡片浮于 canvas 底上；左右外边距 16，底部 14
+            let usable = max(0, geo.size.width - 32)
+            let widths = WorkspaceDualZonePolicy.solve(usableWidth: usable)
             Group {
-                if WorkspaceDualZonePolicy.mode(for: geo.size.width) == .dual {
+                if WorkspaceDualZonePolicy.mode(for: usable) == .dual {
                     HStack(spacing: WorkspaceDualZonePolicy.gap) {
                         understandingZone(meeting: meeting)
                             .frame(width: widths.left)
+                            .bwZoneCard()
                         thoughtZone(meeting: meeting)
                             .frame(width: widths.right)
+                            .bwZoneCard()
                     }
                 } else {
                     singleZoneContent(meeting: meeting)
+                        .bwZoneCard()
                 }
             }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 14)
         }
+        .background(BWTheme.canvas)
     }
 
     private func singleZoneContent(meeting: Meeting) -> some View {
         VStack(spacing: 0) {
-            Picker("", selection: $singleZoneSelection) {
-                Text("理解与回看").tag(WorkspaceSingleZoneSelection.understanding)
-                Text("笔记与 AI").tag(WorkspaceSingleZoneSelection.notesAndAI)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(maxWidth: 360)
+            // 定稿页签组件：canvas 底容器 + 选中 panel 卡（窄窗单区切换）
+            BWSegmentedTabs(
+                items: [
+                    .init(title: "理解与回看", tag: WorkspaceSingleZoneSelection.understanding),
+                    .init(title: "笔记与 AI", tag: WorkspaceSingleZoneSelection.notesAndAI)
+                ],
+                selection: $singleZoneSelection,
+                accessibilityName: "工作区区切换"
+            )
             .padding(.vertical, 8)
-            .tint(BWTheme.accent)
             .onChange(of: externalZoneSwitchRequest) { _, request in
                 if let request { singleZoneSelection = request }
             }
 
-            Divider()
+            Divider().overlay(BWTheme.border)
             Group {
                 if singleZoneSelection == .understanding {
                     understandingZone(meeting: meeting)
@@ -544,19 +555,25 @@ struct ProjectWorkspaceView: View {
 
     private func understandingZone(meeting: Meeting) -> some View {
         VStack(spacing: 0) {
-            Picker("", selection: $understandingPage) {
-                ForEach(UnderstandingPage.allCases, id: \.self) { page in
-                    Text(page.rawValue).tag(page)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(maxWidth: 460)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .tint(BWTheme.accent)
+            // 定稿四页签（页签非四份同等权威原文）；「标记」带已星标计数
+            BWSegmentedTabs(
+                items: UnderstandingPage.allCases.map { page in
+                    BWSegmentedTabs<UnderstandingPage>.Item(
+                        title: page.rawValue,
+                        tag: page,
+                        trailingCount: page == .starred
+                            ? meeting.segments.filter(\.isStarred).count
+                            : nil
+                    )
+                },
+                selection: $understandingPage,
+                accessibilityName: "理解与回看页签"
+            )
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
 
-            Divider()
+            Divider().overlay(BWTheme.border)
 
             switch understandingPage {
             case .overview:
@@ -570,7 +587,6 @@ struct ProjectWorkspaceView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(BWTheme.columnBackground)
     }
 
     private func peoplePage(meeting: Meeting) -> some View {
@@ -1908,9 +1924,78 @@ struct ProjectWorkspaceView: View {
                 }
             )
         }
-        .padding(.horizontal, mode == .narrow ? 10 : 16)
+        .padding(.horizontal, mode == .narrow ? 10 : 20)
         .padding(.vertical, 10)
-        .background(.bar)
+        .frame(minHeight: 60)
+        .background(BWTheme.panel)
+    }
+
+    // MARK: - 状态条（定稿 W1/S03：只挂「需要处理」的项；正常态整行不渲染）
+
+    /// 状态条 chips 数据源一律为持久任务/模型投影（processingJobs、speakers、
+    /// FinalReportFingerprint、分人持久队列），不凭 View 内存猜测（S02 同口径）。
+    @ViewBuilder
+    private func statusBar(project: Project, meeting: Meeting) -> some View {
+        let pendingSpeakers = project.speakers.filter { !$0.isUserConfirmed }.count
+        let failedChunks = diarization?.awaitingUserRetryCount ?? 0
+        let failedJobs = project.processingJobs.filter {
+            $0.status == .failedRetryable || $0.status == .failedFinal
+        }.count
+        let reportFailed: Bool = {
+            if case .failed = finalReportState { return true }
+            return false
+        }()
+        let reportStale: Bool = {
+            guard !reportFailed,
+                  let latest = project.finalReportSnapshots
+                    .sorted(by: { $0.version > $1.version }).first else { return false }
+            return FinalReportFingerprint.isStale(
+                latest, for: project,
+                relatedProjects: sidebarProjects.filter {
+                    project.relatedProjectIDs.contains($0.id)
+                }
+            )
+        }()
+
+        if pendingSpeakers > 0 || failedChunks > 0 || failedJobs > 0 || reportFailed || reportStale {
+            HStack(spacing: 8) {
+                Spacer()
+                if pendingSpeakers > 0 {
+                    BWStatusChip(text: "\(pendingSpeakers) 位人物待确认", tone: .warn) {
+                        understandingPage = .people
+                    }
+                    .accessibilityHint("去人物页确认")
+                }
+                if failedChunks > 0 {
+                    BWStatusChip(text: "\(failedChunks) 分片失败 · 去重试", tone: .error) {
+                        diarization?.retryAwaitingUserChunks()
+                    }
+                    .accessibilityHint("重试失败的分片")
+                }
+                if failedJobs > 0 {
+                    BWStatusChip(text: "\(failedJobs) 项处理失败 · 看处理详情", tone: .error) {
+                        // 处理详情在顶栏右侧弹层；此处先带用户到原话页查看已有文稿
+                        understandingPage = .transcript
+                    }
+                    .accessibilityHint("查看处理状态")
+                }
+                if reportFailed {
+                    BWStatusChip(text: "完整总结失败 · 去重试", tone: .error) {
+                        startFinalReportGeneration()
+                    }
+                    .accessibilityHint("重新生成完整总结")
+                } else if reportStale {
+                    BWStatusChip(text: "完整总结需更新", tone: .warn) {
+                        understandingPage = .overview
+                        centerTab = .finalReport
+                    }
+                    .accessibilityHint("打开完整总结页签")
+                }
+            }
+            .padding(.horizontal, 20)
+            .frame(minHeight: 46)
+            .background(BWTheme.canvas)
+        }
     }
 
     /// 可单击编辑的项目标题
@@ -2084,22 +2169,18 @@ struct ProjectWorkspaceView: View {
                     }
                 }
 
-                Picker("", selection: $centerTab) {
-                    ForEach(CenterTab.allCases, id: \.self) { tab in
-                        Text(tab.rawValue)
-                            .help(tab.explanation)
-                            .tag(tab)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 420)
-                .labelsHidden()
-                .tint(BWTheme.accent)
+                BWSegmentedTabs(
+                    items: CenterTab.allCases.map { tab in
+                        BWSegmentedTabs<CenterTab>.Item(title: tab.rawValue, tag: tab)
+                    },
+                    selection: $centerTab,
+                    accessibilityName: "整体理解页签"
+                )
+                .help(centerTab.explanation)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 7)
             .frame(minHeight: 72)
-            .background(.bar)
 
             Group {
                 analysisTabContent(meeting: meeting)
@@ -2252,75 +2333,83 @@ struct ProjectWorkspaceView: View {
         )
     }
 
-    // MARK: - 底部录音条（录音/暂停时始终可达：暂停 / 继续 / 标记 / 结束）
+    // MARK: - 底部证据条（定稿 W2/W3/W5：标记此刻为会中第一动作；84pt；panel 底）
 
     private func bottomRecordBar(meeting: Meeting) -> some View {
-        HStack(spacing: 16) {
-            HStack(spacing: 6) {
+        let starredCount = meeting.segments.filter(\.isStarred).count
+        return HStack(spacing: 16) {
+            // 左：录音状态点 + 真实电平（随音量起伏，不假装跳动）+ 等宽计时
+            HStack(spacing: 8) {
                 if meeting.status == .recording {
-                    Circle().fill(.red).frame(width: 10, height: 10)
-                    Text("录音中")
+                    Circle().fill(BWTheme.liveRed).frame(width: 8, height: 8)
+                    BWLevelIndicator(
+                        level: liveAudioLevel,
+                        barColor: audioQuality.isPersistentlyLow ? BWTheme.warn : BWTheme.ok
+                    )
                 } else {
-                    Circle().fill(.orange).frame(width: 10, height: 10)
+                    Circle().fill(BWTheme.warn).frame(width: 8, height: 8)
                     Text("已暂停")
+                        .font(.system(size: BWTheme.fontSizeLabel))
+                        .foregroundStyle(BWTheme.warn)
+                }
+                TimelineView(.periodic(from: timerAnchor, by: 1)) { context in
+                    Text(LiveMeetingView.formatDuration(ms: recorder?.elapsedWallMs(at: context.date) ?? 0))
+                        .monospacedDigit()
+                        .font(.system(size: BWTheme.fontSizeBody, weight: .semibold))
+                        .foregroundStyle(BWTheme.ink)
                 }
             }
-            .font(.callout)
-
-            TimelineView(.periodic(from: timerAnchor, by: 1)) { context in
-                Text(LiveMeetingView.formatDuration(ms: recorder?.elapsedWallMs(at: context.date) ?? 0))
-                    .monospacedDigit()
-                    .font(.callout)
-            }
-
-            HStack(spacing: 6) {
-                Image(systemName: "waveform")
-                    .foregroundStyle(audioQuality.isPersistentlyLow ? .orange : .secondary)
-                ProgressView(value: Double(liveAudioLevel))
-                    .frame(width: 70)
-                if audioQuality.isPersistentlyLow {
-                    Text("声音偏小，请靠近麦克风或提高播放音量")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                }
-            }
-            .help("持续偏小会显著降低专有名词和数字的识别准确率")
             .accessibilityElement(children: .combine)
             .accessibilityLabel(
                 audioQuality.isPersistentlyLow
                     ? "录音声音持续偏小，建议靠近麦克风或提高播放音量"
-                    : "当前录音电平"
+                    : "当前录音电平与时长"
             )
+
+            if audioQuality.isPersistentlyLow {
+                Text("声音偏小，请靠近麦克风或提高播放音量")
+                    .font(.system(size: BWTheme.fontSizeDetail))
+                    .foregroundStyle(BWTheme.warn)
+            }
 
             Spacer()
 
-            Button("标记") {
+            // 会中第一动作：44pt 实心主按钮 + 已标记计数（定稿决策 1 / S04）
+            BWMarkButton(
+                markedCount: starredCount,
+                isEnabled: !meeting.segments.isEmpty
+            ) {
                 if let latest = meeting.segments.last {
                     MeetingTranscriptEditor.toggleStar(latest)
                     persistAndRefresh(meeting)
                 }
             }
-            .disabled(meeting.segments.isEmpty)
 
             if meeting.status == .recording {
                 Button("暂停") {
                     run { try recorder?.pauseRecording(); syncAndPersist(meeting) }
                 }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
             } else {
                 Button("继续") {
                     run { try recorder?.resumeRecording(); syncAndPersist(meeting) }
                 }
                 .buttonStyle(.borderedProminent)
+                .tint(BWTheme.accentButton)
+                .controlSize(.large)
                 .disabled(recorder?.deviceInterrupted == true)
             }
 
-            Button("结束录音", role: .destructive) {
+            Button("结束并回看", role: .destructive) {
                 showEndConfirmation = true
             }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(.bar)
+        .padding(.horizontal, 20)
+        .frame(height: 84)
+        .background(BWTheme.panel)
     }
 
     // MARK: - 横幅（仅异常时出现，非阻塞）
@@ -4989,6 +5078,10 @@ struct ProjectWorkspaceView: View {
                     try environment.persist(project, fields: .importPipeline)
                 }
                 operationError = nil
+                // 定稿 F.1：录音结束后默认落到会后成果——「整体理解」的「完整总结」页签，
+                // 生成中/失败/过期状态在该页签如实呈现，不强迫用户逐层找成果
+                understandingPage = .overview
+                centerTab = .finalReport
                 if transcriptionFailed {
                     operationError = "录音已保存，但转写未完成。请先回听原音频，再使用“重新转写”；本次未自动生成总结。"
                 } else {

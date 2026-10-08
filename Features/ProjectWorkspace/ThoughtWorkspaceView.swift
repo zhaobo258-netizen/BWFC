@@ -106,7 +106,7 @@ struct ThoughtWorkspaceView: View {
             }
             .frame(width: geo.size.width, height: geo.size.height)
         }
-        .background(BWTheme.columnBackground.opacity(0.72))
+        // 底色由外层双区卡片（bwZoneCard）提供，这里不再叠一层 canvas
         .onChange(of: externalComposerFocusToken) { _, token in
             // 从原话点「就这句问 AI」后必须切回对话页，让输入可见
             if token != nil, lowerMode != .chat {
@@ -323,17 +323,17 @@ struct ThoughtWorkspaceView: View {
 
     private var lowerPane: some View {
         VStack(spacing: 0) {
-            Picker("", selection: $lowerMode) {
-                ForEach(LowerMode.allCases, id: \.self) { mode in
-                    Text(mode.rawValue).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
+            // 定稿页签组件：canvas 底容器 + 选中 panel 卡
+            BWSegmentedTabs(
+                items: LowerMode.allCases.map { mode in
+                    BWSegmentedTabs<LowerMode>.Item(title: mode.rawValue, tag: mode)
+                },
+                selection: $lowerMode,
+                accessibilityName: "笔记与 AI 页签"
+            )
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
-            .frame(maxWidth: 340)
-            .tint(BWTheme.accent)
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             if lowerMode == .chat {
                 ProjectAIChatView(

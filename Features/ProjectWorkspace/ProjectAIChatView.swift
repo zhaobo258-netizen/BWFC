@@ -81,7 +81,7 @@ struct ProjectAIChatView: View {
             }
             composer
         }
-        .background(BWTheme.columnBackground.opacity(0.72))
+        // 底色由外层双区卡片（bwZoneCard）提供，这里不再叠一层 canvas
         .frame(
             minWidth: 0,
             maxWidth: .infinity,

@@ -12,6 +12,21 @@ import SwiftUI
 /// - `BWLevelIndicator`：录音电平 3 柱 1s 循环动画（录音中才显示）
 /// - `BWTagChip`：语义小标签（推测/待核对/AI 推断等）
 
+// MARK: - 工作区卡片容器
+
+extension View {
+    /// 工作台双区卡片：panel 底 r14 + 1pt border，内容裁剪到圆角内（定稿布局）。
+    func bwZoneCard() -> some View {
+        self
+            .background(BWTheme.panel, in: RoundedRectangle(cornerRadius: 14))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14)
+                    .strokeBorder(BWTheme.border, lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
+}
+
 // MARK: - 状态条 chip
 
 /// 状态条 chip：panel 底 + border + 7pt 状态点。
@@ -78,6 +93,7 @@ struct BWStatusChip: View {
 /// 旁显已标记计数由调用方放置。录音中全屏最大按钮（S04）。
 struct BWMarkButton: View {
     let markedCount: Int
+    var isEnabled: Bool = true
     let action: () -> Void
 
     @State private var justMarked = false
@@ -103,10 +119,14 @@ struct BWMarkButton: View {
                 .foregroundStyle(.white)
                 .padding(.horizontal, 18)
                 .frame(height: BWTheme.heroActionHeight)
-                .background(BWTheme.accentButton, in: RoundedRectangle(cornerRadius: 10))
-                .shadow(color: BWTheme.accentButton.opacity(0.25), radius: 4, y: 2)
+                .background(
+                    BWTheme.accentButton.opacity(isEnabled ? 1 : 0.45),
+                    in: RoundedRectangle(cornerRadius: 10)
+                )
+                .shadow(color: BWTheme.accentButton.opacity(isEnabled ? 0.25 : 0), radius: 4, y: 2)
             }
             .buttonStyle(.plain)
+            .disabled(!isEnabled)
             .animation(reduceMotion ? nil : .easeInOut(duration: 0.15), value: justMarked)
             .accessibilityLabel("标记此刻")
             .help("标记当前时刻的原话，会后在「标记」页集中查看")
@@ -171,33 +191,123 @@ struct BWTagChip: View {
 
 // MARK: - 录音电平指示
 
-/// 电平指示：3 柱 1s 循环缩放动画；与 REC 计时并列，录音中才显示。
+/// 电平指示：3 柱；与 REC 计时并列，录音中才显示。
+/// 两种模式：
+/// - 装饰性待机动画（`level == nil`，1s 循环缩放，纯粹提示「收音中」）；
+/// - 真实电平驱动（传入 0…1 实时电平，柱高随真实音量起伏，不假装跳动）。
 struct BWLevelIndicator: View {
+    /// 实时电平（0…1）；nil = 待机装饰动画
+    var level: Float? = nil
     var barColor: Color = BWTheme.ok
     @State private var animate = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    private let heights: [CGFloat] = [0.6, 1.0, 0.75]
+    private let baseHeights: [CGFloat] = [0.6, 1.0, 0.75]
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 2) {
-            ForEach(Array(heights.enumerated()), id: \.offset) { index, height in
-                RoundedRectangle(cornerRadius: 1)
-                    .fill(barColor)
-                    .frame(width: 3.4, height: 15 * height)
-                    .scaleEffect(y: animate && !reduceMotion ? 0.45 : 1)
-                    .animation(
-                        reduceMotion
-                            ? nil
-                            : .easeInOut(duration: 1)
-                                .repeatForever(autoreverses: true)
-                                .delay(Double(index) * 0.15),
-                        value: animate
+        if let level {
+            // 真实电平：各柱不同灵敏度，底高 0.25，随音量起伏
+            HStack(alignment: .bottom, spacing: 2) {
+                ForEach(Array(baseHeights.enumerated()), id: \.offset) { index, _ in
+                    RoundedRectangle(cornerRadius: 1)
+                        .fill(barColor)
+                        .frame(width: 3.4, height: 15 * liveHeight(index: index, level: level))
+                }
+            }
+            .frame(height: 15)
+            .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: level)
+            .accessibilityHidden(true)
+        } else {
+            // 待机装饰：1s 循环缩放（Reduce Motion 时静止）
+            HStack(alignment: .bottom, spacing: 2) {
+                ForEach(Array(baseHeights.enumerated()), id: \.offset) { index, base in
+                    RoundedRectangle(cornerRadius: 1)
+                        .fill(barColor)
+                        .frame(width: 3.4, height: 15 * base)
+                        .scaleEffect(y: animate && !reduceMotion ? 0.45 : 1)
+                        .animation(
+                            reduceMotion
+                                ? nil
+                                : .easeInOut(duration: 1)
+                                    .repeatForever(autoreverses: true)
+                                    .delay(Double(index) * 0.15),
+                            value: animate
+                        )
+                }
+            }
+            .frame(height: 15)
+            .onAppear { animate = true }
+            .accessibilityHidden(true)
+        }
+    }
+
+    private func liveHeight(index: Int, level: Float) -> CGFloat {
+        let sensitivity: [CGFloat] = [1.15, 1.0, 0.85]
+        let scaled = CGFloat(min(max(level, 0), 1)) * sensitivity[index]
+        return max(0.25, min(1, scaled))
+    }
+}
+
+// MARK: - 分段页签（定稿组件规格）
+
+/// 分段页签：canvas 底容器（r10/padding 3），选中项为 panel 卡（r8 + 轻阴影）。
+/// 用于工作台四页签、窄窗单区切换、右区「AI 对话 / AI 归结」。
+/// 泛型 Tag 需 Hashable；每项可携带末尾计数（如「标记 3」）。
+struct BWSegmentedTabs<Tag: Hashable>: View {
+    struct Item {
+        let title: String
+        let tag: Tag
+        /// 末尾计数（可选，accent 色小字）
+        let trailingCount: Int?
+
+        init(title: String, tag: Tag, trailingCount: Int? = nil) {
+            self.title = title
+            self.tag = tag
+            self.trailingCount = trailingCount
+        }
+    }
+
+    let items: [Item]
+    @Binding var selection: Tag
+    /// 可访问性读屏名称
+    var accessibilityName: String = "页签"
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(items.indices, id: \.self) { index in
+                let item = items[index]
+                let isOn = selection == item.tag
+                Button {
+                    selection = item.tag
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(item.title)
+                            .font(.system(size: BWTheme.fontSizeLabel, weight: isOn ? .semibold : .regular))
+                        if let count = item.trailingCount {
+                            Text("\(count)")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(BWTheme.accent)
+                        }
+                    }
+                    .foregroundStyle(isOn ? BWTheme.ink : BWTheme.ink2)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(
+                        isOn ? BWTheme.panel : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 8)
                     )
+                    .shadow(color: isOn ? .black.opacity(0.08) : .clear, radius: 2, y: 1)
+                    .contentShape(RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("\(accessibilityName)：\(item.title)")
+                .accessibilityValue(isOn ? "已选中" : "未选中")
             }
         }
-        .frame(height: 15)
-        .onAppear { animate = true }
-        .accessibilityHidden(true)
+        .padding(3)
+        .background(BWTheme.canvas, in: RoundedRectangle(cornerRadius: 10))
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.15), value: selection)
     }
 }
