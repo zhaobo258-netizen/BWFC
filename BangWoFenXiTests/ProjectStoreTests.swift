@@ -1278,6 +1278,177 @@ final class ProjectStoreTests {
         }
     }
 
+    @Test("组级生产事务：保存失败还原两棵独立活模型树（第四轮复核）")
+    @MainActor
+    func groupAssignSaveFailureRestoresTwoLiveModelTrees() throws {
+        let base = makeCaseDirectory("group-txn-failure")
+        let environment = AppEnvironment(
+            meetingStore: InMemoryMeetingStore(),
+            fileStore: MeetingFileStore(baseDirectory: base),
+            projectStore: try JSONProjectStore(directory: base),
+            credentialServiceName: "com.zhaobo.BangWoFenXi.tests.group-txn-\(UUID().uuidString)"
+        )
+        let speakerA = UUID()
+        let speakerB = UUID()
+        let project = Project(title: "组级事务", sourceType: .liveRecording)
+        project.speakers = [
+            Speaker(id: speakerA, cloudAlias: "p_01", displayName: "甲"),
+            Speaker(id: speakerB, cloudAlias: "p_02", displayName: "乙"),
+        ]
+        let label = "chunk:0:speaker_1"
+        let anchor = TranscriptSegment(startMs: 0, endMs: 1_000, text: "锚点",
+            remoteSpeakerLabel: label, source: .cloud, state: .final)
+        let sameGroup = TranscriptSegment(startMs: 1_000, endMs: 2_000, text: "同组",
+            remoteSpeakerLabel: label, source: .cloud, state: .final)
+        // meeting 树与 project 树是两棵独立实例（生产中 applyRuntime 会拷贝）
+        project.segments = [
+            TranscriptSegment(id: anchor.id, startMs: anchor.startMs, endMs: anchor.endMs,
+                text: anchor.text, remoteSpeakerLabel: label, source: .cloud, state: .final),
+            TranscriptSegment(id: sameGroup.id, startMs: sameGroup.startMs, endMs: sameGroup.endMs,
+                text: sameGroup.text, remoteSpeakerLabel: label, source: .cloud, state: .final),
+        ]
+        let meetingTree: [TranscriptSegment] = [anchor, sameGroup]
+        try environment.persist(project)
+
+        // Workspace 事务顺序（mutation 前拍 before → assign → 模拟 applyRuntime 拷贝 → persist 失败）
+        var before: [UUID: ProjectWorkspaceView.SpeakerAttributionUndo.Entry] = [:]
+        for segment in meetingTree {
+            before[segment.id] = ProjectWorkspaceView.attributionEntry(of: segment)
+        }
+        let outcome = SpeakerBackfill.assign(
+            anchorSegmentId: anchor.id, to: speakerB, segments: meetingTree)
+        #expect(outcome.changedSegmentIds.count == 2)
+        // applyRuntime 等价拷贝：project 树同步为新值
+        for segment in project.segments {
+            segment.participantId = speakerB
+            segment.speakerWasUserConfirmed = true
+            segment.speakerConfirmationScope = .group
+            segment.speakerAttributionConflict = false
+        }
+
+        environment.markPersistentStorageUnavailableForTesting()
+        #expect(throws: ProjectWriteError.self) {
+            try environment.persist(project, fields: .manualSegments)
+        }
+        // 磁盘保持旧值
+        let stored = try #require(try environment.allProjects().first)
+        for segment in stored.segments {
+            #expect(segment.participantId == nil)
+            #expect(segment.speakerConfirmationScope == nil)
+        }
+        // 生产共享回滚：两棵活模型树全部还原
+        ProjectWorkspaceView.rollbackAttributionState(
+            entries: before,
+            meetingSegments: meetingTree,
+            projectSegments: project.segments
+        )
+        for segment in meetingTree + project.segments {
+            #expect(segment.participantId == nil, "两棵树都必须还原，不能残留新值")
+            #expect(segment.speakerWasUserConfirmed == nil)
+            #expect(segment.speakerConfirmationScope == nil)
+        }
+        // 解除注入重新提交成功
+        environment.clearPersistentStorageUnavailableForTesting()
+        for segment in meetingTree + project.segments {
+            segment.participantId = speakerB
+            segment.speakerWasUserConfirmed = true
+            segment.speakerConfirmationScope = .group
+            segment.speakerAttributionConflict = false
+        }
+        try environment.persist(project, fields: .manualSegments)
+        let retried = try #require(try environment.allProjects().first)
+        #expect(retried.segments.allSatisfy { $0.participantId == speakerB })
+    }
+
+    @Test("组级生产事务：指认→撤销→重读磁盘恢复旧值（第四轮复核）")
+    @MainActor
+    func groupAssignUndoReloadRoundTrip() throws {
+        let base = makeCaseDirectory("group-undo-roundtrip")
+        let environment = AppEnvironment(
+            meetingStore: InMemoryMeetingStore(),
+            fileStore: MeetingFileStore(baseDirectory: base),
+            projectStore: try JSONProjectStore(directory: base),
+            credentialServiceName: "com.zhaobo.BangWoFenXi.tests.group-undo-\(UUID().uuidString)"
+        )
+        let speakerA = UUID()
+        let speakerB = UUID()
+        let project = Project(title: "组级撤销", sourceType: .liveRecording)
+        project.speakers = [
+            Speaker(id: speakerA, cloudAlias: "p_01", displayName: "甲"),
+            Speaker(id: speakerB, cloudAlias: "p_02", displayName: "乙"),
+        ]
+        let anchor = TranscriptSegment(startMs: 0, endMs: 1_000, text: "锚点",
+            remoteSpeakerLabel: "chunk:0:speaker_1", source: .cloud, state: .final)
+        project.segments = [TranscriptSegment(id: anchor.id, startMs: 0, endMs: 1_000,
+            text: "锚点", remoteSpeakerLabel: "chunk:0:speaker_1", source: .cloud, state: .final)]
+        let meetingTree: [TranscriptSegment] = [anchor]
+        try environment.persist(project)
+
+        // 组级指认（before → assign → after → persist）
+        let before = ProjectWorkspaceView.attributionEntry(of: anchor)
+        _ = SpeakerBackfill.assign(anchorSegmentId: anchor.id, to: speakerB, segments: meetingTree)
+        let after = ProjectWorkspaceView.attributionEntry(of: anchor)
+        try environment.persist(project, fields: .manualSegments)
+
+        // 撤销（共享 undoDecision：组级 after 精确匹配，kind=group 不再恒跳过）
+        let record = ProjectWorkspaceView.SpeakerAttributionUndo(
+            kind: .group, speakerID: speakerB,
+            entries: [anchor.id: before], afterEntries: [anchor.id: after],
+            occurredAt: Date())
+        switch ProjectWorkspaceView.undoDecision(
+            for: anchor, before: before, after: after, speakers: project.speakers) {
+        case .apply:
+            anchor.participantId = before.participantId
+            anchor.speakerWasUserConfirmed = before.speakerWasUserConfirmed
+            anchor.speakerAttributionConflict = before.speakerAttributionConflict
+            anchor.speakerConfirmationScope = before.speakerConfirmationScope
+        case .skip(let reason):
+            Issue.record("组级撤销不得跳过：\(reason)")
+        }
+        try environment.persist(project, fields: .manualSegments)
+
+        // 重读磁盘：恢复到指认前
+        let stored = try #require(try environment.allProjects().first)
+        let storedSegment = try #require(stored.segments.first { $0.id == anchor.id })
+        #expect(storedSegment.participantId == nil)
+        #expect(storedSegment.speakerWasUserConfirmed == nil)
+        #expect(storedSegment.speakerConfirmationScope == nil)
+    }
+
+    @Test("组级过期预览：新增同标签语句后重算资格集不一致即拒绝（第四轮复核）")
+    @MainActor
+    func staleGroupPreviewRejectedAfterNewSameLabelSegment() {
+        let target = UUID()
+        let label = "chunk:0:speaker_1"
+        let anchor = TranscriptSegment(startMs: 0, endMs: 1_000, text: "锚点",
+            remoteSpeakerLabel: label, source: .cloud, state: .final)
+        let frozenSegments: [TranscriptSegment] = [anchor]
+        guard let frozenPlan = SpeakerBackfill.groupAssignmentPlan(
+            anchorSegmentId: anchor.id, to: target,
+            segments: frozenSegments, includeAllUnconfirmed: false) else {
+            Issue.record("冻结计划必须生成")
+            return
+        }
+        #expect(frozenPlan.applicableSegmentIds == [anchor.id])
+
+        // 预览后录音追加了一条同标签可修改句
+        let appended = TranscriptSegment(startMs: 5_000, endMs: 6_000, text: "新到的同组句",
+            remoteSpeakerLabel: label, source: .cloud, state: .final)
+        let currentSegments: [TranscriptSegment] = [anchor, appended]
+        let freshPlan = SpeakerBackfill.groupAssignmentPlan(
+            anchorSegmentId: anchor.id, to: target,
+            segments: currentSegments, includeAllUnconfirmed: false)
+        #expect(freshPlan != nil)
+        #expect(ProjectWorkspaceView.groupPlanDrifted(fresh: freshPlan!, frozen: frozenPlan),
+                "新增同标签语句必须判定为计划漂移")
+
+        // 无漂移时（同集合）不误报
+        let unchanged = SpeakerBackfill.groupAssignmentPlan(
+            anchorSegmentId: anchor.id, to: target,
+            segments: frozenSegments, includeAllUnconfirmed: false)
+        #expect(!ProjectWorkspaceView.groupPlanDrifted(fresh: unchanged!, frozen: frozenPlan))
+    }
+
     @Test("保存失败注入：指认落盘失败后磁盘与两棵模型均保持旧值（审查修复 2 生产路径）")
     @MainActor
     func persistFailureKeepsDiskAndModelsUntouched() throws {

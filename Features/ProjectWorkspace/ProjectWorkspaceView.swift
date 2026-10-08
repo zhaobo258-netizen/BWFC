@@ -868,14 +868,37 @@ struct ProjectWorkspaceView: View {
             operationError = "目标人物已不存在或已变更，请重新选择人物。"
             return false
         }
+        // 计划漂移核对（第四轮审查修复）：预览后新增同标签语句或资格变化时，
+        // 重算资格集与冻结集不一致即拒绝，未预览的句子不被静默改动
+        guard let freshPlan = SpeakerBackfill.groupAssignmentPlan(
+            anchorSegmentId: context.anchorSegmentId,
+            to: speaker.id,
+            segments: meeting.segments,
+            includeAllUnconfirmed: context.assignAllUnconfirmed
+        ) else {
+            operationError = "锚点语句已不存在或已重新分段，请重新预览后再指认。"
+            return false
+        }
+        guard !Self.groupPlanDrifted(fresh: freshPlan, frozen: context.plan) else {
+            operationError = "语音组范围已变化（可能新增了同组语句），请重新预览后再指认。"
+            return false
+        }
         // 冻结边界核对：预览后片段变化（重切/归属变化）拒绝提交
         guard Self.frozenBoundariesStillValid(
             frozen: context.frozenBoundaries,
-            applicable: context.plan.applicableSegmentIds,
+            applicable: freshPlan.applicableSegmentIds,
             segments: meeting.segments
         ) else {
             operationError = "所选语句已重新分段或归属已变化，请重新预览后再指认。"
             return false
+        }
+        // 操作前快照必须在任何 mutation 之前拍摄（第四轮审查修复：
+        // 之前在 assign 之后才拍，保存失败回滚恢复的是新值）
+        var beforeCommit: [UUID: SpeakerAttributionUndo.Entry] = [:]
+        for id in freshPlan.applicableSegmentIds {
+            if let segment = meeting.segments.first(where: { $0.id == id }) {
+                beforeCommit[id] = Self.attributionEntry(of: segment)
+            }
         }
         // 执行组级回填（资格判定与预览共享；同组扩展限定锚点来源）
         let outcome = SpeakerBackfill.assign(
@@ -889,22 +912,13 @@ struct ProjectWorkspaceView: View {
             groupPreviewContext = nil
             return true
         }
-        // 撤销记录：全部归属字段 + 边界
-        var entries: [UUID: SpeakerAttributionUndo.Entry] = [:]
+        // 操作后快照（撤销时精确匹配用）
+        var afterCommit: [UUID: SpeakerAttributionUndo.Entry] = [:]
         for id in outcome.changedSegmentIds {
             if let segment = meeting.segments.first(where: { $0.id == id }) {
-                entries[id] = SpeakerAttributionUndo.Entry(
-                    startMs: segment.startMs, endMs: segment.endMs,
-                    sourceAssetId: segment.sourceAssetId,
-                    participantId: segment.participantId,
-                    speakerWasUserConfirmed: segment.speakerWasUserConfirmed,
-                    speakerAttributionConflict: segment.speakerAttributionConflict,
-                    speakerConfirmationScope: segment.speakerConfirmationScope,
-                    updatedAt: segment.updatedAt
-                )
+                afterCommit[id] = Self.attributionEntry(of: segment)
             }
         }
-        let beforeCommit = entries
         guard persistAndRefresh(meeting) else {
             Self.rollbackAttributionState(
                 entries: beforeCommit,
@@ -957,8 +971,8 @@ struct ProjectWorkspaceView: View {
         diarization?.refreshSpeakerMapping()
         analysis?.noteSpeakerContextChanged(segmentIDs: outcome.changedSegmentIds)
         lastAttributionUndo = SpeakerAttributionUndo(
-            kind: .batch, speakerID: speaker.id,
-            entries: beforeCommit, occurredAt: Date()
+            kind: .group, speakerID: speaker.id,
+            entries: beforeCommit, afterEntries: afterCommit, occurredAt: Date()
         )
         let protectedCount = outcome.exclusions.filter { $0.reason == .confirmedToOther }.count
         reviewNotice = protectedCount > 0
@@ -3150,14 +3164,90 @@ struct ProjectWorkspaceView: View {
         enum Kind: Equatable {
             case single
             case batch
+            /// 高级入口的组级指认（scope=.group；撤销按 after 状态匹配）
+            case group
             /// 清除归属（弹层"更多操作"）：撤销时校验"当前为已确认空归属"
             case clear
         }
 
         var kind: Kind
         var speakerID: UUID
+        /// 操作前的归属状态（撤销恢复目标）
         var entries: [UUID: Entry]
+        /// 操作后的归属状态（撤销时精确匹配；第四轮审查修复：
+        /// 组级 scope=.group 之前按 kind 猜导致高级撤销恒跳过）
+        var afterEntries: [UUID: Entry] = [:]
         var occurredAt: Date
+    }
+
+    /// 撤销单条核对结论（生产共享事务逻辑；纯函数可单测）
+    enum UndoSegmentDecision: Equatable {
+        case apply
+        case skip(reason: String)
+    }
+
+    /// 按操作前/后状态核对单条片段是否可恢复（第四轮审查修复）：
+    /// - 时间/来源边界一致（重新分段跳过）；
+    /// - 当前归属五字段与操作后状态完全一致（后来改判/旧任务覆盖跳过；
+    ///   updatedAt 不参与匹配——后续文字修订会更新时间但不阻塞归属撤销）；
+    /// - 恢复目标人物仍在本场人物列表（悬空归属跳过）。
+    static func undoDecision(
+        for segment: TranscriptSegment,
+        before: SpeakerAttributionUndo.Entry,
+        after: SpeakerAttributionUndo.Entry?,
+        speakers: [Speaker]
+    ) -> UndoSegmentDecision {
+        guard let after else {
+            return .skip(reason: "缺少操作后状态快照，跳过")
+        }
+        guard segment.startMs == after.startMs, segment.endMs == after.endMs,
+              segment.sourceAssetId == after.sourceAssetId else {
+            return .skip(reason: "一条已重新分段，跳过")
+        }
+        let current = SpeakerAttributionUndo.Entry(
+            startMs: segment.startMs, endMs: segment.endMs,
+            sourceAssetId: segment.sourceAssetId,
+            participantId: segment.participantId,
+            speakerWasUserConfirmed: segment.speakerWasUserConfirmed,
+            speakerAttributionConflict: segment.speakerAttributionConflict,
+            speakerConfirmationScope: segment.speakerConfirmationScope,
+            updatedAt: segment.updatedAt
+        )
+        guard current.participantId == after.participantId,
+              current.speakerWasUserConfirmed == after.speakerWasUserConfirmed,
+              current.speakerAttributionConflict == after.speakerAttributionConflict,
+              current.speakerConfirmationScope == after.speakerConfirmationScope else {
+            return .skip(reason: "一条归属已再次变化，跳过")
+        }
+        if let previousParticipant = before.participantId,
+           speakers.first(where: { $0.id == previousParticipant }) == nil {
+            return .skip(reason: "一条的原归属人物已不存在，跳过")
+        }
+        return .apply
+    }
+
+    /// 组级提交前的计划漂移核对（第四轮审查修复）：
+    /// 预览后新增同标签语句/资格变化时，重算资格集与冻结集不一致即拒绝，
+    /// 不让未预览的句子被静默改动。
+    static func groupPlanDrifted(
+        fresh: SpeakerBackfill.GroupPlan,
+        frozen: SpeakerBackfill.GroupPlan
+    ) -> Bool {
+        Set(fresh.applicableSegmentIds) != Set(frozen.applicableSegmentIds)
+    }
+
+    /// 拍摄片段归属快照（mutation 前后共用；第四轮审查修复：
+    /// 之前在 assign 之后才拍"操作前"快照，失败回滚恢复的是新值）
+    static func attributionEntry(of segment: TranscriptSegment) -> SpeakerAttributionUndo.Entry {
+        SpeakerAttributionUndo.Entry(
+            startMs: segment.startMs, endMs: segment.endMs,
+            sourceAssetId: segment.sourceAssetId,
+            participantId: segment.participantId,
+            speakerWasUserConfirmed: segment.speakerWasUserConfirmed,
+            speakerAttributionConflict: segment.speakerAttributionConflict,
+            speakerConfirmationScope: segment.speakerConfirmationScope,
+            updatedAt: segment.updatedAt
+        )
     }
 
     @State private var lastAttributionUndo: SpeakerAttributionUndo?
@@ -3260,19 +3350,11 @@ struct ProjectWorkspaceView: View {
             return (changed: [], skipped: preview.exclusions)
         }
 
-        // 变更集：保存操作前全部归属字段与时间/来源边界
+        // 变更集：mutation 前拍操作前快照（全部归属字段与时间/来源边界）
         var entries: [UUID: SpeakerAttributionUndo.Entry] = [:]
         for id in preview.applicableSegmentIds {
             guard let segment = segments.first(where: { $0.id == id }) else { continue }
-            entries[id] = SpeakerAttributionUndo.Entry(
-                startMs: segment.startMs, endMs: segment.endMs,
-                sourceAssetId: segment.sourceAssetId,
-                participantId: segment.participantId,
-                speakerWasUserConfirmed: segment.speakerWasUserConfirmed,
-                speakerAttributionConflict: segment.speakerAttributionConflict,
-                speakerConfirmationScope: segment.speakerConfirmationScope,
-                updatedAt: segment.updatedAt
-            )
+            entries[id] = Self.attributionEntry(of: segment)
         }
 
         // 单条快捷/右键改判同一策略贯穿预览与执行（审查修复 1）
@@ -3283,6 +3365,13 @@ struct ProjectWorkspaceView: View {
         if outcome.changedSegmentIds.isEmpty {
             // 零变更（如单条"已是此人"）：不落盘、不覆盖有效的撤销记录（审查修复 1）
             return (changed: [], skipped: outcome.exclusions)
+        }
+        // 操作后快照（撤销精确匹配）
+        var afterEntries: [UUID: SpeakerAttributionUndo.Entry] = [:]
+        for id in outcome.changedSegmentIds {
+            if let segment = segments.first(where: { $0.id == id }) {
+                afterEntries[id] = Self.attributionEntry(of: segment)
+            }
         }
         guard persistAndRefresh(meeting) else {
             Self.rollbackAttributionState(
@@ -3301,6 +3390,7 @@ struct ProjectWorkspaceView: View {
             kind: kind,
             speakerID: speaker.id,
             entries: entries,
+            afterEntries: afterEntries,
             occurredAt: Date()
         )
         analysis?.noteSpeakerContextChanged(segmentIDs: outcome.changedSegmentIds)
@@ -3377,54 +3467,26 @@ struct ProjectWorkspaceView: View {
                 missingCount += 1
                 continue
             }
-            beforeUndo[entryID] = SpeakerAttributionUndo.Entry(
-                startMs: segment.startMs, endMs: segment.endMs,
-                sourceAssetId: segment.sourceAssetId,
-                participantId: segment.participantId,
-                speakerWasUserConfirmed: segment.speakerWasUserConfirmed,
-                speakerAttributionConflict: segment.speakerAttributionConflict,
-                speakerConfirmationScope: segment.speakerConfirmationScope,
-                updatedAt: segment.updatedAt
-            )
-            // 时间/来源边界表明该句已重新分段：跳过
-            guard segment.startMs == entry.startMs, segment.endMs == entry.endMs,
-                  segment.sourceAssetId == entry.sourceAssetId else {
-                skippedReasons.append("一条已重新分段，跳过")
-                continue
+            beforeUndo[entryID] = Self.attributionEntry(of: segment)
+            // 共享核对（第四轮审查修复）：按操作后状态精确匹配，
+            // 单条（segment）/批量（segment）/组级（group）/清除各自成立
+            switch Self.undoDecision(
+                for: segment,
+                before: entry,
+                after: record.afterEntries[entryID],
+                speakers: project.speakers
+            ) {
+            case .apply:
+                segment.participantId = entry.participantId
+                segment.speakerWasUserConfirmed = entry.speakerWasUserConfirmed
+                segment.speakerAttributionConflict = entry.speakerAttributionConflict
+                segment.speakerConfirmationScope = entry.speakerConfirmationScope
+                // 撤销作为一次新编辑记录当前时间，不回退后来其他编辑的时间
+                segment.updatedAt = Date()
+                restored.append(entryID)
+            case .skip(let reason):
+                skippedReasons.append(reason)
             }
-            // 归属后来再次变化：不覆盖后来的决定。按操作类型核对"本次操作留下的状态"；
-            // 后续云端文字更新不改这些归属字段，不阻塞撤销。冲突字段也在核对内。
-            let matchesPostOperationState: Bool
-            switch record.kind {
-            case .single, .batch:
-                matchesPostOperationState = segment.participantId == record.speakerID
-                    && segment.speakerWasUserConfirmed == true
-                    && segment.speakerConfirmationScope == .segment
-                    && segment.speakerAttributionConflict == false
-            case .clear:
-                matchesPostOperationState = segment.participantId == nil
-                    && segment.speakerWasUserConfirmed == true
-                    && segment.speakerConfirmationScope == .segment
-                    && segment.speakerAttributionConflict == false
-            }
-            guard matchesPostOperationState else {
-                skippedReasons.append("一条归属已再次变化，跳过")
-                continue
-            }
-            // 恢复目标人物必须仍在本场人物列表（审查修复 6，按归属真源 project.speakers
-            // 直接拒绝，不借 Person ID 放行）：人物已删除不恢复悬空归属
-            if let previousParticipant = entry.participantId,
-               project.speakers.first(where: { $0.id == previousParticipant }) == nil {
-                skippedReasons.append("一条的原归属人物已不存在，跳过")
-                continue
-            }
-            segment.participantId = entry.participantId
-            segment.speakerWasUserConfirmed = entry.speakerWasUserConfirmed
-            segment.speakerAttributionConflict = entry.speakerAttributionConflict
-            segment.speakerConfirmationScope = entry.speakerConfirmationScope
-            // 撤销作为一次新编辑记录当前时间，不回退后来其他编辑的时间
-            segment.updatedAt = Date()
-            restored.append(entryID)
         }
         if missingCount > 0 {
             skippedReasons.append("\(missingCount) 条片段已不存在，跳过")
@@ -3519,21 +3581,16 @@ struct ProjectWorkspaceView: View {
             operationError = "这句话还在识别中，定稿后再修改归属。"
             return false
         }
-        // 记录清除前状态供撤销
+        // 记录清除前状态供撤销（mutation 前拍摄）
         let entries: [UUID: SpeakerAttributionUndo.Entry] = [
-            segment.id: SpeakerAttributionUndo.Entry(
-                startMs: target.startMs, endMs: target.endMs,
-                sourceAssetId: target.sourceAssetId,
-                participantId: target.participantId,
-                speakerWasUserConfirmed: target.speakerWasUserConfirmed,
-                speakerAttributionConflict: target.speakerAttributionConflict,
-                speakerConfirmationScope: target.speakerConfirmationScope,
-                updatedAt: target.updatedAt
-            )
+            segment.id: Self.attributionEntry(of: target)
         ]
         MeetingTranscriptEditor.clearSpeaker(target)
         // clearSpeaker 会置 confirmed=true（“明确清空”也是人工决定）；scope 记为句级
         target.speakerConfirmationScope = .segment
+        let afterEntries: [UUID: SpeakerAttributionUndo.Entry] = [
+            segment.id: Self.attributionEntry(of: target)
+        ]
         guard persistAndRefresh(meeting) else {
             Self.rollbackAttributionState(
                 entries: entries,
@@ -3547,7 +3604,7 @@ struct ProjectWorkspaceView: View {
         diarization?.refreshSpeakerMapping()
         lastAttributionUndo = SpeakerAttributionUndo(
             kind: .clear, speakerID: entries[segment.id]?.participantId ?? UUID(),
-            entries: entries, occurredAt: Date()
+            entries: entries, afterEntries: afterEntries, occurredAt: Date()
         )
         analysis?.noteSpeakerContextChanged(segmentIDs: [segment.id])
         reviewNotice = "已清除这一条的归属 · 撤销"
