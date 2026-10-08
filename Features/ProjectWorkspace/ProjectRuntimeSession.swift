@@ -221,6 +221,14 @@ final class ProjectRuntimePersistenceController {
         }
     }
 
+    /// 调用方回滚手动事务时撤销该次强制意图（最终验收缺陷 2）：
+    /// 写失败后调用方已把 runtime 树回滚，若保留旧 IDs，后续自动落盘
+    /// 会把回滚值强写到磁盘，覆盖失败期间落盘的更新的人工归属。
+    /// 用户重试会重新注册新意图，不受影响。
+    func clearPendingExplicitSegmentIDs() {
+        pendingExplicitSegmentIDs = nil
+    }
+
     func schedule() {
         hasPendingChanges = true
         // 窗口从第一条未保存片段起算，持续转写时也能保证最多约 2 秒未落盘。

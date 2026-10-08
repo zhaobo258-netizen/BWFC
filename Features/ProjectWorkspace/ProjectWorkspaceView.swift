@@ -928,6 +928,7 @@ struct ProjectWorkspaceView: View {
                 meetingSegments: meeting.segments,
                 projectSegments: project.segments
             )
+            runtimePersistence?.clearPendingExplicitSegmentIDs()
             transcription?.refreshSegments()
             reviewNotice = "说话人标注未保存；请重试。"
             return false
@@ -3410,6 +3411,7 @@ struct ProjectWorkspaceView: View {
                 meetingSegments: meeting.segments,
                 projectSegments: project.segments
             )
+            runtimePersistence?.clearPendingExplicitSegmentIDs()
             transcription?.refreshSegments()
             reviewNotice = "说话人标注未保存；已选语句保留，请重试。"
             return nil
@@ -3529,12 +3531,14 @@ struct ProjectWorkspaceView: View {
             return
         }
         guard persistAndRefresh(meeting, explicitSegmentIDs: Set(restored)) else {
-            // 撤销保存失败：两棵模型与 updatedAt 完整还原，撤销记录保留可重试
+            // 撤销保存失败：两棵模型与 updatedAt 完整还原，撤销记录保留可重试；
+            // 同时撤销该次强制落盘意图——自动重试不得把回滚值强写到磁盘
             Self.rollbackAttributionState(
                 entries: beforeUndo,
                 meetingSegments: segments,
                 projectSegments: project.segments
             )
+            runtimePersistence?.clearPendingExplicitSegmentIDs()
             transcription?.refreshSegments()
             reviewNotice = "撤销未保存；归属保持撤销前状态，可重试。"
             return
@@ -3628,6 +3632,7 @@ struct ProjectWorkspaceView: View {
                 meetingSegments: meeting.segments,
                 projectSegments: project.segments
             )
+            runtimePersistence?.clearPendingExplicitSegmentIDs()
             transcription?.refreshSegments()
             operationError = "清除归属未保存，请重试。"
             return false

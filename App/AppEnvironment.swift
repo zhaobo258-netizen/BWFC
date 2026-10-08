@@ -224,11 +224,22 @@ enum ProjectPersistence {
         )
         let incomingIDs = Set(incoming.map(\.id))
         var merged = incoming.map { segment in
-            // 显式人工归属变更（指认/撤销/改判/清除）无条件采用 runtime 值：
+            // 显式人工归属变更（指认/撤销/改判/清除）只应用授权的归属字段：
             // 撤销把 confirmed 行改回未确认时，下方 confirmed 保护会错误保留磁盘旧对象，
-            // 导致落盘丢失而保存报成功（最终复核 P1）。保护只针对自动管线更新。
+            // 导致落盘丢失而保存报成功（最终复核 P1）。但 runtime 副本可能滞后，
+            // 磁盘同 ID 行后来的人工文字/星标/边界等非归属内容不得被旧副本覆盖
+            //（最终验收缺陷 1），因此磁盘已有该行时仅改写归属五字段。
+            // 保护本体仍只针对自动管线更新，不全局移除。
             if explicitSegmentIDs.contains(segment.id) {
-                return segment
+                guard var storedSegment = storedByID[segment.id] else {
+                    return segment
+                }
+                storedSegment.participantId = segment.participantId
+                storedSegment.speakerWasUserConfirmed = segment.speakerWasUserConfirmed
+                storedSegment.speakerAttributionConflict = segment.speakerAttributionConflict
+                storedSegment.speakerConfirmationScope = segment.speakerConfirmationScope
+                storedSegment.updatedAt = segment.updatedAt
+                return storedSegment
             }
             guard let existing = storedByID[segment.id],
                   existing.state == .edited

@@ -1464,6 +1464,127 @@ final class ProjectStoreTests {
         #expect(stored.note.markdown == "手写笔记。")
     }
 
+    @Test("显式归属只应用归属字段：磁盘较新的文字/星标不被 runtime 旧副本覆盖（最终验收缺陷 1）")
+    @MainActor
+    func explicitAssignPreservesNewerNonAttributionContent() throws {
+        let (environment, project, meeting, _, speakerB) = try makeRecordingPersistenceFixture(
+            directoryName: "attr-only", credentialTag: "attr-only")
+        let targetID = meeting.segments[0].id
+        // 磁盘初始：旧文字、无星标
+        try environment.persist(project, fields: .recordingRuntime)
+
+        // 磁盘上同一句后来被人工编辑：新文字 + 星标（runtime 副本未知）
+        let stored = try #require(try environment.allProjects().first)
+        let storedSegment = try #require(stored.segments.first { $0.id == targetID })
+        let newerText = "磁盘上人工编辑过的新文字"
+        storedSegment.text = newerText
+        storedSegment.isStarred = true
+        storedSegment.updatedAt = Date()
+        try environment.persist(stored, fields: .manualSegments)
+
+        // runtime 树仍是旧文字副本（stale）；现在只改归属（撤销到未指认）
+        meeting.segments[0].participantId = nil
+        meeting.segments[0].speakerWasUserConfirmed = nil
+        meeting.segments[0].speakerAttributionConflict = nil
+        meeting.segments[0].speakerConfirmationScope = nil
+        try ProjectRuntimeSession.applyRuntime(meeting, to: project)
+        try environment.persist(
+            project, fields: .recordingRuntime,
+            explicitSegmentIDs: [targetID])
+
+        // 磁盘：归属已撤销，但较新的文字与星标保留
+        let after = try #require(try environment.allProjects().first)
+        let merged = try #require(after.segments.first { $0.id == targetID })
+        #expect(merged.participantId == nil, "归属变更必须落盘")
+        #expect(merged.speakerWasUserConfirmed == nil)
+        #expect(merged.speakerConfirmationScope == nil)
+        #expect(merged.text == newerText, "较新的人工文字不得被 runtime 旧副本覆盖")
+        #expect(merged.isStarred == true, "星标不得被 runtime 旧副本覆盖")
+
+        // 反向：改判给乙同样只动归属
+        meeting.segments[0].participantId = speakerB
+        meeting.segments[0].speakerWasUserConfirmed = true
+        meeting.segments[0].speakerConfirmationScope = .segment
+        try ProjectRuntimeSession.applyRuntime(meeting, to: project)
+        try environment.persist(
+            project, fields: .recordingRuntime,
+            explicitSegmentIDs: [targetID])
+        let afterAssign = try #require(try environment.allProjects().first)
+        let reassigned = try #require(afterAssign.segments.first { $0.id == targetID })
+        #expect(reassigned.participantId == speakerB)
+        #expect(reassigned.text == newerText, "改判同样只动归属")
+        #expect(reassigned.isStarred == true)
+    }
+
+    @Test("写失败回滚后撤销强制意图：自动重试不得覆盖磁盘后来的人工归属（最终验收缺陷 2）")
+    @MainActor
+    func failedFlushRevokesExplicitIntentForAutomaticRetry() async throws {
+        let base = makeCaseDirectory("revoke-intent")
+        let environment = AppEnvironment(
+            meetingStore: InMemoryMeetingStore(),
+            fileStore: MeetingFileStore(baseDirectory: base),
+            projectStore: try JSONProjectStore(directory: base),
+            credentialServiceName: "com.zhaobo.BangWoFenXi.tests.revoke-intent-\(UUID().uuidString)"
+        )
+        let speakerB = UUID()
+        let project = Project(title: "意图撤销", sourceType: .liveRecording)
+        project.speakers = [Speaker(id: speakerB, cloudAlias: "p_02", displayName: "乙")]
+        project.segments = [
+            TranscriptSegment(startMs: 0, endMs: 1_000, text: "目标行",
+                remoteSpeakerLabel: "chunk:0:speaker_1", source: .cloud, state: .final),
+        ]
+        try environment.persist(project)
+        let meeting = try ProjectRuntimeSession.makeRuntimeMeeting(from: project)
+
+        var writeCalls = 0
+        var shouldFail = false
+        let controller = ProjectRuntimePersistenceController(
+            meeting: meeting, project: project,
+            persist: { [environment] project, explicitIDs in
+                writeCalls += 1
+                if shouldFail { throw ProjectWriteError.storageUnavailable }
+                try environment.persist(
+                    project, fields: .recordingRuntime, explicitSegmentIDs: explicitIDs)
+            },
+            debounce: .seconds(60),
+            onFailure: { _ in }
+        )
+        // 生产事务：指认 → applyRuntime → 显式 flush 失败 → 调用方回滚并撤销意图
+        _ = SpeakerBackfill.assign(
+            anchorSegmentId: meeting.segments[0].id, to: speakerB, segments: meeting.segments)
+        try ProjectRuntimeSession.applyRuntime(meeting, to: project)
+        controller.markExplicitSegmentIDs([meeting.segments[0].id])
+        shouldFail = true
+        #expect(!controller.flush(force: true), "前置：注入失败")
+        // 调用方回滚 runtime 树 + 撤销强制意图（生产失败路径）
+        meeting.segments[0].participantId = nil
+        meeting.segments[0].speakerWasUserConfirmed = nil
+        meeting.segments[0].speakerConfirmationScope = nil
+        controller.clearPendingExplicitSegmentIDs()
+
+        // 磁盘后来收到人工归属变更（另一工作台路径直接落盘）
+        let storedMid = try #require(try environment.allProjects().first)
+        let midSegment = try #require(storedMid.segments.first)
+        midSegment.participantId = speakerB
+        midSegment.speakerWasUserConfirmed = true
+        midSegment.speakerConfirmationScope = .segment
+        try environment.persist(storedMid, fields: .manualSegments)
+
+        // 自动重试（转写 final 片段触发 schedule，无显式意图）不得覆盖磁盘人工归属
+        shouldFail = false
+        controller.schedule()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while ContinuousClock.now < deadline, controller.writeAttemptCount < 2 {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        let afterRetry = try #require(try environment.allProjects().first)
+        let finalSegment = try #require(afterRetry.segments.first)
+        #expect(finalSegment.participantId == speakerB,
+                "回滚后撤销的强制意图不得在自动重试时覆盖磁盘后来的人工归属")
+        #expect(finalSegment.speakerConfirmationScope == .segment)
+        #expect(finalSegment.speakerWasUserConfirmed == true)
+    }
+
     @Test("录音管线撤销失败重试：磁盘保持 B，解除注入后重试成功（最终复核 P1）")
     @MainActor
     func recordingUndoFailureRetry() throws {
