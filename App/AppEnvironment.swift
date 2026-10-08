@@ -73,11 +73,45 @@ enum ProjectPersistence {
         "archive": .runtime
     ]
 
+    /// 显式归属事务 preflight（最终验收）：对每个授权 ID 核对磁盘当前状态——
+    /// - 磁盘行存在：边界（startMs/endMs/sourceAssetId）必须等于授权快照，
+    ///   且当前归属必须等于事务起点（快照归属）；重切/来源漂移或第三方已改动即拒绝。
+    /// - 磁盘行缺失：快照声明「尚未落盘的新句」则放行（合法）；声明已落盘则拒绝
+    ///   （旧句不得由手工意图重建）。
+    /// 任一核对失败抛 staleAttributionIntent，整个事务不写盘、不部分生效。
+    static func preflightAttributionIntents(
+        _ intents: [UUID: AppEnvironment.SpeakerAttributionIntent],
+        for incoming: Project,
+        in projects: [Project]
+    ) throws {
+        let stored = projects.first { $0.id == incoming.id }
+        for (id, intent) in intents {
+            let disk = stored?.segments.first { $0.id == id }
+            guard let disk else {
+                if intent.persistedAtPreview {
+                    throw ProjectWriteError.staleAttributionIntent(segmentID: id)
+                }
+                continue
+            }
+            guard disk.startMs == intent.startMs,
+                  disk.endMs == intent.endMs,
+                  disk.sourceAssetId == intent.sourceAssetId else {
+                throw ProjectWriteError.staleAttributionIntent(segmentID: id)
+            }
+            guard disk.participantId == intent.expectedParticipantId,
+                  disk.speakerWasUserConfirmed == intent.expectedConfirmed,
+                  disk.speakerAttributionConflict == intent.expectedConflict,
+                  disk.speakerConfirmationScope == intent.expectedScope else {
+                throw ProjectWriteError.staleAttributionIntent(segmentID: id)
+            }
+        }
+    }
+
     static func upsert(
         _ incoming: Project,
         into projects: inout [Project],
         fields: ProjectFieldOwnership,
-        explicitSegmentIDs: Set<UUID>? = nil
+        explicitAttributions: [UUID: AppEnvironment.SpeakerAttributionIntent]? = nil
     ) {
         guard let index = projects.firstIndex(where: { $0.id == incoming.id }) else {
             projects.append(incoming)
@@ -128,7 +162,7 @@ enum ProjectPersistence {
             stored.legacySnapshots = incoming.legacySnapshots
             mergePipelineSegments(
                 incoming.segments, into: stored,
-                explicitSegmentIDs: explicitSegmentIDs ?? []
+                explicitAttributions: explicitAttributions ?? [:]
             )
             stored.lastActivityAt = incoming.lastActivityAt
         case .analysis:
@@ -216,7 +250,7 @@ enum ProjectPersistence {
     private static func mergePipelineSegments(
         _ incoming: [TranscriptSegment],
         into stored: Project,
-        explicitSegmentIDs: Set<UUID> = []
+        explicitAttributions: [UUID: AppEnvironment.SpeakerAttributionIntent] = [:]
     ) {
         let storedByID = Dictionary(
             stored.segments.map { ($0.id, $0) },
@@ -229,8 +263,10 @@ enum ProjectPersistence {
             // 导致落盘丢失而保存报成功（最终复核 P1）。但 runtime 副本可能滞后，
             // 磁盘同 ID 行后来的人工文字/星标/边界等非归属内容不得被旧副本覆盖
             //（最终验收缺陷 1），因此磁盘已有该行时仅改写归属五字段。
+            // 边界/起点核对在 persist 的 preflight 完成；磁盘缺失的行仅当快照声明
+            // 「尚未落盘的新句」时整体采用（旧句缺失不得由手工意图重建）。
             // 保护本体仍只针对自动管线更新，不全局移除。
-            if explicitSegmentIDs.contains(segment.id) {
+            if let intent = explicitAttributions[segment.id] {
                 guard var storedSegment = storedByID[segment.id] else {
                     return segment
                 }
@@ -937,23 +973,43 @@ final class AppEnvironment {
         try projectStore.loadProjects()
     }
 
+    /// 显式人工归属事务的授权意图（最终验收：预览/操作时刻冻结的边界与起点归属）。
+    /// persist 前与磁盘当前状态逐一核对：边界漂移或归属已被第三方改动即拒绝整个事务，
+    /// 不部分写入、不静默跳过后报成功。
+    struct SpeakerAttributionIntent: Sendable, Equatable {
+        var startMs: Int64
+        var endMs: Int64
+        var sourceAssetId: UUID?
+        /// 快照时该片段是否已落盘；false = 尚未 flush 的新录音最终句（磁盘缺失合法）
+        var persistedAtPreview: Bool
+        /// 事务起点归属（磁盘当前应处的状态）
+        var expectedParticipantId: UUID?
+        var expectedConfirmed: Bool?
+        var expectedConflict: Bool?
+        var expectedScope: SpeakerConfirmationScope?
+    }
+
     /// 保存单个项目；导入项目按调用方字段所有权合并，避免并发副本互相覆盖。
     /// - Parameters:
-    ///   - explicitSegmentIDs: 显式人工归属变更涉及的片段（录音中 .recordingRuntime
-    ///     管线对 confirmed 行有合并保护；这些 IDs 必须无条件采用 runtime 值，
-    ///     否则撤销/改判/清除会被静默丢弃而保存却报成功——最终复核 P1）。
+    ///   - explicitAttributions: 显式人工归属事务的授权意图。录音中 .recordingRuntime
+    ///     管线对 confirmed 行有合并保护；命中意图的片段只应用归属字段（保留磁盘较新的
+    ///     非归属内容），且写前按意图核对边界与起点归属，防止陈旧授权作用到重切后的新句子。
     func persist(
         _ project: Project,
         fields: ProjectFieldOwnership = .all,
-        explicitSegmentIDs: Set<UUID>? = nil
+        explicitAttributions: [UUID: SpeakerAttributionIntent]? = nil
     ) throws {
         guard !isPersistentStorageUnavailable else { throw ProjectWriteError.storageUnavailable }
         if testForcedStorageUnavailable { throw ProjectWriteError.storageUnavailable }
         guard !deletedProjectIDs.contains(project.id) else { throw ProjectWriteError.projectDeleted }
         var projects = try projectStore.loadProjects()
+        if let explicitAttributions, !explicitAttributions.isEmpty {
+            try ProjectPersistence.preflightAttributionIntents(
+                explicitAttributions, for: project, in: projects)
+        }
         ProjectPersistence.upsert(
             project, into: &projects, fields: fields,
-            explicitSegmentIDs: explicitSegmentIDs
+            explicitAttributions: explicitAttributions
         )
         try projectStore.saveProjects(projects)
     }
@@ -1276,11 +1332,14 @@ final class AppEnvironment {
     }
 }
 
-enum ProjectWriteError: LocalizedError {
+enum ProjectWriteError: LocalizedError, Equatable {
     case storageUnavailable
     case projectDeleted
     /// V1 旧入口要删除的会议已迁移为 V2 权威项目（15 号计划 H.2）
     case migratedProjectStillExists
+    /// 显式归属事务的授权已过期：磁盘边界漂移、起点归属被第三方改动或旧句缺失
+    ///（说话人左键指认计划最终验收）。携带任一受影响片段 ID。
+    case staleAttributionIntent(segmentID: UUID)
 
     var errorDescription: String? {
         switch self {
@@ -1288,6 +1347,8 @@ enum ProjectWriteError: LocalizedError {
         case .projectDeleted: return "录音已删除，后台结果未保存。"
         case .migratedProjectStillExists:
             return "这份录音已迁移为权威项目数据；请在项目工作台删除项目，旧界面删除会连带删除同一份录音文件。"
+        case .staleAttributionIntent:
+            return "所选语句已重新分段或归属已变化，指认未能保存；请重新预览后再指认。"
         }
     }
 }

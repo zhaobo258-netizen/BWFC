@@ -175,12 +175,13 @@ final class ProjectRuntimePersistenceController {
     private let project: Project
     /// persist 闭包第二个参数：显式人工归属变更片段（最终复核 P1：
     /// 录音管线对 confirmed 行的合并保护不得吞掉撤销/改判/清除）
-    private let persist: (Project, Set<UUID>?) throws -> Void
+    private let persist: (Project, [UUID: AppEnvironment.SpeakerAttributionIntent]?) throws -> Void
+    private var pendingAttributionIntents: [UUID: AppEnvironment.SpeakerAttributionIntent]?
     private let debounce: Duration
     private let onFailure: (Error) -> Void
     private var flushTask: Task<Void, Never>?
     /// 待落盘的显式归属变更片段；成功落盘前保留（失败重试仍强制）
-    private var pendingExplicitSegmentIDs: Set<UUID>?
+
     /// 单调递增的落盘任务代号：只有当前代号的任务有权清空 flushTask，
     /// 避免 await 边界后 cancel() 作用在已被替换的引用上导致重复写盘。
     private var flushGeneration = 0
@@ -200,7 +201,7 @@ final class ProjectRuntimePersistenceController {
     init(
         meeting: Meeting,
         project: Project,
-        persist: @escaping (Project, Set<UUID>?) throws -> Void,
+        persist: @escaping (Project, [UUID: AppEnvironment.SpeakerAttributionIntent]?) throws -> Void,
         debounce: Duration = .seconds(2),
         onFailure: @escaping (Error) -> Void = { _ in }
     ) {
@@ -213,11 +214,11 @@ final class ProjectRuntimePersistenceController {
 
     /// 标记显式归属变更片段并在下次落盘时无条件采用 runtime 值；
     /// 落盘成功前保留（写失败重试仍强制），成功后清空。
-    func markExplicitSegmentIDs(_ ids: Set<UUID>) {
-        if let pending = pendingExplicitSegmentIDs {
-            pendingExplicitSegmentIDs = pending.union(ids)
+    func markAttributionIntents(_ intents: [UUID: AppEnvironment.SpeakerAttributionIntent]) {
+        if let pending = pendingAttributionIntents {
+            pendingAttributionIntents = pending.merging(intents) { _, new in new }
         } else {
-            pendingExplicitSegmentIDs = ids
+            pendingAttributionIntents = intents
         }
     }
 
@@ -226,7 +227,7 @@ final class ProjectRuntimePersistenceController {
     /// 会把回滚值强写到磁盘，覆盖失败期间落盘的更新的人工归属。
     /// 用户重试会重新注册新意图，不受影响。
     func clearPendingExplicitSegmentIDs() {
-        pendingExplicitSegmentIDs = nil
+        pendingAttributionIntents = nil
     }
 
     func schedule() {
@@ -264,8 +265,8 @@ final class ProjectRuntimePersistenceController {
         writeAttemptCount += 1
         do {
             try ProjectRuntimeSession.applyRuntime(meeting, to: project)
-            try persist(project, pendingExplicitSegmentIDs)
-            pendingExplicitSegmentIDs = nil
+            try persist(project, pendingAttributionIntents)
+            pendingAttributionIntents = nil
             hasPendingChanges = false
             saveError = nil
             consecutiveFailures = 0

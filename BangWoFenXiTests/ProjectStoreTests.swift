@@ -1378,6 +1378,25 @@ final class ProjectStoreTests {
         #expect(retried.segments.allSatisfy { $0.participantId == speakerB })
     }
 
+
+    /// 单片段授权意图（测试用）：边界与「事务起点归属」取自给定快照。
+    /// 快照必须在 mutation 之前拍摄——expected 是磁盘当前应处的状态。
+    @MainActor
+    private func makeIntent(
+        _ startState: ProjectWorkspaceView.SpeakerAttributionUndo.Entry,
+        id segmentID: UUID,
+        persistedAtPreview: Bool = true
+    ) -> [UUID: AppEnvironment.SpeakerAttributionIntent] {
+        return [segmentID: AppEnvironment.SpeakerAttributionIntent(
+            startMs: startState.startMs, endMs: startState.endMs,
+            sourceAssetId: startState.sourceAssetId,
+            persistedAtPreview: persistedAtPreview,
+            expectedParticipantId: startState.participantId,
+            expectedConfirmed: startState.speakerWasUserConfirmed,
+            expectedConflict: startState.speakerAttributionConflict,
+            expectedScope: startState.speakerConfirmationScope)]
+    }
+
     // MARK: - 录音持久化管线（.recordingRuntime + explicitSegmentIDs）回归（最终复核 P1）
 
     /// 生产录音持久化事务的最小复刻：
@@ -1431,7 +1450,11 @@ final class ProjectStoreTests {
 
         // 录音中撤销：before/after → undoDecision → 恢复 runtime 树 → persist(.recordingRuntime, IDs)
         let before = ProjectWorkspaceView.attributionEntry(of: meeting.segments[0])
+        _ = SpeakerBackfill.assign(
+            anchorSegmentId: meeting.segments[0].id, to: speakerB, segments: meeting.segments)
         let after = ProjectWorkspaceView.attributionEntry(of: meeting.segments[0])
+        // 撤销授权意图的起点 = 指认后状态（磁盘当前），必须在 revert 前拍
+        let undoIntent = makeIntent(after, id: meeting.segments[0].id)
         let record = ProjectWorkspaceView.SpeakerAttributionUndo(
             kind: .group, speakerID: speakerB,
             entries: [meeting.segments[0].id: before],
@@ -1449,10 +1472,10 @@ final class ProjectStoreTests {
             Issue.record("撤销不得跳过：\(reason)")
         }
         try ProjectRuntimeSession.applyRuntime(meeting, to: project)
-        // 关键：录音字段 + 显式 IDs（生产 syncAndPersist 链路）
+        // 关键：录音字段 + 显式授权意图（生产 syncAndPersist 链路）
         try environment.persist(
             project, fields: .recordingRuntime,
-            explicitSegmentIDs: [meeting.segments[0].id])
+            explicitAttributions: undoIntent)
         let stored = try #require(try environment.allProjects().first)
         let undone = try #require(stored.segments.first { $0.id == meeting.segments[0].id })
         #expect(undone.participantId == nil, "撤销必须落盘，不得被 confirmed 保护吞掉")
@@ -1490,7 +1513,7 @@ final class ProjectStoreTests {
         try ProjectRuntimeSession.applyRuntime(meeting, to: project)
         try environment.persist(
             project, fields: .recordingRuntime,
-            explicitSegmentIDs: [targetID])
+            explicitAttributions: makeIntent(ProjectWorkspaceView.attributionEntry(of: storedSegment), id: storedSegment.id))
 
         // 磁盘：归属已撤销，但较新的文字与星标保留
         let after = try #require(try environment.allProjects().first)
@@ -1505,10 +1528,12 @@ final class ProjectStoreTests {
         meeting.segments[0].participantId = speakerB
         meeting.segments[0].speakerWasUserConfirmed = true
         meeting.segments[0].speakerConfirmationScope = .segment
+        let diskBeforeReassign = try #require(try environment.allProjects().first)
+        let intentSource = try #require(diskBeforeReassign.segments.first { $0.id == targetID })
         try ProjectRuntimeSession.applyRuntime(meeting, to: project)
         try environment.persist(
             project, fields: .recordingRuntime,
-            explicitSegmentIDs: [targetID])
+            explicitAttributions: makeIntent(ProjectWorkspaceView.attributionEntry(of: intentSource), id: intentSource.id))
         let afterAssign = try #require(try environment.allProjects().first)
         let reassigned = try #require(afterAssign.segments.first { $0.id == targetID })
         #expect(reassigned.participantId == speakerB)
@@ -1540,11 +1565,11 @@ final class ProjectStoreTests {
         var shouldFail = false
         let controller = ProjectRuntimePersistenceController(
             meeting: meeting, project: project,
-            persist: { [environment] project, explicitIDs in
+            persist: { [environment] project, explicitAttributions in
                 writeCalls += 1
                 if shouldFail { throw ProjectWriteError.storageUnavailable }
                 try environment.persist(
-                    project, fields: .recordingRuntime, explicitSegmentIDs: explicitIDs)
+                    project, fields: .recordingRuntime, explicitAttributions: explicitAttributions)
             },
             debounce: .seconds(60),
             onFailure: { _ in }
@@ -1553,9 +1578,13 @@ final class ProjectStoreTests {
         _ = SpeakerBackfill.assign(
             anchorSegmentId: meeting.segments[0].id, to: speakerB, segments: meeting.segments)
         try ProjectRuntimeSession.applyRuntime(meeting, to: project)
-        controller.markExplicitSegmentIDs([meeting.segments[0].id])
+        let intents = makeIntent(ProjectWorkspaceView.attributionEntry(of: meeting.segments[0]), id: meeting.segments[0].id)
+        controller.markAttributionIntents(intents)
         shouldFail = true
+        let attemptsBeforeFlush = writeCalls
         #expect(!controller.flush(force: true), "前置：注入失败")
+        #expect(controller.writeAttemptCount == attemptsBeforeFlush + 1, "失败 flush 必须真实发生一次写尝试")
+        #expect(controller.saveError != nil, "失败后必须保留 saveError")
         // 调用方回滚 runtime 树 + 撤销强制意图（生产失败路径）
         meeting.segments[0].participantId = nil
         meeting.segments[0].speakerWasUserConfirmed = nil
@@ -1574,15 +1603,131 @@ final class ProjectStoreTests {
         shouldFail = false
         controller.schedule()
         let deadline = ContinuousClock.now.advanced(by: .seconds(3))
-        while ContinuousClock.now < deadline, controller.writeAttemptCount < 2 {
+        while ContinuousClock.now < deadline, controller.writeAttemptCount < attemptsBeforeFlush + 2 {
             try? await Task.sleep(for: .milliseconds(20))
         }
+        #expect(controller.writeAttemptCount >= attemptsBeforeFlush + 2,
+                "自动重试必须真实发生第二次写且成功（排除空转通过）")
+        #expect(controller.saveError == nil, "自动重试必须成功")
         let afterRetry = try #require(try environment.allProjects().first)
         let finalSegment = try #require(afterRetry.segments.first)
         #expect(finalSegment.participantId == speakerB,
                 "回滚后撤销的强制意图不得在自动重试时覆盖磁盘后来的人工归属")
         #expect(finalSegment.speakerConfirmationScope == .segment)
         #expect(finalSegment.speakerWasUserConfirmed == true)
+    }
+
+    @Test("边界漂移拒绝：同 UUID 重切后 startMs/sourceAssetId 变化，过期授权整事务拒绝且无部分写入（最终验收）")
+    @MainActor
+    func staleIntentRejectedOnBoundaryDrift() throws {
+        let (environment, project, meeting, _, speakerB) = try makeRecordingPersistenceFixture(
+            directoryName: "boundary-drift", credentialTag: "boundary-drift")
+        // 预置：行已确认给乙（磁盘 B）
+        _ = SpeakerBackfill.assign(
+            anchorSegmentId: meeting.segments[0].id, to: speakerB, segments: meeting.segments)
+        try ProjectRuntimeSession.applyRuntime(meeting, to: project)
+        try environment.persist(project, fields: .recordingRuntime)
+        let beforeDrift = try #require(try environment.allProjects().first)
+        let beforeShaSegment = try #require(beforeDrift.segments.first)
+        let oldText = beforeShaSegment.text
+
+        // 云端重切：同 UUID、边界与来源变化（新 startMs/sourceAssetId）
+        let drifted = try #require(try environment.allProjects().first)
+        let driftedSegment = try #require(drifted.segments.first)
+        driftedSegment.startMs = 500
+        driftedSegment.endMs = 1_500
+        driftedSegment.sourceAssetId = UUID()
+        driftedSegment.speakerWasUserConfirmed = nil
+        driftedSegment.participantId = nil
+        try environment.persist(drifted, fields: .manualSegments)
+
+        // 过期授权（起点=重切前边界与归属）提交：必须整事务拒绝
+        let staleIntentEntry = ProjectWorkspaceView.attributionEntry(of: beforeShaSegment)
+        let staleIntent = makeIntent(staleIntentEntry, id: meeting.segments[0].id)
+        meeting.segments[0].participantId = speakerB
+        meeting.segments[0].speakerWasUserConfirmed = true
+        meeting.segments[0].speakerConfirmationScope = .segment
+        try ProjectRuntimeSession.applyRuntime(meeting, to: project)
+        #expect(throws: ProjectWriteError.self) {
+            try environment.persist(
+                project, fields: .recordingRuntime,
+                explicitAttributions: staleIntent)
+        }
+        // 无部分写入：重切后的边界与新归属保持，未应用过期授权
+        let afterReject = try #require(try environment.allProjects().first)
+        let rejected = try #require(afterReject.segments.first { $0.id == meeting.segments[0].id })
+        #expect(rejected.startMs == 500 && rejected.endMs == 1_500)
+        #expect(rejected.sourceAssetId != nil)
+        #expect(rejected.participantId == nil, "过期授权不得应用到重切后的新句子")
+        #expect(rejected.speakerWasUserConfirmed == nil)
+        #expect(rejected.text == oldText)
+    }
+
+    @Test("后来人工归属保护：磁盘归属被人工改为乙后，过期授权（甲）提交被拒绝（最终验收）")
+    @MainActor
+    func laterManualAttributionProtectedFromStaleIntent() throws {
+        let (environment, project, meeting, speakerA, speakerB) = try makeRecordingPersistenceFixture(
+            directoryName: "later-manual", credentialTag: "later-manual")
+        // 预览时起点：未指认（nil）
+        try environment.persist(project, fields: .recordingRuntime)
+        let intent = makeIntent(
+            ProjectWorkspaceView.attributionEntry(of: meeting.segments[0]),
+            id: meeting.segments[0].id)
+
+        // 预览后磁盘行被人工确认给乙（另一工作台路径直接落盘）
+        let drifted = try #require(try environment.allProjects().first)
+        let driftedSegment = try #require(drifted.segments.first)
+        driftedSegment.participantId = speakerB
+        driftedSegment.speakerWasUserConfirmed = true
+        driftedSegment.speakerConfirmationScope = .segment
+        try environment.persist(drifted, fields: .manualSegments)
+
+        // 过期授权（起点=nil）提交：归属已被第三方改动，必须拒绝
+        meeting.segments[0].participantId = speakerA
+        meeting.segments[0].speakerWasUserConfirmed = true
+        meeting.segments[0].speakerConfirmationScope = .segment
+        try ProjectRuntimeSession.applyRuntime(meeting, to: project)
+        #expect(throws: ProjectWriteError.self) {
+            try environment.persist(
+                project, fields: .recordingRuntime,
+                explicitAttributions: intent)
+        }
+        let after = try #require(try environment.allProjects().first)
+        let kept = try #require(after.segments.first)
+        #expect(kept.participantId == speakerB, "后来的人工归属必须保留")
+        #expect(kept.speakerConfirmationScope == .segment)
+    }
+
+    @Test("尚未 flush 的新句仍可指认：磁盘缺失且 persistedAtPreview=false 放行（最终验收）")
+    @MainActor
+    func notYetFlushedSentenceRemainsAssignable() throws {
+        let (environment, project, meeting, _, speakerB) = try makeRecordingPersistenceFixture(
+            directoryName: "not-flushed", credentialTag: "not-flushed")
+        try environment.persist(project, fields: .recordingRuntime)
+        // runtime 树里新增一条「尚未落盘」的最终句（录音追加中、转写未 flush）
+        let fresh = TranscriptSegment(startMs: 99_000, endMs: 100_000,
+            text: "尚未落盘的新句：交付范围下周确认。", source: .local, state: .final)
+        // 新句在被 flush 前先完成左键指认（生产路径：追加到达→用户立即指认）
+        fresh.participantId = speakerB
+        fresh.speakerWasUserConfirmed = true
+        fresh.speakerConfirmationScope = .segment
+        meeting.segments.append(fresh)
+        // 磁盘当前确实没有该行（未 flush）——persistedAtPreview=false
+        let storedNow = try #require(try environment.allProjects().first)
+        #expect(!storedNow.segments.contains { $0.id == fresh.id })
+
+        // 生产链路：runtime 变更经 applyRuntime 同步到权威树后再落盘
+        try ProjectRuntimeSession.applyRuntime(meeting, to: project)
+        try environment.persist(
+            project, fields: .recordingRuntime,
+            explicitAttributions: makeIntent(
+                ProjectWorkspaceView.attributionEntry(of: fresh),
+                id: fresh.id, persistedAtPreview: false))
+        let stored = try #require(try environment.allProjects().first)
+        let assigned = try #require(stored.segments.first { $0.id == fresh.id })
+        #expect(assigned.participantId == speakerB, "新句指认必须落盘")
+        #expect(assigned.speakerConfirmationScope == .segment)
+        #expect(assigned.text.contains("尚未落盘的新句"), "新句文字完整写入")
     }
 
     @Test("录音管线撤销失败重试：磁盘保持 B，解除注入后重试成功（最终复核 P1）")
@@ -1595,6 +1740,11 @@ final class ProjectStoreTests {
         try ProjectRuntimeSession.applyRuntime(meeting, to: project)
         try environment.persist(project, fields: .recordingRuntime)
 
+        // 撤销授权意图的起点 = 指认后状态，必须在 revert 前拍
+        let undoIntent = makeIntent(
+            ProjectWorkspaceView.attributionEntry(of: meeting.segments[0]),
+            id: meeting.segments[0].id)
+
         // 撤销 runtime 树
         meeting.segments[0].participantId = nil
         meeting.segments[0].speakerWasUserConfirmed = nil
@@ -1605,7 +1755,7 @@ final class ProjectStoreTests {
         #expect(throws: ProjectWriteError.self) {
             try environment.persist(
                 project, fields: .recordingRuntime,
-                explicitSegmentIDs: [meeting.segments[0].id])
+                explicitAttributions: undoIntent)
         }
         // 失败：磁盘保持 B（可重试状态）
         let duringFailure = try #require(try environment.allProjects().first)
@@ -1614,7 +1764,7 @@ final class ProjectStoreTests {
         environment.clearPersistentStorageUnavailableForTesting()
         try environment.persist(
             project, fields: .recordingRuntime,
-            explicitSegmentIDs: [meeting.segments[0].id])
+            explicitAttributions: undoIntent)
         let retried = try #require(try environment.allProjects().first)
         #expect(retried.segments.first?.participantId == nil)
         #expect(retried.segments.first?.speakerConfirmationScope == nil)
@@ -1631,24 +1781,31 @@ final class ProjectStoreTests {
         meeting.segments[0].speakerConfirmationScope = .segment
         try ProjectRuntimeSession.applyRuntime(meeting, to: project)
         try environment.persist(project, fields: .recordingRuntime)
+        // 改判授权意图的起点 = A 态（改判前）
+        let reassignIntent = makeIntent(
+            ProjectWorkspaceView.attributionEntry(of: meeting.segments[0]),
+            id: meeting.segments[0].id)
 
         // 改判 A→B（单条显式改判语义）经录音管线落盘
         meeting.segments[0].participantId = speakerB
         try ProjectRuntimeSession.applyRuntime(meeting, to: project)
         try environment.persist(
             project, fields: .recordingRuntime,
-            explicitSegmentIDs: [meeting.segments[0].id])
+            explicitAttributions: reassignIntent)
         let afterReassign = try #require(try environment.allProjects().first)
         #expect(try #require(afterReassign.segments.first).participantId == speakerB,
                 "confirmed 行改判必须落盘")
 
-        // 清除归属经录音管线落盘
+        // 清除归属经录音管线落盘；清除授权意图的起点 = B 态（清除前，mutation 前拍）
+        let clearIntent = makeIntent(
+            ProjectWorkspaceView.attributionEntry(of: meeting.segments[0]),
+            id: meeting.segments[0].id)
         MeetingTranscriptEditor.clearSpeaker(meeting.segments[0])
         meeting.segments[0].speakerConfirmationScope = .segment
         try ProjectRuntimeSession.applyRuntime(meeting, to: project)
         try environment.persist(
             project, fields: .recordingRuntime,
-            explicitSegmentIDs: [meeting.segments[0].id])
+            explicitAttributions: clearIntent)
         let afterClear = try #require(try environment.allProjects().first)
         let cleared = try #require(afterClear.segments.first)
         #expect(cleared.participantId == nil)
